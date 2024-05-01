@@ -1,7 +1,7 @@
 // Copyright 2022 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{fmt, error, panic::Location};
+use std::panic::Location;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -15,13 +15,13 @@ pub enum Error {
 
     #[error("Nix errorno at {location} - {source}")]
     Errno {
-        source: nix::errno::Errno,
+        source: rustix::io::Errno,
         location: &'static Location<'static>,
     },
 
     #[error("Invalid data: at {location} - {message}")]
     InvalidData {
-        message: &'static str,
+        message: String,
         location: &'static Location<'static>,
     },
 }
@@ -33,12 +33,17 @@ impl Error {
     }
 
     #[track_caller]
-    pub fn new_errno(source: nix::errno::Errno) -> Error {
+    pub fn new_errno(source: rustix::io::Errno) -> Error {
         Error::Errno { source, location: Location::caller() }
     }
 
     #[track_caller]
-    pub fn new_invalid_data(message: &'static str) -> Error {
+    pub fn new_invalid_data(message: String) -> Error {
         Error::InvalidData { message, location: Location::caller() }
+    }
+
+    #[track_caller]
+    pub fn new_utf8(source: std::str::Utf8Error) -> Error {
+        Error::InvalidData { message: format!("{}", source), location: Location::caller() }
     }
 }
