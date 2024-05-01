@@ -1,4 +1,6 @@
-use std::sync::RwLock;
+// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 use std::path::PathBuf;
 
 use crate::property_area::PropertyAreaMap;
@@ -22,7 +24,7 @@ impl ContextNode {
     }
 
     pub fn open(&mut self, access_rw: bool, fsetxattr_failed: &mut bool) -> Result<()> {
-        let mut property_area = &mut self.property_area;
+        let property_area = &mut self.property_area;
         if property_area.is_some() {
             return Ok(());
         }

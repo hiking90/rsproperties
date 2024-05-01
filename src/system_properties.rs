@@ -1,3 +1,6 @@
+// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 use std::path::Path;
 use std::sync::RwLock;
 use std::sync::atomic::{fence, Ordering};

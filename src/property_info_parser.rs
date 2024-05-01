@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    cmp::Ordering, ffi::{c_void, CStr}, fs::File, mem::size_of, path::Path, ptr::NonNull
+    cmp::Ordering, ffi::{c_void, CStr}, fs::File, mem::size_of, path::Path
 };
 
 // This is a workaround for the fact that the `MetadataExt` trait is not implemented for `std::fs::Metadata` on all platforms.
@@ -28,7 +28,6 @@ where
     let mut top = array_length as i32 - 1;
     while top >= bottom {
         let search = (top + bottom) / 2;
-        let cmp = f(search);
 
         match f(search) {
             Ordering::Equal => return search,
@@ -239,7 +238,7 @@ impl<'a> PropertyInfoArea<'a> {
 
     fn check_prefix_match(&self, remaining_name: &str, trie_node: &TrieNode,
         context_index: &mut u32, type_index: &mut u32) {
-        let mut remaining_name_size = remaining_name.len();
+        let remaining_name_size = remaining_name.len();
         for i in 0..trie_node.num_prefixes() {
             let prefix = trie_node.prefix(i as _);
             if prefix.namelen > remaining_name_size as u32 {
@@ -264,7 +263,7 @@ impl<'a> PropertyInfoArea<'a> {
         let mut return_type_index: u32 = !0;
         let mut remaining_name = name;
         let mut trie_node = self.root_node();
-        while true {
+        loop {
             if trie_node.context_index() != !0 {
                 return_context_index = trie_node.context_index();
             }
@@ -312,7 +311,7 @@ impl<'a> PropertyInfoArea<'a> {
         return (return_context_index, return_type_index);
     }
 
-    pub fn get_property_info(&self, name: &str) -> (Option<&CStr>, Option<&CStr>) {
+    pub(crate) fn get_property_info(&self, name: &str) -> (Option<&CStr>, Option<&CStr>) {
         let (context_index, type_index) = self.get_property_info_indexes(name);
         let context_cstr = if context_index == !0 {
             None
@@ -363,7 +362,6 @@ impl PropertyInfoAreaFile {
 
         Ok(Self {
             mmap_base: map_result,
-            // mmap_base: NonNull::new(map_result).unwrap(),
             mmap_size: mmap_size as usize,
         })
     }
@@ -388,7 +386,6 @@ impl std::ops::Drop for PropertyInfoAreaFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use android_system_properties::AndroidSystemProperties;
 
     #[test]
     fn test_property_info_area_file() -> Result<()> {

@@ -1,10 +1,13 @@
+// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 use std::{
     ffi::CStr,
     fs::OpenOptions,
     mem,
     path::Path,
     ptr,
-    sync::atomic::{AtomicUsize, AtomicU32},
+    sync::atomic::AtomicU32,
     os::unix::fs::OpenOptionsExt,
     fmt::Debug,
 };
@@ -17,18 +20,18 @@ use std::os::android::fs::MetadataExt;
 #[cfg(target_os = "linux")]
 use std::os::linux::fs::MetadataExt;
 
-use rustix::path::Arg;
 use rustix::{fs, mm};
 
 use crate::errors::*;
-use crate::property_info::PropertyInfo;
+use crate::property_info::{
+    PropertyInfo,
+    name_from_trailing_data,
+    init_name_with_trailing_data,
+};
 
 const PA_SIZE: u64 = 128 * 1024;
 const PROP_AREA_MAGIC: u32 = 0x504f5250;
 const PROP_AREA_VERSION: u32 = 0xfc6ed0ab;
-
-static PA_SIZE_ATOMIC: AtomicUsize = AtomicUsize::new(0);
-static PA_DATA_SIZE_ATOMIC: AtomicUsize = AtomicUsize::new(0);
 
 #[repr(C, align(4))]
 pub(crate) struct PropertyTrieNode {
@@ -47,20 +50,11 @@ impl PropertyTrieNode {
         self.children.store(0, std::sync::atomic::Ordering::Relaxed);
 
         self.namelen = name.len() as _;
-        unsafe {
-            let self_ptr = self as *mut _ as *mut u8;
-            let name_ptr = self_ptr.add(mem::size_of::<Self>()) as *mut u8;
-            ptr::copy_nonoverlapping(name.as_ptr(), name_ptr, name.len());
-            *name_ptr.add(name.len()) = 0; // Add null terminator
-        }
+        init_name_with_trailing_data(self, name);
     }
 
     pub(crate) fn name(&self) -> &CStr {
-        unsafe {
-            let self_ptr = self as *const _ as *const u8;
-            let name_ptr = self_ptr.add(mem::size_of::<Self>());
-            CStr::from_bytes_with_nul_unchecked(std::slice::from_raw_parts(name_ptr, self.namelen as usize + 1))
-        }
+        name_from_trailing_data(self, Some(self.namelen as _))
     }
 }
 
