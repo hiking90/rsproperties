@@ -1,8 +1,7 @@
-// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-#[macro_use]
-extern crate zerocopy;
+use std::sync::OnceLock;
 
 mod property_info_parser;
 mod errors;
@@ -11,16 +10,20 @@ mod contexts_serialized;
 mod property_area;
 mod context_node;
 mod property_info;
+mod system_property_set;
 
 pub use errors::*;
 
 pub const PROP_VALUE_MAX: usize = 92;
 pub const PROP_DIRNAME: &str = "/dev/__properties__";
 
-lazy_static::lazy_static! {
-    pub static ref SYSTEM_PROPERTIES: system_properties::SystemProperties =
+static SYSTEM_PROPERTIES: OnceLock<system_properties::SystemProperties> = OnceLock::new();
+
+fn system_properties() -> &'static system_properties::SystemProperties {
+    SYSTEM_PROPERTIES.get_or_init(|| {
         system_properties::SystemProperties::new(&std::path::Path::new(PROP_DIRNAME))
-        .expect("Cannot open system properties. Please check if \"/dev/__properties__\" exists.");
+            .expect("Cannot open system properties. Please check if \"/dev/__properties__\" exists.")
+    })
 }
 
 pub(crate) fn bionic_align(value: usize, alignment: usize) -> usize {
@@ -28,14 +31,18 @@ pub(crate) fn bionic_align(value: usize, alignment: usize) -> usize {
 }
 
 pub fn get_with_default(name: &str, default: &str) -> String {
-    SYSTEM_PROPERTIES.get(name).unwrap_or_else(|err| {
+    system_properties().get(name).unwrap_or_else(|err| {
         log::error!("Error getting property {}: {}", name, err);
         default.to_string()
     })
 }
 
 pub fn get(name: &str) -> Result<String> {
-    SYSTEM_PROPERTIES.get(name)
+    system_properties().get(name)
+}
+
+pub fn set(name: &str, value: &str) -> Result<()> {
+    system_property_set::set(name, value)
 }
 
 #[cfg(test)]
@@ -96,5 +103,18 @@ mod tests {
             println!("{}: [{}], [{}]", prop, value1, value2);
             assert_eq!(value1, value2);
         }
+    }
+
+    #[test]
+    fn test_set() -> Result<()> {
+        let prop = "test.property";
+        let value = "test.value";
+
+        set(prop, value)?;
+
+        let value1: String = get(prop)?;
+        assert_eq!(value1, value);
+
+        Ok(())
     }
 }

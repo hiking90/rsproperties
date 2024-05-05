@@ -1,4 +1,4 @@
-// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
@@ -167,7 +167,7 @@ impl PropertyAreaMap {
         if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
             metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
             metadata.st_size() < mem::size_of::<PropertyArea>() as u64 {
-            return Err(Error::new_invalid_data("Invalid file metadata".to_owned()));
+            return Err(Error::new_custom("Invalid file metadata".to_owned()));
         }
 
         let pa_size = metadata.st_size() as _;
@@ -190,7 +190,7 @@ impl PropertyAreaMap {
 
         if thiz.property_area().magic != PROP_AREA_MAGIC ||
            thiz.property_area().version != PROP_AREA_VERSION {
-            return Err(Error::new_invalid_data("Invalid magic or version".to_owned()));
+            return Err(Error::new_custom("Invalid magic or version".to_owned()));
         }
 
         Ok(thiz)
@@ -227,7 +227,7 @@ impl PropertyAreaMap {
                         current = node;
                         break;
                     } else {
-                        return Err(Error::new_invalid_data("Can't manage PropertyTrieNode".to_owned()));
+                        return Err(Error::new_custom("Can't manage PropertyTrieNode".to_owned()));
                     }
                 }
                 std::cmp::Ordering::Greater => {
@@ -240,7 +240,7 @@ impl PropertyAreaMap {
                         current = node;
                         break;
                     } else {
-                        return Err(Error::new_invalid_data("Can't manage PropertyTrieNode".to_owned()));
+                        return Err(Error::new_custom("Can't manage PropertyTrieNode".to_owned()));
                     }
                 }
                 std::cmp::Ordering::Equal => {
@@ -264,7 +264,7 @@ impl PropertyAreaMap {
             };
 
             if substr_size == 0 {
-                return Err(Error::new_invalid_data("Invalid property name".to_owned()));
+                return Err(Error::new_custom("Invalid property name".to_owned()));
             }
 
             let subname = &remaining_name[0..substr_size];
@@ -278,7 +278,7 @@ impl PropertyAreaMap {
                 node
             }
             else {
-                return Err(Error::new_invalid_data("Can't manage PropertyTrieNode".to_owned()));
+                return Err(Error::new_custom("Can't manage PropertyTrieNode".to_owned()));
             };
 
             current = self.find_prop_trie_node(root, subname, alloc_if_needed)?;
@@ -299,7 +299,7 @@ impl PropertyAreaMap {
             current.prop.store(offset, std::sync::atomic::Ordering::Release);
             Ok(info)
         } else {
-            return Err(Error::new_invalid_data("Can't manage PropertyInfo".to_owned()));
+            return Err(Error::new_custom("Can't manage PropertyInfo".to_owned()));
         }
     }
 
@@ -307,7 +307,7 @@ impl PropertyAreaMap {
         let aligned = crate::bionic_align(size, mem::size_of::<u32>());
         let offset = self.property_area().bytes_used;
         if offset + (aligned as u32) > self.pa_data_size as u32 {
-            return Err(Error::new_invalid_data("Out of memory".to_owned()));
+            return Err(Error::new_custom("Out of memory".to_owned()));
         }
 
         self.property_area_mut().bytes_used += aligned as u32;
@@ -353,16 +353,17 @@ impl PropertyAreaMap {
         self.to_prop_obj(offset as _)
     }
 
+    // TODO: Change to use `zerocopy` crate if it supports atomic types in the future
     fn to_prop_obj<T: Sized>(&self, offset: usize) -> Result<&T> {
         if offset + mem::size_of::<T>() > self.pa_data_size {
-            return Err(Error::new_invalid_data("Invalid offset".to_owned()));
+            return Err(Error::new_custom("Invalid offset".to_owned()));
         }
         Ok(unsafe { &*(self.data.offset(offset as _) as *const T) })
     }
 
     fn to_prop_obj_mut<T: Sized>(&self, offset: usize) -> Result<&mut T> {
         if offset + mem::size_of::<T>() > self.pa_data_size {
-            return Err(Error::new_invalid_data("Invalid offset".to_owned()));
+            return Err(Error::new_custom("Invalid offset".to_owned()));
         }
         Ok(unsafe { &mut *(self.data.offset(offset as _) as *mut T) })
     }

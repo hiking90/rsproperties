@@ -1,4 +1,4 @@
-// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
 use std::panic::Location;
@@ -38,7 +38,7 @@ impl Error {
     }
 
     #[track_caller]
-    pub fn new_invalid_data(message: String) -> Error {
+    pub fn new_custom(message: String) -> Error {
         Error::InvalidData { message, location: Location::caller() }
     }
 

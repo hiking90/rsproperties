@@ -1,4 +1,4 @@
-// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::atomic::AtomicU32;
@@ -26,6 +26,7 @@ union Union {
     long_property: std::mem::ManuallyDrop<LongProperty>,
 }
 
+#[repr(C, align(4))]
 pub(crate) struct PropertyInfo {
     pub(crate) serial: AtomicU32,
     data: Union,
@@ -97,7 +98,7 @@ pub(crate) fn name_from_trailing_data<'a, I: Sized>(thiz: &'a I, len: Option<usi
         let name_ptr = thiz_ptr.add(mem::size_of::<I>()) as _;
         match len {
             Some(len) => {
-                CStr::from_bytes_until_nul(std::slice::from_raw_parts(name_ptr, len))
+                CStr::from_bytes_until_nul(std::slice::from_raw_parts(name_ptr, len + 1))
                     .expect("Failed to convert name to CStr")
             }
             None => CStr::from_ptr(name_ptr as *const i8),

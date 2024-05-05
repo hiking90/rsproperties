@@ -1,4 +1,4 @@
-// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
 use std::path::Path;
@@ -75,12 +75,12 @@ impl SystemProperties {
         let mut serial;
         loop {
             serial = new_serial;
-            let len: u32 = serial_value_len(serial);
+            let _len: u32 = serial_value_len(serial);
             let value = if serial_dirty(serial) {
                 let mut guard = self.contexts.write().unwrap();
                 let pa = guard
                     .get_prop_area_for_name(prop_info.name().to_str().map_err(Error::new_utf8)?)?
-                    .ok_or(Error::new_invalid_data("Invalid PropertyInfo".to_owned()))?;
+                    .ok_or(Error::new_custom("Invalid PropertyInfo".to_owned()))?;
                 let value = pa.dirty_backup_area()?;
                 value.as_str().map_err(Error::new_errno)?.to_owned()
             } else {

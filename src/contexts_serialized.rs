@@ -1,4 +1,4 @@
-// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
 use std::path::{Path, PathBuf};
@@ -86,7 +86,7 @@ impl Contexts for ContextsSerialized {
             .property_info_area()
             .get_property_info_indexes(name);
         if index == u32::MAX || index >= self.context_nodes.len() as u32 {
-            return Err(Error::new_invalid_data(format!("Could not find context for property {name}")));
+            return Err(Error::new_custom(format!("Could not find context for property {name}")));
         }
 
         let context_node = &mut self.context_nodes[index as usize];

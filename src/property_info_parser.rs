@@ -1,4 +1,4 @@
-// Copyright 2022 Jeff Kim <hiking90@gmail.com>
+// Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
@@ -348,7 +348,7 @@ impl PropertyInfoAreaFile {
         if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
             metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
             metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
-            return Err(Error::new_invalid_data("Invalid file metadata".to_owned()));
+            return Err(Error::new_custom("Invalid file metadata".to_owned()));
         }
 
         let mmap_size = metadata.st_size();

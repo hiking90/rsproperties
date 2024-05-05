@@ -21,7 +21,7 @@ fi
 
 function ndk_build() {
     read_remote_android
-    cargo ndk --no-strip -t $ndk_target build --example test && cargo ndk --no-strip -t $ndk_target -- test --no-run
+    cargo ndk --no-strip -t $ndk_target -- test --no-run
 }
 
 function ndk_sync() {
