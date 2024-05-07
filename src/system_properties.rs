@@ -119,6 +119,21 @@ impl SystemProperties {
             }
         }
     }
+
+    // pub fn add(&mut self, name: &str, value: &str) -> Result<()> {
+    //     let mut contexts = self.contexts.write().unwrap();
+    //     let pa = contexts.get_prop_area_for_name(name)?;
+    //     match pa {
+    //         Some(pa) => {
+    //             pa.add(name, value)?;
+    //         }
+    //         None => {
+    //             unimplemented!()
+    //         }
+    //     }
+
+    //     Ok(())
+    // }
 }
 
 #[cfg(test)]

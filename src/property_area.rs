@@ -205,7 +205,7 @@ impl PropertyAreaMap {
     }
 
     pub(crate) fn find(&self, name: &str) -> Result<&PropertyInfo> {
-        self.find_property(self.property_area(), self.root_node()?, name, "", false)
+        self.find_property(self.root_node()?, name, "", false)
     }
 
     pub(crate) fn dirty_backup_area(&self) -> Result<&CStr> {
@@ -251,7 +251,7 @@ impl PropertyAreaMap {
         Ok(current)
     }
 
-    pub(crate) fn find_property(&self, prop_area: &PropertyArea,
+    pub(crate) fn find_property(&self,
         trie: &PropertyTrieNode, name: &str, value: &str,
         alloc_if_needed: bool) -> Result<&PropertyInfo> {
         let mut remaining_name = name;

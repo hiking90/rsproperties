@@ -53,7 +53,7 @@ impl PropertyInfo {
             *dest.add(value.len()) = 0; // Add null terminator
         }
     }
-
+/*
     pub(crate) fn set_name(&mut self, name: &str) {
         unsafe {
             let self_ptr = self as *mut _ as *mut u8;
@@ -62,7 +62,7 @@ impl PropertyInfo {
             *name_ptr.add(name.len()) = 0; // Add null terminator
         }
     }
-
+*/
     pub(crate) fn name(&self) -> &CStr {
         name_from_trailing_data(self, None)
     }
