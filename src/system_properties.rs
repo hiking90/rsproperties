@@ -54,6 +54,14 @@ impl SystemProperties {
         })
     }
 
+    pub fn new_area(filename: &Path) -> Result<Self> {
+        let contexts = Box::new(ContextsSerialized::new(true, filename, &mut false, false)?);
+
+        Ok(Self {
+            contexts: RwLock::new(contexts),
+        })
+    }
+
     fn find_unlocked<'a>(&'a self, name: &'a str, contexts: &'a mut Box<dyn Contexts>) -> Result<Option<&'a PropertyInfo>> {
         let pa = contexts.get_prop_area_for_name(name)?;
         match pa {

@@ -11,8 +11,10 @@ mod property_area;
 mod context_node;
 mod property_info;
 mod system_property_set;
+mod property_info_serializer;
 
 pub use errors::*;
+pub use system_properties::SystemProperties;
 
 pub const PROP_VALUE_MAX: usize = 92;
 pub const PROP_DIRNAME: &str = "/dev/__properties__";

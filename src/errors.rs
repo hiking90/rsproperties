@@ -13,7 +13,7 @@ pub enum Error {
         location: &'static Location<'static>,
     },
 
-    #[error("Nix errorno at {location} - {source}")]
+    #[error("Errno at {location} - {source}")]
     Errno {
         source: rustix::io::Errno,
         location: &'static Location<'static>,
