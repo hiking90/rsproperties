@@ -2,11 +2,11 @@ use std::path::Path;
 use std::fs::File;
 use std::io::{BufReader, BufRead};
 
-use log;
+use crate::errors::*;
+use crate::trie_builder::*;
+use crate::trie_serializer::*;
 
-use crate::errors::{self, *};
-
-struct PropertyInfoEntry {
+pub struct PropertyInfoEntry {
     name: String,
     context: String,
     type_str: String,
@@ -14,8 +14,6 @@ struct PropertyInfoEntry {
 }
 
 impl PropertyInfoEntry {
-
-
     fn is_type_valid(type_strings: &Vec<String>) -> bool {
         if type_strings.is_empty() {
             return false;
@@ -107,6 +105,17 @@ impl PropertyInfoEntry {
     }
 }
 
+
+pub fn build_trie(property_info: &Vec<PropertyInfoEntry>, default_context: &str, default_type: &str) -> Result<Vec<u8>> {
+    let mut trie = TrieBuilder::new(default_context, default_type);
+    for entry in property_info {
+        trie.add_to_trie(entry.name.as_str(), entry.context.as_str(), entry.type_str.as_str(), entry.exact_match)?;
+    }
+
+    let mut serializer = TrieSerializer::new(&trie);
+    Ok(serializer.take_data())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +153,8 @@ mod tests {
         assert_eq!(entries.1.len(), 0);
         assert_eq!(entries.0[0].name, "net.rmnet");
         assert_eq!(entries.0[entries.0.len() - 1].name, "ro.quick_start.device_id");
+
+        let data: Vec<u8> = build_trie(&entries.0, "u:object_r:build_prop:s0", "string").unwrap();
+        println!("{}", pretty_hex::pretty_hex(&data));
     }
 }

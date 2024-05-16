@@ -72,7 +72,7 @@ impl ContextsSerialized {
 
     fn map_serial_property_area(serial_filename: &Path, access_rw: bool, fsetxattr_failed: &mut bool) -> Result<PropertyAreaMap> {
         if access_rw {
-            let context = unsafe { CStr::from_bytes_with_nul_unchecked(b"u:object_r:properties_serial:s0\0") };
+            let context: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"u:object_r:properties_serial:s0\0") };
             PropertyAreaMap::new_rw(serial_filename, Some(context), fsetxattr_failed)
         } else {
             PropertyAreaMap::new_ro(serial_filename)
@@ -96,10 +96,10 @@ impl Contexts for ContextsSerialized {
     }
 
     fn get_serial_prop_name(&self) -> Result<&PropertyArea> {
-        unimplemented!()
+        unimplemented!("get_serial_prop_name")
     }
 
     fn reset_access(&mut self) {
-
+        unimplemented!("reset_access")
     }
 }

@@ -5,6 +5,10 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["builder"]
+builder = []
+
 [dependencies]
 rustix = { version = "0.38", features = ["fs", "mm", "event"] }
 log = "0.4"

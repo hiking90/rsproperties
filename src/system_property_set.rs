@@ -1,5 +1,6 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
+
 use std::os::unix::net::UnixStream;
 use std::io::{prelude::*, IoSlice};
 use std::fs;

@@ -11,10 +11,19 @@ mod property_area;
 mod context_node;
 mod property_info;
 mod system_property_set;
+#[cfg(feature = "builder")]
 mod property_info_serializer;
+#[cfg(feature = "builder")]
+mod trie_builder;
+#[cfg(feature = "builder")]
+mod trie_serializer;
+#[cfg(feature = "builder")]
+mod trie_node_arena;
 
 pub use errors::*;
 pub use system_properties::SystemProperties;
+#[cfg(feature = "builder")]
+pub use property_info_serializer::*;
 
 pub const PROP_VALUE_MAX: usize = 92;
 pub const PROP_DIRNAME: &str = "/dev/__properties__";

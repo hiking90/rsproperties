@@ -41,11 +41,11 @@ where
 
 #[derive(FromZeroes, FromBytes, Debug)]
 #[repr(C, align(4))]
-pub struct PropertyEntry {
-    name_offset: u32,
-    namelen: u32,
-    context_index: u32,
-    type_index: u32,
+pub(crate) struct PropertyEntry {
+    pub(crate) name_offset: u32,
+    pub(crate) namelen: u32,
+    pub(crate) context_index: u32,
+    pub(crate) type_index: u32,
 }
 
 impl PropertyEntry {
@@ -57,24 +57,24 @@ impl PropertyEntry {
 #[derive(FromZeroes, FromBytes, Debug)]
 #[repr(C, align(4))]
 pub(crate) struct TrieNodeData {
-    property_entry: u32,
-    num_child_nodes: u32,
-    child_nodes: u32,
-    num_prefixes: u32,
-    prefix_entries: u32,
-    num_exact_matches: u32,
-    exact_match_entries: u32,
+    pub(crate) property_entry: u32,
+    pub(crate) num_child_nodes: u32,
+    pub(crate) child_nodes: u32,
+    pub(crate) num_prefixes: u32,
+    pub(crate) prefix_entries: u32,
+    pub(crate) num_exact_matches: u32,
+    pub(crate) exact_match_entries: u32,
 }
 
 #[derive(FromZeroes, FromBytes, Debug)]
 #[repr(C, align(4))]
 pub struct PropertyInfoAreaHeader {
-    current_version: u32,
-    minimum_supported_version: u32,
-    size: u32,
-    contexts_offset: u32,
-    types_offset: u32,
-    root_offset: u32,
+    pub(crate) current_version: u32,
+    pub(crate) minimum_supported_version: u32,
+    pub(crate) size: u32,
+    pub(crate) contexts_offset: u32,
+    pub(crate) types_offset: u32,
+    pub(crate) root_offset: u32,
 }
 
 pub struct TrieNode<'a> {
@@ -157,7 +157,7 @@ pub struct PropertyInfoArea<'a> {
 }
 
 impl<'a> PropertyInfoArea<'a> {
-    fn new(data_base: &'a [u8]) -> Self {
+    pub(crate) fn new(data_base: &'a [u8]) -> Self {
         Self {
             data_base,
         }
@@ -325,6 +325,20 @@ impl<'a> PropertyInfoArea<'a> {
             Some(self.cstr(self.type_offset(type_index as _) as _))
         };
         (context_cstr, type_cstr)
+    }
+
+    #[cfg(feature = "builder")]
+    pub(crate) fn find_context_index(&self, context: &str) -> i32 {
+        find(self.num_contexts() as _, |i| {
+            self.cstr(self.context_offset(i as _)).to_str().unwrap().cmp(context)
+        })
+    }
+
+    #[cfg(feature = "builder")]
+    pub(crate) fn find_type_index(&self, rtype: &str) -> i32 {
+        find(self.num_types() as _, |i| {
+            self.cstr(self.type_offset(i as _)).to_str().unwrap().cmp(rtype)
+        })
     }
 }
 
