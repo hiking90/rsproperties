@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use crate::property_area::PropertyAreaMap;
 use crate::errors::*;
 
-pub struct ContextNode {
+pub(crate) struct ContextNode {
     filename: PathBuf,
     context_offset: usize,
     property_area: Option<PropertyAreaMap>,
@@ -14,7 +14,7 @@ pub struct ContextNode {
 }
 
 impl ContextNode {
-    pub fn new(context_offset: usize, filename: PathBuf) -> Self {
+    pub(crate) fn new(context_offset: usize, filename: PathBuf) -> Self {
         Self {
             filename: filename,
             context_offset,
@@ -23,7 +23,7 @@ impl ContextNode {
         }
     }
 
-    pub fn open(&mut self, access_rw: bool, fsetxattr_failed: &mut bool) -> Result<()> {
+    pub(crate) fn open(&mut self, access_rw: bool, fsetxattr_failed: &mut bool) -> Result<()> {
         let property_area = &mut self.property_area;
         if property_area.is_some() {
             return Ok(());
@@ -38,11 +38,11 @@ impl ContextNode {
         Ok(())
     }
 
-    pub fn context_offset(&self) -> usize {
+    pub(crate) fn context_offset(&self) -> usize {
         self.context_offset
     }
 
-    pub fn get_property_area(&self) -> Option<&PropertyAreaMap> {
+    pub(crate) fn get_property_area(&self) -> Option<&PropertyAreaMap> {
         self.property_area.as_ref()
         // let mut property_area = self.property_area.;
         // match *property_area {

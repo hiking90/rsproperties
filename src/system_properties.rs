@@ -43,10 +43,10 @@ impl SystemProperties {
             if fs::access(Path::new(PROP_TREE_FILE), fs::Access::READ_OK).is_ok() {
                 Box::new(ContextsSerialized::new(false, filename, &mut false, false)?)
             } else {
-                unimplemented!()
+                unimplemented!("ContextsSplit")
             }
         } else {
-            unimplemented!()
+            unimplemented!("ContextsPreSplit")
         };
 
         Ok(Self {
@@ -54,6 +54,8 @@ impl SystemProperties {
         })
     }
 
+    /// Create a new area for system properties
+    /// The new area is used by the property service to store system properties.
     pub fn new_area(filename: &Path) -> Result<Self> {
         let contexts = Box::new(ContextsSerialized::new(true, filename, &mut false, false)?);
 

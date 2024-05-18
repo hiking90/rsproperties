@@ -118,7 +118,9 @@ pub fn build_trie(property_info: &Vec<PropertyInfoEntry>, default_context: &str,
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
     use super::*;
+    use crate::property_info_parser::*;
 
     #[test]
     fn test_parse_from_line() {
@@ -155,6 +157,13 @@ mod tests {
         assert_eq!(entries.0[entries.0.len() - 1].name, "ro.quick_start.device_id");
 
         let data: Vec<u8> = build_trie(&entries.0, "u:object_r:build_prop:s0", "string").unwrap();
-        println!("{}", pretty_hex::pretty_hex(&data));
+
+        let property_info = PropertyInfoArea::new(&data);
+        let index = property_info.get_property_info("ro.unknown.unknown");
+        assert_eq!(index, (Some(CString::new("u:object_r:build_prop:s0").unwrap()).as_deref(), Some(CString::new("string").unwrap()).as_deref()));
+        let index = property_info.get_property_info("net.rmnet");
+        assert_eq!(index, (Some(CString::new("u:object_r:net_radio_prop:s0").unwrap()).as_deref(), Some(CString::new("string").unwrap()).as_deref()));
+        let index = property_info.get_property_info("ro.quick_start.device_id");
+        assert_eq!(index, (Some(CString::new("u:object_r:quick_start_prop:s0").unwrap()).as_deref(), Some(CString::new("string").unwrap()).as_deref()));
     }
 }

@@ -78,6 +78,9 @@ impl TrieBuilderNode {
             rtype: Some(rtype),
         };
 
+        if self.property_entry.name == Rc::new("root".to_owned()) {
+            println!("Adding prefix: {:?}", entry);
+        }
         if self.prefixes.insert(entry) {
             Ok(())
         } else {
@@ -111,8 +114,12 @@ impl TrieBuilder {
         contexts.insert(context.clone());
         types.insert(rtypes.clone());
 
+        let mut root = TrieBuilderNode::new(Rc::new("root".to_owned()));
+        root.set_context(context);
+        root.set_rtype(rtypes);
+
         TrieBuilder {
-            root: TrieBuilderNode::new(Rc::new("root".to_owned())),
+            root,
             contexts,
             types,
         }

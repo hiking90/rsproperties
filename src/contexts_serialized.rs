@@ -1,7 +1,7 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ffi::CStr;
 
 use rustix::fs;
@@ -13,12 +13,9 @@ use crate::errors::*;
 use crate::property_info_parser::PropertyInfoAreaFile;
 
 pub(crate) struct ContextsSerialized {
-    dirname: PathBuf,
-    tree_filename: PathBuf,
-    serial_filename: PathBuf,
     property_info_area_file: PropertyInfoAreaFile,
     context_nodes: Vec<ContextNode>,
-    serial_property_area_map: PropertyAreaMap,
+    _serial_property_area_map: PropertyAreaMap,
 }
 
 impl ContextsSerialized {
@@ -61,12 +58,9 @@ impl ContextsSerialized {
         };
 
         Ok(Self {
-            dirname,
-            tree_filename,
-            serial_filename,
             property_info_area_file,
             context_nodes,
-            serial_property_area_map,
+            _serial_property_area_map: serial_property_area_map,
         })
     }
 

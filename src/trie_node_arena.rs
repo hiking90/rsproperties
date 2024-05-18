@@ -1,58 +1,32 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{mem, ptr};
+use std::mem;
 use std::str;
 use std::vec::Vec;
 
 use crate::property_info_parser::*;
 
 #[derive(Debug)]
-pub(crate) struct ArenaObjectPointer<T> {
-    arena_data: *mut u8,
-    offset: usize,
-    _marker: std::marker::PhantomData<T>,
-}
-
-impl<T> ArenaObjectPointer<T> {
-    fn new(arena_data: *mut u8, offset: usize) -> Self {
-        Self {
-            arena_data,
-            offset,
-            _marker: std::marker::PhantomData,
-        }
-    }
-
-    pub(crate) fn offset(&self) -> usize {
-        self.offset
-    }
-
-    pub(crate) fn as_ref(&self) -> &T {
-        unsafe { &*(self.arena_data.add(self.offset) as *const T) }
-    }
-
-    pub(crate) fn as_mut(&self) -> &mut T {
-        unsafe { &mut *(self.arena_data.add(self.offset) as *mut T) }
-    }
-}
-
-#[derive(Debug)]
 pub(crate) struct TrieNodeArena {
-    data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
     current_data_pointer: usize,
 }
 
 impl TrieNodeArena {
     pub(crate) fn new() -> Self {
         Self {
-            data: Vec::with_capacity(1024),
+            data: Vec::with_capacity(16*1024),
             current_data_pointer: 0,
         }
     }
 
-    pub(crate) fn allocate_object<T>(&mut self) -> ArenaObjectPointer<T> {
-        let offset = self.allocate_data(mem::size_of::<T>());
-        ArenaObjectPointer::new(self.data.as_mut_ptr(), offset)
+    pub(crate) fn to_object<T>(&mut self, offset: usize) -> &mut T {
+        unsafe { &mut *(self.data.as_mut_ptr().add(offset) as *mut T) }
+    }
+
+    pub(crate) fn allocate_object<T>(&mut self) -> usize {
+        self.allocate_data(mem::size_of::<T>())
     }
 
     pub(crate) fn allocate_uint32_array(&mut self, length: usize) -> usize {
@@ -80,7 +54,7 @@ impl TrieNodeArena {
         let offset = self.allocate_data(mem::size_of::<u32>());
         unsafe {
             let ptr = self.data.as_mut_ptr().add(offset) as *mut u32;
-            ptr::write(ptr, value);
+            *ptr = value;
         }
     }
 
@@ -99,9 +73,9 @@ impl TrieNodeArena {
         self.current_data_pointer
     }
 
-    fn data(&self) -> &[u8] {
-        &self.data
-    }
+    // fn data(&self) -> &[u8] {
+    //     &self.data
+    // }
 
     pub(crate) fn info(&self) -> PropertyInfoArea {
         PropertyInfoArea::new(&self.data)
@@ -110,6 +84,8 @@ impl TrieNodeArena {
     pub(crate) fn take_data(&mut self) -> Vec<u8> {
         let mut data = std::mem::take(&mut self.data);
         data.truncate(self.current_data_pointer);
+
+        self.current_data_pointer = 0;
 
         data
     }

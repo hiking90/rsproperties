@@ -108,6 +108,7 @@ pub(crate) struct PropertyAreaMap {
     pa_size: usize,
     data: *mut u8,
     pa_data_size: usize,
+    is_mmap: bool,
 }
 
 unsafe impl Send for PropertyAreaMap {}
@@ -149,6 +150,7 @@ impl PropertyAreaMap {
             pa_size,
             data: unsafe { memory_area.offset(std::mem::size_of::<PropertyArea>() as _) },
             pa_data_size,
+            is_mmap: true,
         };
 
         thiz.property_area_mut().init(PROP_AREA_MAGIC, PROP_AREA_VERSION);
@@ -171,7 +173,6 @@ impl PropertyAreaMap {
         }
 
         let pa_size = metadata.st_size() as _;
-        let pa_data_size = pa_size as usize - std::mem::size_of::<PropertyArea>();
 
         let memory_area = unsafe {
             mm::mmap(std::ptr::null_mut(),
@@ -181,11 +182,26 @@ impl PropertyAreaMap {
                 file, 0)
         }.map_err(Error::new_errno)? as *mut u8;
 
+        Self::new_with_ptr(memory_area, pa_size, true)
+    }
+
+    // pub(crate) fn new_with_slice(data: &[u8]) -> Result<Self> {
+    //     if data.len() < mem::size_of::<PropertyArea>() {
+    //         return Err(Error::new_custom("Invalid data size".to_owned()));
+    //     }
+
+    //     Self::new_with_ptr(data.as_ptr() as *mut u8, data.len() as _, false)
+    // }
+
+    fn new_with_ptr(memory_area: *mut u8, pa_size: usize, is_mmap: bool) -> Result<Self> {
+        let pa_data_size = pa_size - std::mem::size_of::<PropertyArea>();
+
         let thiz = Self {
             property_area: memory_area as _,
             pa_size,
             data: unsafe { memory_area.offset(std::mem::size_of::<PropertyArea>() as _) },
             pa_data_size,
+            is_mmap,
         };
 
         if thiz.property_area().magic != PROP_AREA_MAGIC ||
@@ -383,8 +399,10 @@ impl PropertyAreaMap {
 
 impl std::ops::Drop for PropertyAreaMap {
     fn drop(&mut self) {
-        unsafe {
-            mm::munmap(self.property_area as _, self.pa_size).unwrap();
+        if self.is_mmap {
+            unsafe {
+                mm::munmap(self.property_area as _, self.pa_size).unwrap();
+            }
         }
     }
 }

@@ -49,7 +49,7 @@ pub(crate) struct PropertyEntry {
 }
 
 impl PropertyEntry {
-    pub fn name<'a>(&'a self, property_info_area: &'a PropertyInfoArea) -> &'a CStr {
+    pub(crate) fn name<'a>(&'a self, property_info_area: &'a PropertyInfoArea) -> &'a CStr {
         property_info_area.cstr(self.name_offset as usize)
     }
 }
@@ -77,6 +77,7 @@ pub struct PropertyInfoAreaHeader {
     pub(crate) root_offset: u32,
 }
 
+#[derive(Debug)]
 pub struct TrieNode<'a> {
     property_info_area: PropertyInfoArea<'a>,
     trie_node_offset: usize,
@@ -90,7 +91,7 @@ impl<'a> TrieNode<'a> {
         }
     }
 
-    pub fn name(&self) -> &CStr {
+    pub(crate) fn name(&self) -> &CStr {
         let name_offset = self.property_entry().name_offset as usize;
         self.property_info_area.cstr(name_offset)
     }
@@ -103,24 +104,24 @@ impl<'a> TrieNode<'a> {
         self.property_info_area.ref_from(self.data().property_entry as usize)
     }
 
-    pub fn context_index(&self) -> u32 {
+    pub(crate) fn context_index(&self) -> u32 {
         self.property_entry().context_index
     }
 
-    pub fn type_index(&self) -> u32 {
+    pub(crate) fn type_index(&self) -> u32 {
         self.property_entry().type_index
     }
 
-    pub fn num_child_nodes(&self) -> u32 {
+    pub(crate) fn num_child_nodes(&self) -> u32 {
         self.data().num_child_nodes
     }
 
-    pub fn child_node(&self, n: usize) -> TrieNode {
+    fn child_node(&self, n: usize) -> TrieNode {
         let child_node_offset = u32::slice_from(&self.property_info_area.data_base[self.data().child_nodes as usize..]).unwrap()[n];
         TrieNode::new(&self.property_info_area, child_node_offset as usize)
     }
 
-    pub fn find_child_for_string(&self, input: &str) -> Option<TrieNode> {
+    fn find_child_for_string(&self, input: &str) -> Option<TrieNode> {
         let node_index = find(self.num_child_nodes(), |i| {
             let child = self.child_node(i as _);
             child.name().to_str().unwrap().cmp(input)
@@ -132,20 +133,20 @@ impl<'a> TrieNode<'a> {
         }
     }
 
-    pub fn num_prefixes(&self) -> u32 {
+    pub(crate) fn num_prefixes(&self) -> u32 {
         self.data().num_prefixes
     }
 
-    pub fn prefix(&self, n: usize) -> &PropertyEntry {
+    pub(crate) fn prefix(&self, n: usize) -> &PropertyEntry {
         let offset = self.property_info_area.u32_slice_from(self.data().prefix_entries as usize)[n] as usize;
         self.property_info_area.ref_from(offset)
     }
 
-    pub fn num_exact_matches(&self) -> u32 {
+    pub(crate) fn num_exact_matches(&self) -> u32 {
         self.data().num_exact_matches
     }
 
-    pub fn exact_match(&self, n: usize) -> &PropertyEntry {
+    pub(crate) fn exact_match(&self, n: usize) -> &PropertyEntry {
         let offset = self.property_info_area.u32_slice_from(self.data().exact_match_entries as usize)[n] as usize;
         self.property_info_area.ref_from(offset)
     }
@@ -172,7 +173,6 @@ impl<'a> PropertyInfoArea<'a> {
         match self.data_base[offset..].iter().position(|&x| x == 0) {
             Some(end) => {
                 let end = end + offset + 1;
-                // println!("{offset}\n{:?}", &self.data_base[offset .. end].hex_dump());
                 CStr::from_bytes_with_nul(&self.data_base[offset .. end]).unwrap()
             }
             None => {
@@ -184,7 +184,7 @@ impl<'a> PropertyInfoArea<'a> {
     #[inline]
     pub(crate) fn ref_from<T: FromBytes>(&self, offset: usize) -> &T {
         let size_of = size_of::<T>();
-        T::ref_from(&self.data_base[offset..offset + size_of]).unwrap()
+        T::ref_from(&self.data_base[offset..offset + size_of]).expect("Failed to create reference")
     }
 
     #[inline]
@@ -193,45 +193,45 @@ impl<'a> PropertyInfoArea<'a> {
     }
 
     #[inline]
-    fn header(&self) -> &PropertyInfoAreaHeader {
+    pub(crate) fn header(&self) -> &PropertyInfoAreaHeader {
         self.ref_from(0)
     }
 
     #[inline]
-    pub fn current_version(&self) -> u32 {
+    pub(crate) fn current_version(&self) -> u32 {
         self.header().current_version
     }
 
     #[inline]
-    pub fn minimum_supported_version(&self) -> u32 {
+    pub(crate) fn minimum_supported_version(&self) -> u32 {
         self.header().minimum_supported_version
     }
 
     #[inline]
-    pub fn size(&self) -> usize {
+    pub(crate) fn size(&self) -> usize {
         self.header().size as _
     }
 
     #[inline]
-    pub fn num_contexts(&self) -> usize {
+    pub(crate) fn num_contexts(&self) -> usize {
         self.u32_slice_from(self.header().contexts_offset as usize)[0] as _
     }
 
     #[inline]
-    pub fn num_types(&self) -> usize {
+    pub(crate) fn num_types(&self) -> usize {
         self.u32_slice_from(self.header().types_offset as usize)[0] as _
     }
 
-    pub fn root_node(&self) -> TrieNode {
+    pub(crate) fn root_node(&self) -> TrieNode {
         TrieNode::new(self, self.header().root_offset as usize)
     }
 
-    pub fn context_offset(&self, index: usize) -> usize {
+    pub(crate) fn context_offset(&self, index: usize) -> usize {
         let context_array_offset = self.header().contexts_offset as usize + size_of::<u32>();
         self.u32_slice_from(context_array_offset)[index] as _
     }
 
-    pub fn type_offset(&self, index: usize) -> usize {
+    pub(crate) fn type_offset(&self, index: usize) -> usize {
         let type_array_offset = self.header().types_offset as usize + size_of::<u32>();
         self.u32_slice_from(type_array_offset)[index] as _
     }
@@ -258,7 +258,7 @@ impl<'a> PropertyInfoArea<'a> {
         }
     }
 
-    pub fn get_property_info_indexes(&self, name: &str) -> (u32, u32) {
+    pub(crate) fn get_property_info_indexes(&self, name: &str) -> (u32, u32) {
         let mut return_context_index: u32 = !0;
         let mut return_type_index: u32 = !0;
         let mut remaining_name = name;
@@ -351,11 +351,11 @@ unsafe impl Send for PropertyInfoAreaFile {}
 unsafe impl Sync for PropertyInfoAreaFile {}
 
 impl PropertyInfoAreaFile {
-    pub fn load_default_path() -> Result<Self> {
+    pub(crate) fn load_default_path() -> Result<Self> {
         Self::load_path(Path::new(crate::system_properties::PROP_TREE_FILE))
     }
 
-    pub fn load_path(path: &Path) -> Result<Self> {
+    pub(crate) fn load_path(path: &Path) -> Result<Self> {
         let file = File::open(path).map_err(Error::new_io)?;
 
         let metadata = file.metadata().map_err(Error::new_io)?;
@@ -380,7 +380,7 @@ impl PropertyInfoAreaFile {
         })
     }
 
-    pub fn property_info_area(&self) -> PropertyInfoArea {
+    pub(crate) fn property_info_area(&self) -> PropertyInfoArea {
         let data_base = unsafe {
             std::slice::from_raw_parts(self.mmap_base as *const u8, self.mmap_size)
         };
@@ -410,17 +410,13 @@ mod tests {
         assert_eq!(info_area.current_version(), 1);
         assert_eq!(info_area.minimum_supported_version(), 1);
 
-        println!("info_area.header() = {:?}", info_area.header());
-
         let num_context_nodes = info_area.num_contexts();
-        println!("num_context_nodes = {:?}", num_context_nodes);
 
         // for i in 0..num_context_nodes {
         //     println!("context: {:?}", info_area.cstr(info_area.context_offset(i)));
         // }
 
         let (context_cstr, type_cstr) = info_area.get_property_info("ro.build.version.sdk");
-        println!("context_cstr = {:?}, type_cstr = {:?}", context_cstr, type_cstr);
         assert_eq!(context_cstr.unwrap().to_str().unwrap(), "ro");
 
         Ok(())
