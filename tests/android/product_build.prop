@@ -1,0 +1,78 @@
+####################################
+# from generate-common-build-props
+# These properties identify this partition image.
+####################################
+ro.product.product.brand=google
+ro.product.product.device=emu64xa
+ro.product.product.manufacturer=Google
+ro.product.product.model=sdk_gphone64_x86_64
+ro.product.product.name=sdk_gphone64_x86_64
+ro.product.model_for_attestation=
+ro.product.brand_for_attestation=
+ro.product.name_for_attestation=
+ro.product.build.date=Tue Mar 19 18:00:27 UTC 2024
+ro.product.build.date.utc=1710871227
+ro.product.build.fingerprint=google/sdk_gphone64_x86_64/emu64xa:14/UE1A.230829.036.A2/11596452:userdebug/dev-keys
+ro.product.build.id=UE1A.230829.036.A2
+ro.product.build.tags=dev-keys
+ro.product.build.type=userdebug
+ro.product.build.version.incremental=11596452
+ro.product.build.version.release=14
+ro.product.build.version.release_or_codename=14
+ro.product.build.version.sdk=34
+####################################
+# from device/generic/goldfish/bluetooth.prop
+####################################
+# Set the Bluetooth Class of Device
+# Service Field: 0x5A -> 90
+#    Bit 17: Networking
+#    Bit 19: Capturing
+#    Bit 20: Object Transfer
+#    Bit 22: Telephony
+# MAJOR_CLASS: 0x02 -> 2 (Phone)
+# MINOR_CLASS: 0x0C -> 12 (Smart Phone)
+bluetooth.device.class_of_device=90,2,12
+# Set supported Bluetooth profiles to enabled
+# Disable asha profile as it will disable
+# the cts-verifier multi advertising tests (b/249536741)
+# bluetooth.profile.asha.central.enabled=true
+# Disable LeAudio related profile as there is no support for it
+bluetooth.profile.bap.broadcast.assist.enabled=false
+bluetooth.profile.bap.unicast.client.enabled=false
+bluetooth.profile.bas.client.enabled=false
+bluetooth.profile.ccp.server.enabled=false
+bluetooth.profile.hap.client.enabled=false
+bluetooth.profile.csip.set_coordinator.enabled=false
+bluetooth.profile.vcp.controller.enabled=false
+bluetooth.profile.a2dp.source.enabled=true
+bluetooth.profile.avrcp.target.enabled=true
+bluetooth.profile.gatt.enabled=true
+bluetooth.profile.hfp.ag.enabled=true
+bluetooth.profile.hid.device.enabled=true
+bluetooth.profile.hid.host.enabled=true
+bluetooth.profile.map.server.enabled=true
+bluetooth.profile.mcp.server.enabled=true
+bluetooth.profile.opp.enabled=true
+bluetooth.profile.pan.nap.enabled=true
+bluetooth.profile.pan.panu.enabled=true
+bluetooth.profile.pbap.server.enabled=true
+####################################
+# from variable ADDITIONAL_PRODUCT_PROPERTIES
+####################################
+ro.product.vndk.version=34
+ro.build.characteristics=emulator
+ro.product.cpu.pagesize.max=65536
+ro.dalvik.vm.enable_uffd_gc=false
+####################################
+# from variable PRODUCT_PRODUCT_PROPERTIES
+####################################
+ro.com.google.acsa=true
+setupwizard.feature.deferred_setup_notification=false
+setupwizard.feature.deferred_setup_suggestion=false
+ro.config.ringtone=Ring_Synth_04.ogg
+ro.config.notification_sound=pixiedust.ogg
+ro.com.android.dataroaming=true
+remote_provisioning.enable_rkpd=true
+remote_provisioning.hostname=remoteprovisioning.googleapis.com
+persist.wm.extensions.enabled=true
+# end of file

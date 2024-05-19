@@ -1,0 +1,23 @@
+####################################
+# from generate-common-build-props
+# These properties identify this partition image.
+####################################
+ro.product.vendor_dlkm.brand=google
+ro.product.vendor_dlkm.device=emu64xa
+ro.product.vendor_dlkm.manufacturer=Google
+ro.product.vendor_dlkm.model=sdk_gphone64_x86_64
+ro.product.vendor_dlkm.name=sdk_gphone64_x86_64
+ro.product.model_for_attestation=
+ro.product.brand_for_attestation=
+ro.product.name_for_attestation=
+ro.vendor_dlkm.build.date=Tue Mar 19 18:00:27 UTC 2024
+ro.vendor_dlkm.build.date.utc=1710871227
+ro.vendor_dlkm.build.fingerprint=google/sdk_gphone64_x86_64/emu64xa:14/UE1A.230829.036.A2/11596452:userdebug/dev-keys
+ro.vendor_dlkm.build.id=UE1A.230829.036.A2
+ro.vendor_dlkm.build.tags=dev-keys
+ro.vendor_dlkm.build.type=userdebug
+ro.vendor_dlkm.build.version.incremental=11596452
+ro.vendor_dlkm.build.version.release=14
+ro.vendor_dlkm.build.version.release_or_codename=14
+ro.vendor_dlkm.build.version.sdk=34
+# end of file

@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn test_parse_from_file() {
-        let entries = PropertyInfoEntry::parse_from_file(Path::new("tests/plat_property_contexts"), false).unwrap();
+        let entries = PropertyInfoEntry::parse_from_file(Path::new("tests/android/plat_property_contexts"), false).unwrap();
         assert_eq!(entries.1.len(), 0);
         assert_eq!(entries.0[0].name, "net.rmnet");
         assert_eq!(entries.0[entries.0.len() - 1].name, "ro.quick_start.device_id");

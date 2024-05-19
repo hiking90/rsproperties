@@ -33,11 +33,13 @@ pub trait Contexts : Send + Sync {
     fn reset_access(&mut self);
 }
 
+/// System properties
 pub struct SystemProperties {
     contexts: RwLock<Box<dyn Contexts>>,
 }
 
 impl SystemProperties {
+    /// Create a new system properties to read system properties from a file or a directory.
     pub fn new(filename: &Path) -> Result<Self> {
         let contexts = if filename.is_dir() {
             if fs::access(Path::new(PROP_TREE_FILE), fs::Access::READ_OK).is_ok() {
@@ -119,6 +121,7 @@ impl SystemProperties {
         Ok((name, value))
     }
 
+    /// Get the value of a system property
     pub fn get(&self, name: &str) -> Result<String> {
         match self.find_unlocked(name, &mut self.contexts.write().unwrap())? {
             Some(prop_info) => {

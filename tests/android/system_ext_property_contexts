@@ -1,0 +1,8 @@
+#line 1 "vendor/google/sdk/sepolicy/system_ext/private/property_contexts"
+# Boot animation dynamic colors
+persist.bootanim.color1     u:object_r:bootanim_system_prop:s0     exact    int
+persist.bootanim.color2     u:object_r:bootanim_system_prop:s0     exact    int
+persist.bootanim.color3     u:object_r:bootanim_system_prop:s0     exact    int
+persist.bootanim.color4     u:object_r:bootanim_system_prop:s0     exact    int
+#line 1 "out/soong/.intermediates/system/sepolicy/contexts/system_ext_property_contexts/android_common/gen/newline"
+

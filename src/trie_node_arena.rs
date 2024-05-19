@@ -21,14 +21,17 @@ impl TrieNodeArena {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn to_object<T>(&mut self, offset: usize) -> &mut T {
         unsafe { &mut *(self.data.as_mut_ptr().add(offset) as *mut T) }
     }
 
+    #[inline(always)]
     pub(crate) fn allocate_object<T>(&mut self) -> usize {
         self.allocate_data(mem::size_of::<T>())
     }
 
+    #[inline(always)]
     pub(crate) fn allocate_uint32_array(&mut self, length: usize) -> usize {
         self.allocate_data(mem::size_of::<u32>() * length)
     }
