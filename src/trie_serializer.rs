@@ -73,10 +73,6 @@ impl TrieSerializer {
         entry.context_index = context_index as _;
         entry.type_index = type_index as _;
 
-        if property_entry.name == Rc::new("root".to_owned()) {
-            println!("root property entry: {:?}, index: {context_index}, {type_index}", property_entry);
-        }
-
         return entry_offset as _;
     }
 

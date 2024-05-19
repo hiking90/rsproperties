@@ -82,7 +82,8 @@ impl PropertyInfoEntry {
     }
 
     pub fn parse_from_file(filename: &Path, require_prefix_or_exact: bool) -> Result<(Vec<PropertyInfoEntry>, Vec<Error>)> {
-        let file = File::open(filename).map_err(Error::new_io)?;
+        let file = File::open(filename)
+            .map_err(|e| Error::new_custom(format!("Failed to open to file {filename:?}: {:?}", e)))?;
         let reader = BufReader::new(file);
 
         let mut errors = Vec::new();
@@ -104,7 +105,6 @@ impl PropertyInfoEntry {
         Ok((entries, errors))
     }
 }
-
 
 pub fn build_trie(property_info: &Vec<PropertyInfoEntry>, default_context: &str, default_type: &str) -> Result<Vec<u8>> {
     let mut trie = TrieBuilder::new(default_context, default_type);

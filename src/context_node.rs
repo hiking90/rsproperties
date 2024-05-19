@@ -42,16 +42,8 @@ impl ContextNode {
         self.context_offset
     }
 
-    pub(crate) fn get_property_area(&self) -> Option<&PropertyAreaMap> {
-        self.property_area.as_ref()
-        // let mut property_area = self.property_area.;
-        // match *property_area {
-        //     Some(pa) => Some(&pa),
-        //     None => {
-        //         *property_area = PropertyAreaMap::new_ro(self.filename.as_path()).ok();
-        //         property_area.as_ref()
-        //     }
-        // }
+    pub(crate) fn get_property_area(&mut self) -> Option<&mut PropertyAreaMap> {
+        self.property_area.as_mut()
     }
 
     // pub fn reset_access(&self) {

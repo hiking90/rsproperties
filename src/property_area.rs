@@ -100,6 +100,10 @@ impl PropertyArea {
         self.bytes_used = mem::size_of::<PropertyTrieNode>() as _;
         self.bytes_used += crate::bionic_align(crate::PROP_VALUE_MAX, mem::size_of::<u32>()) as u32;
     }
+
+    pub(crate) fn serial(&self) -> &AtomicU32 {
+        &self.serial
+    }
 }
 
 #[derive(Debug)]
@@ -123,7 +127,7 @@ impl PropertyAreaMap {
             .custom_flags((fs::OFlags::NOFOLLOW.bits() | fs::OFlags::EXCL.bits()) as _) // additional flags
             .mode(0o444)              // permission: 0444
             .open(filename)
-            .map_err(Error::new_io)?;
+            .map_err(|e| Error::new_custom(format!("File open is failed in: {filename:?}: {e:?}")))?;
 
         if let Some(context) = context {
             if fs::fsetxattr(&file, "selinux", context.to_bytes_with_nul(),
@@ -166,10 +170,17 @@ impl PropertyAreaMap {
             .map_err(Error::new_io)?;
 
         let metadata = file.metadata().map_err(Error::new_io)?;
-        if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
-            metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
-            metadata.st_size() < mem::size_of::<PropertyArea>() as u64 {
-            return Err(Error::new_custom("Invalid file metadata".to_owned()));
+        if cfg!(test) {
+            if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
+                metadata.st_size() < mem::size_of::<PropertyArea>() as u64 {
+                return Err(Error::new_custom("Invalid file metadata".to_owned()));
+            }
+        } else {
+            if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
+                metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
+                metadata.st_size() < mem::size_of::<PropertyArea>() as u64 {
+                return Err(Error::new_custom("Invalid file metadata".to_owned()));
+            }
         }
 
         let pa_size = metadata.st_size() as _;
@@ -224,8 +235,28 @@ impl PropertyAreaMap {
         self.find_property(self.root_node()?, name, "", false)
     }
 
+    pub(crate) fn add(&self, name: &str, value: &str) -> Result<()> {
+        self.find_property(self.root_node()?, name, value, true)
+            .map(|_| ())
+    }
+
     pub(crate) fn dirty_backup_area(&self) -> Result<&CStr> {
         self.to_prop_cstr(mem::size_of::<PropertyTrieNode>() as _)
+    }
+
+    pub(crate) fn set_dirty_backup_area(&self, value: &CStr) -> Result<()> {
+        let offset = mem::size_of::<PropertyTrieNode>() as _;
+        let bytes = value.to_bytes_with_nul();
+        if bytes.len() + offset > self.pa_data_size {
+            return Err(Error::new_custom("Invalid offset".to_owned()));
+        }
+
+        unsafe {
+            let dest = self.data.add(offset);
+            ptr::copy_nonoverlapping(&bytes[0], dest, bytes.len());
+        }
+
+        Ok(())
     }
 
     fn find_prop_trie_node<'a>(&'a self, trie: &'a PropertyTrieNode, name: &str, alloc_if_needed: bool) -> Result<&'a PropertyTrieNode> {

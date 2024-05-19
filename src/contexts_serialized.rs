@@ -15,7 +15,7 @@ use crate::property_info_parser::PropertyInfoAreaFile;
 pub(crate) struct ContextsSerialized {
     property_info_area_file: PropertyInfoAreaFile,
     context_nodes: Vec<ContextNode>,
-    _serial_property_area_map: PropertyAreaMap,
+    serial_property_area_map: PropertyAreaMap,
 }
 
 impl ContextsSerialized {
@@ -41,8 +41,10 @@ impl ContextsSerialized {
         }
 
         let serial_property_area_map = if writable {
-            fs::mkdir(dirname.as_path(), fs::Mode::RWXU | fs::Mode::XGRP | fs::Mode::XOTH)
-                .map_err(Error::new_errno)?;
+            if dirname.is_dir() == false {
+                fs::mkdir(dirname.as_path(), fs::Mode::RWXU | fs::Mode::XGRP | fs::Mode::XOTH)
+                    .map_err(|e| Error::new_custom(format!("mkdir is failed in: {dirname:?}: {e:?}")))?;
+            }
 
             *fsetxattr_failed = false;
 
@@ -60,7 +62,7 @@ impl ContextsSerialized {
         Ok(Self {
             property_info_area_file,
             context_nodes,
-            _serial_property_area_map: serial_property_area_map,
+            serial_property_area_map,
         })
     }
 
@@ -75,7 +77,7 @@ impl ContextsSerialized {
 }
 
 impl Contexts for ContextsSerialized {
-    fn get_prop_area_for_name(&mut self, name: &str) -> Result<Option<&PropertyAreaMap>> {
+    fn get_prop_area_for_name(&mut self, name: &str) -> Result<Option<&mut PropertyAreaMap>> {
         let (index, _) = self.property_info_area_file
             .property_info_area()
             .get_property_info_indexes(name);
@@ -89,8 +91,12 @@ impl Contexts for ContextsSerialized {
         Ok(context_node.get_property_area())
     }
 
-    fn get_serial_prop_name(&self) -> Result<&PropertyArea> {
+    fn get_serial_prop_name(&self) -> Result<&PropertyAreaMap> {
         unimplemented!("get_serial_prop_name")
+    }
+
+    fn get_serial_prop_area(&self) -> &PropertyArea {
+        self.serial_property_area_map.property_area()
     }
 
     fn reset_access(&mut self) {

@@ -10,7 +10,7 @@ default = ["builder"]
 builder = []
 
 [dependencies]
-rustix = { version = "0.38", features = ["fs", "mm", "event"] }
+rustix = { version = "0.38", features = ["fs", "mm", "event", "thread", "net", "process"] }
 log = "0.4"
 zerocopy = "0.7"
 zerocopy-derive = "0.7"
@@ -19,3 +19,4 @@ pretty_hex = { version = "0.4", package = "pretty-hex" }
 
 [dev-dependencies]
 android_system_properties = "0.1"
+env_logger = "0.11"

@@ -27,7 +27,7 @@ union Union {
 }
 
 #[repr(C, align(4))]
-pub(crate) struct PropertyInfo {
+pub struct PropertyInfo {
     pub(crate) serial: AtomicU32,
     data: Union,
 }
@@ -83,6 +83,15 @@ impl PropertyInfo {
                 CStr::from_bytes_until_nul(std::slice::from_raw_parts(value_ptr, PROP_VALUE_MAX))
                     .expect("Failed to convert value to CStr")
             }
+        }
+    }
+
+    // TODO: self must be mutable. The current implementation is a workaround.
+    pub(crate) fn set_value(&self, value: &str) {
+        unsafe {
+            let dest = self.data.value.as_ptr() as *mut u8;
+            ptr::copy_nonoverlapping(value.as_ptr(), dest, value.len());
+            *dest.add(value.len()) = 0; // Add null terminator
         }
     }
 

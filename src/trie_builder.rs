@@ -78,9 +78,6 @@ impl TrieBuilderNode {
             rtype: Some(rtype),
         };
 
-        if self.property_entry.name == Rc::new("root".to_owned()) {
-            println!("Adding prefix: {:?}", entry);
-        }
         if self.prefixes.insert(entry) {
             Ok(())
         } else {

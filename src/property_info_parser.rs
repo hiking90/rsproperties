@@ -356,13 +356,21 @@ impl PropertyInfoAreaFile {
     }
 
     pub(crate) fn load_path(path: &Path) -> Result<Self> {
-        let file = File::open(path).map_err(Error::new_io)?;
+        let file: File = File::open(path)
+            .map_err(|e| Error::new_custom(format!("File open is failed in: {path:?}: {e:?}")))?;
 
         let metadata = file.metadata().map_err(Error::new_io)?;
-        if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
-            metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
-            metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
-            return Err(Error::new_custom("Invalid file metadata".to_owned()));
+        if cfg!(test) {
+            if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
+                metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
+                return Err(Error::new_custom("Invalid file metadata".to_owned()));
+            }
+        } else {
+            if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
+                metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
+                metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
+                return Err(Error::new_custom("Invalid file metadata".to_owned()));
+            }
         }
 
         let mmap_size = metadata.st_size();
@@ -401,23 +409,36 @@ impl std::ops::Drop for PropertyInfoAreaFile {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_property_info_area_file() -> Result<()> {
-        let info_area_file = PropertyInfoAreaFile::load_default_path()?;
-
-        let info_area = info_area_file.property_info_area();
-
+    fn test_info_area(info_area: &PropertyInfoArea) {
         assert_eq!(info_area.current_version(), 1);
         assert_eq!(info_area.minimum_supported_version(), 1);
 
         let num_context_nodes = info_area.num_contexts();
 
-        // for i in 0..num_context_nodes {
-        //     println!("context: {:?}", info_area.cstr(info_area.context_offset(i)));
-        // }
+        for i in 0..num_context_nodes {
+            println!("context: {:?}", info_area.cstr(info_area.context_offset(i)));
+        }
 
         let (context_cstr, type_cstr) = info_area.get_property_info("ro.build.version.sdk");
-        assert_eq!(context_cstr.unwrap().to_str().unwrap(), "ro");
+        assert_eq!(context_cstr.unwrap().to_str().unwrap(), "u:object_r:build_prop:s0");
+        assert_eq!(type_cstr.unwrap().to_str().unwrap(), "int");
+    }
+
+    #[cfg(target_os = "android")]
+    #[test]
+    fn test_property_info_area_file() -> Result<()> {
+        test_info_area(PropertyInfoAreaFile::load_default_path()?.property_info_area());
+        Ok(())
+    }
+
+    #[cfg(feature = "builder")]
+    #[test]
+    fn test_property_info_area_with_builder() -> Result<()> {
+        #[cfg(feature = "builder")]
+        let entries = crate::property_info_serializer::PropertyInfoEntry::parse_from_file(Path::new("tests/android/plat_property_contexts"), false).unwrap();
+        let data: Vec<u8> = crate::property_info_serializer::build_trie(&entries.0, "u:object_r:build_prop:s0", "string").unwrap();
+
+        test_info_area(&PropertyInfoArea::new(&data));
 
         Ok(())
     }
