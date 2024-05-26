@@ -100,7 +100,6 @@ mod tests {
     fn test_load_properties_from_file() {
         let mut properties = HashMap::new();
         load_properties_from_file(Path::new("tests/android/system_build.prop"), None, "u:r:init:s0", &mut properties).unwrap();
-        println!("{:?}", properties);
         assert_eq!(properties.get("persist.sys.usb.config"), Some(&"adb".to_string()));
     }
 }

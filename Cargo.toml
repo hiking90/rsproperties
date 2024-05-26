@@ -16,6 +16,7 @@ zerocopy = "0.7"
 zerocopy-derive = "0.7"
 thiserror = "1.0"
 pretty_hex = { version = "0.4", package = "pretty-hex" }
+lazy_static = "1.4"
 
 [dev-dependencies]
 android_system_properties = "0.1"

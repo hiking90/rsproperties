@@ -415,10 +415,6 @@ mod tests {
 
         let num_context_nodes = info_area.num_contexts();
 
-        for i in 0..num_context_nodes {
-            println!("context: {:?}", info_area.cstr(info_area.context_offset(i)));
-        }
-
         let (context_cstr, type_cstr) = info_area.get_property_info("ro.build.version.sdk");
         assert_eq!(context_cstr.unwrap().to_str().unwrap(), "u:object_r:build_prop:s0");
         assert_eq!(type_cstr.unwrap().to_str().unwrap(), "int");
@@ -427,7 +423,7 @@ mod tests {
     #[cfg(target_os = "android")]
     #[test]
     fn test_property_info_area_file() -> Result<()> {
-        test_info_area(PropertyInfoAreaFile::load_default_path()?.property_info_area());
+        test_info_area(&PropertyInfoAreaFile::load_default_path()?.property_info_area());
         Ok(())
     }
 

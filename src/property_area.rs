@@ -227,11 +227,11 @@ impl PropertyAreaMap {
         unsafe { &*self.property_area }
     }
 
-    pub(crate) fn property_area_mut(&self) -> &mut PropertyArea {
+    fn property_area_mut(&self) -> &mut PropertyArea {
         unsafe { &mut *self.property_area }
     }
 
-    pub(crate) fn find(&self, name: &str) -> Result<&PropertyInfo> {
+    pub(crate) fn find(&self, name: &str) -> Result<(&PropertyInfo, u32)> {
         self.find_property(self.root_node()?, name, "", false)
     }
 
@@ -300,7 +300,7 @@ impl PropertyAreaMap {
 
     pub(crate) fn find_property(&self,
         trie: &PropertyTrieNode, name: &str, value: &str,
-        alloc_if_needed: bool) -> Result<&PropertyInfo> {
+        alloc_if_needed: bool) -> Result<(&PropertyInfo, u32)> {
         let mut remaining_name = name;
         let mut current = trie;
         loop {
@@ -340,11 +340,12 @@ impl PropertyAreaMap {
         let prop_offset = current.prop.load(std::sync::atomic::Ordering::Relaxed);
 
         if prop_offset != 0 {
-            self.to_prop_obj_from_atomic::<PropertyInfo>(&current.prop)
+            let offset = &current.prop.load(std::sync::atomic::Ordering::Acquire);
+            Ok((self.to_prop_obj(*offset as _)?, *offset))
         } else if alloc_if_needed {
             let (info, offset) = self.new_prop_info(name, value)?;
             current.prop.store(offset, std::sync::atomic::Ordering::Release);
-            Ok(info)
+            Ok((info, offset))
         } else {
             return Err(Error::new_custom("Can't manage PropertyInfo".to_owned()));
         }
@@ -401,15 +402,15 @@ impl PropertyAreaMap {
     }
 
     // TODO: Change to use `zerocopy` crate if it supports atomic types in the future
-    fn to_prop_obj<T: Sized>(&self, offset: usize) -> Result<&T> {
-        if offset + mem::size_of::<T>() > self.pa_data_size {
+    pub(crate) fn to_prop_obj<T: Sized>(&self, offset: u32) -> Result<&T> {
+        if offset as usize + mem::size_of::<T>() > self.pa_data_size {
             return Err(Error::new_custom("Invalid offset".to_owned()));
         }
         Ok(unsafe { &*(self.data.offset(offset as _) as *const T) })
     }
 
-    fn to_prop_obj_mut<T: Sized>(&self, offset: usize) -> Result<&mut T> {
-        if offset + mem::size_of::<T>() > self.pa_data_size {
+    fn to_prop_obj_mut<T: Sized>(&self, offset: u32) -> Result<&mut T> {
+        if offset as usize + mem::size_of::<T>() > self.pa_data_size {
             return Err(Error::new_custom("Invalid offset".to_owned()));
         }
         Ok(unsafe { &mut *(self.data.offset(offset as _) as *mut T) })

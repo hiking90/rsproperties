@@ -8,24 +8,23 @@ use crate::errors::*;
 
 pub(crate) struct ContextNode {
     filename: PathBuf,
-    context_offset: usize,
+    _context_offset: usize,
     property_area: Option<PropertyAreaMap>,
-    no_access: bool,
+    _no_access: bool,
 }
 
 impl ContextNode {
-    pub(crate) fn new(context_offset: usize, filename: PathBuf) -> Self {
+    pub(crate) fn new(_context_offset: usize, filename: PathBuf) -> Self {
         Self {
             filename: filename,
-            context_offset,
+            _context_offset,
             property_area: None,
-            no_access: false,
+            _no_access: false,
         }
     }
 
     pub(crate) fn open(&mut self, access_rw: bool, fsetxattr_failed: &mut bool) -> Result<()> {
-        let property_area = &mut self.property_area;
-        if property_area.is_some() {
+        if self.property_area.is_some() {
             return Ok(());
         }
         let pa = if access_rw {
@@ -34,19 +33,19 @@ impl ContextNode {
             PropertyAreaMap::new_ro(self.filename.as_path())?
         };
 
-        *property_area = Some(pa);
+        self.property_area = Some(pa);
         Ok(())
     }
 
-    pub(crate) fn context_offset(&self) -> usize {
-        self.context_offset
+    // pub(crate) fn context_offset(&self) -> usize {
+    //     self.context_offset
+    // }
+
+    pub(crate) fn property_area(&self) -> Option<&PropertyAreaMap> {
+        self.property_area.as_ref()
     }
 
-    pub(crate) fn get_property_area(&mut self) -> Option<&mut PropertyAreaMap> {
+    pub(crate) fn property_area_mut(&mut self) -> Option<&mut PropertyAreaMap> {
         self.property_area.as_mut()
     }
-
-    // pub fn reset_access(&self) {
-    //     self.no_access = false;
-    // }
 }

@@ -189,7 +189,6 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
             wait_for_socket_close(conn.stream.as_fd())?;
         }
         ProtocolVersion::V2 => {
-            println!("Protocol version 2");
             let value_len = value.len() as u32;
             let name_len = name.len() as u32;
             if value.len() >= PROP_VALUE_MAX && name.starts_with("ro.") == false {
@@ -205,7 +204,6 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
                 .send(&mut conn)?;
 
             let res = conn.recv_i32()?;
-            println!("res: {}", res);
             if res != PROP_SUCCESS {
                 return Err(Error::new_custom(
                     format!("Unable to set property \"{name}\" to \"{value}\": error code: 0x{res:X}")));

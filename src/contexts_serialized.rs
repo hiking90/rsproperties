@@ -77,7 +77,7 @@ impl ContextsSerialized {
 }
 
 impl Contexts for ContextsSerialized {
-    fn get_prop_area_for_name(&mut self, name: &str) -> Result<Option<&mut PropertyAreaMap>> {
+    fn get_prop_area_for_name(&mut self, name: &str) -> Result<Option<(&mut PropertyAreaMap, u32)>> {
         let (index, _) = self.property_info_area_file
             .property_info_area()
             .get_property_info_indexes(name);
@@ -88,7 +88,7 @@ impl Contexts for ContextsSerialized {
         let context_node = &mut self.context_nodes[index as usize];
         context_node.open(false, &mut false)?;
 
-        Ok(context_node.get_property_area())
+        Ok(context_node.property_area_mut().map(|pa| (pa, index)))
     }
 
     fn get_serial_prop_name(&self) -> Result<&PropertyAreaMap> {
@@ -99,7 +99,9 @@ impl Contexts for ContextsSerialized {
         self.serial_property_area_map.property_area()
     }
 
-    fn reset_access(&mut self) {
-        unimplemented!("reset_access")
+    fn get_prop_area_with_index(&self, context_index: u32) -> Result<Option<&PropertyAreaMap>> {
+        let context_node = &self.context_nodes[context_index as usize];
+
+        Ok(context_node.property_area())
     }
 }
