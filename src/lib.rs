@@ -313,7 +313,6 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "android", target_os = "linux"))]
     #[test]
     fn test_wait() {
         enable_logger();
@@ -326,23 +325,21 @@ mod tests {
         let wait_any = || {
             std::thread::spawn(move || {
                 let system_properties = system_properties();
-                system_properties.wait_any(system_properties.context_serial());
+                system_properties.wait_any();
             })
         };
 
         let handle = wait_any();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        println!("Add property: {}", test_prop);
         system_properties_area.add(test_prop, "true").unwrap();
         handle.join().unwrap();
-        println!("End add property: {}", test_prop);
 
         let handle = std::thread::spawn(move || {
             let system_properties = system_properties();
             let index = system_properties.find(&test_prop).unwrap();
-            let serial = system_properties.serial(index.as_ref().unwrap());
-            system_properties.wait(index.as_ref(), serial, None);
+            // let serial = system_properties.serial(index.as_ref().unwrap());
+            system_properties.wait(index.as_ref(), None);
         });
 
         let handle_any = wait_any();

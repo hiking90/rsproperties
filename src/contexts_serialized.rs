@@ -6,8 +6,7 @@ use std::ffi::CStr;
 
 use rustix::fs;
 
-use crate::system_properties::Contexts;
-use crate::context_node::ContextNode;
+use crate::context_node::{ContextNode, PropertyAreaGuard};
 use crate::property_area::{PropertyArea, PropertyAreaMap};
 use crate::errors::*;
 use crate::property_info_parser::PropertyInfoAreaFile;
@@ -37,7 +36,7 @@ impl ContextsSerialized {
         for i in 0..num_context_nodes {
             let context_offset = property_info_area.context_offset(i);
             let filename = dirname.join(property_info_area.cstr(context_offset).to_str().unwrap());
-            context_nodes.push(ContextNode::new(context_offset, filename))
+            context_nodes.push(ContextNode::new(writable, context_offset, filename))
         }
 
         let serial_property_area_map = if writable {
@@ -49,9 +48,8 @@ impl ContextsSerialized {
             *fsetxattr_failed = false;
 
             for node in &mut context_nodes {
-                let mut fsetxattr_failed = false;
                 // let filename = dirname.join(property_info_area.cstr(node.context_offset()).to_str().unwrap());
-                node.open(true, &mut fsetxattr_failed)?;
+                node.open(fsetxattr_failed)?;
             }
 
             Self::map_serial_property_area(serial_filename.as_path(), true, fsetxattr_failed)?
@@ -74,10 +72,8 @@ impl ContextsSerialized {
             PropertyAreaMap::new_ro(serial_filename)
         }
     }
-}
 
-impl Contexts for ContextsSerialized {
-    fn get_prop_area_for_name(&mut self, name: &str) -> Result<Option<(&mut PropertyAreaMap, u32)>> {
+    pub(crate) fn get_prop_area_for_name(&self, name: &str) -> Result<(PropertyAreaGuard<'_>, u32)> {
         let (index, _) = self.property_info_area_file
             .property_info_area()
             .get_property_info_indexes(name);
@@ -85,23 +81,22 @@ impl Contexts for ContextsSerialized {
             return Err(Error::new_custom(format!("Could not find context for property {name}")));
         }
 
-        let context_node = &mut self.context_nodes[index as usize];
-        context_node.open(false, &mut false)?;
-
-        Ok(context_node.property_area_mut().map(|pa| (pa, index)))
+        let context_node = &self.context_nodes[index as usize];
+        Ok((context_node.property_area()?, index))
     }
 
-    fn get_serial_prop_name(&self) -> Result<&PropertyAreaMap> {
-        unimplemented!("get_serial_prop_name")
-    }
+    // pub(crate) fn get_serial_prop_name(&self) -> Result<&PropertyAreaMap> {
+    //     unimplemented!("get_serial_prop_name")
+    // }
 
-    fn get_serial_prop_area(&self) -> &PropertyArea {
+    pub(crate) fn get_serial_prop_area(&self) -> &PropertyArea {
         self.serial_property_area_map.property_area()
     }
 
-    fn get_prop_area_with_index(&self, context_index: u32) -> Result<Option<&PropertyAreaMap>> {
+    pub(crate) fn get_prop_area_with_index(&self, context_index: u32) -> Result<PropertyAreaGuard<'_>> {
         let context_node = &self.context_nodes[context_index as usize];
 
-        Ok(context_node.property_area())
+        Ok(context_node.property_area()?)
     }
 }
+

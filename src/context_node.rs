@@ -2,38 +2,42 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::path::PathBuf;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::property_area::PropertyAreaMap;
 use crate::errors::*;
 
 pub(crate) struct ContextNode {
+    access_rw: bool,
     filename: PathBuf,
     _context_offset: usize,
-    property_area: Option<PropertyAreaMap>,
+    property_area: RwLock<Option<PropertyAreaMap>>,
     _no_access: bool,
 }
 
 impl ContextNode {
-    pub(crate) fn new(_context_offset: usize, filename: PathBuf) -> Self {
+    pub(crate) fn new(access_rw: bool, _context_offset: usize, filename: PathBuf) -> Self {
         Self {
+            access_rw,
             filename: filename,
             _context_offset,
-            property_area: None,
+            property_area: RwLock::new(None),
             _no_access: false,
         }
     }
 
-    pub(crate) fn open(&mut self, access_rw: bool, fsetxattr_failed: &mut bool) -> Result<()> {
-        if self.property_area.is_some() {
+    pub(crate) fn open(&self, fsetxattr_failed: &mut bool) -> Result<()> {
+        if self.access_rw == false {
+            panic!("open() must be called with access_rw == true");
+        }
+
+        let mut prop_area = self.property_area.write().unwrap();
+        if prop_area.is_some() {
             return Ok(());
         }
-        let pa = if access_rw {
-            PropertyAreaMap::new_rw(self.filename.as_path(), None, fsetxattr_failed)?
-        } else {
-            PropertyAreaMap::new_ro(self.filename.as_path())?
-        };
 
-        self.property_area = Some(pa);
+        *prop_area = Some(PropertyAreaMap::new_rw(self.filename.as_path(), None, fsetxattr_failed)?);
+
         Ok(())
     }
 
@@ -41,11 +45,32 @@ impl ContextNode {
     //     self.context_offset
     // }
 
-    pub(crate) fn property_area(&self) -> Option<&PropertyAreaMap> {
-        self.property_area.as_ref()
+    pub(crate) fn property_area(&self) -> Result<PropertyAreaGuard<'_>> {
+        loop {
+            {
+                let guard = self.property_area.read().unwrap();
+                if guard.is_some() {
+                    return Ok(PropertyAreaGuard { guard });
+                }
+            }
+            let mut guard = self.property_area.write().unwrap();
+            if guard.is_none() {
+                *guard = Some(PropertyAreaMap::new_ro(self.filename.as_path())?);
+            }
+        }
     }
 
-    pub(crate) fn property_area_mut(&mut self) -> Option<&mut PropertyAreaMap> {
-        self.property_area.as_mut()
+    pub(crate) fn _property_area_mut(&self) -> RwLockWriteGuard<'_, Option<PropertyAreaMap>> {
+        self.property_area.write().unwrap()
+    }
+}
+
+pub(crate) struct PropertyAreaGuard<'a> {
+    guard: RwLockReadGuard<'a, Option<PropertyAreaMap>>
+}
+
+impl<'a> PropertyAreaGuard<'a> {
+    pub(crate) fn property_area(&self) -> &PropertyAreaMap {
+        self.guard.as_ref().expect("PropertyAreaMap is not initialized")
     }
 }
