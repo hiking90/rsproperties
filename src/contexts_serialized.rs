@@ -6,7 +6,7 @@ use std::ffi::CStr;
 
 use rustix::fs;
 
-use crate::context_node::{ContextNode, PropertyAreaGuard};
+use crate::context_node::{ContextNode, PropertyAreaGuard, PropertyAreaMutGuard};
 use crate::property_area::{PropertyArea, PropertyAreaMap};
 use crate::errors::*;
 use crate::property_info_parser::PropertyInfoAreaFile;
@@ -73,7 +73,7 @@ impl ContextsSerialized {
         }
     }
 
-    pub(crate) fn get_prop_area_for_name(&self, name: &str) -> Result<(PropertyAreaGuard<'_>, u32)> {
+    pub(crate) fn prop_area_for_name(&self, name: &str) -> Result<(PropertyAreaGuard<'_>, u32)> {
         let (index, _) = self.property_info_area_file
             .property_info_area()
             .get_property_info_indexes(name);
@@ -85,18 +85,36 @@ impl ContextsSerialized {
         Ok((context_node.property_area()?, index))
     }
 
+    pub(crate) fn prop_area_mut_for_name(&self, name: &str) -> Result<(PropertyAreaMutGuard<'_>, u32)> {
+        let (index, _) = self.property_info_area_file
+            .property_info_area()
+            .get_property_info_indexes(name);
+        if index == u32::MAX || index >= self.context_nodes.len() as u32 {
+            return Err(Error::new_custom(format!("Could not find context for property {name}")));
+        }
+
+        let context_node = &self.context_nodes[index as usize];
+        Ok((context_node.property_area_mut()?, index))
+    }
+
     // pub(crate) fn get_serial_prop_name(&self) -> Result<&PropertyAreaMap> {
     //     unimplemented!("get_serial_prop_name")
     // }
 
-    pub(crate) fn get_serial_prop_area(&self) -> &PropertyArea {
+    pub(crate) fn serial_prop_area(&self) -> &PropertyArea {
         self.serial_property_area_map.property_area()
     }
 
-    pub(crate) fn get_prop_area_with_index(&self, context_index: u32) -> Result<PropertyAreaGuard<'_>> {
+    pub(crate) fn prop_area_with_index(&self, context_index: u32) -> Result<PropertyAreaGuard<'_>> {
         let context_node = &self.context_nodes[context_index as usize];
 
         Ok(context_node.property_area()?)
+    }
+
+    pub(crate) fn prop_area_mut_with_index(&self, context_index: u32) -> Result<PropertyAreaMutGuard<'_>> {
+        let context_node = &self.context_nodes[context_index as usize];
+
+        Ok(context_node.property_area_mut()?)
     }
 }
 

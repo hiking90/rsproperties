@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    cmp::Ordering, ffi::{c_void, CStr}, fs::File, mem::size_of, path::Path
+    cmp::Ordering, ffi::CStr, fs::File, mem::size_of, path::Path
 };
 
 // This is a workaround for the fact that the `MetadataExt` trait is not implemented for `std::fs::Metadata` on all platforms.
@@ -13,12 +13,13 @@ use std::os::android::fs::MetadataExt;
 #[cfg(target_os = "linux")]
 use std::os::linux::fs::MetadataExt;
 
-use rustix::{fs, mm};
+use rustix::fs;
 
 use zerocopy::FromBytes;
 use zerocopy_derive::{FromBytes, FromZeroes};
 
 use crate::errors::*;
+use crate::property_area::MemoryMap;
 
 fn find<F>(array_length: u32, f: F) -> i32
 where
@@ -343,12 +344,8 @@ impl<'a> PropertyInfoArea<'a> {
 }
 
 pub struct PropertyInfoAreaFile {
-    mmap_base: *const c_void,
-    mmap_size: usize,
+    mmap: MemoryMap,
 }
-
-unsafe impl Send for PropertyInfoAreaFile {}
-unsafe impl Sync for PropertyInfoAreaFile {}
 
 impl PropertyInfoAreaFile {
     pub(crate) fn load_default_path() -> Result<Self> {
@@ -373,35 +370,13 @@ impl PropertyInfoAreaFile {
             }
         }
 
-        let mmap_size = metadata.st_size();
-        let map_result = unsafe {
-            mm::mmap(std::ptr::null_mut(),
-                mmap_size as usize,
-                mm::ProtFlags::READ,
-                mm::MapFlags::SHARED,
-                file, 0)
-        }.map_err(Error::new_errno)?;
-
         Ok(Self {
-            mmap_base: map_result,
-            mmap_size: mmap_size as usize,
+            mmap: MemoryMap::new(file, metadata.st_size() as usize, false)?,
         })
     }
 
     pub(crate) fn property_info_area(&self) -> PropertyInfoArea {
-        let data_base = unsafe {
-            std::slice::from_raw_parts(self.mmap_base as *const u8, self.mmap_size)
-        };
-
-        PropertyInfoArea::new(data_base)
-    }
-}
-
-impl std::ops::Drop for PropertyInfoAreaFile {
-    fn drop(&mut self) {
-        unsafe {
-            mm::munmap(self.mmap_base as _, self.mmap_size).unwrap();
-        }
+        PropertyInfoArea::new(self.mmap.data(0, 0, self.mmap.size()).expect("offset is 0. So, it must be valid."))
     }
 }
 

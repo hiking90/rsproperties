@@ -60,8 +60,9 @@ impl ContextNode {
         }
     }
 
-    pub(crate) fn _property_area_mut(&self) -> RwLockWriteGuard<'_, Option<PropertyAreaMap>> {
-        self.property_area.write().unwrap()
+    pub(crate) fn property_area_mut(&self) -> Result<PropertyAreaMutGuard<'_>> {
+        self.property_area()?;
+        Ok(PropertyAreaMutGuard { guard: self.property_area.write().unwrap() })
     }
 }
 
@@ -72,5 +73,15 @@ pub(crate) struct PropertyAreaGuard<'a> {
 impl<'a> PropertyAreaGuard<'a> {
     pub(crate) fn property_area(&self) -> &PropertyAreaMap {
         self.guard.as_ref().expect("PropertyAreaMap is not initialized")
+    }
+}
+
+pub(crate) struct PropertyAreaMutGuard<'a> {
+    guard: RwLockWriteGuard<'a, Option<PropertyAreaMap>>
+}
+
+impl<'a> PropertyAreaMutGuard<'a> {
+    pub(crate) fn property_area_mut(&mut self) -> &mut PropertyAreaMap {
+        self.guard.as_mut().expect("PropertyAreaMap is not initialized")
     }
 }

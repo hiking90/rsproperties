@@ -91,7 +91,7 @@ impl SystemProperties {
             serial = new_serial;
             let _len: u32 = serial_value_len(serial);
             let value = if serial_dirty(serial) {
-                let res = self.contexts.get_prop_area_for_name(prop_info.name().to_str().map_err(Error::new_utf8)?)?;
+                let res = self.contexts.prop_area_for_name(prop_info.name().to_str().map_err(Error::new_utf8)?)?;
                 let pa = res.0.property_area();
                 let value = pa.dirty_backup_area()?;
                 value.as_str().map_err(Error::new_errno)?.to_owned()
@@ -123,7 +123,7 @@ impl SystemProperties {
 
     /// Get the value of a system property
     pub fn get(&self, name: &str) -> Result<String> {
-        let res = self.contexts.get_prop_area_for_name(name)?;
+        let res = self.contexts.prop_area_for_name(name)?;
         let pa = res.0.property_area();
 
         match pa.find(name) {
@@ -138,7 +138,7 @@ impl SystemProperties {
     }
 
     pub fn find(&self, name: &str) -> Result<Option<PropertyIndex>> {
-        let res = self.contexts.get_prop_area_for_name(name)?;
+        let res = self.contexts.prop_area_for_name(name)?;
         let pa = res.0.property_area();
         match pa.find(name) {
             Ok(pi) => {
@@ -158,9 +158,9 @@ impl SystemProperties {
             return Err(Error::new_custom(format!("Value too long: {value}")));
         }
 
-        let res = self.contexts.get_prop_area_with_index(index.context_index)?;
-        let pa = res.property_area();
-        let pi = pa.to_prop_obj::<PropertyInfo>(index.property_index)?;
+        let mut res = self.contexts.prop_area_mut_with_index(index.context_index)?;
+        let pa = res.property_area_mut();
+        let pi = pa.property_info(index.property_index)?;
 
         let name = pi.name().to_bytes();
         if name.len() > 0 && &name[0..3] == b"ro." {
@@ -168,13 +168,15 @@ impl SystemProperties {
         }
 
         let mut serial = pi.serial.load(Ordering::Relaxed);
+        let backup_value = pi.value().to_owned();
 
         // Before updating, the property value must be backed up
-        pa.set_dirty_backup_area(pi.value())?;
+        pa.set_dirty_backup_area(&backup_value)?;
         fence(Ordering::Release);
 
         // Set dirty flag
         serial |= 1;
+        let pi = pa.property_info(index.property_index)?;
         pi.serial.store(serial, Ordering::Relaxed);
         // Set the new value
         pi.set_value(value);
@@ -183,7 +185,7 @@ impl SystemProperties {
         pi.serial.store((value.len() << 24) as u32 | ((serial + 1) & 0xffffff), std::sync::atomic::Ordering::Relaxed);
         futex_wake(pi.serial.as_ptr())?;
 
-        let serial_pa = self.contexts.get_serial_prop_area();
+        let serial_pa = self.contexts.serial_prop_area();
         serial_pa.serial().store(serial_pa.serial().load(Ordering::Relaxed) + 1, Ordering::Release);
         futex_wake(serial_pa.serial().as_ptr())?;
 
@@ -195,11 +197,11 @@ impl SystemProperties {
             return Err(Error::new_custom(format!("Value too long: {}", value.len())));
         }
 
-        let res = self.contexts.get_prop_area_for_name(name)?;
-        let pa = res.0.property_area();
+        let mut res = self.contexts.prop_area_mut_for_name(name)?;
+        let pa = res.0.property_area_mut();
         pa.add(name, value)?;
 
-        let serial_pa = self.contexts.get_serial_prop_area();
+        let serial_pa = self.contexts.serial_prop_area();
         serial_pa.serial().store(serial_pa.serial().load(Ordering::Relaxed) + 1, Ordering::Release);
         futex_wake(serial_pa.serial().as_ptr())?;
 
@@ -207,15 +209,15 @@ impl SystemProperties {
     }
 
     pub fn context_serial(&self) -> u32 {
-        let serial_pa = self.contexts.get_serial_prop_area();
+        let serial_pa = self.contexts.serial_prop_area();
         serial_pa.serial().load(Ordering::Acquire)
     }
 
     pub fn serial(&self, idx: &PropertyIndex) -> u32 {
-        match self.contexts.get_prop_area_with_index(idx.context_index).ok() {
+        match self.contexts.prop_area_with_index(idx.context_index).ok() {
             Some(guard) => {
                 let pa = guard.property_area();
-                match pa.to_prop_obj::<PropertyInfo>(idx.property_index).ok() {
+                match pa.property_info(idx.property_index).ok() {
                     Some(pi) => {
                         pi.serial.load(Ordering::Acquire)
                     }
@@ -239,10 +241,10 @@ impl SystemProperties {
     pub fn wait(&self, index: Option<&PropertyIndex>, timeout: Option<&Timespec>) -> Option<u32> {
         let serial = match index {
             Some(idx) => {
-                match self.contexts.get_prop_area_with_index(idx.context_index).ok() {
+                match self.contexts.prop_area_with_index(idx.context_index).ok() {
                     Some(guard) => {
                         let pa = guard.property_area();
-                        match pa.to_prop_obj::<PropertyInfo>(idx.property_index).ok() {
+                        match pa.property_info(idx.property_index).ok() {
                             Some(pi) => {
                                 (pi.serial.as_ptr(), pi.serial.load(Ordering::Acquire))
                             }
@@ -259,7 +261,7 @@ impl SystemProperties {
                 }
             }
             None => {
-                let serial_pa = self.contexts.get_serial_prop_area().serial();
+                let serial_pa = self.contexts.serial_prop_area().serial();
                 (serial_pa.as_ptr(), serial_pa.load(Ordering::Acquire))
             }
         };
