@@ -16,16 +16,19 @@
 //! ## Usage
 //!
 //! ```rust
-//! // Initialize system properties.
-//! // It must be called before using other functions. And None means the default directory "/dev/__properties__".
-//! rsproperties::init(None);
+//! #[cfg(target_os = "android")]
+//! {
+//!     // Initialize system properties.
+//!     // It must be called before using other functions. And None means the default directory "/dev/__properties__".
+//!     rsproperties::init(None);
 //!
-//! // Get a value of the property.
-//! let value = rsproperties::get_with_default("ro.build.version.sdk", "0");
-//! println!("ro.build.version.sdk: {}", value);
+//!     // Get a value of the property.
+//!     let value = rsproperties::get_with_default("ro.build.version.sdk", "0");
+//!     println!("ro.build.version.sdk: {}", value);
 //!
-//! // Set a value of the property.
-//! rsproperties::set("test.property", "test.value").unwrap();
+//!     // Set a value of the property.
+//!     rsproperties::set("test.property", "test.value").unwrap();
+//! }
 //! ```
 
 use std::{
