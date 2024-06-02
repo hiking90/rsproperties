@@ -101,7 +101,7 @@ impl PropertyInfo {
 }
 
 #[inline(always)]
-pub(crate) fn name_from_trailing_data<'a, I: Sized>(thiz: &'a I, len: Option<usize>) -> &'a CStr {
+pub(crate) fn name_from_trailing_data<I: Sized>(thiz: &I, len: Option<usize>) -> &CStr {
     unsafe {
         let thiz_ptr = thiz as *const _ as *const u8;
         let name_ptr = thiz_ptr.add(mem::size_of::<I>()) as _;

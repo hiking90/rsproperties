@@ -152,12 +152,12 @@ impl TrieBuilder {
 
         if exact {
             current_node.add_exact_match_context(last_name, Rc::clone(&context), Rc::clone(&rtype))?;
-        } else if ends_with_dot == false {
+        } else if !ends_with_dot {
             current_node.add_prefix_context(last_name, Rc::clone(&context), Rc::clone(&rtype))?;
         } else {
             let child = current_node.children.entry(Rc::clone(&last_name))
                 .or_insert_with(|| TrieBuilderNode::new(last_name));
-            if child.context() != None || child.rtype() != None {
+            if child.context().is_some() || child.rtype().is_some() {
                 return Err(Error::new_custom(format!("Duplicate prefix match detected for '{}'", name)));
             }
 

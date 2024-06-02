@@ -40,7 +40,7 @@ impl ContextsSerialized {
         }
 
         let serial_property_area_map = if writable {
-            if dirname.is_dir() == false {
+            if !dirname.is_dir() {
                 fs::mkdir(dirname.as_path(), fs::Mode::RWXU | fs::Mode::XGRP | fs::Mode::XOTH)
                     .map_err(|e| Error::new_custom(format!("mkdir is failed in: {dirname:?}: {e:?}")))?;
             }
@@ -107,14 +107,12 @@ impl ContextsSerialized {
 
     pub(crate) fn prop_area_with_index(&self, context_index: u32) -> Result<PropertyAreaGuard<'_>> {
         let context_node = &self.context_nodes[context_index as usize];
-
-        Ok(context_node.property_area()?)
+        context_node.property_area()
     }
 
     pub(crate) fn prop_area_mut_with_index(&self, context_index: u32) -> Result<PropertyAreaMutGuard<'_>> {
         let context_node = &self.context_nodes[context_index as usize];
-
-        Ok(context_node.property_area_mut()?)
+        context_node.property_area_mut()
     }
 }
 

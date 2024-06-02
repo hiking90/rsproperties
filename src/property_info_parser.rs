@@ -309,7 +309,7 @@ impl<'a> PropertyInfoArea<'a> {
         }
 
         self.check_prefix_match(remaining_name, &trie_node, &mut return_context_index, &mut return_type_index);
-        return (return_context_index, return_type_index);
+        (return_context_index, return_type_index)
     }
 
     pub(crate) fn get_property_info(&self, name: &str) -> (Option<&CStr>, Option<&CStr>) {
@@ -362,12 +362,10 @@ impl PropertyInfoAreaFile {
                 metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
                 return Err(Error::new_custom("Invalid file metadata".to_owned()));
             }
-        } else {
-            if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
-                metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
-                metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
-                return Err(Error::new_custom("Invalid file metadata".to_owned()));
-            }
+        } else if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
+            metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
+            metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
+            return Err(Error::new_custom("Invalid file metadata".to_owned()));
         }
 
         Ok(Self {

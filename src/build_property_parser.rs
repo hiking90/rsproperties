@@ -39,7 +39,7 @@ pub fn load_properties_from_file(filename: &Path, filter: Option<&str>, context:
             continue;
         }
 
-        if has_filter == false && line.starts_with("import ") {
+        if !has_filter && line.starts_with("import ") {
             // let line = line[7..].trim();
             unimplemented!("import")
         } else {
@@ -51,13 +51,11 @@ pub fn load_properties_from_file(filename: &Path, filter: Option<&str>, context:
             if has_filter {
                 let filter = filter.expect("filter must be valid.");
                 if filter.ends_with('*') {
-                    if key.starts_with(&filter[..filter.len() - 1]) == false {
+                    if !key.starts_with(&filter[..filter.len() - 1]) {
                         continue;
                     }
-                } else {
-                    if line != filter {
-                        continue;
-                    }
+                } else if line != filter {
+                    continue;
                 }
             }
 

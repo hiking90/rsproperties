@@ -71,12 +71,10 @@ impl Debug for PropertyTrieNode {
 }
 
 fn cmp_prop_name(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
-    if a.len() < b.len() {
-        return std::cmp::Ordering::Less;
-    } else if a.len() > b.len() {
-        return std::cmp::Ordering::Greater;
-    } else {
-        return a.cmp(b);
+    match a.len().cmp(&b.len()) {
+        std::cmp::Ordering::Less => std::cmp::Ordering::Less,
+        std::cmp::Ordering::Greater => std::cmp::Ordering::Greater,
+        _ => a.cmp(b),
     }
 }
 
@@ -133,7 +131,7 @@ impl PropertyAreaMap {
         fs::ftruncate(&file, PA_SIZE).map_err(Error::new_errno)?;
 
         let pa_size = PA_SIZE as usize;
-        let pa_data_size = pa_size as usize - std::mem::size_of::<PropertyArea>();
+        let pa_data_size = pa_size - std::mem::size_of::<PropertyArea>();
 
         let mut thiz = Self {
             mmap: MemoryMap::new(file, pa_size, true)?,
@@ -159,12 +157,10 @@ impl PropertyAreaMap {
                 metadata.st_size() < mem::size_of::<PropertyArea>() as u64 {
                 return Err(Error::new_custom("Invalid file metadata".to_owned()));
             }
-        } else {
-            if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
-                metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
-                metadata.st_size() < mem::size_of::<PropertyArea>() as u64 {
-                return Err(Error::new_custom("Invalid file metadata".to_owned()));
-            }
+        } else if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
+            metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
+            metadata.st_size() < mem::size_of::<PropertyArea>() as u64 {
+            return Err(Error::new_custom("Invalid file metadata".to_owned()));
         }
 
         let pa_size = metadata.st_size() as usize;
@@ -262,7 +258,7 @@ impl PropertyAreaMap {
                 current_node.children.load(std::sync::atomic::Ordering::Acquire)
             } else {
                 let offset = self.new_prop_trie_node(subname)?;
-                let current_node = self.mmap.to_object::<PropertyTrieNode>(current as usize, self.data_offset)?;
+                let current_node = self.mmap.to_object::<PropertyTrieNode>(current, self.data_offset)?;
                 current_node.children.store(offset, std::sync::atomic::Ordering::Release);
                 offset
             };
@@ -295,7 +291,7 @@ impl PropertyAreaMap {
     }
 
     pub(crate) fn set_dirty_backup_area(&mut self, value: &CStr) -> Result<()> {
-        let offset = mem::size_of::<PropertyTrieNode>() as usize;
+        let offset = mem::size_of::<PropertyTrieNode>();
         let bytes = value.to_bytes_with_nul();
         if bytes.len() + offset > self.pa_data_size {
             return Err(Error::new_custom("Invalid offset".to_owned()));
@@ -473,7 +469,7 @@ impl MemoryMap {
         self.check_size(offset, size)?;
 
         Ok(unsafe {
-            std::slice::from_raw_parts_mut(self.data.add(offset) as *mut u8, size)
+            std::slice::from_raw_parts_mut(self.data.add(offset), size)
         })
     }
 

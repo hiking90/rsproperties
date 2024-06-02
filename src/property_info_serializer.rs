@@ -14,7 +14,7 @@ pub struct PropertyInfoEntry {
 }
 
 impl PropertyInfoEntry {
-    fn is_type_valid(type_strings: &Vec<String>) -> bool {
+    fn is_type_valid(type_strings: &[String]) -> bool {
         if type_strings.is_empty() {
             return false;
         }
@@ -65,11 +65,11 @@ impl PropertyInfoEntry {
 
         if match_operation == Some("exact") {
             exact_match = true;
-        } else if match_operation != Some("prefix") && require_prefix_or_exact == true {
+        } else if match_operation != Some("prefix") && require_prefix_or_exact {
             return Err(Error::new_custom(format!("Match operation '{match_operation:?}' is not valid. Must be 'prefix' or 'exact'")));
         }
 
-        if type_strings.is_empty() == false && Self::is_type_valid(&type_strings) == false {
+        if !type_strings.is_empty() && !Self::is_type_valid(&type_strings) {
             return Err(Error::new_custom(format!("Type '{}' is not valid.", type_strings.join(" "))));
         }
 
@@ -91,7 +91,7 @@ impl PropertyInfoEntry {
         for line in reader.lines() {
             let line = line.map_err(Error::new_io)?;
             let line = line.trim();
-            if line.is_empty() || line.starts_with("#") {
+            if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             match PropertyInfoEntry::parse_from_line(line, require_prefix_or_exact) {
@@ -128,25 +128,25 @@ mod tests {
         assert_eq!(entry.name, "ro.build.host");
         assert_eq!(entry.context, "u:object_r:build_prop:s0");
         assert_eq!(entry.type_str, "string");
-        assert_eq!(entry.exact_match, true);
+        assert!(entry.exact_match);
 
         let entry = PropertyInfoEntry::parse_from_line("ro.build.host u:object_r:build_prop:s0 prefix string", true).unwrap();
         assert_eq!(entry.name, "ro.build.host");
         assert_eq!(entry.context, "u:object_r:build_prop:s0");
         assert_eq!(entry.type_str, "string");
-        assert_eq!(entry.exact_match, false);
+        assert!(!entry.exact_match);
 
         let entry = PropertyInfoEntry::parse_from_line("ro.build.host u:object_r:build_prop:s0", false).unwrap();
         assert_eq!(entry.name, "ro.build.host");
         assert_eq!(entry.context, "u:object_r:build_prop:s0");
         assert_eq!(entry.type_str, "");
-        assert_eq!(entry.exact_match, false);
+        assert!(!entry.exact_match);
 
         let entry = PropertyInfoEntry::parse_from_line("ro.build.host u:object_r:build_prop:s0 exact enum string int", true).unwrap();
         assert_eq!(entry.name, "ro.build.host");
         assert_eq!(entry.context, "u:object_r:build_prop:s0");
         assert_eq!(entry.type_str, "enum string int");
-        assert_eq!(entry.exact_match, true);
+        assert!(entry.exact_match);
     }
 
     #[test]

@@ -32,7 +32,7 @@ impl ServiceConnection {
     fn new(name: &str) -> Result<Self> {
         let socket_name = if name == "sys.powerctl" &&
             fs::metadata(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET)
-                .map(|metadata| metadata.permissions().readonly() == false)
+                .map(|metadata| !metadata.permissions().readonly())
                 .is_ok() {
             PROPERTY_SERVICE_FOR_SYSTEM_SOCKET
         } else {
@@ -191,7 +191,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
         ProtocolVersion::V2 => {
             let value_len = value.len() as u32;
             let name_len = name.len() as u32;
-            if value.len() >= PROP_VALUE_MAX && name.starts_with("ro.") == false {
+            if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
                 return Err(Error::new_custom(
                     format!("Property value is too long: {}", value.len())));
             }

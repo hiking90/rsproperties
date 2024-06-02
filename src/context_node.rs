@@ -19,7 +19,7 @@ impl ContextNode {
     pub(crate) fn new(access_rw: bool, _context_offset: usize, filename: PathBuf) -> Self {
         Self {
             access_rw,
-            filename: filename,
+            filename,
             _context_offset,
             property_area: RwLock::new(None),
             _no_access: false,
@@ -27,7 +27,7 @@ impl ContextNode {
     }
 
     pub(crate) fn open(&self, fsetxattr_failed: &mut bool) -> Result<()> {
-        if self.access_rw == false {
+        if !self.access_rw {
             panic!("open() must be called with access_rw == true");
         }
 

@@ -70,7 +70,7 @@ impl SystemProperties {
         let contexts = ContextsSerialized::new(false, filename, &mut false, false)?;
 
         Ok(Self {
-            contexts: contexts,
+            contexts,
         })
     }
 
@@ -80,7 +80,7 @@ impl SystemProperties {
         let contexts = ContextsSerialized::new(true, filename, &mut false, false)?;
 
         Ok(Self {
-            contexts: contexts,
+            contexts,
         })
     }
 
@@ -163,7 +163,7 @@ impl SystemProperties {
         let pi = pa.property_info(index.property_index)?;
 
         let name = pi.name().to_bytes();
-        if name.len() > 0 && &name[0..3] == b"ro." {
+        if !name.is_empty() && &name[0..3] == b"ro." {
             return Err(Error::new_custom(format!("Try to update the read-only property: {name:?}")));
         }
 
@@ -193,7 +193,7 @@ impl SystemProperties {
     }
 
     pub fn add(&mut self, name: &str, value: &str) -> Result<()> {
-        if value.len() >= PROP_VALUE_MAX && name.starts_with("ro.") == false {
+        if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
             return Err(Error::new_custom(format!("Value too long: {}", value.len())));
         }
 

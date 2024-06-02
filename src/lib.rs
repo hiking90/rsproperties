@@ -16,20 +16,16 @@
 //! ## Usage
 //!
 //! ```rust
-//! use rsproperties;
+//! // Initialize system properties.
+//! // It must be called before using other functions. And None means the default directory "/dev/__properties__".
+//! rsproperties::init(None);
 //!
-//! fn main() {
-//!     // Initialize system properties.
-//!     // It must be called before using other functions. And None means the default directory "/dev/__properties__".
-//!     rsproperties::init(None);
+//! // Get a value of the property.
+//! let value = rsproperties::get_with_default("ro.build.version.sdk", "0");
+//! println!("ro.build.version.sdk: {}", value);
 //!
-//!    // Get a value of the property.
-//!    let value = rsproperties::get_with_default("ro.build.version.sdk", "0");
-//!    println!("ro.build.version.sdk: {}", value);
-//!
-//!     // Set a value of the property.
-//!     rsproperties::set("test.property", "test.value").unwrap();
-//! }
+//! // Set a value of the property.
+//! rsproperties::set("test.property", "test.value").unwrap();
 //! ```
 
 use std::{
@@ -95,9 +91,9 @@ pub fn dirname() -> Option<&'static PathBuf> {
 /// It panics if init() is not called or the system properties cannot be opened.
 pub fn system_properties() -> &'static system_properties::SystemProperties {
     SYSTEM_PROPERTIES.get_or_init(|| {
-        let dir = dirname().expect(&format!("Call init() first."));
+        let dir = dirname().unwrap_or_else(|| panic!("Call init() first."));
         system_properties::SystemProperties::new(dir)
-            .expect(&format!("Cannot open system properties. Please check if \"{dir:?}\" exists."))
+            .unwrap_or_else(|_| panic!("Cannot open system properties. Please check if \"{dir:?}\" exists."))
     })
 }
 
@@ -106,9 +102,9 @@ pub fn system_properties() -> &'static system_properties::SystemProperties {
 /// It is used for adding and updating system properties.
 pub fn system_properties_area() -> &'static Mutex<SystemProperties> {
     SYSTEM_PROPERTIES_AREA.get_or_init(|| {
-        let dir = dirname().expect(&format!("Call init() first."));
+        let dir = dirname().unwrap_or_else(|| panic!("Call init() first."));
         Mutex::new(SystemProperties::new_area(dir)
-            .expect(&format!("Cannot create system properties. Please check if \"{dir:?}\" exists.")))
+            .unwrap_or_else(|_| panic!("Cannot create system properties. Please check if \"{dir:?}\" exists.")))
     })
 }
 
@@ -267,13 +263,13 @@ mod tests {
             let mut property_infos = Vec::new();
             for file in property_contexts_files {
                 let (mut property_info, errors) = PropertyInfoEntry::parse_from_file(Path::new(file), false).unwrap();
-                if errors.len() > 0 {
+                if !errors.is_empty() {
                     log::error!("{:?}", errors);
                 }
                 property_infos.append(&mut property_info);
             }
 
-            let data = build_trie(&mut property_infos, "u:object_r:build_prop:s0", "string").unwrap();
+            let data = build_trie(&property_infos, "u:object_r:build_prop:s0", "string").unwrap();
 
             let dir = dirname().unwrap();
             remove_dir_all(dir).unwrap_or_default();
@@ -337,7 +333,7 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             let system_properties = system_properties();
-            let index = system_properties.find(&test_prop).unwrap();
+            let index = system_properties.find(test_prop).unwrap();
             // let serial = system_properties.serial(index.as_ref().unwrap());
             system_properties.wait(index.as_ref(), None);
         });
@@ -345,7 +341,7 @@ mod tests {
         let handle_any = wait_any();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let index = system_properties_area.find(&test_prop).unwrap();
+        let index = system_properties_area.find(test_prop).unwrap();
         system_properties_area.update(&index.unwrap(), "false").unwrap();
 
         handle.join().unwrap();

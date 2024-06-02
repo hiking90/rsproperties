@@ -73,7 +73,7 @@ impl TrieSerializer {
         entry.context_index = context_index as _;
         entry.type_index = type_index as _;
 
-        return entry_offset as _;
+        entry_offset as _
     }
 
     fn write_trie_node(&mut self, builder_node: &TrieBuilderNode) -> u32 {
@@ -119,7 +119,7 @@ impl TrieSerializer {
             self.arena.uint32_array(children_offset_array_offset)[i] = self.write_trie_node(child_node);
         }
 
-        return trie_offset as _;
+        trie_offset as _
     }
 
     fn serialize_strings(&mut self, strings: &BTreeSet<Rc<String>>) {
