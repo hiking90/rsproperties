@@ -211,7 +211,7 @@ impl PropertyAreaMap {
             let root = if children_offset != 0 {
                 self.to_prop_obj_from_atomic::<PropertyTrieNode>(&current.children)?
             } else {
-                return Err(Error::new_custom("Can't manage PropertyTrieNode".to_owned()));
+                return Err(Error::new_not_found(name.to_owned()));
             };
 
             current = self.find_prop_trie_node(root, subname)?;
@@ -229,7 +229,7 @@ impl PropertyAreaMap {
             let offset = &current.prop.load(std::sync::atomic::Ordering::Acquire);
             Ok((self.mmap.to_object(*offset as usize, self.data_offset)?, *offset))
         } else {
-            Err(Error::new_custom("Can't manage PropertyInfo".to_owned()))
+            Err(Error::new_not_found(name.to_owned()))
         }
     }
 
@@ -353,7 +353,7 @@ impl PropertyAreaMap {
                     if left_offset != 0 {
                         current = self.to_prop_obj_from_atomic::<PropertyTrieNode>(&current.left)?;
                     } else {
-                        return Err(Error::new_custom("Can't manage PropertyTrieNode".to_owned()));
+                        return Err(Error::new_not_found(name.to_owned()));
                     }
                 }
                 std::cmp::Ordering::Greater => {
@@ -361,7 +361,7 @@ impl PropertyAreaMap {
                     if right_offset != 0 {
                         current = self.to_prop_obj_from_atomic::<PropertyTrieNode>(&current.right)?;
                     } else {
-                        return Err(Error::new_custom("Can't manage PropertyTrieNode".to_owned()));
+                        return Err(Error::new_not_found(name.to_owned()));
                     }
                 }
                 std::cmp::Ordering::Equal => {

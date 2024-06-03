@@ -24,6 +24,12 @@ pub enum Error {
         message: String,
         location: &'static Location<'static>,
     },
+
+    #[error("NotFound: {location} - Key: {key}")]
+    NotFound {
+        key: String,
+        location: &'static Location<'static>,
+    },
 }
 
 impl Error {
@@ -45,5 +51,10 @@ impl Error {
     #[track_caller]
     pub fn new_utf8(source: std::str::Utf8Error) -> Error {
         Error::InvalidData { message: format!("{}", source), location: Location::caller() }
+    }
+
+    #[track_caller]
+    pub fn new_not_found(key: String) -> Error {
+        Error::NotFound { key, location: Location::caller() }
     }
 }
