@@ -53,6 +53,7 @@ fn futex_wait(_addr: *mut u32, _value: i32, _timeout: Option<&Timespec>) -> Resu
     Ok(0)
 }
 
+// To avoid lifetime issues, the property index is used to access the property value.
 pub struct PropertyIndex {
     pub(crate) context_index: u32,
     pub(crate) property_index: u32,
@@ -137,6 +138,9 @@ impl SystemProperties {
         }
     }
 
+    /// Get the property index of a system property by name.
+    /// The property index is used to update the property value.
+    /// If the property is not found, it returns Ok(None)
     pub fn find(&self, name: &str) -> Result<Option<PropertyIndex>> {
         let res = self.contexts.prop_area_for_name(name)?;
         let pa = res.0.property_area();

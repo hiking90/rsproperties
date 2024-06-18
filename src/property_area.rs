@@ -111,6 +111,7 @@ pub(crate) struct PropertyAreaMap {
 }
 
 impl PropertyAreaMap {
+    // Initialize the property area map with the given file to create a new property area map.
     pub(crate) fn new_rw(filename: &Path, context: Option<&CStr>, fsetxattr_failed: &mut bool) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)               // O_RDWR
@@ -144,6 +145,7 @@ impl PropertyAreaMap {
         Ok(thiz)
     }
 
+    // Initialize the property area map with the given file to read-only property area map.
     pub(crate) fn new_ro(filename: &Path) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)               // read only
@@ -191,6 +193,7 @@ impl PropertyAreaMap {
             .expect("PropertyArea's offset is zero. So, it must be valid.")
     }
 
+    // Find the property information with the given name.
     pub(crate) fn find(&self, name: &str) -> Result<(&PropertyInfo, u32)> {
         let mut remaining_name = name;
         let mut current = self.mmap.to_object::<PropertyTrieNode>(0, self.data_offset)?;
@@ -233,6 +236,7 @@ impl PropertyAreaMap {
         }
     }
 
+    // Add the property information with the given name and value.
     pub(crate) fn add(&mut self, name: &str, value: &str) -> Result<()> {
         let mut remaining_name = name;
         let mut current = 0;
@@ -286,10 +290,13 @@ impl PropertyAreaMap {
         Ok(())
     }
 
+    // Read the dirty backup area.
     pub(crate) fn dirty_backup_area(&self) -> Result<&CStr> {
         self.mmap.to_cstr(mem::size_of::<PropertyTrieNode>(), self.data_offset)
     }
 
+    // Set the dirty backup area.
+    // It is used to store the backup of the property area.
     pub(crate) fn set_dirty_backup_area(&mut self, value: &CStr) -> Result<()> {
         let offset = mem::size_of::<PropertyTrieNode>();
         let bytes = value.to_bytes_with_nul();
@@ -302,6 +309,8 @@ impl PropertyAreaMap {
         Ok(())
     }
 
+    // Add a new property trie node with the given name to the given trie node.
+    // It uses trie offset to avoid the life time issue of the current trie node.
     fn add_prop_trie_node(&mut self, trie_offset: u32, name: &str) -> Result<u32> {
         let name_bytes = name.as_bytes();
         let mut current_offset = trie_offset;
@@ -423,6 +432,8 @@ impl PropertyAreaMap {
     }
 }
 
+// MemoryMap is a wrapper for the memory-mapped file.
+// It provides the safe access to the memory-mapped file.
 #[derive(Debug)]
 pub(crate) struct MemoryMap {
     data: *mut u8,
@@ -480,18 +491,23 @@ impl MemoryMap {
         Ok(())
     }
 
+    // Convert the memory-mapped file to the object with the given offset.
+    // base is the base offset of the object.
+    // offset is calculated by adding the base offset and the given offset.
     pub(crate) fn to_object<T>(&self, offset: usize, base: usize) -> Result<&T> {
         let offset = offset + base;
         self.check_size(offset, mem::size_of::<T>())?;
         Ok(unsafe { &*(self.data.add(offset as _) as *const T) })
     }
 
+    // Convert the memory-mapped file to the mutable object with the given offset.
     pub(crate) fn to_object_mut<T>(&mut self, offset: usize, base: usize) -> Result<&mut T> {
         let offset = offset + base;
         self.check_size(offset, mem::size_of::<T>())?;
         Ok(unsafe { &mut *(self.data.add(offset) as *mut T) })
     }
 
+    // Convert the memory-mapped file to the CStr with the given offset.
     pub(crate) fn to_cstr(&self, offset: usize, base: usize) -> Result<&CStr> {
         let offset = offset + base;
         self.check_size(offset, 1)?;

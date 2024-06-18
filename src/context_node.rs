@@ -66,6 +66,7 @@ impl ContextNode {
     }
 }
 
+// PropertyAreaGuard is used to get a reference to the PropertyAreaMap.
 pub(crate) struct PropertyAreaGuard<'a> {
     guard: RwLockReadGuard<'a, Option<PropertyAreaMap>>
 }
@@ -76,6 +77,10 @@ impl<'a> PropertyAreaGuard<'a> {
     }
 }
 
+// PropertyAreaMutGuard is used to get a mutable reference to the PropertyAreaMap.
+// Option<PropertyAreaMap> is initialized when the PropertyAreaMap is first accessed.
+// After that, the PropertyAreaMap is never replaced.
+// This is to ensure that the PropertyAreaMap is not replaced by another PropertyAreaMap.
 pub(crate) struct PropertyAreaMutGuard<'a> {
     guard: RwLockWriteGuard<'a, Option<PropertyAreaMap>>
 }

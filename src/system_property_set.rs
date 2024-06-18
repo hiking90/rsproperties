@@ -166,6 +166,7 @@ fn wait_for_socket_close(socket_fd: BorrowedFd<'_>) -> Result<()> {
 }
 
 
+// Set a system property via local domain socket.
 pub(crate) fn set(name: &str, value: &str) -> Result<()> {
     match protocol_version() {
         ProtocolVersion::V1 => {
