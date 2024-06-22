@@ -142,6 +142,7 @@ pub fn set(name: &str, value: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(unused_imports)]
     use super::*;
     use std::fs::{File, remove_dir_all, create_dir};
     use std::io::Write;
@@ -231,6 +232,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "builder")]
     fn load_properties() -> HashMap<String, String> {
         let build_prop_files = vec![
             "tests/android/product_build.prop",
@@ -251,6 +253,7 @@ mod tests {
         properties
     }
 
+    #[cfg(feature = "builder")]
     fn build_property_dir(dir: &str) -> HashMap<String, String> {
         static INIT_PROPERTY_AREA: OnceLock<bool> = OnceLock::new();
 
@@ -299,6 +302,7 @@ mod tests {
         load_properties()
     }
 
+    #[cfg(feature = "builder")]
     #[test]
     fn test_property_info() {
         enable_logger();
@@ -312,6 +316,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "builder")]
     #[test]
     fn test_wait() {
         enable_logger();
