@@ -171,12 +171,12 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
     match protocol_version() {
         ProtocolVersion::V1 => {
             if name.len() >= PROP_NAME_MAX {
-                return Err(Error::new_custom(
+                return Err(Error::new_context(
                     format!("Property name is too long: {}", name.len())));
             }
 
             if value.len() >= PROP_VALUE_MAX {
-                return Err(Error::new_custom(
+                return Err(Error::new_context(
                     format!("Property value is too long: {}", value.len())));
             }
 
@@ -193,7 +193,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
             let value_len = value.len() as u32;
             let name_len = name.len() as u32;
             if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
-                return Err(Error::new_custom(
+                return Err(Error::new_context(
                     format!("Property value is too long: {}", value.len())));
             }
 
@@ -206,7 +206,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
 
             let res = conn.recv_i32()?;
             if res != PROP_SUCCESS {
-                return Err(Error::new_custom(
+                return Err(Error::new_context(
                     format!("Unable to set property \"{name}\" to \"{value}\": error code: 0x{res:X}")));
             }
         }

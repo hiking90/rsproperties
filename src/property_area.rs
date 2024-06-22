@@ -120,7 +120,7 @@ impl PropertyAreaMap {
             .custom_flags((fs::OFlags::NOFOLLOW.bits() | fs::OFlags::EXCL.bits()) as _) // additional flags
             .mode(0o444)              // permission: 0444
             .open(filename)
-            .map_err(|e| Error::new_custom(format!("File open is failed in: {filename:?}: {e:?}")))?;
+            .map_err(|e| Error::new_context(format!("File open is failed in: {filename:?}: {e:?}")))?;
 
         if let Some(context) = context {
             if fs::fsetxattr(&file, "selinux", context.to_bytes_with_nul(),
@@ -157,12 +157,12 @@ impl PropertyAreaMap {
         if cfg!(test) {
             if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
                 metadata.st_size() < mem::size_of::<PropertyArea>() as u64 {
-                return Err(Error::new_custom("Invalid file metadata".to_owned()));
+                return Err(Error::new_context("Invalid file metadata".to_owned()));
             }
         } else if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
             metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
             metadata.st_size() < mem::size_of::<PropertyArea>() as u64 {
-            return Err(Error::new_custom("Invalid file metadata".to_owned()));
+            return Err(Error::new_context("Invalid file metadata".to_owned()));
         }
 
         let pa_size = metadata.st_size() as usize;
@@ -177,7 +177,7 @@ impl PropertyAreaMap {
 
         if thiz.property_area().magic != PROP_AREA_MAGIC ||
            thiz.property_area().version != PROP_AREA_VERSION {
-            Err(Error::new_custom("Invalid magic or version".to_owned()))
+            Err(Error::new_context("Invalid magic or version".to_owned()))
         } else {
             Ok(thiz)
         }
@@ -205,7 +205,7 @@ impl PropertyAreaMap {
             };
 
             if substr_size == 0 {
-                return Err(Error::new_custom("Invalid property name".to_owned()));
+                return Err(Error::new_context("Invalid property name".to_owned()));
             }
 
             let subname = &remaining_name[0..substr_size];
@@ -248,7 +248,7 @@ impl PropertyAreaMap {
             };
 
             if substr_size == 0 {
-                return Err(Error::new_custom("Invalid property name".to_owned()));
+                return Err(Error::new_context("Invalid property name".to_owned()));
             }
 
             let subname = &remaining_name[0..substr_size];
@@ -301,7 +301,7 @@ impl PropertyAreaMap {
         let offset = mem::size_of::<PropertyTrieNode>();
         let bytes = value.to_bytes_with_nul();
         if bytes.len() + offset > self.pa_data_size {
-            return Err(Error::new_custom("Invalid offset".to_owned()));
+            return Err(Error::new_context("Invalid offset".to_owned()));
         }
 
         self.mmap.data_mut(offset, self.data_offset, bytes.len())?.copy_from_slice(bytes);
@@ -385,7 +385,7 @@ impl PropertyAreaMap {
         let aligned = crate::bionic_align(size, mem::size_of::<u32>());
         let offset = self.property_area().bytes_used;
         if offset + (aligned as u32) > self.pa_data_size as u32 {
-            return Err(Error::new_custom("Out of memory".to_owned()));
+            return Err(Error::new_context("Out of memory".to_owned()));
         }
 
         self.property_area_mut().bytes_used += aligned as u32;
@@ -486,7 +486,7 @@ impl MemoryMap {
 
     fn check_size(&self, offset: usize, size: usize) -> Result<()> {
         if offset + size > self.size {
-            return Err(Error::new_custom(format!("Invalid offset: {} > {}", offset + size, self.size)));
+            return Err(Error::new_context(format!("Invalid offset: {} > {}", offset + size, self.size)));
         }
         Ok(())
     }

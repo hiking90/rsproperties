@@ -42,7 +42,7 @@ impl ContextsSerialized {
         let serial_property_area_map = if writable {
             if !dirname.is_dir() {
                 fs::mkdir(dirname.as_path(), fs::Mode::RWXU | fs::Mode::XGRP | fs::Mode::XOTH)
-                    .map_err(|e| Error::new_custom(format!("mkdir is failed in: {dirname:?}: {e:?}")))?;
+                    .map_err(|e| Error::new_context(format!("mkdir is failed in: {dirname:?}: {e:?}")))?;
             }
 
             *fsetxattr_failed = false;
@@ -90,7 +90,7 @@ impl ContextsSerialized {
             .property_info_area()
             .get_property_info_indexes(name);
         if index == u32::MAX || index >= self.context_nodes.len() as u32 {
-            return Err(Error::new_custom(format!("Could not find context for property {name}")));
+            return Err(Error::new_context(format!("Could not find context for property {name}")));
         }
 
         let context_node = &self.context_nodes[index as usize];

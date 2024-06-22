@@ -92,7 +92,7 @@ impl SystemProperties {
             serial = new_serial;
             let _len: u32 = serial_value_len(serial);
             let value = if serial_dirty(serial) {
-                let res = self.contexts.prop_area_for_name(prop_info.name().to_str().map_err(Error::new_utf8)?)?;
+                let res = self.contexts.prop_area_for_name(prop_info.name().to_str()?)?;
                 let pa = res.0.property_area();
                 let value = pa.dirty_backup_area()?;
                 value.as_str().map_err(Error::new_errno)?.to_owned()
@@ -114,7 +114,7 @@ impl SystemProperties {
         let name_cstr = prop_info.name();
 
         let name = if is_name {
-            Some(name_cstr.to_str().map_err(Error::new_utf8)?.to_owned())
+            Some(name_cstr.to_str()?.to_owned())
         } else {
             None
         };
@@ -159,7 +159,7 @@ impl SystemProperties {
 
     pub fn update(&mut self, index: &PropertyIndex, value: &str) -> Result<bool> {
         if value.len() >= PROP_VALUE_MAX {
-            return Err(Error::new_custom(format!("Value too long: {value}")));
+            return Err(Error::new_context(format!("Value too long: {value}")));
         }
 
         let mut res = self.contexts.prop_area_mut_with_index(index.context_index)?;
@@ -168,7 +168,7 @@ impl SystemProperties {
 
         let name = pi.name().to_bytes();
         if !name.is_empty() && &name[0..3] == b"ro." {
-            return Err(Error::new_custom(format!("Try to update the read-only property: {name:?}")));
+            return Err(Error::new_context(format!("Try to update the read-only property: {name:?}")));
         }
 
         let mut serial = pi.serial.load(Ordering::Relaxed);
@@ -198,7 +198,7 @@ impl SystemProperties {
 
     pub fn add(&mut self, name: &str, value: &str) -> Result<()> {
         if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
-            return Err(Error::new_custom(format!("Value too long: {}", value.len())));
+            return Err(Error::new_context(format!("Value too long: {}", value.len())));
         }
 
         let mut res = self.contexts.prop_area_mut_for_name(name)?;

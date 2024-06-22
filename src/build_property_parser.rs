@@ -28,7 +28,7 @@ pub fn check_permissions(_key: &str, _value: &str, _context: &str, _cr: &UCred) 
 
 pub fn load_properties_from_file(filename: &Path, filter: Option<&str>, context: &str, properties: &mut HashMap<String, String>) -> Result<()> {
     let file = File::open(filename)
-        .map_err(|e| Error::new_custom(format!("Failed to open to {filename:?}: {e:?}")))?;
+        .map_err(|e| Error::new_context(format!("Failed to open to {filename:?}: {e:?}")))?;
     let reader = BufReader::new(file);
     let has_filter = match filter {
         Some(filter) => !filter.is_empty(),

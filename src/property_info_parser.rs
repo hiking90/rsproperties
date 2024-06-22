@@ -354,18 +354,18 @@ impl PropertyInfoAreaFile {
 
     pub(crate) fn load_path(path: &Path) -> Result<Self> {
         let file: File = File::open(path)
-            .map_err(|e| Error::new_custom(format!("File open is failed in: {path:?}: {e:?}")))?;
+            .map_err(|e| Error::new_context(format!("File open is failed in: {path:?}: {e:?}")))?;
 
         let metadata = file.metadata().map_err(Error::new_io)?;
         if cfg!(test) {
             if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
                 metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
-                return Err(Error::new_custom("Invalid file metadata".to_owned()));
+                return Err(Error::new_context("Invalid file metadata".to_owned()));
             }
         } else if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
             metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
             metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
-            return Err(Error::new_custom("Invalid file metadata".to_owned()));
+            return Err(Error::new_context("Invalid file metadata".to_owned()));
         }
 
         Ok(Self {
