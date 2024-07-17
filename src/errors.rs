@@ -68,6 +68,20 @@ impl From<std::str::Utf8Error> for Error {
     }
 }
 
+impl From<std::ffi::OsString> for Error {
+    #[track_caller]
+    fn from(source: std::ffi::OsString) -> Self {
+        Error::Context { context: format!("{:?}", source), location: Location::caller() }
+    }
+}
+
+impl From<&str> for Error {
+    #[track_caller]
+    fn from(source: &str) -> Self {
+        Error::Context { context: source.to_owned(), location: Location::caller() }
+    }
+}
+
 pub trait ResultContext<T,E> {
     fn context<C>(self, context: C) -> Result<T>
     where

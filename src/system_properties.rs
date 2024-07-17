@@ -77,8 +77,9 @@ impl SystemProperties {
 
     // Create a new area for system properties
     // The new area is used by the property service to store system properties.
-    pub(crate) fn new_area(filename: &Path) -> Result<Self> {
-        let contexts = ContextsSerialized::new(true, filename, &mut false, false)?;
+    #[cfg(feature = "builder")]
+    pub fn new_area(dirname: &Path) -> Result<Self> {
+        let contexts = ContextsSerialized::new(true, dirname, &mut false, false)?;
 
         Ok(Self {
             contexts,
@@ -157,6 +158,26 @@ impl SystemProperties {
         }
     }
 
+    /// Set the value of a system property
+    /// If the property is not found, it creates a new property.
+    /// If the property value is too long, it returns an error.
+    /// If the property is read-only, it returns an error.
+    /// If the property is updated successfully, it returns Ok(()).
+    #[cfg(feature = "builder")]
+    pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        match self.find(key)? {
+            Some(prop_ref) => {
+                self.update(&prop_ref, value)?;
+            },
+            None => {
+                self.add(key, value)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "builder")]
     pub fn update(&mut self, index: &PropertyIndex, value: &str) -> Result<bool> {
         if value.len() >= PROP_VALUE_MAX {
             return Err(Error::new_context(format!("Value too long: {value}")));
@@ -196,6 +217,7 @@ impl SystemProperties {
         Ok(true)
     }
 
+    #[cfg(feature = "builder")]
     pub fn add(&mut self, name: &str, value: &str) -> Result<()> {
         if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
             return Err(Error::new_context(format!("Value too long: {}", value.len())));

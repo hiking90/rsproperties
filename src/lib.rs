@@ -32,12 +32,12 @@
 //! ```
 
 use std::{
-    sync::{OnceLock, Mutex},
-    path::PathBuf,
+    sync::OnceLock,
+    path::{PathBuf, Path},
 };
 
 mod property_info_parser;
-mod errors;
+pub mod errors;
 mod system_properties;
 mod contexts_serialized;
 mod property_area;
@@ -69,8 +69,6 @@ pub const PROP_DIRNAME: &str = "/dev/__properties__";
 static SYSTEM_PROPERTIES_DIR: OnceLock<PathBuf> = OnceLock::new();
 // Global system properties.
 static SYSTEM_PROPERTIES: OnceLock<system_properties::SystemProperties> = OnceLock::new();
-// Global system properties area.
-static SYSTEM_PROPERTIES_AREA: OnceLock<Mutex<SystemProperties>> = OnceLock::new();
 
 /// Initialize system properties.
 /// It must be called before using other functions.
@@ -85,8 +83,8 @@ pub fn init(dir: Option<&str>) {
 /// Get the system properties directory.
 /// It returns None if init() is not called.
 /// It returns Some(&PathBuf) if init() is called.
-pub fn dirname() -> Option<&'static PathBuf> {
-    SYSTEM_PROPERTIES_DIR.get()
+pub fn dirname() -> &'static Path {
+    SYSTEM_PROPERTIES_DIR.get().expect("Call init() first.").as_path()
 }
 
 /// Get the system properties.
@@ -94,20 +92,9 @@ pub fn dirname() -> Option<&'static PathBuf> {
 /// It panics if init() is not called or the system properties cannot be opened.
 pub fn system_properties() -> &'static system_properties::SystemProperties {
     SYSTEM_PROPERTIES.get_or_init(|| {
-        let dir = dirname().unwrap_or_else(|| panic!("Call init() first."));
+        let dir = dirname();
         system_properties::SystemProperties::new(dir)
             .unwrap_or_else(|_| panic!("Cannot open system properties. Please check if \"{dir:?}\" exists."))
-    })
-}
-
-/// Get the system properties area.
-/// Before calling this function, init() must be called.
-/// It is used for adding and updating system properties.
-pub fn system_properties_area() -> &'static Mutex<SystemProperties> {
-    SYSTEM_PROPERTIES_AREA.get_or_init(|| {
-        let dir = dirname().unwrap_or_else(|| panic!("Call init() first."));
-        Mutex::new(SystemProperties::new_area(dir)
-            .unwrap_or_else(|_| panic!("Cannot create system properties. Please check if \"{dir:?}\" exists.")))
     })
 }
 
@@ -254,6 +241,14 @@ mod tests {
     }
 
     #[cfg(feature = "builder")]
+    fn system_properties_area() -> SystemProperties {
+        let dir = dirname();
+        SystemProperties::new_area(dir)
+            .unwrap_or_else(|_| panic!("Cannot create system properties. Please check if \"{dir:?}\" exists."))
+    }
+
+
+    #[cfg(feature = "builder")]
     fn build_property_dir(dir: &str) -> HashMap<String, String> {
         static INIT_PROPERTY_AREA: OnceLock<bool> = OnceLock::new();
 
@@ -275,16 +270,16 @@ mod tests {
                 property_infos.append(&mut property_info);
             }
 
-            let data = build_trie(&property_infos, "u:object_r:build_prop:s0", "string").unwrap();
+            let data: Vec<u8> = build_trie(&property_infos, "u:object_r:build_prop:s0", "string").unwrap();
 
-            let dir = dirname().unwrap();
+            let dir = dirname();
             remove_dir_all(dir).unwrap_or_default();
             create_dir(dir).unwrap_or_default();
             File::create(dir.join("property_info")).unwrap().write_all(&data).unwrap();
 
             let properties = load_properties();
 
-            let mut system_properties = system_properties_area().lock().unwrap();
+            let mut system_properties = system_properties_area();
             for (key, value) in properties.iter() {
                 match system_properties.find(key.as_str()).unwrap() {
                     Some(prop_ref) => {
@@ -324,7 +319,7 @@ mod tests {
         let _properties = build_property_dir(TEST_PROPERTY_DIR);
 
         let test_prop = "test.property";
-        let mut system_properties_area = system_properties_area().lock().unwrap();
+        let mut system_properties_area = system_properties_area();
 
         let wait_any = || {
             std::thread::spawn(move || {

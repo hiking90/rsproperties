@@ -85,6 +85,7 @@ impl ContextsSerialized {
         Ok((context_node.property_area()?, index))
     }
 
+    #[cfg(feature = "builder")]
     pub(crate) fn prop_area_mut_for_name(&self, name: &str) -> Result<(PropertyAreaMutGuard<'_>, u32)> {
         let (index, _) = self.property_info_area_file
             .property_info_area()
@@ -110,6 +111,7 @@ impl ContextsSerialized {
         context_node.property_area()
     }
 
+    #[cfg(feature = "builder")]
     pub(crate) fn prop_area_mut_with_index(&self, context_index: u32) -> Result<PropertyAreaMutGuard<'_>> {
         let context_node = &self.context_nodes[context_index as usize];
         context_node.property_area_mut()
