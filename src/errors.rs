@@ -1,7 +1,7 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::panic::Location;
+use std::{num::ParseIntError, panic::Location};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -79,6 +79,13 @@ impl From<&str> for Error {
     #[track_caller]
     fn from(source: &str) -> Self {
         Error::Context { context: source.to_owned(), location: Location::caller() }
+    }
+}
+
+impl From<ParseIntError> for Error {
+    #[track_caller]
+    fn from(source: ParseIntError) -> Self {
+        Error::Context { context: format!("{}", source), location: Location::caller() }
     }
 }
 
