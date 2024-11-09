@@ -15,8 +15,7 @@ use std::os::linux::fs::MetadataExt;
 
 use rustix::fs;
 
-use zerocopy::FromBytes;
-use zerocopy_derive::{FromBytes, FromZeroes};
+use zerocopy_derive::*;
 
 use crate::errors::*;
 use crate::property_area::MemoryMap;
@@ -40,7 +39,7 @@ where
 }
 
 
-#[derive(FromZeroes, FromBytes, Debug)]
+#[derive(FromBytes, KnownLayout, Immutable, Debug)]
 #[repr(C, align(4))]
 pub(crate) struct PropertyEntry {
     pub(crate) name_offset: u32,
@@ -55,7 +54,7 @@ impl PropertyEntry {
     }
 }
 
-#[derive(FromZeroes, FromBytes, Debug)]
+#[derive(FromBytes, KnownLayout, Immutable, Debug)]
 #[repr(C, align(4))]
 pub(crate) struct TrieNodeData {
     pub(crate) property_entry: u32,
@@ -67,7 +66,7 @@ pub(crate) struct TrieNodeData {
     pub(crate) exact_match_entries: u32,
 }
 
-#[derive(FromZeroes, FromBytes, Debug)]
+#[derive(FromBytes, KnownLayout, Immutable, Debug)]
 #[repr(C, align(4))]
 pub struct PropertyInfoAreaHeader {
     pub(crate) current_version: u32,
@@ -118,7 +117,7 @@ impl<'a> TrieNode<'a> {
     }
 
     fn child_node(&self, n: usize) -> TrieNode {
-        let child_node_offset = u32::slice_from(&self.property_info_area.data_base[self.data().child_nodes as usize..]).unwrap()[n];
+        let child_node_offset = self.property_info_area.u32_slice_from(self.data().child_nodes as usize)[n];
         TrieNode::new(&self.property_info_area, child_node_offset as usize)
     }
 
@@ -183,14 +182,17 @@ impl<'a> PropertyInfoArea<'a> {
     }
 
     #[inline]
-    pub(crate) fn ref_from<T: FromBytes>(&self, offset: usize) -> &T {
+    pub(crate) fn ref_from<T: zerocopy::FromBytes + zerocopy::KnownLayout + zerocopy::Immutable>(&self, offset: usize) -> &T {
         let size_of = size_of::<T>();
-        T::ref_from(&self.data_base[offset..offset + size_of]).expect("Failed to create reference")
+        &T::ref_from_bytes(&self.data_base[offset..offset + size_of]).expect("Failed to create reference")
     }
 
     #[inline]
     fn u32_slice_from(&self, offset: usize) -> &[u32] {
-        u32::slice_from(&self.data_base[offset..]).unwrap()
+        let (prefix, u32_slice, suffix) = unsafe { self.data_base[offset..].align_to::<u32>() };
+        assert!(prefix.is_empty() && suffix.is_empty());
+        u32_slice
+        // u32::read_from_bytes(&self.data_base[offset..]).unwrap()
     }
 
     #[inline]
@@ -357,7 +359,7 @@ impl PropertyInfoAreaFile {
             .map_err(|e| Error::new_context(format!("File open is failed in: {path:?}: {e:?}")))?;
 
         let metadata = file.metadata().map_err(Error::new_io)?;
-        if cfg!(test) {
+        if cfg!(test) || cfg!(debug_assertions) {
             if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
                 metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
                 return Err(Error::new_context("Invalid file metadata".to_owned()));
@@ -386,7 +388,7 @@ mod tests {
         assert_eq!(info_area.current_version(), 1);
         assert_eq!(info_area.minimum_supported_version(), 1);
 
-        let num_context_nodes = info_area.num_contexts();
+        let _num_context_nodes = info_area.num_contexts();
 
         let (context_cstr, type_cstr) = info_area.get_property_info("ro.build.version.sdk");
         assert_eq!(context_cstr.unwrap().to_str().unwrap(), "u:object_r:build_prop:s0");

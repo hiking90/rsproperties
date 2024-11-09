@@ -73,9 +73,14 @@ static SYSTEM_PROPERTIES: OnceLock<system_properties::SystemProperties> = OnceLo
 /// Initialize system properties.
 /// It must be called before using other functions.
 /// If dir is None, it uses the default directory "/dev/__properties__".
-pub fn init(dir: Option<&str>) {
-    let dir = dir.unwrap_or(PROP_DIRNAME);
-    if let Err(e) = SYSTEM_PROPERTIES_DIR.set(PathBuf::from(dir)) {
+pub fn init(dir: Option<PathBuf>) {
+    let dir = if let Some(dir) = dir {
+        dir
+    } else {
+        PathBuf::from(PROP_DIRNAME)
+    };
+
+    if let Err(e) = SYSTEM_PROPERTIES_DIR.set(dir) {
         log::error!("Error setting system properties directory: {}", e.display());
     }
 }
@@ -253,7 +258,7 @@ mod tests {
         static INIT_PROPERTY_AREA: OnceLock<bool> = OnceLock::new();
 
         let _ = INIT_PROPERTY_AREA.get_or_init(|| {
-            crate::init(Some(dir));
+            crate::init(Some(PathBuf::from(dir)));
 
             let property_contexts_files = vec![
                 "tests/android/plat_property_contexts",

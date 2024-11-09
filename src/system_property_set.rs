@@ -6,8 +6,10 @@ use std::io::{prelude::*, IoSlice};
 use std::fs;
 use std::sync::OnceLock;
 
-use zerocopy::AsBytes;
-use zerocopy_derive::{FromBytes, FromZeroes, AsBytes};
+use zerocopy::IntoBytes;
+// use zerocopy::AsBytes;
+// use zerocopy_derive::{FromBytes, FromZeroes, AsBytes};
+use zerocopy_derive::*;
 
 use crate::errors::*;
 
@@ -93,7 +95,7 @@ enum ProtocolVersion {
     V2 = 2,
 }
 
-#[derive(AsBytes, FromZeroes, FromBytes, Debug)]
+#[derive(FromBytes, IntoBytes, Immutable, Debug)]
 #[repr(C)]
 struct PropertyMessage {
     cmd: u32,
