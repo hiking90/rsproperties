@@ -5,7 +5,7 @@ use std::path::Path;
 use std::fs::File;
 use std::io::{BufReader, BufRead};
 
-use crate::errors::*;
+use rserror::*;
 use crate::trie_builder::*;
 use crate::trie_serializer::*;
 
@@ -52,10 +52,10 @@ impl PropertyInfoEntry {
         let mut tokenizer = line.split_whitespace();
 
         let property = tokenizer.next().ok_or_else(||
-            Error::new_context(format!("Did not find a property entry in '{line}'")))?;
+            rserror!("Did not find a property entry in '{line}'"))?;
 
         let context = tokenizer.next().ok_or_else(||
-            Error::new_context(format!("Did not find a context entry in '{line}'")))?;
+            rserror!("Did not find a context entry in '{line}'"))?;
 
         let match_operation = tokenizer.next();
 
@@ -69,11 +69,11 @@ impl PropertyInfoEntry {
         if match_operation == Some("exact") {
             exact_match = true;
         } else if match_operation != Some("prefix") && require_prefix_or_exact {
-            return Err(Error::new_context(format!("Match operation '{match_operation:?}' is not valid. Must be 'prefix' or 'exact'")));
+            return Err(rserror!("Match operation '{match_operation:?}' is not valid. Must be 'prefix' or 'exact'"));
         }
 
         if !type_strings.is_empty() && !Self::is_type_valid(&type_strings) {
-            return Err(Error::new_context(format!("Type '{}' is not valid.", type_strings.join(" "))));
+            return Err(rserror!("Type '{}' is not valid.", type_strings.join(" ")));
         }
 
         Ok(Self {
@@ -84,15 +84,15 @@ impl PropertyInfoEntry {
         })
     }
 
-    pub fn parse_from_file(filename: &Path, require_prefix_or_exact: bool) -> Result<(Vec<PropertyInfoEntry>, Vec<Error>)> {
+    pub fn parse_from_file(filename: &Path, require_prefix_or_exact: bool) -> Result<(Vec<PropertyInfoEntry>, Vec<anyhow::Error>)> {
         let file = File::open(filename)
-            .map_err(|e| Error::new_context(format!("Failed to open to file {filename:?}: {:?}", e)))?;
+            .context_with_location(format!("Failed to open to file {filename:?}"))?;
         let reader = BufReader::new(file);
 
         let mut errors = Vec::new();
         let mut entries = Vec::new();
         for line in reader.lines() {
-            let line = line.map_err(Error::new_io)?;
+            let line = line.context_with_location("Failed to read line")?;
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;

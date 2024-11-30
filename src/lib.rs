@@ -35,9 +35,9 @@ use std::{
     sync::OnceLock,
     path::{PathBuf, Path},
 };
+use rserror::*;
 
 mod property_info_parser;
-pub mod errors;
 mod system_properties;
 mod contexts_serialized;
 mod property_area;
@@ -55,7 +55,6 @@ mod trie_node_arena;
 #[cfg(feature = "builder")]
 mod build_property_parser;
 
-pub use errors::*;
 pub use system_properties::SystemProperties;
 #[cfg(feature = "builder")]
 pub use property_info_serializer::*;

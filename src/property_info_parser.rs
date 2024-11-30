@@ -17,7 +17,7 @@ use rustix::fs;
 
 use zerocopy_derive::*;
 
-use crate::errors::*;
+use rserror::*;
 use crate::property_area::MemoryMap;
 
 fn find<F>(array_length: u32, f: F) -> i32
@@ -356,18 +356,19 @@ impl PropertyInfoAreaFile {
 
     pub(crate) fn load_path(path: &Path) -> Result<Self> {
         let file: File = File::open(path)
-            .map_err(|e| Error::new_context(format!("File open is failed in: {path:?}: {e:?}")))?;
+            .context_with_location(format!("File open is failed in: {path:?}"))?;
 
-        let metadata = file.metadata().map_err(Error::new_io)?;
+        let metadata = file.metadata()
+            .context_with_location(format!("File metadata is failed in: {path:?}"))?;
         if cfg!(test) || cfg!(debug_assertions) {
             if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
                 metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
-                return Err(Error::new_context("Invalid file metadata".to_owned()));
+                return Err(rserror!("Invalid file metadata"));
             }
         } else if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
             metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
             metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
-            return Err(Error::new_context("Invalid file metadata".to_owned()));
+            return Err(rserror!("Invalid file metadata"));
         }
 
         Ok(Self {

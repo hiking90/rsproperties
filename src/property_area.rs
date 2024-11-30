@@ -20,8 +20,9 @@ use std::os::android::fs::MetadataExt;
 use std::os::linux::fs::MetadataExt;
 
 use rustix::{fs, mm};
+use anyhow::Context;
+use rserror::*;
 
-use crate::errors::*;
 use crate::property_info::{
     PropertyInfo,
     name_from_trailing_data,
@@ -120,7 +121,7 @@ impl PropertyAreaMap {
             .custom_flags((fs::OFlags::NOFOLLOW.bits() | fs::OFlags::EXCL.bits()) as _) // additional flags
             .mode(0o444)              // permission: 0444
             .open(filename)
-            .map_err(|e| Error::new_context(format!("File open is failed in: {filename:?}: {e:?}")))?;
+            .context(format!("Failed to open to {filename:?}"))?;
 
         if let Some(context) = context {
             if fs::fsetxattr(&file, "selinux", context.to_bytes_with_nul(),
@@ -129,7 +130,7 @@ impl PropertyAreaMap {
             }
         }
 
-        fs::ftruncate(&file, PA_SIZE).map_err(Error::new_errno)?;
+        fs::ftruncate(&file, PA_SIZE).map_err(Error::from)?;
 
         let pa_size = PA_SIZE as usize;
         let pa_data_size = pa_size - std::mem::size_of::<PropertyArea>();
@@ -151,18 +152,19 @@ impl PropertyAreaMap {
             .read(true)               // read only
             .custom_flags(fs::OFlags::NOFOLLOW.bits() as _) // additional flags
             .open(filename)
-            .map_err(Error::new_io)?;
+            .context_with_location("Failed to open to {filename:?}")?;
 
-        let metadata = file.metadata().map_err(Error::new_io)?;
+        let metadata = file.metadata()
+            .context_with_location("Failed to get metadata")?;
         if cfg!(test) {
             if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
                 metadata.st_size() < mem::size_of::<PropertyArea>() as u64 {
-                return Err(Error::new_context("Invalid file metadata".to_owned()));
+                anyhow::bail!("Invalid file metadata");
             }
         } else if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
             metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
             metadata.st_size() < mem::size_of::<PropertyArea>() as u64 {
-            return Err(Error::new_context("Invalid file metadata".to_owned()));
+            anyhow::bail!("Invalid file metadata");
         }
 
         let pa_size = metadata.st_size() as usize;
@@ -177,7 +179,7 @@ impl PropertyAreaMap {
 
         if thiz.property_area().magic != PROP_AREA_MAGIC ||
            thiz.property_area().version != PROP_AREA_VERSION {
-            Err(Error::new_context("Invalid magic or version".to_owned()))
+            Err(anyhow::anyhow!("Invalid magic or version"))
         } else {
             Ok(thiz)
         }
@@ -205,7 +207,7 @@ impl PropertyAreaMap {
             };
 
             if substr_size == 0 {
-                return Err(Error::new_context("Invalid property name".to_owned()));
+                anyhow::bail!("Invalid property name: {name}");
             }
 
             let subname = &remaining_name[0..substr_size];
@@ -214,7 +216,7 @@ impl PropertyAreaMap {
             let root = if children_offset != 0 {
                 self.to_prop_obj_from_atomic::<PropertyTrieNode>(&current.children)?
             } else {
-                return Err(Error::new_not_found(name.to_owned()));
+                return Err(Error::new_not_found(name.to_owned()).into());
             };
 
             current = self.find_prop_trie_node(root, subname)?;
@@ -232,7 +234,7 @@ impl PropertyAreaMap {
             let offset = &current.prop.load(std::sync::atomic::Ordering::Acquire);
             Ok((self.mmap.to_object(*offset as usize, self.data_offset)?, *offset))
         } else {
-            Err(Error::new_not_found(name.to_owned()))
+            Err(Error::new_not_found(name.to_owned()).into())
         }
     }
 
@@ -248,7 +250,7 @@ impl PropertyAreaMap {
             };
 
             if substr_size == 0 {
-                return Err(Error::new_context("Invalid property name".to_owned()));
+                return Err(rserror!("Invalid property name: {name}"));
             }
 
             let subname = &remaining_name[0..substr_size];
@@ -301,7 +303,7 @@ impl PropertyAreaMap {
         let offset = mem::size_of::<PropertyTrieNode>();
         let bytes = value.to_bytes_with_nul();
         if bytes.len() + offset > self.pa_data_size {
-            return Err(Error::new_context("Invalid offset".to_owned()));
+            return Err(rserror!("Invalid offset"));
         }
 
         self.mmap.data_mut(offset, self.data_offset, bytes.len())?.copy_from_slice(bytes);
@@ -362,7 +364,7 @@ impl PropertyAreaMap {
                     if left_offset != 0 {
                         current = self.to_prop_obj_from_atomic::<PropertyTrieNode>(&current.left)?;
                     } else {
-                        return Err(Error::new_not_found(name.to_owned()));
+                        return Err(Error::new_not_found(name.to_owned()).into());
                     }
                 }
                 std::cmp::Ordering::Greater => {
@@ -370,7 +372,7 @@ impl PropertyAreaMap {
                     if right_offset != 0 {
                         current = self.to_prop_obj_from_atomic::<PropertyTrieNode>(&current.right)?;
                     } else {
-                        return Err(Error::new_not_found(name.to_owned()));
+                        return Err(Error::new_not_found(name.to_owned()).into());
                     }
                 }
                 std::cmp::Ordering::Equal => {
@@ -385,7 +387,7 @@ impl PropertyAreaMap {
         let aligned = crate::bionic_align(size, mem::size_of::<u32>());
         let offset = self.property_area().bytes_used;
         if offset + (aligned as u32) > self.pa_data_size as u32 {
-            return Err(Error::new_context("Out of memory".to_owned()));
+            return Err(rserror!("Out of memory"));
         }
 
         self.property_area_mut().bytes_used += aligned as u32;
@@ -455,7 +457,7 @@ impl MemoryMap {
             mm::mmap(std::ptr::null_mut(),
                 size, flags, mm::MapFlags::SHARED,
                 file, 0)
-        }.map_err(|e| Error::new_errno(e))? as *mut u8;
+        }.map_err(Error::from)? as *mut u8;
 
         Ok(Self {
             data: memory_area,
@@ -486,7 +488,7 @@ impl MemoryMap {
 
     fn check_size(&self, offset: usize, size: usize) -> Result<()> {
         if offset + size > self.size {
-            return Err(Error::new_context(format!("Invalid offset: {} > {}", offset + size, self.size)));
+            return Err(rserror!("Invalid offset: {} > {}", offset + size, self.size));
         }
         Ok(())
     }

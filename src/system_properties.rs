@@ -11,8 +11,9 @@ use rustix::{
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use rustix::thread::{futex, FutexOperation, FutexFlags};
 
+use rserror::*;
+
 use crate::contexts_serialized::ContextsSerialized;
-use crate::errors::*;
 use crate::property_info::PropertyInfo;
 
 pub(crate) const PROP_VALUE_MAX: usize = 92;
@@ -96,10 +97,10 @@ impl SystemProperties {
                 let res = self.contexts.prop_area_for_name(prop_info.name().to_str()?)?;
                 let pa = res.0.property_area();
                 let value = pa.dirty_backup_area()?;
-                value.as_str().map_err(Error::new_errno)?.to_owned()
+                value.as_str().map_err(Error::from)?.to_owned()
             } else {
                 let value = prop_info.value();
-                value.as_str().map_err(Error::new_errno)?.to_owned()
+                value.as_str().map_err(Error::from)?.to_owned()
             };
             fence(Ordering::Acquire);
             let new_serial = prop_info.serial.load(std::sync::atomic::Ordering::Acquire);
@@ -180,7 +181,7 @@ impl SystemProperties {
     #[cfg(feature = "builder")]
     pub fn update(&mut self, index: &PropertyIndex, value: &str) -> Result<bool> {
         if value.len() >= PROP_VALUE_MAX {
-            return Err(Error::new_context(format!("Value too long: {value}")));
+            return Err(rserror!("Value too long: {value}"));
         }
 
         let mut res = self.contexts.prop_area_mut_with_index(index.context_index)?;
@@ -189,7 +190,7 @@ impl SystemProperties {
 
         let name = pi.name().to_bytes();
         if !name.is_empty() && &name[0..3] == b"ro." {
-            return Err(Error::new_context(format!("Try to update the read-only property: {name:?}")));
+            return Err(rserror!("Try to update the read-only property: {name:?}"));
         }
 
         let mut serial = pi.serial.load(Ordering::Relaxed);
@@ -220,7 +221,7 @@ impl SystemProperties {
     #[cfg(feature = "builder")]
     pub fn add(&mut self, name: &str, value: &str) -> Result<()> {
         if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
-            return Err(Error::new_context(format!("Value too long: {}", value.len())));
+            return Err(rserror!("Value too long: {}", value.len()));
         }
 
         let mut res = self.contexts.prop_area_mut_for_name(name)?;

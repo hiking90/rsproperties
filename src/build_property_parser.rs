@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 
 use rustix::process::{Pid, Uid, Gid};
+use anyhow::Error;
+use rserror::*;
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use rustix::net::UCred;
@@ -17,8 +19,6 @@ pub struct UCred {
     pub gid: Gid,
 }
 
-use crate::errors::*;
-
 const RESTORECON_PROPERTY: &str = "selinux.restorecon_recursive";
 // const INIT_CONTEXT: &str = "u:r:init:s0";
 
@@ -28,7 +28,7 @@ pub fn check_permissions(_key: &str, _value: &str, _context: &str, _cr: &UCred) 
 
 pub fn load_properties_from_file(filename: &Path, filter: Option<&str>, context: &str, properties: &mut HashMap<String, String>) -> Result<()> {
     let file = File::open(filename)
-        .map_err(|e| Error::new_context(format!("Failed to open to {filename:?}: {e:?}")))?;
+        .context_with_location(format!("Failed to open to {filename:?}"))?;
     let reader = BufReader::new(file);
     let has_filter = match filter {
         Some(filter) => !filter.is_empty(),
@@ -36,7 +36,7 @@ pub fn load_properties_from_file(filename: &Path, filter: Option<&str>, context:
     };
 
     for line in reader.lines() {
-        let line = line.map_err(Error::new_io)?;
+        let line = line.map_err(Error::from)?;
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;

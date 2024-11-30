@@ -11,7 +11,7 @@ use zerocopy::IntoBytes;
 // use zerocopy_derive::{FromBytes, FromZeroes, AsBytes};
 use zerocopy_derive::*;
 
-use crate::errors::*;
+use rserror::*;
 
 const PROPERTY_SERVICE_SOCKET: &str = "/dev/socket/property_service";
 const PROPERTY_SERVICE_FOR_SYSTEM_SOCKET: &str = "/dev/socket/property_service_for_system";
@@ -42,14 +42,14 @@ impl ServiceConnection {
         };
 
         let stream = UnixStream::connect(socket_name)
-            .map_err(Error::new_io)?;
+            .context_with_location("Unable to connect to property service")?;
         Ok(Self { stream })
     }
 
     fn recv_i32(&mut self) -> Result<i32> {
         let value: i32 = 0;
         self.stream.read_exact(&mut value.to_ne_bytes())
-            .map_err(Error::new_io)?;
+            .context_with_location("Unable to read i32 from property service")?;
         Ok(value)
     }
 }
@@ -83,9 +83,9 @@ impl<'a> ServiceWriter<'a> {
 
     fn send(self, conn: &mut ServiceConnection) -> Result<()> {
         conn.stream.write_vectored(&self.buffers)
-            .map_err(Error::new_io)?;
+            .context_with_location("Unable to write to property service")?;
         conn.stream.flush()
-            .map_err(Error::new_io)?;
+            .context_with_location("Unable to flush property service")?;
         Ok(())
     }
 }
@@ -159,7 +159,7 @@ fn wait_for_socket_close(socket_fd: BorrowedFd<'_>) -> Result<()> {
             }
             Err(e) => {
                 // Handle possible errors
-                return Err(Error::new_errno(e))
+                return Err(Error::from(e).into())
             }
         }
     }
@@ -173,13 +173,11 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
     match protocol_version() {
         ProtocolVersion::V1 => {
             if name.len() >= PROP_NAME_MAX {
-                return Err(Error::new_context(
-                    format!("Property name is too long: {}", name.len())));
+                return Err(rserror!("Property name is too long: {}", name.len()));
             }
 
             if value.len() >= PROP_VALUE_MAX {
-                return Err(Error::new_context(
-                    format!("Property value is too long: {}", value.len())));
+                return Err(rserror!("Property value is too long: {}", value.len()));
             }
 
             let mut conn = ServiceConnection::new(PROP_SERVICE_NAME)?;
@@ -195,8 +193,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
             let value_len = value.len() as u32;
             let name_len = name.len() as u32;
             if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
-                return Err(Error::new_context(
-                    format!("Property value is too long: {}", value.len())));
+                return Err(rserror!("Property value is too long: {}", value.len()));
             }
 
             let mut conn = ServiceConnection::new(name)?;
@@ -208,8 +205,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
 
             let res = conn.recv_i32()?;
             if res != PROP_SUCCESS {
-                return Err(Error::new_context(
-                    format!("Unable to set property \"{name}\" to \"{value}\": error code: 0x{res:X}")));
+                return Err(rserror!("Unable to set property \"{name}\" to \"{value}\": error code: 0x{res:X}"));
             }
         }
     }

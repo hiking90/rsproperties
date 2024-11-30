@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::property_area::PropertyAreaMap;
-use crate::errors::*;
+use rserror::*;
 
 pub(crate) struct ContextNode {
     access_rw: bool,

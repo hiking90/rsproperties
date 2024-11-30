@@ -5,10 +5,11 @@ use std::path::Path;
 use std::ffi::CStr;
 
 use rustix::fs;
+use anyhow::Context;
+use rserror::*;
 
 use crate::context_node::{ContextNode, PropertyAreaGuard, PropertyAreaMutGuard};
 use crate::property_area::{PropertyArea, PropertyAreaMap};
-use crate::errors::*;
 use crate::property_info_parser::PropertyInfoAreaFile;
 
 pub(crate) struct ContextsSerialized {
@@ -42,7 +43,8 @@ impl ContextsSerialized {
         let serial_property_area_map = if writable {
             if !dirname.is_dir() {
                 fs::mkdir(dirname.as_path(), fs::Mode::RWXU | fs::Mode::XGRP | fs::Mode::XOTH)
-                    .map_err(|e| Error::new_context(format!("mkdir is failed in: {dirname:?}: {e:?}")))?;
+                    .map_err(Error::from)
+                    .context(format!("mkdir is failed in: {dirname:?}"))?;
             }
 
             *fsetxattr_failed = false;
@@ -78,7 +80,7 @@ impl ContextsSerialized {
             .property_info_area()
             .get_property_info_indexes(name);
         if index == u32::MAX || index >= self.context_nodes.len() as u32 {
-            return Err(Error::new_not_found(name.to_owned()));
+            return Err(Error::new_not_found(name.to_owned()).into());
         }
 
         let context_node = &self.context_nodes[index as usize];
@@ -91,7 +93,7 @@ impl ContextsSerialized {
             .property_info_area()
             .get_property_info_indexes(name);
         if index == u32::MAX || index >= self.context_nodes.len() as u32 {
-            return Err(Error::new_context(format!("Could not find context for property {name}")));
+            return Err(rserror::rserror!("Could not find context for property {name}"));
         }
 
         let context_node = &self.context_nodes[index as usize];
@@ -117,4 +119,3 @@ impl ContextsSerialized {
         context_node.property_area_mut()
     }
 }
-
