@@ -144,7 +144,11 @@ fn wait_for_socket_close(socket_fd: BorrowedFd<'_>) -> Result<()> {
 
     // Poll with a timeout of 250 milliseconds
     loop {
-        match event::poll(&mut fds, 250) {
+        let timeout = event::Timespec {
+            tv_sec: 0, 
+            tv_nsec: 250_000_000
+        };
+        match event::poll(&mut fds, Some(&timeout)) {
             Ok(0) => {
                 // Timeout reached, treat as a success due to server delay
                 log::info!("Timeout reached, but treating as success.");
