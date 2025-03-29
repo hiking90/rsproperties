@@ -9,7 +9,7 @@ use rustix::{
     path::Arg,
 };
 #[cfg(any(target_os = "android", target_os = "linux"))]
-use rustix::thread::{futex, FutexOperation, FutexFlags};
+use rustix::thread::futex;
 
 use rserror::*;
 
@@ -29,29 +29,35 @@ fn serial_dirty(serial: u32) -> bool {
     (serial & 1) != 0
 }
 
-fn futex_wake(_addr: *mut u32) -> Result<usize> {
+fn futex_wake(_addr: &AtomicU32) -> Result<usize> {
     #[cfg(any(target_os = "android", target_os = "linux"))]
-    unsafe {
-        futex(_addr, FutexOperation::Wake, FutexFlags::empty(), i32::MAX as u32, std::ptr::null(), std::ptr::null_mut(), 0)
-            .map_err(Error::new_errno)
+    {
+        futex::wake(_addr, futex::Flags::empty(), i32::MAX as u32)
+            .context_with_location("Failed to wake futex")
+            // .map_err(Error::new_errno)
     }
     #[cfg(target_os = "macos")]
     Ok(0)
 }
 
-fn futex_wait(_addr: *mut u32, _value: i32, _timeout: Option<&Timespec>) -> Result<usize> {
+fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> Option<u32> {
     #[cfg(any(target_os = "android", target_os = "linux"))]
-    unsafe {
-        let timeout = match _timeout {
-            Some(timeout) => timeout as *const Timespec,
-            None => std::ptr::null_mut(),
-        };
-        let res = futex(_addr, FutexOperation::Wait, FutexFlags::empty(), _value as _, timeout, std::ptr::null_mut(), 0)
-            .map_err(Error::new_errno);
-        res
+    loop {
+        match futex::wait(_serial, futex::Flags::empty(), _value as _, _timeout) {
+            Ok(_) => {
+                let new_serial = _serial.load(Ordering::Acquire);
+                if _value != new_serial {
+                    return Some(new_serial);
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to wait for property change: {}", e);
+                return None;
+            }
+        }
     }
     #[cfg(target_os = "macos")]
-    Ok(0)
+    None
 }
 
 // To avoid lifetime issues, the property index is used to access the property value.
@@ -209,11 +215,11 @@ impl SystemProperties {
         fence(Ordering::Release);
         // Set the new serial. It is cleared the dirty flag and set the new length of the value.
         pi.serial.store((value.len() << 24) as u32 | ((serial + 1) & 0xffffff), std::sync::atomic::Ordering::Relaxed);
-        futex_wake(pi.serial.as_ptr())?;
+        futex_wake(&pi.serial)?;
 
         let serial_pa = self.contexts.serial_prop_area();
         serial_pa.serial().store(serial_pa.serial().load(Ordering::Relaxed) + 1, Ordering::Release);
-        futex_wake(serial_pa.serial().as_ptr())?;
+        futex_wake(&serial_pa.serial())?;
 
         Ok(true)
     }
@@ -230,7 +236,7 @@ impl SystemProperties {
 
         let serial_pa = self.contexts.serial_prop_area();
         serial_pa.serial().store(serial_pa.serial().load(Ordering::Relaxed) + 1, Ordering::Release);
-        futex_wake(serial_pa.serial().as_ptr())?;
+        futex_wake(&serial_pa.serial())?;
 
         Ok(())
     }
@@ -266,47 +272,36 @@ impl SystemProperties {
     }
 
     pub fn wait(&self, index: Option<&PropertyIndex>, timeout: Option<&Timespec>) -> Option<u32> {
-        let serial = match index {
+        match index {
             Some(idx) => {
                 match self.contexts.prop_area_with_index(idx.context_index).ok() {
                     Some(guard) => {
                         let pa = guard.property_area();
                         match pa.property_info(idx.property_index).ok() {
                             Some(pi) => {
-                                (pi.serial.as_ptr(), pi.serial.load(Ordering::Acquire))
+                                futex_wait(
+                                    &pi.serial, 
+                                    pi.serial.load(Ordering::Acquire), 
+                                    timeout)
                             }
                             None => {
                                 log::error!("Failed to get PropertyInfo for index: {}", idx.property_index);
-                                return None;
+                                None
                             }
                         }
                     }
                     None => {
                         log::error!("Failed to get PropertyArea for index: {}", idx.context_index);
-                        return None;
+                        None
                     }
                 }
             }
             None => {
                 let serial_pa = self.contexts.serial_prop_area().serial();
-                (serial_pa.as_ptr(), serial_pa.load(Ordering::Acquire))
-            }
-        };
-
-        loop {
-            match futex_wait(serial.0, serial.1 as _, timeout) {
-                Ok(_) => {
-                    let new_serial = unsafe {
-                        AtomicU32::from_ptr(serial.0).load(Ordering::Acquire)
-                    };
-                    if serial.1 != new_serial {
-                        return Some(new_serial);
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to wait for property change: {}", e);
-                    return None;
-                }
+                futex_wait(
+                    &serial_pa, 
+                    serial_pa.load(Ordering::Acquire), 
+                    timeout)
             }
         }
     }
