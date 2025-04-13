@@ -179,7 +179,7 @@ impl PropertyAreaMap {
 
         if thiz.property_area().magic != PROP_AREA_MAGIC ||
            thiz.property_area().version != PROP_AREA_VERSION {
-            Err(anyhow::anyhow!("Invalid magic or version"))
+            Err(rserror!("Invalid magic or version"))
         } else {
             Ok(thiz)
         }
