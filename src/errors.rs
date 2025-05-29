@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{num::ParseIntError, panic::Location};
+use anyhow::Context;
 
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
 
@@ -71,6 +72,20 @@ impl From<ParseIntError> for Error {
     #[track_caller]
     fn from(source: ParseIntError) -> Self {
         Error::Context(format!("{}", source), Location::caller())
+    }
+}
+
+pub trait ContextWithLocation<T> {
+    fn context_with_location(self, msg: impl Into<String>) -> Result<T>;
+}
+
+impl<T, E> ContextWithLocation<T> for std::result::Result<T, E>
+where
+    E: Into<anyhow::Error>,
+{
+    #[track_caller]
+    fn context_with_location(self, msg: impl Into<String>) -> Result<T> {
+        self.map_err(|e| e.into()).context(msg.into())
     }
 }
 

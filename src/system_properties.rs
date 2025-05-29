@@ -11,7 +11,7 @@ use rustix::{
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use rustix::thread::futex;
 
-use rserror::*;
+use crate::errors::*;
 
 use crate::contexts_serialized::ContextsSerialized;
 use crate::property_info::PropertyInfo;
@@ -43,7 +43,7 @@ fn futex_wake(_addr: &AtomicU32) -> Result<usize> {
 fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> Option<u32> {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     loop {
-        match futex::wait(_serial, futex::Flags::empty(), _value as _, _timeout) {
+        match futex::wait(_serial, futex::Flags::empty(), _value as _, _timeout.copied()) {
             Ok(_) => {
                 let new_serial = _serial.load(Ordering::Acquire);
                 if _value != new_serial {
@@ -187,7 +187,7 @@ impl SystemProperties {
     #[cfg(feature = "builder")]
     pub fn update(&mut self, index: &PropertyIndex, value: &str) -> Result<bool> {
         if value.len() >= PROP_VALUE_MAX {
-            return Err(rserror!("Value too long: {value}"));
+            return Err(Error::new_context(format!("Value too long: {value}")).into());
         }
 
         let mut res = self.contexts.prop_area_mut_with_index(index.context_index)?;
@@ -196,7 +196,7 @@ impl SystemProperties {
 
         let name = pi.name().to_bytes();
         if !name.is_empty() && &name[0..3] == b"ro." {
-            return Err(rserror!("Try to update the read-only property: {name:?}"));
+            return Err(Error::new_context(format!("Try to update the read-only property: {name:?}")).into());
         }
 
         let mut serial = pi.serial.load(Ordering::Relaxed);
@@ -227,7 +227,7 @@ impl SystemProperties {
     #[cfg(feature = "builder")]
     pub fn add(&mut self, name: &str, value: &str) -> Result<()> {
         if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
-            return Err(rserror!("Value too long: {}", value.len()));
+            return Err(Error::new_context(format!("Value too long: {}", value.len())).into());
         }
 
         let mut res = self.contexts.prop_area_mut_for_name(name)?;
@@ -280,8 +280,8 @@ impl SystemProperties {
                         match pa.property_info(idx.property_index).ok() {
                             Some(pi) => {
                                 futex_wait(
-                                    &pi.serial, 
-                                    pi.serial.load(Ordering::Acquire), 
+                                    &pi.serial,
+                                    pi.serial.load(Ordering::Acquire),
                                     timeout)
                             }
                             None => {
@@ -299,8 +299,8 @@ impl SystemProperties {
             None => {
                 let serial_pa = self.contexts.serial_prop_area().serial();
                 futex_wait(
-                    &serial_pa, 
-                    serial_pa.load(Ordering::Acquire), 
+                    &serial_pa,
+                    serial_pa.load(Ordering::Acquire),
                     timeout)
             }
         }

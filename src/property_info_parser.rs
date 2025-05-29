@@ -17,7 +17,7 @@ use rustix::fs;
 
 use zerocopy_derive::*;
 
-use rserror::*;
+use crate::errors::*;
 use crate::property_area::MemoryMap;
 
 fn find<F>(array_length: u32, f: F) -> i32
@@ -39,7 +39,7 @@ where
 }
 
 
-#[derive(FromBytes, KnownLayout, Immutable, Debug)]
+#[derive(FromBytes, FromZeroes, KnownLayout, Debug)]
 #[repr(C, align(4))]
 pub(crate) struct PropertyEntry {
     pub(crate) name_offset: u32,
@@ -54,7 +54,7 @@ impl PropertyEntry {
     }
 }
 
-#[derive(FromBytes, KnownLayout, Immutable, Debug)]
+#[derive(FromBytes, FromZeroes, KnownLayout, Debug)]
 #[repr(C, align(4))]
 pub(crate) struct TrieNodeData {
     pub(crate) property_entry: u32,
@@ -66,7 +66,7 @@ pub(crate) struct TrieNodeData {
     pub(crate) exact_match_entries: u32,
 }
 
-#[derive(FromBytes, KnownLayout, Immutable, Debug)]
+#[derive(FromBytes, FromZeroes, KnownLayout, Debug)]
 #[repr(C, align(4))]
 pub struct PropertyInfoAreaHeader {
     pub(crate) current_version: u32,
@@ -182,9 +182,11 @@ impl<'a> PropertyInfoArea<'a> {
     }
 
     #[inline]
-    pub(crate) fn ref_from<T: zerocopy::FromBytes + zerocopy::KnownLayout + zerocopy::Immutable>(&self, offset: usize) -> &T {
+    pub(crate) fn ref_from<T: zerocopy::FromBytes + zerocopy::KnownLayout>(&self, offset: usize) -> &T {
         let size_of = size_of::<T>();
-        &T::ref_from_bytes(&self.data_base[offset..offset + size_of]).expect("Failed to create reference")
+        zerocopy::Ref::<&[u8], T>::new(&self.data_base[offset..offset + size_of])
+            .expect("Failed to create reference")
+            .into_ref()
     }
 
     #[inline]
@@ -363,12 +365,12 @@ impl PropertyInfoAreaFile {
         if cfg!(test) || cfg!(debug_assertions) {
             if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
                 metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
-                return Err(rserror!("Invalid file metadata"));
+                return Err(Error::new_context("Invalid file metadata".to_string()).into());
             }
         } else if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
             metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
             metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
-            return Err(rserror!("Invalid file metadata"));
+            return Err(Error::new_context("Invalid file metadata".to_string()).into());
         }
 
         Ok(Self {

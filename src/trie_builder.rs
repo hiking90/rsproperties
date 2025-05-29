@@ -5,7 +5,7 @@ use std::collections::{HashMap, BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-use rserror::*;
+use crate::errors::*;
 
 #[derive(Debug)]
 pub(crate) struct PropertyEntryBuilder {
@@ -67,7 +67,7 @@ impl TrieBuilderNode {
         if self.exact_matches.insert(entry) {
             Ok(())
         } else {
-            Err(rserror!("Exact match already exists for '{name}'"))
+            Err(Error::new_context(format!("Exact match already exists for '{name}'")).into())
         }
     }
 
@@ -81,7 +81,7 @@ impl TrieBuilderNode {
         if self.prefixes.insert(entry) {
             Ok(())
         } else {
-            Err(rserror!("Prefix already exists for '{name}'"))
+            Err(Error::new_context(format!("Prefix already exists for '{name}'")).into())
         }
     }
 
@@ -140,7 +140,7 @@ impl TrieBuilder {
         };
 
         let last_name = name_parts.pop()
-            .ok_or(rserror!("No name parts for '{name}'"))?;
+            .ok_or(Error::new_context(format!("No name parts for '{name}'")))?;
 
         for part in name_parts {
             let part = Rc::new(part.to_owned());
@@ -158,7 +158,7 @@ impl TrieBuilder {
             let child = current_node.children.entry(Rc::clone(&last_name))
                 .or_insert_with(|| TrieBuilderNode::new(last_name));
             if child.context().is_some() || child.rtype().is_some() {
-                return Err(rserror!("Duplicate prefix match detected for '{name}'"));
+                return Err(Error::new_context(format!("Duplicate prefix match detected for '{name}'")).into());
             }
 
             child.set_context(context);

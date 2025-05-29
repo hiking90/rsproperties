@@ -6,7 +6,7 @@ use std::ffi::CStr;
 
 use rustix::fs;
 use anyhow::Context;
-use rserror::*;
+use crate::errors::*;
 
 use crate::context_node::{ContextNode, PropertyAreaGuard, PropertyAreaMutGuard};
 use crate::property_area::{PropertyArea, PropertyAreaMap};
@@ -93,7 +93,7 @@ impl ContextsSerialized {
             .property_info_area()
             .get_property_info_indexes(name);
         if index == u32::MAX || index >= self.context_nodes.len() as u32 {
-            return Err(rserror::rserror!("Could not find context for property {name}"));
+            return Err(Error::new_context(format!("Could not find context for property {name}")).into());
         }
 
         let context_node = &self.context_nodes[index as usize];

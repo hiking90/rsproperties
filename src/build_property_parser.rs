@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader};
 
 use rustix::process::{Pid, Uid, Gid};
 use anyhow::Error;
-use rserror::*;
+use crate::errors::*;
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use rustix::net::UCred;

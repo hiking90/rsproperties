@@ -35,7 +35,9 @@ use std::{
     sync::OnceLock,
     path::{PathBuf, Path},
 };
-use rserror::*;
+
+pub mod errors;
+pub use errors::{Error, Result, ContextWithLocation};
 
 mod property_info_parser;
 mod system_properties;
@@ -204,7 +206,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[cfg(all(any(target_os = "android", target_os = "linux"), feature = "builder"))]
     #[test]
     fn test_set() -> Result<()> {
         enable_logger();

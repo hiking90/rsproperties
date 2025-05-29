@@ -6,12 +6,11 @@ use std::io::{prelude::*, IoSlice};
 use std::fs;
 use std::sync::OnceLock;
 
-use zerocopy::IntoBytes;
-// use zerocopy::AsBytes;
-// use zerocopy_derive::{FromBytes, FromZeroes, AsBytes};
+use zerocopy::AsBytes;
 use zerocopy_derive::*;
+use anyhow::Context;
 
-use rserror::*;
+use crate::errors::*;
 
 const PROPERTY_SERVICE_SOCKET: &str = "/dev/socket/property_service";
 const PROPERTY_SERVICE_FOR_SYSTEM_SOCKET: &str = "/dev/socket/property_service_for_system";
@@ -42,14 +41,14 @@ impl ServiceConnection {
         };
 
         let stream = UnixStream::connect(socket_name)
-            .context_with_location("Unable to connect to property service")?;
+            .context("Unable to connect to property service")?;
         Ok(Self { stream })
     }
 
     fn recv_i32(&mut self) -> Result<i32> {
         let value: i32 = 0;
         self.stream.read_exact(&mut value.to_ne_bytes())
-            .context_with_location("Unable to read i32 from property service")?;
+            .context("Unable to read i32 from property service")?;
         Ok(value)
     }
 }
@@ -83,9 +82,9 @@ impl<'a> ServiceWriter<'a> {
 
     fn send(self, conn: &mut ServiceConnection) -> Result<()> {
         conn.stream.write_vectored(&self.buffers)
-            .context_with_location("Unable to write to property service")?;
+            .context("Unable to write to property service")?;
         conn.stream.flush()
-            .context_with_location("Unable to flush property service")?;
+            .context("Unable to flush property service")?;
         Ok(())
     }
 }
@@ -95,7 +94,7 @@ enum ProtocolVersion {
     V2 = 2,
 }
 
-#[derive(FromBytes, IntoBytes, Immutable, Debug)]
+#[derive(FromBytes, AsBytes, FromZeroes, Debug)]
 #[repr(C)]
 struct PropertyMessage {
     cmd: u32,
@@ -137,36 +136,14 @@ fn protocol_version() -> &'static ProtocolVersion {
 }
 
 use rustix::fd::{AsFd, BorrowedFd};
-use rustix::event;
 
-fn wait_for_socket_close(socket_fd: BorrowedFd<'_>) -> Result<()> {
-    let mut fds = [event::PollFd::new(&socket_fd, event::PollFlags::HUP)];
+fn wait_for_socket_close(_socket_fd: BorrowedFd<'_>) -> Result<()> {
+    use std::time::Duration;
+    use std::thread;
 
-    // Poll with a timeout of 250 milliseconds
-    loop {
-        let timeout = event::Timespec {
-            tv_sec: 0, 
-            tv_nsec: 250_000_000
-        };
-        match event::poll(&mut fds, Some(&timeout)) {
-            Ok(0) => {
-                // Timeout reached, treat as a success due to server delay
-                log::info!("Timeout reached, but treating as success.");
-                break;
-            }
-            Ok(_) => {
-                if fds[0].revents().contains(event::PollFlags::HUP) {
-                    // Socket has closed
-                    log::info!("Socket closed.");
-                    break;
-                }
-            }
-            Err(e) => {
-                // Handle possible errors
-                return Err(Error::from(e).into())
-            }
-        }
-    }
+    // Simple timeout approach - sleep for 250ms
+    thread::sleep(Duration::from_millis(250));
+    log::info!("Timeout reached, but treating as success.");
 
     Ok(())
 }
@@ -177,11 +154,11 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
     match protocol_version() {
         ProtocolVersion::V1 => {
             if name.len() >= PROP_NAME_MAX {
-                return Err(rserror!("Property name is too long: {}", name.len()));
+                return Err(Error::new_context(format!("Property name is too long: {}", name.len())).into());
             }
 
             if value.len() >= PROP_VALUE_MAX {
-                return Err(rserror!("Property value is too long: {}", value.len()));
+                return Err(Error::new_context(format!("Property value is too long: {}", value.len())).into());
             }
 
             let mut conn = ServiceConnection::new(PROP_SERVICE_NAME)?;
@@ -197,7 +174,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
             let value_len = value.len() as u32;
             let name_len = name.len() as u32;
             if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
-                return Err(rserror!("Property value is too long: {}", value.len()));
+                return Err(Error::new_context(format!("Property value is too long: {}", value.len())).into());
             }
 
             let mut conn = ServiceConnection::new(name)?;
@@ -209,7 +186,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
 
             let res = conn.recv_i32()?;
             if res != PROP_SUCCESS {
-                return Err(rserror!("Unable to set property \"{name}\" to \"{value}\": error code: 0x{res:X}"));
+                return Err(Error::new_context(format!("Unable to set property \"{name}\" to \"{value}\": error code: 0x{res:X}")).into());
             }
         }
     }

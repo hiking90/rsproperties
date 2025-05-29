@@ -5,7 +5,7 @@ use std::path::Path;
 use std::fs::File;
 use std::io::{BufReader, BufRead};
 
-use rserror::*;
+use crate::errors::*;
 use crate::trie_builder::*;
 use crate::trie_serializer::*;
 
@@ -52,10 +52,10 @@ impl PropertyInfoEntry {
         let mut tokenizer = line.split_whitespace();
 
         let property = tokenizer.next().ok_or_else(||
-            rserror!("Did not find a property entry in '{line}'"))?;
+            Error::new_context(format!("Did not find a property entry in '{line}'")))?;
 
         let context = tokenizer.next().ok_or_else(||
-            rserror!("Did not find a context entry in '{line}'"))?;
+            Error::new_context(format!("Did not find a context entry in '{line}'")))?;
 
         let match_operation = tokenizer.next();
 
@@ -69,11 +69,11 @@ impl PropertyInfoEntry {
         if match_operation == Some("exact") {
             exact_match = true;
         } else if match_operation != Some("prefix") && require_prefix_or_exact {
-            return Err(rserror!("Match operation '{match_operation:?}' is not valid. Must be 'prefix' or 'exact'"));
+            return Err(Error::new_context(format!("Match operation '{match_operation:?}' is not valid. Must be 'prefix' or 'exact'")).into());
         }
 
         if !type_strings.is_empty() && !Self::is_type_valid(&type_strings) {
-            return Err(rserror!("Type '{}' is not valid.", type_strings.join(" ")));
+            return Err(Error::new_context(format!("Type '{}' is not valid.", type_strings.join(" "))).into());
         }
 
         Ok(Self {

@@ -21,7 +21,7 @@ use std::os::linux::fs::MetadataExt;
 
 use rustix::{fs, mm};
 use anyhow::Context;
-use rserror::*;
+use crate::errors::*;
 
 use crate::property_info::{
     PropertyInfo,
@@ -179,7 +179,7 @@ impl PropertyAreaMap {
 
         if thiz.property_area().magic != PROP_AREA_MAGIC ||
            thiz.property_area().version != PROP_AREA_VERSION {
-            Err(rserror!("Invalid magic or version"))
+            Err(Error::new_context("Invalid magic or version".to_string()).into())
         } else {
             Ok(thiz)
         }
@@ -250,7 +250,7 @@ impl PropertyAreaMap {
             };
 
             if substr_size == 0 {
-                return Err(rserror!("Invalid property name: {name}"));
+                return Err(Error::new_context(format!("Invalid property name: {name}")).into());
             }
 
             let subname = &remaining_name[0..substr_size];
@@ -303,7 +303,7 @@ impl PropertyAreaMap {
         let offset = mem::size_of::<PropertyTrieNode>();
         let bytes = value.to_bytes_with_nul();
         if bytes.len() + offset > self.pa_data_size {
-            return Err(rserror!("Invalid offset"));
+            return Err(Error::new_context("Invalid offset".to_string()).into());
         }
 
         self.mmap.data_mut(offset, self.data_offset, bytes.len())?.copy_from_slice(bytes);
@@ -387,7 +387,7 @@ impl PropertyAreaMap {
         let aligned = crate::bionic_align(size, mem::size_of::<u32>());
         let offset = self.property_area().bytes_used;
         if offset + (aligned as u32) > self.pa_data_size as u32 {
-            return Err(rserror!("Out of memory"));
+            return Err(Error::new_context("Out of memory".to_string()).into());
         }
 
         self.property_area_mut().bytes_used += aligned as u32;
@@ -488,7 +488,7 @@ impl MemoryMap {
 
     fn check_size(&self, offset: usize, size: usize) -> Result<()> {
         if offset + size > self.size {
-            return Err(rserror!("Invalid offset: {} > {}", offset + size, self.size));
+            return Err(Error::new_context(format!("Invalid offset: {} > {}", offset + size, self.size)).into());
         }
         Ok(())
     }
