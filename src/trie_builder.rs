@@ -4,6 +4,7 @@
 use std::collections::{HashMap, BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+use log::{trace, debug, info, error};
 
 use crate::errors::*;
 
@@ -37,6 +38,7 @@ pub(crate) struct TrieBuilderNode {
 
 impl TrieBuilderNode {
     fn new(name: Rc<String>) -> Self {
+        trace!("Creating new TrieBuilderNode: {}", name);
         TrieBuilderNode {
             property_entry: PropertyEntryBuilder {
                 name,
@@ -50,14 +52,18 @@ impl TrieBuilderNode {
     }
 
     fn set_context(&mut self, context: Rc<String>) {
+        debug!("Setting context for '{}': {}", self.property_entry.name, context);
         self.property_entry.context = Some(context);
     }
 
     fn set_rtype(&mut self, rtype: Rc<String>) {
+        debug!("Setting type for '{}': {}", self.property_entry.name, rtype);
         self.property_entry.rtype = Some(rtype);
     }
 
     fn add_exact_match_context(&mut self, name: Rc<String>, context: Rc<String>, rtype: Rc<String>) -> Result<()> {
+        debug!("Adding exact match for '{}' with context '{}' and type '{}'", name, context, rtype);
+
         let entry = PropertyEntryBuilder {
             name: Rc::clone(&name),
             context: Some(context),
@@ -65,13 +71,17 @@ impl TrieBuilderNode {
         };
 
         if self.exact_matches.insert(entry) {
+            trace!("Successfully added exact match for '{}'", name);
             Ok(())
         } else {
+            error!("Exact match already exists for '{}'", name);
             Err(Error::new_context(format!("Exact match already exists for '{name}'")).into())
         }
     }
 
     fn add_prefix_context(&mut self, name: Rc<String>, context: Rc<String>, rtype: Rc<String>) -> Result<()> {
+        debug!("Adding prefix match for '{}' with context '{}' and type '{}'", name, context, rtype);
+
         let entry = PropertyEntryBuilder {
             name: Rc::clone(&name),
             context: Some(context),
@@ -79,8 +89,10 @@ impl TrieBuilderNode {
         };
 
         if self.prefixes.insert(entry) {
+            trace!("Successfully added prefix match for '{}'", name);
             Ok(())
         } else {
+            error!("Prefix already exists for '{}'", name);
             Err(Error::new_context(format!("Prefix already exists for '{name}'")).into())
         }
     }
@@ -102,6 +114,8 @@ pub(crate) struct TrieBuilder {
 
 impl TrieBuilder {
     pub(crate) fn new(default_context: &str, default_type: &str) -> Self {
+        info!("Creating TrieBuilder with default context '{}' and type '{}'", default_context, default_type);
+
         let mut contexts = BTreeSet::new();
         let mut types = BTreeSet::new();
 
@@ -110,11 +124,13 @@ impl TrieBuilder {
 
         contexts.insert(context.clone());
         types.insert(rtypes.clone());
+        trace!("Added default context and type to sets");
 
         let mut root = TrieBuilderNode::new(Rc::new("root".to_owned()));
         root.set_context(context);
         root.set_rtype(rtypes);
 
+        debug!("TrieBuilder created with root node");
         TrieBuilder {
             root,
             contexts,
@@ -123,47 +139,67 @@ impl TrieBuilder {
     }
 
     pub(crate) fn add_to_trie(&mut self, name: &str, context: &str, rtype: &str, exact: bool) -> Result<()> {
+        debug!("Adding '{}' to trie with context '{}', type '{}', exact={}", name, context, rtype, exact);
+
         let context = Rc::new(context.to_owned());
         let rtype = Rc::new(rtype.to_owned());
 
         self.contexts.insert(context.clone());
         self.types.insert(rtype.clone());
+        trace!("Added context '{}' and type '{}' to global sets", context, rtype);
 
         let mut current_node = &mut self.root;
         let mut name_parts = name.split('.').collect::<Vec<&str>>();
 
         let ends_with_dot = if name_parts.last() == Some(&"") {
             name_parts.pop();
+            trace!("Property name '{}' ends with dot", name);
             true
         } else {
             false
         };
 
-        let last_name = name_parts.pop()
+        let last_name: &str = name_parts.pop()
             .ok_or(Error::new_context(format!("No name parts for '{name}'")))?;
+
+        trace!("Navigating trie path: {:?}, final part: {}", name_parts, last_name);
 
         for part in name_parts {
             let part = Rc::new(part.to_owned());
+            trace!("Processing trie path segment: {}", part);
             current_node = current_node.children.entry(Rc::clone(&part))
-                .or_insert_with(|| TrieBuilderNode::new(part));
+                .or_insert_with(|| {
+                    trace!("Creating new trie node for segment: {}", part);
+                    TrieBuilderNode::new(part)
+                });
         }
 
         let last_name = Rc::new(last_name.to_owned());
 
         if exact {
+            debug!("Adding as exact match: {}", last_name);
             current_node.add_exact_match_context(last_name, Rc::clone(&context), Rc::clone(&rtype))?;
         } else if !ends_with_dot {
+            debug!("Adding as prefix match: {}", last_name);
             current_node.add_prefix_context(last_name, Rc::clone(&context), Rc::clone(&rtype))?;
         } else {
+            debug!("Adding as child node: {}", last_name);
             let child = current_node.children.entry(Rc::clone(&last_name))
-                .or_insert_with(|| TrieBuilderNode::new(last_name));
+                .or_insert_with(|| {
+                    trace!("Creating new child node: {}", last_name);
+                    TrieBuilderNode::new(last_name)
+                });
+
             if child.context().is_some() || child.rtype().is_some() {
+                error!("Duplicate prefix match detected for '{}'", name);
                 return Err(Error::new_context(format!("Duplicate prefix match detected for '{name}'")).into());
             }
 
             child.set_context(context);
             child.set_rtype(rtype);
         }
+
+        info!("Successfully added '{}' to trie", name);
         Ok(())
     }
 }

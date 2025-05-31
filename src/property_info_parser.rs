@@ -14,6 +14,7 @@ use std::os::android::fs::MetadataExt;
 use std::os::linux::fs::MetadataExt;
 
 use rustix::fs;
+use log::{debug, info, warn, error, trace};
 
 use zerocopy_derive::*;
 
@@ -24,22 +25,33 @@ fn find<F>(array_length: u32, f: F) -> i32
 where
     F: Fn(i32) -> Ordering,
 {
+    trace!("Binary search in array of length {}", array_length);
     let mut bottom = 0;
     let mut top = array_length as i32 - 1;
     while top >= bottom {
         let search = (top + bottom) / 2;
 
         match f(search) {
-            Ordering::Equal => return search,
-            Ordering::Less => bottom = search + 1,
-            Ordering::Greater => top = search - 1,
+            Ordering::Equal => {
+                trace!("Found match at index {}", search);
+                return search;
+            },
+            Ordering::Less => {
+                trace!("Search {} too small, moving to upper half", search);
+                bottom = search + 1;
+            },
+            Ordering::Greater => {
+                trace!("Search {} too large, moving to lower half", search);
+                top = search - 1;
+            },
         };
     }
+    trace!("No match found in binary search");
     -1
 }
 
 
-#[derive(FromBytes, FromZeroes, KnownLayout, Debug)]
+#[derive(FromBytes, KnownLayout, Immutable, Debug)]
 #[repr(C, align(4))]
 pub(crate) struct PropertyEntry {
     pub(crate) name_offset: u32,
@@ -54,7 +66,7 @@ impl PropertyEntry {
     }
 }
 
-#[derive(FromBytes, FromZeroes, KnownLayout, Debug)]
+#[derive(FromBytes, KnownLayout, Debug, Immutable)]
 #[repr(C, align(4))]
 pub(crate) struct TrieNodeData {
     pub(crate) property_entry: u32,
@@ -66,7 +78,7 @@ pub(crate) struct TrieNodeData {
     pub(crate) exact_match_entries: u32,
 }
 
-#[derive(FromBytes, FromZeroes, KnownLayout, Debug)]
+#[derive(FromBytes, KnownLayout, Immutable, Debug)]
 #[repr(C, align(4))]
 pub struct PropertyInfoAreaHeader {
     pub(crate) current_version: u32,
@@ -122,13 +134,20 @@ impl<'a> TrieNode<'a> {
     }
 
     fn find_child_for_string(&self, input: &str) -> Option<TrieNode> {
+        trace!("Finding child node for string: '{}'", input);
+
         let node_index = find(self.num_child_nodes(), |i| {
             let child = self.child_node(i as _);
-            child.name().to_str().unwrap().cmp(input)
+            let child_name = child.name().to_str().unwrap();
+            trace!("Comparing '{}' with child '{}'", input, child_name);
+            child_name.cmp(input)
         });
+
         if node_index < 0 {
+            debug!("No child found for string: '{}'", input);
             None
         } else {
+            debug!("Found child at index {} for string: '{}'", node_index, input);
             Some(self.child_node(node_index as _))
         }
     }
@@ -182,11 +201,15 @@ impl<'a> PropertyInfoArea<'a> {
     }
 
     #[inline]
-    pub(crate) fn ref_from<T: zerocopy::FromBytes + zerocopy::KnownLayout>(&self, offset: usize) -> &T {
+    pub(crate) fn ref_from<T>(&self, offset: usize) -> &T
+    where
+        T: zerocopy::FromBytes + zerocopy::KnownLayout + zerocopy::Immutable,
+    {
         let size_of = size_of::<T>();
-        zerocopy::Ref::<&[u8], T>::new(&self.data_base[offset..offset + size_of])
+        zerocopy::Ref::into_ref(
+            zerocopy::Ref::<&[u8], T>::from_bytes(&self.data_base[offset..offset + size_of])
             .expect("Failed to create reference")
-            .into_ref()
+        )
     }
 
     #[inline]
@@ -243,59 +266,91 @@ impl<'a> PropertyInfoArea<'a> {
 
     fn check_prefix_match(&self, remaining_name: &str, trie_node: &TrieNode,
         context_index: &mut u32, type_index: &mut u32) {
+        trace!("Checking prefix matches for: '{}' (node has {} prefixes)", remaining_name, trie_node.num_prefixes());
+
         let remaining_name_size = remaining_name.len();
         for i in 0..trie_node.num_prefixes() {
             let prefix = trie_node.prefix(i as _);
             if prefix.namelen > remaining_name_size as u32 {
+                trace!("Prefix {} too long: {} > {}", i, prefix.namelen, remaining_name_size);
                 continue;
             }
             let prefix_name = prefix.name(self).to_str().unwrap();
+            trace!("Checking prefix {}: '{}'", i, prefix_name);
+
             if remaining_name.starts_with(prefix_name) {
+                debug!("Found matching prefix: '{}' for remaining name: '{}'", prefix_name, remaining_name);
+
                 if prefix.context_index != !0 {
+                    trace!("Updating context_index from {} to {}", *context_index, prefix.context_index);
                     *context_index = prefix.context_index;
                 }
 
                 if prefix.type_index != !0 {
+                    trace!("Updating type_index from {} to {}", *type_index, prefix.type_index);
                     *type_index = prefix.type_index;
                 }
                 return;
             }
         }
+        trace!("No matching prefix found for: '{}'", remaining_name);
     }
 
     pub(crate) fn get_property_info_indexes(&self, name: &str) -> (u32, u32) {
+        debug!("Getting property info indexes for: '{}'", name);
+
         let mut return_context_index: u32 = !0;
         let mut return_type_index: u32 = !0;
         let mut remaining_name = name;
         let mut trie_node = self.root_node();
+
+        trace!("Starting traversal with root node");
+
         loop {
             if trie_node.context_index() != !0 {
+                trace!("Node has context_index: {}", trie_node.context_index());
                 return_context_index = trie_node.context_index();
             }
 
             if trie_node.type_index() != !0 {
+                trace!("Node has type_index: {}", trie_node.type_index());
                 return_type_index = trie_node.type_index();
             }
 
             self.check_prefix_match(remaining_name, &trie_node, &mut return_context_index, &mut return_type_index);
+
             match remaining_name.find('.') {
                 Some(index) => {
-                    match trie_node.find_child_for_string(&remaining_name[..index]) {
+                    let segment = &remaining_name[..index];
+                    trace!("Processing segment: '{}' from remaining: '{}'", segment, remaining_name);
+
+                    match trie_node.find_child_for_string(segment) {
                         Some(node) => {
                             remaining_name = &remaining_name[index + 1..];
+                            trace!("Found child node, remaining name: '{}'", remaining_name);
                             trie_node = self.clone_trie_node(&node);
                         }
-                        None => break,
+                        None => {
+                            debug!("No child found for segment: '{}', stopping traversal", segment);
+                            break;
+                        },
                     };
                 }
-                None => break,
+                None => {
+                    trace!("No more segments to process, checking exact matches");
+                    break;
+                },
             }
         }
 
+        trace!("Checking {} exact matches for final segment: '{}'", trie_node.num_exact_matches(), remaining_name);
         for i in 0..trie_node.num_exact_matches() {
             let exact_match = trie_node.exact_match(i as _);
             let exact_match_name = exact_match.name(self).to_str().unwrap();
+            trace!("Checking exact match {}: '{}'", i, exact_match_name);
             if exact_match_name == remaining_name {
+                debug!("Found exact match: '{}' at index {}", exact_match_name, i);
+
                 let context_index = if exact_match.context_index != !0 {
                     exact_match.context_index
                 } else {
@@ -308,10 +363,12 @@ impl<'a> PropertyInfoArea<'a> {
                     return_type_index
                 };
 
+                info!("Property '{}' resolved: context_index={}, type_index={}", name, context_index, type_index);
                 return (context_index, type_index);
             }
         }
 
+        debug!("No exact match found, using accumulated indexes: context={}, type={}", return_context_index, return_type_index);
         self.check_prefix_match(remaining_name, &trie_node, &mut return_context_index, &mut return_type_index);
         (return_context_index, return_type_index)
     }
@@ -332,14 +389,14 @@ impl<'a> PropertyInfoArea<'a> {
         (context_cstr, type_cstr)
     }
 
-    #[cfg(feature = "builder")]
+    #[cfg(all(feature = "builder", target_os = "linux"))]
     pub(crate) fn find_context_index(&self, context: &str) -> i32 {
         find(self.num_contexts() as _, |i| {
             self.cstr(self.context_offset(i as _)).to_str().unwrap().cmp(context)
         })
     }
 
-    #[cfg(feature = "builder")]
+    #[cfg(all(feature = "builder", target_os = "linux"))]
     pub(crate) fn find_type_index(&self, rtype: &str) -> i32 {
         find(self.num_types() as _, |i| {
             self.cstr(self.type_offset(i as _)).to_str().unwrap().cmp(rtype)
@@ -353,23 +410,33 @@ pub struct PropertyInfoAreaFile {
 
 impl PropertyInfoAreaFile {
     pub(crate) fn load_default_path() -> Result<Self> {
+        debug!("Loading property info area from default path");
         Self::load_path(Path::new(crate::system_properties::PROP_TREE_FILE))
     }
 
     pub(crate) fn load_path(path: &Path) -> Result<Self> {
+        debug!("Loading property info area from path: {:?}", path);
+
         let file: File = File::open(path)
             .context_with_location(format!("File open is failed in: {path:?}"))?;
 
         let metadata = file.metadata()
             .context_with_location(format!("File metadata is failed in: {path:?}"))?;
+
+        trace!("Property info file metadata: uid={}, gid={}, mode={:#o}, size={}",
+               metadata.st_uid(), metadata.st_gid(), metadata.st_mode(), metadata.st_size());
+
         if cfg!(test) || cfg!(debug_assertions) {
             if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
                 metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
+                error!("Invalid file metadata for test/debug mode: {:?}", path);
                 return Err(Error::new_context("Invalid file metadata".to_string()).into());
             }
         } else if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
             metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
             metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
+            error!("Invalid file metadata: uid={}, gid={}, mode={:#o}, size={} for {:?}",
+                   metadata.st_uid(), metadata.st_gid(), metadata.st_mode(), metadata.st_size(), path);
             return Err(Error::new_context("Invalid file metadata".to_string()).into());
         }
 
@@ -405,10 +472,9 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "builder")]
+    #[cfg(all(feature = "builder", target_os = "linux"))]
     #[test]
     fn test_property_info_area_with_builder() -> Result<()> {
-        #[cfg(feature = "builder")]
         let entries = crate::property_info_serializer::PropertyInfoEntry::parse_from_file(Path::new("tests/android/plat_property_contexts"), false).unwrap();
         let data: Vec<u8> = crate::property_info_serializer::build_trie(&entries.0, "u:object_r:build_prop:s0", "string").unwrap();
 

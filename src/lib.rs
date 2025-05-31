@@ -46,22 +46,27 @@ mod property_area;
 mod context_node;
 mod property_info;
 mod system_property_set;
-#[cfg(feature = "builder")]
+#[cfg(all(feature = "builder", target_os = "linux"))]
 mod property_info_serializer;
-#[cfg(feature = "builder")]
+#[cfg(all(feature = "builder", target_os = "linux"))]
 mod trie_builder;
-#[cfg(feature = "builder")]
+#[cfg(all(feature = "builder", target_os = "linux"))]
 mod trie_serializer;
-#[cfg(feature = "builder")]
+#[cfg(all(feature = "builder", target_os = "linux"))]
 mod trie_node_arena;
-#[cfg(feature = "builder")]
+#[cfg(all(feature = "builder", target_os = "linux"))]
 mod build_property_parser;
+#[cfg(all(feature = "builder", target_os = "linux"))]
+mod socket_service;
 
 pub use system_properties::SystemProperties;
-#[cfg(feature = "builder")]
+#[cfg(all(feature = "builder", target_os = "linux"))]
 pub use property_info_serializer::*;
-#[cfg(feature = "builder")]
+#[cfg(all(feature = "builder", target_os = "linux"))]
 pub use build_property_parser::*;
+#[cfg(all(feature = "builder", target_os = "linux"))]
+pub use socket_service::*;
+pub use system_property_set::set_socket_dir;
 
 pub const PROP_VALUE_MAX: usize = 92;
 pub const PROP_DIRNAME: &str = "/dev/__properties__";
@@ -76,13 +81,20 @@ static SYSTEM_PROPERTIES: OnceLock<system_properties::SystemProperties> = OnceLo
 /// If dir is None, it uses the default directory "/dev/__properties__".
 pub fn init(dir: Option<PathBuf>) {
     let dir = if let Some(dir) = dir {
+        log::info!("Initializing system properties with custom directory: {:?}", dir);
         dir
     } else {
+        log::info!("Initializing system properties with default directory: {}", PROP_DIRNAME);
         PathBuf::from(PROP_DIRNAME)
     };
 
-    if let Err(e) = SYSTEM_PROPERTIES_DIR.set(dir) {
-        log::error!("Error setting system properties directory: {}", e.display());
+    match SYSTEM_PROPERTIES_DIR.set(dir.clone()) {
+        Ok(_) => {
+            log::debug!("Successfully set system properties directory to: {:?}", dir);
+        },
+        Err(e) => {
+            log::error!("Error setting system properties directory to {:?}: {}", dir, e.display());
+        }
     }
 }
 
@@ -90,7 +102,9 @@ pub fn init(dir: Option<PathBuf>) {
 /// It returns None if init() is not called.
 /// It returns Some(&PathBuf) if init() is called.
 pub fn dirname() -> &'static Path {
-    SYSTEM_PROPERTIES_DIR.get().expect("Call init() first.").as_path()
+    let path = SYSTEM_PROPERTIES_DIR.get().expect("Call init() first.").as_path();
+    log::trace!("Getting system properties directory: {:?}", path);
+    path
 }
 
 /// Get the system properties.
@@ -99,8 +113,18 @@ pub fn dirname() -> &'static Path {
 pub fn system_properties() -> &'static system_properties::SystemProperties {
     SYSTEM_PROPERTIES.get_or_init(|| {
         let dir = dirname();
-        system_properties::SystemProperties::new(dir)
-            .unwrap_or_else(|_| panic!("Cannot open system properties. Please check if \"{dir:?}\" exists."))
+        log::info!("Initializing global SystemProperties instance from: {:?}", dir);
+
+        match system_properties::SystemProperties::new(dir) {
+            Ok(props) => {
+                log::info!("Successfully initialized global SystemProperties instance");
+                props
+            },
+            Err(e) => {
+                log::error!("Failed to initialize SystemProperties from {:?}: {}", dir, e);
+                panic!("Cannot open system properties. Please check if \"{dir:?}\" exists.")
+            }
+        }
     })
 }
 
@@ -141,6 +165,7 @@ mod tests {
     use std::io::Write;
     use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
     #[cfg(target_os = "android")]
     use android_system_properties::AndroidSystemProperties;
 
@@ -206,18 +231,17 @@ mod tests {
         }
     }
 
-    #[cfg(all(any(target_os = "android", target_os = "linux"), feature = "builder"))]
+    #[cfg(all(target_os = "linux", feature = "builder"))]
     #[test]
     fn test_set() -> Result<()> {
         enable_logger();
 
-        #[cfg(target_os = "linux")]
-        build_property_dir(TEST_PROPERTY_DIR);
+        let _guard = system_properties_area();
 
         let prop = "test.property";
         let value = "test.value";
 
-        set(prop, value)?;
+        super::set(prop, value)?;
 
         let value1: String = get(prop)?;
         assert_eq!(value1, value);
@@ -225,7 +249,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "builder")]
+    #[cfg(all(feature = "builder", target_os = "linux"))]
     fn load_properties() -> HashMap<String, String> {
         let build_prop_files = vec![
             "tests/android/product_build.prop",
@@ -246,86 +270,89 @@ mod tests {
         properties
     }
 
-    #[cfg(feature = "builder")]
-    fn system_properties_area() -> SystemProperties {
+    #[cfg(all(feature = "builder", target_os = "linux"))]
+    fn system_properties_area() -> MutexGuard<'static, Option<SystemProperties>> {
+        static SYSTEM_PROPERTIES: Mutex<Option<SystemProperties>> = Mutex::new(None);
+        let mut system_properties_guard = SYSTEM_PROPERTIES.lock().unwrap();
+
+        if let None = *system_properties_guard {
+            *system_properties_guard = Some(build_property_dir(TEST_PROPERTY_DIR));
+        }
+        system_properties_guard
+    }
+
+    #[cfg(all(feature = "builder", target_os = "linux"))]
+    fn build_property_dir(dir: &str) -> SystemProperties {
+        crate::init(Some(PathBuf::from(dir)));
+
+        let property_contexts_files = vec![
+            "tests/android/plat_property_contexts",
+            "tests/android/system_ext_property_contexts",
+            "tests/android/vendor_property_contexts",
+        ];
+
+        let mut property_infos = Vec::new();
+        for file in property_contexts_files {
+            let (mut property_info, errors) = PropertyInfoEntry::parse_from_file(Path::new(file), false).unwrap();
+            if !errors.is_empty() {
+                log::error!("{:?}", errors);
+            }
+            property_infos.append(&mut property_info);
+        }
+
+        let data: Vec<u8> = build_trie(&property_infos, "u:object_r:build_prop:s0", "string").unwrap();
+
         let dir = dirname();
-        SystemProperties::new_area(dir)
-            .unwrap_or_else(|_| panic!("Cannot create system properties. Please check if \"{dir:?}\" exists."))
-    }
+        remove_dir_all(dir).unwrap_or_default();
+        create_dir(dir).unwrap_or_default();
+        File::create(dir.join("property_info")).unwrap().write_all(&data).unwrap();
 
+        let properties = load_properties();
 
-    #[cfg(feature = "builder")]
-    fn build_property_dir(dir: &str) -> HashMap<String, String> {
-        static INIT_PROPERTY_AREA: OnceLock<bool> = OnceLock::new();
-
-        let _ = INIT_PROPERTY_AREA.get_or_init(|| {
-            crate::init(Some(PathBuf::from(dir)));
-
-            let property_contexts_files = vec![
-                "tests/android/plat_property_contexts",
-                "tests/android/system_ext_property_contexts",
-                "tests/android/vendor_property_contexts",
-            ];
-
-            let mut property_infos = Vec::new();
-            for file in property_contexts_files {
-                let (mut property_info, errors) = PropertyInfoEntry::parse_from_file(Path::new(file), false).unwrap();
-                if !errors.is_empty() {
-                    log::error!("{:?}", errors);
-                }
-                property_infos.append(&mut property_info);
-            }
-
-            let data: Vec<u8> = build_trie(&property_infos, "u:object_r:build_prop:s0", "string").unwrap();
-
-            let dir = dirname();
-            remove_dir_all(dir).unwrap_or_default();
-            create_dir(dir).unwrap_or_default();
-            File::create(dir.join("property_info")).unwrap().write_all(&data).unwrap();
-
-            let properties = load_properties();
-
-            let mut system_properties = system_properties_area();
-            for (key, value) in properties.iter() {
-                match system_properties.find(key.as_str()).unwrap() {
-                    Some(prop_ref) => {
-                        system_properties.update(&prop_ref, value.as_str()).unwrap();
-                    },
-                    None => {
-                        system_properties.add(key.as_str(), value.as_str()).unwrap();
-                    }
+        let dir = dirname();
+        let mut system_properties = SystemProperties::new_area(dir)
+            .unwrap_or_else(|e| panic!("Cannot create system properties: {}. Please check if {dir:?} exists.", e));
+        for (key, value) in properties.iter() {
+            match system_properties.find(key.as_str()).unwrap() {
+                Some(prop_ref) => {
+                    system_properties.update(&prop_ref, value.as_str()).unwrap();
+                },
+                None => {
+                    system_properties.add(key.as_str(), value.as_str()).unwrap();
                 }
             }
+        }
 
-            true
-        });
-
-        load_properties()
+        system_properties
     }
 
-    #[cfg(feature = "builder")]
+    #[cfg(all(feature = "builder", target_os = "linux"))]
     #[test]
     fn test_property_info() {
         enable_logger();
 
-        let properties = build_property_dir(TEST_PROPERTY_DIR);
+        let _guard = system_properties_area();
 
         let system_properties = system_properties();
+
+        let properties = load_properties();
+
         for (key, value) in properties.iter() {
             let prop_value = system_properties.get(key.as_str()).unwrap();
             assert_eq!(prop_value, value.as_str());
         }
     }
 
-    #[cfg(feature = "builder")]
+    #[cfg(all(feature = "builder", target_os = "linux"))]
     #[test]
     fn test_wait() {
         enable_logger();
 
-        let _properties = build_property_dir(TEST_PROPERTY_DIR);
+        let mut guard = system_properties_area();
+
+        let system_properties_area = guard.as_mut().unwrap();
 
         let test_prop = "test.property";
-        let mut system_properties_area = system_properties_area();
 
         let wait_any = || {
             std::thread::spawn(move || {

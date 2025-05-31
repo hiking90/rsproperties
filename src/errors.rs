@@ -24,46 +24,73 @@ pub enum Error {
 impl Error {
     #[track_caller]
     pub fn new_not_found(key: String) -> Error {
-        Error::NotFound(key, Location::caller())
+        let error = Error::NotFound(key.clone(), Location::caller());
+        // log::error!("Property not found: {} at {}", key, Location::caller());
+        error
     }
 
     #[track_caller]
     pub fn new_context(context: String) -> Error {
-        Error::Context(context, Location::caller())
+        let error = Error::Context(context.clone(), Location::caller());
+        // log::error!("Context error: {} at {}", context, Location::caller());
+        error
+    }
+
+    #[track_caller]
+    pub fn new_io(io_error: std::io::Error) -> Error {
+        let error = Error::Io(io_error, Location::caller());
+        log::error!("I/O error: {} at {}", error, Location::caller());
+        error
+    }
+
+    #[track_caller]
+    pub fn new_errno(errno: rustix::io::Errno) -> Error {
+        let error = Error::Errno(errno, Location::caller());
+        log::error!("Errno error: {} at {}", error, Location::caller());
+        error
     }
 }
 
 impl From<rustix::io::Errno> for Error {
     #[track_caller]
     fn from(source: rustix::io::Errno) -> Self {
-        Error::Errno(source, Location::caller())
+        let error = Error::Errno(source, Location::caller());
+        log::error!("Converting errno to Error: {} at {}", source, Location::caller());
+        error
     }
 }
 
 impl From<std::io::Error> for Error {
     #[track_caller]
     fn from(source: std::io::Error) -> Self {
-        Error::Io(source, Location::caller())
+        let error = Error::Io(source, Location::caller());
+        log::error!("Converting I/O error to Error: {} at {}", error, Location::caller());
+        error
     }
 }
 
 impl From<std::str::Utf8Error> for Error {
     #[track_caller]
     fn from(source: std::str::Utf8Error) -> Self {
-        Error::Context(format!("{}", source), Location::caller())
+        let error_msg = format!("UTF-8 conversion error: {}", source);
+        log::error!("{} at {}", error_msg, Location::caller());
+        Error::Context(error_msg, Location::caller())
     }
 }
 
 impl From<std::ffi::OsString> for Error {
     #[track_caller]
     fn from(source: std::ffi::OsString) -> Self {
-        Error::Context(format!("{:?}", source), Location::caller())
+        let error_msg = format!("OsString conversion error: {:?}", source);
+        log::error!("{} at {}", error_msg, Location::caller());
+        Error::Context(error_msg, Location::caller())
     }
 }
 
 impl From<&str> for Error {
     #[track_caller]
     fn from(source: &str) -> Self {
+        log::error!("String error: {} at {}", source, Location::caller());
         Error::Context(source.to_owned(), Location::caller())
     }
 }
@@ -71,7 +98,9 @@ impl From<&str> for Error {
 impl From<ParseIntError> for Error {
     #[track_caller]
     fn from(source: ParseIntError) -> Self {
-        Error::Context(format!("{}", source), Location::caller())
+        let error_msg = format!("Parse integer error: {}", source);
+        log::error!("{} at {}", error_msg, Location::caller());
+        Error::Context(error_msg, Location::caller())
     }
 }
 

@@ -4,6 +4,7 @@
 use std::path::Path;
 use std::fs::File;
 use std::io::{BufReader, BufRead};
+use log::{trace, debug, info, warn, error};
 
 use crate::errors::*;
 use crate::trie_builder::*;
@@ -18,15 +19,21 @@ pub struct PropertyInfoEntry {
 
 impl PropertyInfoEntry {
     fn is_type_valid(type_strings: &[String]) -> bool {
+        trace!("Validating type strings: {:?}", type_strings);
+
         if type_strings.is_empty() {
+            trace!("Type validation failed: empty type strings");
             return false;
         }
 
         if type_strings[0] == "enum" {
-            return type_strings.len() > 1;
+            let valid = type_strings.len() > 1;
+            trace!("Enum type validation result: {} (has {} elements)", valid, type_strings.len());
+            return valid;
         }
 
         if type_strings.len() > 1 {
+            trace!("Type validation failed: multiple non-enum types");
             return false;
         }
 
@@ -34,10 +41,12 @@ impl PropertyInfoEntry {
 
         for no_parameter_type in NO_PARAMETER_TYPES {
             if type_strings[0] == *no_parameter_type {
+                trace!("Valid simple type found: {}", no_parameter_type);
                 return true;
             }
         }
 
+        trace!("Type validation failed: '{}' is not a recognized type", type_strings[0]);
         false
     }
 
@@ -49,74 +58,119 @@ impl PropertyInfoEntry {
     // Example:
     //     ro.build.host u:object_r:build_prop:s0 exact string
     fn parse_from_line(line: &str, require_prefix_or_exact: bool) -> Result<PropertyInfoEntry> {
+        debug!("Parsing property info line: '{}' (require_prefix_or_exact={})", line, require_prefix_or_exact);
+
         let mut tokenizer = line.split_whitespace();
 
         let property = tokenizer.next().ok_or_else(||
             Error::new_context(format!("Did not find a property entry in '{line}'")))?;
+        trace!("Found property: {}", property);
 
         let context = tokenizer.next().ok_or_else(||
             Error::new_context(format!("Did not find a context entry in '{line}'")))?;
+        trace!("Found context: {}", context);
 
         let match_operation = tokenizer.next();
+        trace!("Found match operation: {:?}", match_operation);
 
         let mut type_strings = Vec::new();
         for type_str in tokenizer {
             type_strings.push(type_str.to_owned());
         }
+        trace!("Found type strings: {:?}", type_strings);
 
         let mut exact_match = false;
 
         if match_operation == Some("exact") {
             exact_match = true;
+            trace!("Set as exact match");
         } else if match_operation != Some("prefix") && require_prefix_or_exact {
+            error!("Invalid match operation '{:?}' - must be 'prefix' or 'exact'", match_operation);
             return Err(Error::new_context(format!("Match operation '{match_operation:?}' is not valid. Must be 'prefix' or 'exact'")).into());
         }
 
         if !type_strings.is_empty() && !Self::is_type_valid(&type_strings) {
+            error!("Invalid type specification: '{}'", type_strings.join(" "));
             return Err(Error::new_context(format!("Type '{}' is not valid.", type_strings.join(" "))).into());
         }
 
-        Ok(Self {
+        let entry = Self {
             name: property.to_owned(),
             context: context.to_owned(),
             type_str: type_strings.join(" "),
             exact_match,
-        })
+        };
+
+        debug!("Successfully parsed property entry: {} -> {} (type: {}, exact: {})",
+               entry.name, entry.context, entry.type_str, entry.exact_match);
+
+        Ok(entry)
     }
 
     pub fn parse_from_file(filename: &Path, require_prefix_or_exact: bool) -> Result<(Vec<PropertyInfoEntry>, Vec<anyhow::Error>)> {
+        info!("Parsing property info file: {:?} (require_prefix_or_exact={})", filename, require_prefix_or_exact);
+
         let file = File::open(filename)
             .context_with_location(format!("Failed to open to file {filename:?}"))?;
         let reader = BufReader::new(file);
 
         let mut errors = Vec::new();
         let mut entries = Vec::new();
+        let mut line_count = 0;
+        let mut skipped_lines = 0;
+
         for line in reader.lines() {
+            line_count += 1;
             let line = line.context_with_location("Failed to read line")?;
             let line = line.trim();
+
             if line.is_empty() || line.starts_with('#') {
+                skipped_lines += 1;
                 continue;
             }
+
             match PropertyInfoEntry::parse_from_line(line, require_prefix_or_exact) {
-                Ok(entry) => entries.push(entry),
+                Ok(entry) => {
+                    trace!("Line {}: Successfully parsed entry '{}'", line_count, entry.name);
+                    entries.push(entry);
+                }
                 Err(err) => {
+                    warn!("Line {}: Failed to parse line '{}': {}", line_count, line, err);
                     errors.push(err);
                 }
             }
         }
+
+        info!("Finished parsing property info file: {} total lines, {} entries parsed, {} lines skipped, {} errors",
+              line_count, entries.len(), skipped_lines, errors.len());
 
         Ok((entries, errors))
     }
 }
 
 pub fn build_trie(property_info: &Vec<PropertyInfoEntry>, default_context: &str, default_type: &str) -> Result<Vec<u8>> {
+    info!("Building trie from {} property info entries (default_context='{}', default_type='{}')",
+          property_info.len(), default_context, default_type);
+
     let mut trie = TrieBuilder::new(default_context, default_type);
+    let mut processed_count = 0;
+
     for entry in property_info {
-        trie.add_to_trie(entry.name.as_str(), entry.context.as_str(), entry.type_str.as_str(), entry.exact_match)?;
+        debug!("Adding property '{}' to trie", entry.name);
+        trie.add_to_trie(
+            entry.name.as_str(),
+            entry.context.as_str(),
+            entry.type_str.as_str(),
+            entry.exact_match)?;
+        processed_count += 1;
     }
 
+    debug!("Successfully added {} properties to trie, now serializing", processed_count);
     let mut serializer = TrieSerializer::new(&trie);
-    Ok(serializer.take_data())
+    let data = serializer.take_data();
+
+    info!("Trie built and serialized successfully: {} bytes", data.len());
+    Ok(data)
 }
 
 #[cfg(test)]

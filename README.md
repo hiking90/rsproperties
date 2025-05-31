@@ -50,6 +50,43 @@ if let Some(brand) = rsproperties::get("ro.product.brand") {
 rsproperties::set("debug.test.property", "test_value").unwrap();
 ```
 
+### Socket Directory Configuration
+
+For property setting operations, you can configure the socket directory globally:
+
+```rust
+use rsproperties::set_socket_dir;
+
+// Configure custom socket directory (can only be called once)
+if set_socket_dir("/custom/socket/dir") {
+    println!("Socket directory configured successfully");
+} else {
+    println!("Socket directory was already configured");
+}
+
+// Now all property set operations will use the custom directory
+rsproperties::set("test.property", "test.value").unwrap();
+```
+
+You can also use environment variables:
+
+```bash
+# Set socket directory via environment variable
+export PROPERTY_SERVICE_SOCKET_DIR="/tmp/test_socket"
+
+# Set protocol version (defaults to V2)
+export PROPERTY_SERVICE_VERSION="2"
+
+# Override specific socket paths
+export PROPERTY_SERVICE_SOCKET="/custom/path/property_service"
+export PROPERTY_SERVICE_FOR_SYSTEM_SOCKET="/custom/path/property_service_for_system"
+```
+
+Priority order for socket directory configuration:
+1. `set_socket_dir()` function call
+2. `PROPERTY_SERVICE_SOCKET_DIR` environment variable
+3. Default directory: `/dev/socket`
+
 ### Property Monitoring
 
 ```rust
