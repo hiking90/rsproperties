@@ -1,5 +1,5 @@
 use std::env;
-use rsproperties::{set_socket_dir, set};
+use rsproperties::{set, PropertyConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
@@ -19,11 +19,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set custom socket directory if provided
     if let Some(socket_dir) = args.get(3) {
         println!("Setting socket directory to: {}", socket_dir);
-        if set_socket_dir(socket_dir) {
-            println!("✓ Socket directory set successfully");
-        } else {
-            println!("⚠ Socket directory was already set (ignoring new value)");
-        }
+        let config = PropertyConfig::with_socket_dir(socket_dir);
+        rsproperties::init(Some(config));
+    } else {
+        // Use default socket directory
+        rsproperties::init(None);
     }
 
     println!("Setting property: '{}' = '{}'", property_name, property_value);

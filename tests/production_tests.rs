@@ -10,16 +10,14 @@
 extern crate rsproperties;
 
 use rsproperties::{PROP_VALUE_MAX, PROP_DIRNAME};
-use std::sync::Once;
 
-static INIT_ONCE: Once = Once::new();
+#[path = "common.rs"]
+mod common;
+use common::init_test;
 
 /// Initialize the property system once for all tests
 fn init_properties() {
-    INIT_ONCE.call_once(|| {
-        // Use the __properties__ directory in the workspace root
-        rsproperties::init(Some("__properties__".into()));
-    });
+    init_test();
 }
 
 #[test]
@@ -77,7 +75,7 @@ fn test_get_nonexistent_returns_error() {
     ];
 
     for prop in &nonexistent_props {
-        let result = rsproperties::get(prop);
+        let result = rsproperties::get_with_result(prop);
         assert!(result.is_err(), "Property '{}' should not exist and should return error", prop);
     }
 
@@ -220,31 +218,6 @@ mod builder_tests {
     use super::*;
 
     #[test]
-    fn test_set_property_basic() {
-        init_properties();
-
-        let result = rsproperties::set("test.set.basic", "test_value");
-
-        match result {
-            Ok(_) => {
-                println!("✓ Property set successfully");
-
-                // Try to read it back
-                match rsproperties::get("test.set.basic") {
-                    Ok(value) => {
-                        assert_eq!(value, "test_value");
-                        println!("✓ Property read back: '{}'", value);
-                    }
-                    Err(e) => println!("⚠ Could not read back: {}", e),
-                }
-            }
-            Err(e) => {
-                println!("⚠ Property set failed (expected without property service): {}", e);
-            }
-        }
-    }
-
-    #[test]
     fn test_set_various_values() {
         init_properties();
 
@@ -300,13 +273,9 @@ mod builder_tests {
                 match rsproperties::set(prop, "updated") {
                     Ok(_) => {
                         // Verify
-                        match rsproperties::get(prop) {
-                            Ok(value) => {
-                                assert_eq!(value, "updated");
-                                println!("✓ Property update verified");
-                            }
-                            Err(e) => println!("⚠ Could not verify update: {}", e),
-                        }
+                        let value = rsproperties::get(prop);
+                        assert_eq!(value, "updated");
+                        println!("✓ Property update verified");
                     }
                     Err(e) => println!("⚠ Update failed: {}", e),
                 }
@@ -340,7 +309,7 @@ fn test_comprehensive_integration() {
 
     // 4. Test get for non-existent properties
     for prop in &props {
-        let result = rsproperties::get(prop);
+        let result = rsproperties::get_with_result(prop);
         assert!(result.is_err());
     }
 

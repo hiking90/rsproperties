@@ -5,16 +5,7 @@ use std::{
     cmp::Ordering, ffi::CStr, fs::File, mem::size_of, path::Path
 };
 
-// This is a workaround for the fact that the `MetadataExt` trait is not implemented for `std::fs::Metadata` on all platforms.
-#[cfg(target_os = "macos")]
-use std::os::macos::fs::MetadataExt;
-#[cfg(target_os = "android")]
-use std::os::android::fs::MetadataExt;
-#[cfg(target_os = "linux")]
-use std::os::linux::fs::MetadataExt;
-
-use rustix::fs;
-use log::{debug, info, warn, error, trace};
+use log::{debug, info, trace};
 
 use zerocopy_derive::*;
 
@@ -423,25 +414,11 @@ impl PropertyInfoAreaFile {
         let metadata = file.metadata()
             .context_with_location(format!("File metadata is failed in: {path:?}"))?;
 
-        trace!("Property info file metadata: uid={}, gid={}, mode={:#o}, size={}",
-               metadata.st_uid(), metadata.st_gid(), metadata.st_mode(), metadata.st_size());
-
-        if cfg!(test) || cfg!(debug_assertions) {
-            if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
-                metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
-                error!("Invalid file metadata for test/debug mode: {:?}", path);
-                return Err(Error::new_context("Invalid file metadata".to_string()).into());
-            }
-        } else if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
-            metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
-            metadata.st_size() < size_of::<PropertyInfoAreaHeader>() as u64 {
-            error!("Invalid file metadata: uid={}, gid={}, mode={:#o}, size={} for {:?}",
-                   metadata.st_uid(), metadata.st_gid(), metadata.st_mode(), metadata.st_size(), path);
-            return Err(Error::new_context("Invalid file metadata".to_string()).into());
-        }
+        // Validate file metadata using common utility function
+        crate::errors::validate_file_metadata(&metadata, path, size_of::<PropertyInfoAreaHeader>() as u64)?;
 
         Ok(Self {
-            mmap: MemoryMap::new(file, metadata.st_size() as usize, false)?,
+            mmap: MemoryMap::new(file, metadata.len() as usize, false)?,
         })
     }
 

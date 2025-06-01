@@ -6,24 +6,29 @@
 //! These tests serve as both verification and documentation
 //! of the most common use cases.
 
-use std::path::PathBuf;
 use rsproperties::{self, Result};
+
+#[path = "common.rs"]
+mod common;
+use common::init_test;
 
 /// Basic usage example - demonstrates the most common patterns
 #[test]
 fn example_basic_usage() -> Result<()> {
     // Initialize the library with a test directory
-    rsproperties::init(Some(PathBuf::from("example_basic")));
+    init_test();
 
     // Reading a property that doesn't exist - use get_with_default
     let sdk_version = rsproperties::get_with_default("ro.build.version.sdk", "unknown");
     println!("SDK Version: {}", sdk_version);
     assert_eq!(sdk_version, "unknown"); // Should return default since property doesn't exist
 
-    // Reading a property that might not exist - use get for error handling
-    match rsproperties::get("ro.product.model") {
-        Ok(model) => println!("Product Model: {}", model),
-        Err(_) => println!("Product model not available"),
+    // Reading a property that might not exist - get returns String directly now
+    let model = rsproperties::get("ro.product.model");
+    if model.is_empty() {
+        println!("Product model not available");
+    } else {
+        println!("Product Model: {}", model);
     }
 
     Ok(())
@@ -33,19 +38,19 @@ fn example_basic_usage() -> Result<()> {
 #[test]
 fn example_setting_properties() -> Result<()> {
     // Initialize for testing
-    rsproperties::init(Some(PathBuf::from("example_setting")));
+    init_test();
 
     // Set a simple property
     rsproperties::set("my.app.version", "1.0.0")?;
 
     // Read it back
-    let version = rsproperties::get("my.app.version")?;
+    let version = rsproperties::get("my.app.version");
     assert_eq!(version, "1.0.0");
     println!("App version: {}", version);
 
     // Update the property
     rsproperties::set("my.app.version", "1.0.1")?;
-    let updated_version = rsproperties::get("my.app.version")?;
+    let updated_version = rsproperties::get("my.app.version");
     assert_eq!(updated_version, "1.0.1");
     println!("Updated app version: {}", updated_version);
 
@@ -62,7 +67,7 @@ fn example_setting_properties() -> Result<()> {
 
     // Read them all back
     for (key, expected_value) in &app_properties {
-        let actual_value = rsproperties::get(key)?;
+        let actual_value = rsproperties::get(key);
         assert_eq!(actual_value, *expected_value);
         println!("{} = {}", key, actual_value);
     }
@@ -73,28 +78,26 @@ fn example_setting_properties() -> Result<()> {
 /// Example showing error handling patterns
 #[test]
 fn example_error_handling() {
-    rsproperties::init(Some(PathBuf::from("example_errors")));
+    init_test();
 
     // Safe way - always get a value, using default for missing properties
     let timeout = rsproperties::get_with_default("network.timeout", "30");
     let timeout_seconds: u32 = timeout.parse().unwrap_or(30);
     println!("Network timeout: {} seconds", timeout_seconds);
 
-    // Explicit error handling
-    match rsproperties::get("service.status") {
-        Ok(status) => {
-            println!("Service status: {}", status);
-            // Process the status...
-        }
-        Err(e) => {
-            eprintln!("Could not get service status: {}", e);
-            // Handle the error appropriately...
-        }
+    // Check property value
+    let status = rsproperties::get("service.status");
+    if !status.is_empty() {
+        println!("Service status: {}", status);
+        // Process the status...
+    } else {
+        eprintln!("Could not get service status: property not found");
+        // Handle the missing property appropriately...
     }
 
     // Using Result in a function that can fail
     fn get_required_config() -> Result<String> {
-        let config = rsproperties::get("app.required.config")?;
+        let config = rsproperties::get("app.required.config");
         if config.is_empty() {
             return Err(rsproperties::Error::new_context("Config cannot be empty".into()).into());
         }
@@ -110,7 +113,7 @@ fn example_error_handling() {
 /// Example showing different property patterns used in Android
 #[test]
 fn example_android_property_patterns() {
-    rsproperties::init(Some(PathBuf::from("example_android")));
+    init_test();
 
     // Common Android property patterns and their typical usage
     let android_properties = vec![
@@ -162,7 +165,7 @@ fn example_android_property_patterns() {
 #[cfg(feature = "builder")]
 #[test]
 fn example_configuration_management() -> Result<()> {
-    rsproperties::init(Some(PathBuf::from("example_config")));
+    init_test();
 
     // Example: Managing application configuration through properties
 
@@ -189,22 +192,22 @@ fn example_configuration_management() -> Result<()> {
     // Read and use configuration
     println!("\nReading current configuration:");
 
-    let log_level = rsproperties::get("app.log.level")?;
+    let log_level = rsproperties::get("app.log.level");
     println!("Log level: {}", log_level);
 
-    let max_connections: i32 = rsproperties::get("app.max.connections")?
+    let max_connections: i32 = rsproperties::get("app.max.connections")
         .parse().unwrap_or(50);
     println!("Max connections: {}", max_connections);
 
-    let timeout: u64 = rsproperties::get("app.timeout.seconds")?
+    let timeout: u64 = rsproperties::get("app.timeout.seconds")
         .parse().unwrap_or(10);
     println!("Timeout: {} seconds", timeout);
 
-    let experimental_enabled = rsproperties::get("app.feature.experimental")?
+    let experimental_enabled = rsproperties::get("app.feature.experimental")
         .to_lowercase() == "true";
     println!("Experimental features: {}", experimental_enabled);
 
-    let cache_size: u32 = rsproperties::get("app.cache.size.mb")?
+    let cache_size: u32 = rsproperties::get("app.cache.size.mb")
         .parse().unwrap_or(128);
     println!("Cache size: {} MB", cache_size);
 
@@ -225,7 +228,7 @@ fn example_configuration_management() -> Result<()> {
 /// Example showing property watching patterns (conceptual)
 #[test]
 fn example_property_monitoring() {
-    rsproperties::init(Some(PathBuf::from("example_monitoring")));
+    init_test();
 
     // This demonstrates how you might monitor properties in a real application
     // Note: Actual watching would require the wait functionality from SystemProperties
@@ -255,7 +258,7 @@ fn example_property_monitoring() {
 /// Example demonstrating best practices
 #[test]
 fn example_best_practices() -> Result<()> {
-    rsproperties::init(Some(PathBuf::from("example_best_practices")));
+    init_test();
 
     // ✅ Good: Use meaningful property names with clear hierarchy
     #[cfg(feature = "builder")]
@@ -273,16 +276,14 @@ fn example_best_practices() -> Result<()> {
     println!("Cache enabled: {}", cache_enabled);
     println!("Retry count: {}", retry_count);
 
-    // ✅ Good: Handle errors appropriately
-    match rsproperties::get("com.myapp.critical.setting") {
-        Ok(setting) => {
-            println!("Critical setting: {}", setting);
-            // Proceed with the setting
-        }
-        Err(_) => {
-            println!("Critical setting not found, using safe defaults");
-            // Use safe defaults or fail safely
-        }
+    // ✅ Good: Handle missing properties appropriately
+    let setting = rsproperties::get("com.myapp.critical.setting");
+    if !setting.is_empty() {
+        println!("Critical setting: {}", setting);
+        // Proceed with the setting
+    } else {
+        println!("Critical setting not found, using safe defaults");
+        // Use safe defaults or fail safely
     }
 
     // ✅ Good: Validate property values

@@ -11,14 +11,6 @@ use std::{
     fmt::Debug,
 };
 
-// This is a workaround for the fact that the `MetadataExt` trait is not implemented for `std::fs::Metadata` on all platforms.
-#[cfg(target_os = "macos")]
-use std::os::macos::fs::MetadataExt;
-#[cfg(target_os = "android")]
-use std::os::android::fs::MetadataExt;
-#[cfg(target_os = "linux")]
-use std::os::linux::fs::MetadataExt;
-
 use rustix::{fs, mm};
 use anyhow::Context;
 use log::{debug, info, warn, error, trace};
@@ -170,24 +162,10 @@ impl PropertyAreaMap {
         let metadata = file.metadata()
             .context_with_location("Failed to get metadata")?;
 
-        trace!("File metadata: uid={}, gid={}, mode={:#o}, size={}",
-               metadata.st_uid(), metadata.st_gid(), metadata.st_mode(), metadata.st_size());
+        // Validate file metadata using common utility function
+        crate::errors::validate_file_metadata(&metadata, filename, mem::size_of::<PropertyArea>() as u64)?;
 
-        if cfg!(test) {
-            if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
-                metadata.st_size() < mem::size_of::<PropertyArea>() as u64 {
-                error!("Invalid file metadata for test mode: {:?}", filename);
-                anyhow::bail!("Invalid file metadata");
-            }
-        } else if metadata.st_uid() != 0 || metadata.st_gid() != 0 ||
-            metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 ||
-            metadata.st_size() < mem::size_of::<PropertyArea>() as u64 {
-            error!("Invalid file metadata: uid={}, gid={}, mode={:#o}, size={} for {:?}",
-                   metadata.st_uid(), metadata.st_gid(), metadata.st_mode(), metadata.st_size(), filename);
-            anyhow::bail!("Invalid file metadata");
-        }
-
-        let pa_size = metadata.st_size() as usize;
+        let pa_size = metadata.len() as usize;
         let pa_data_size = pa_size - std::mem::size_of::<PropertyArea>();
 
         debug!("Creating read-only memory map: size={}, data_size={}", pa_size, pa_data_size);

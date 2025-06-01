@@ -3,7 +3,7 @@
 
 use std::os::unix::net::UnixStream;
 use std::io::{prelude::*, IoSlice};
-use std::{fs, env, path::Path};
+use std::{fs, env, path::{Path, PathBuf}};
 use std::sync::OnceLock;
 
 use zerocopy_derive::*;
@@ -16,7 +16,6 @@ use crate::errors::*;
 const DEFAULT_SOCKET_DIR: &str = "/dev/socket";
 const PROPERTY_SERVICE_SOCKET_NAME: &str = "property_service";
 const PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME: &str = "property_service_for_system";
-const SERVICE_VERSION_PROPERTY_NAME: &str = "ro.property_service.version";
 const PROP_SERVICE_NAME: &str = "property_service";
 // const PROP_SERVICE_FOR_SYSTEM_NAME: &str = "property_service_for_system";
 
@@ -28,9 +27,9 @@ const PROP_NAME_MAX: usize = 32;
 const PROP_VALUE_MAX: usize = 92;
 
 /// Global socket directory configuration
-static SOCKET_DIR: OnceLock<String> = OnceLock::new();
+static SOCKET_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Set the global socket directory for property services.
+/// Set the global socket directory for property services (internal use only).
 /// This function can only be called once. Subsequent calls will be ignored.
 ///
 /// # Arguments
@@ -39,30 +38,17 @@ static SOCKET_DIR: OnceLock<String> = OnceLock::new();
 /// # Returns
 /// * `true` if the directory was successfully set (first call)
 /// * `false` if the directory was already set (subsequent calls)
-///
-/// # Example
-/// ```
-/// use rsproperties::set_socket_dir;
-///
-/// // Set custom socket directory
-/// let success = set_socket_dir("/tmp/test_socket");
-/// assert!(success);
-///
-/// // Subsequent calls will be ignored
-/// let ignored = set_socket_dir("/other/path");
-/// assert!(!ignored);
-/// ```
-pub fn set_socket_dir<P: AsRef<Path>>(dir: P) -> bool {
-    let dir_str = dir.as_ref().to_string_lossy().into_owned();
-    log::info!("Attempting to set socket directory to: {}", dir_str);
+pub(crate) fn set_socket_dir_internal<P: AsRef<Path>>(dir: P) -> bool {
+    let dir_path = dir.as_ref().to_path_buf();
+    log::info!("Attempting to set socket directory to: {}", dir_path.display());
 
-    match SOCKET_DIR.set(dir_str.clone()) {
+    match SOCKET_DIR.set(dir_path.clone()) {
         Ok(_) => {
-            log::info!("Successfully set socket directory to: {}", dir_str);
+            log::info!("Successfully set socket directory to: {}", dir_path.display());
             true
         }
         Err(_) => {
-            log::warn!("Socket directory already set, ignoring new value: {}", dir_str);
+            log::warn!("Socket directory already set, ignoring new value: {}", dir_path.display());
             false
         }
     }
@@ -75,27 +61,28 @@ pub fn set_socket_dir<P: AsRef<Path>>(dir: P) -> bool {
 /// 1. Directory set via `set_socket_dir()`
 /// 2. `PROPERTY_SERVICE_SOCKET_DIR` environment variable
 /// 3. Default directory: `/dev/socket`
-fn get_socket_dir() -> &'static str {
+pub(crate) fn get_socket_dir() -> &'static PathBuf {
     SOCKET_DIR.get_or_init(|| {
         let dir = env::var("PROPERTY_SERVICE_SOCKET_DIR")
             .unwrap_or_else(|_| DEFAULT_SOCKET_DIR.to_string());
-        log::debug!("Initialized socket directory to: {}", dir);
-        dir
+        let dir_path = PathBuf::from(dir);
+        log::debug!("Initialized socket directory to: {}", dir_path.display());
+        dir_path
     })
 }
 
 /// Get the full path to the property service socket
 fn get_property_service_socket() -> String {
-    let socket_path = format!("{}/{}", get_socket_dir(), PROPERTY_SERVICE_SOCKET_NAME);
-    log::trace!("Property service socket path: {}", socket_path);
-    socket_path
+    let socket_path = get_socket_dir().join(PROPERTY_SERVICE_SOCKET_NAME);
+    log::trace!("Property service socket path: {}", socket_path.display());
+    socket_path.to_string_lossy().into_owned()
 }
 
 /// Get the full path to the system property service socket
 fn get_property_service_for_system_socket() -> String {
-    let socket_path = format!("{}/{}", get_socket_dir(), PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
-    log::trace!("System property service socket path: {}", socket_path);
-    socket_path
+    let socket_path = get_socket_dir().join(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
+    log::trace!("System property service socket path: {}", socket_path.display());
+    socket_path.to_string_lossy().into_owned()
 }
 
 struct ServiceConnection {
@@ -106,12 +93,10 @@ impl ServiceConnection {
     fn new(name: &str) -> Result<Self> {
         log::debug!("Creating service connection for property: {}", name);
 
-        let property_service_socket = env::var("PROPERTY_SERVICE_SOCKET")
-            .unwrap_or_else(|_| get_property_service_socket());
+        let property_service_socket = get_property_service_socket();
 
         let socket_name = if name == "sys.powerctl" {
-            let system_socket = env::var("PROPERTY_SERVICE_FOR_SYSTEM_SOCKET")
-                .unwrap_or_else(|_| get_property_service_for_system_socket());
+            let system_socket = get_property_service_for_system_socket();
             if fs::metadata(&system_socket)
                 .map(|metadata| !metadata.permissions().readonly())
                 .is_ok() {
@@ -127,7 +112,7 @@ impl ServiceConnection {
         };
 
         log::trace!("Connecting to Unix domain socket: {}", socket_name);
-        let stream = UnixStream::connect(&socket_name)
+        let stream: UnixStream = UnixStream::connect(&socket_name)
             .context("Unable to connect to property service")?;
 
         log::debug!("Successfully connected to property service socket: {}", socket_name);

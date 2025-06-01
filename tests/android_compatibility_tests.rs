@@ -9,28 +9,53 @@
 #![cfg(feature = "builder")]
 
 use std::path::{Path, PathBuf};
-use std::fs::{create_dir_all, remove_dir_all, File};
+use std::fs::{remove_dir_all, File, create_dir};
 use std::io::Write;
 use std::collections::HashMap;
-use rsproperties::{self, PropertyInfoEntry, build_trie, load_properties_from_file};
+use std::sync::{Mutex, MutexGuard};
+use rsproperties::{self, PropertyInfoEntry, build_trie, load_properties_from_file, SystemProperties};
 
-const ANDROID_TEST_DIR: &str = "android_test_properties";
+#[path = "common.rs"]
+mod common;
+use common::TEST_PROPERTIES_DIR;
 
-fn setup_android_test_env() -> HashMap<String, String> {
-    let _ = env_logger::builder().is_test(true).try_init();
+static SYSTEM_PROPERTIES: Mutex<Option<SystemProperties>> = Mutex::new(None);
 
-    // Initialize with test directory
-    rsproperties::init(Some(PathBuf::from(ANDROID_TEST_DIR)));
+fn load_properties() -> HashMap<String, String> {
+    let build_prop_files = vec![
+        "tests/android/product_build.prop",
+        "tests/android/system_build.prop",
+        "tests/android/system_dlkm_build.prop",
+        "tests/android/system_ext_build.prop",
+        "tests/android/vendor_build.prop",
+        "tests/android/vendor_dlkm_build.prop",
+        "tests/android/vendor_odm_build.prop",
+        "tests/android/vendor_odm_dlkm_build.prop",
+    ];
 
-    // Clean up and create test directory
-    let _ = remove_dir_all(ANDROID_TEST_DIR);
-    create_dir_all(ANDROID_TEST_DIR).expect("Failed to create test directory");
+    let mut properties = HashMap::new();
+    for file in build_prop_files {
+        if let Err(e) = load_properties_from_file(Path::new(file), None, "u:r:init:s0", &mut properties) {
+            eprintln!("Warning: Failed to load {}: {}", file, e);
+        }
+    }
 
-    setup_property_contexts_and_build_props()
+    properties
 }
 
-fn setup_property_contexts_and_build_props() -> HashMap<String, String> {
-    // Load property contexts
+fn system_properties_area() -> MutexGuard<'static, Option<SystemProperties>> {
+    let mut system_properties_guard = SYSTEM_PROPERTIES.lock().unwrap();
+
+    if system_properties_guard.is_none() {
+        *system_properties_guard = Some(build_property_dir(TEST_PROPERTIES_DIR));
+    }
+    system_properties_guard
+}
+
+fn build_property_dir(dir: &str) -> SystemProperties {
+    let config = rsproperties::PropertyConfig::with_properties_dir(PathBuf::from(dir));
+    rsproperties::init(Some(config));
+
     let property_contexts_files = vec![
         "tests/android/plat_property_contexts",
         "tests/android/system_ext_property_contexts",
@@ -51,41 +76,41 @@ fn setup_property_contexts_and_build_props() -> HashMap<String, String> {
     let data = build_trie(&property_infos, "u:object_r:build_prop:s0", "string")
         .expect("Failed to build trie");
 
-    let dir = rsproperties::dirname();
-    let property_info_path = dir.join("property_info");
-    File::create(property_info_path)
+    let dir_path = rsproperties::dirname();
+    let _ = remove_dir_all(dir_path);
+    create_dir(dir_path).expect("Failed to create directory");
+    File::create(dir_path.join("property_info"))
         .expect("Failed to create property_info file")
         .write_all(&data)
         .expect("Failed to write property_info data");
 
-    // Load build properties
-    load_build_properties()
-}
+    let properties = load_properties();
 
-fn load_build_properties() -> HashMap<String, String> {
-    let build_prop_files = vec![
-        "tests/android/product_build.prop",
-        "tests/android/system_build.prop",
-        "tests/android/system_dlkm_build.prop",
-        "tests/android/system_ext_build.prop",
-        "tests/android/vendor_build.prop",
-        "tests/android/vendor_dlkm_build.prop",
-        "tests/android/vendor_odm_build.prop",
-        "tests/android/vendor_odm_dlkm_build.prop",
-    ];
+    let mut system_properties = SystemProperties::new_area(dir_path)
+        .unwrap_or_else(|e| panic!("Cannot create system properties: {}. Please check if {dir_path:?} exists.", e));
 
-    let mut properties = HashMap::new();
-    for file in build_prop_files {
-        if let Err(e) = load_properties_from_file(Path::new(file), None, "u:r:init:s0", &mut properties) {
-            eprintln!("Warning: Failed to load {}: {}", file, e);
+    for (key, value) in properties.iter() {
+        match system_properties.find(key.as_str()).unwrap() {
+            Some(prop_ref) => {
+                system_properties.update(&prop_ref, value.as_str()).unwrap();
+            },
+            None => {
+                system_properties.add(key.as_str(), value.as_str()).unwrap();
+            }
         }
     }
 
-    // This is a conceptual setup - in real usage, properties would be set during system initialization
-    // For testing purposes, we'll just return the loaded properties without setting them in the system
-    println!("Note: Properties would normally be set in the system during initialization");
+    system_properties
+}
 
-    properties
+fn setup_android_test_env() -> HashMap<String, String> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // Initialize the system properties area
+    let _guard = system_properties_area();
+
+    // Return the loaded properties for verification
+    load_properties()
 }
 
 #[test]
@@ -119,14 +144,12 @@ fn test_get_android_properties() {
     // Test getting properties through the public API
     for (key, expected_value) in properties.iter().take(10) { // Test first 10 properties
         let retrieved_value = rsproperties::get(key);
-        match retrieved_value {
-            Ok(value) => {
-                assert_eq!(value, *expected_value, "Property {} has incorrect value", key);
-                println!("✓ {}: {}", key, value);
-            }
-            Err(e) => {
-                eprintln!("✗ Failed to get property {}: {}", key, e);
-            }
+        // Since get() now returns String directly, we check if it matches expected value or is empty
+        if retrieved_value.is_empty() {
+            eprintln!("✗ Property {} not found (empty string returned)", key);
+        } else {
+            assert_eq!(retrieved_value, *expected_value, "Property {} has incorrect value", key);
+            println!("✓ {}: {}", key, retrieved_value);
         }
     }
 }

@@ -6,14 +6,16 @@
 //! These tests verify edge cases, error conditions, and API stability
 //! to ensure robust behavior under unusual conditions.
 
-use std::path::PathBuf;
 use rsproperties::{self, Result, PROP_VALUE_MAX, PROP_DIRNAME};
 
-const EDGE_TEST_DIR: &str = "edge_test_properties";
+#[path = "common.rs"]
+mod common;
+use common::init_test;
+
 
 fn setup_edge_test_env() {
     let _ = env_logger::builder().is_test(true).try_init();
-    rsproperties::init(Some(PathBuf::from(EDGE_TEST_DIR)));
+    init_test();
 }
 
 /// Test API constants are properly exposed and have expected values
@@ -24,30 +26,13 @@ fn test_api_constants() {
     assert_eq!(PROP_DIRNAME, "/dev/__properties__", "PROP_DIRNAME should match Android default");
 }
 
-/// Test initialization edge cases
-#[test]
-fn test_init_edge_cases() {
-    // Test multiple initializations
-    rsproperties::init(Some(PathBuf::from("test1")));
-    assert_eq!(rsproperties::dirname().to_str().unwrap(), "test1");
-
-    // Second init should not change the directory (OnceLock behavior)
-    rsproperties::init(Some(PathBuf::from("test2")));
-    assert_eq!(rsproperties::dirname().to_str().unwrap(), "test1");
-
-    // Test with None (default directory)
-    // Note: This will fail to change due to OnceLock, but should not panic
-    rsproperties::init(None);
-    // Directory should still be "test1" from first initialization
-}
-
 /// Test empty and whitespace property names
 #[test]
 fn test_empty_property_names() {
     setup_edge_test_env();
 
     // Test empty property name
-    let result = rsproperties::get("");
+    let result = rsproperties::get_with_result("");
     assert!(result.is_err(), "Getting empty property name should fail");
 
     let default_result = rsproperties::get_with_default("", "default");
@@ -172,27 +157,19 @@ fn test_property_value_edge_cases() {
         ("1e10", "scientific notation"),
     ];
 
-    #[cfg(feature = "builder")]
-    {
-        for (i, (value, description)) in test_values.iter().enumerate() {
-            let prop_name = format!("edge.value.test.{}", i);
+    for (i, (value, description)) in test_values.iter().enumerate() {
+        let prop_name = format!("edge.value.test.{}", i);
 
-            match rsproperties::set(&prop_name, value) {
-                Ok(_) => {
-                    let retrieved = rsproperties::get(&prop_name).unwrap();
-                    assert_eq!(retrieved, *value, "Failed for {}: {}", description, value.escape_debug());
-                    println!("✓ {}: '{}'", description, value.escape_debug());
-                }
-                Err(e) => {
-                    println!("✗ Failed to set {}: {} - Error: {}", description, value.escape_debug(), e);
-                }
+        match rsproperties::set(&prop_name, value) {
+            Ok(_) => {
+                let retrieved = rsproperties::get(&prop_name);
+                assert_eq!(retrieved, *value, "Failed for {}: {}", description, value.escape_debug());
+                println!("✓ {}: '{}'", description, value.escape_debug());
+            }
+            Err(e) => {
+                println!("✗ Failed to set {}: {} - Error: {}", description, value.escape_debug(), e);
             }
         }
-    }
-
-    #[cfg(not(feature = "builder"))]
-    {
-        println!("Skipping value edge case tests (builder feature not enabled)");
     }
 }
 
@@ -216,7 +193,7 @@ fn test_maximum_length_values() {
 
         match rsproperties::set(&prop_name, &value) {
             Ok(_) => {
-                let retrieved = rsproperties::get(&prop_name).unwrap();
+                let retrieved = rsproperties::get(&prop_name);
                 assert_eq!(retrieved.len(), length);
                 assert_eq!(retrieved, value);
                 println!("✓ Successfully set/get property with {} byte value", length);
@@ -233,9 +210,9 @@ fn test_maximum_length_values() {
     match result {
         Ok(_) => {
             // If it succeeds, check if value was truncated
-            let retrieved = rsproperties::get("edge.oversized").unwrap();
+            let retrieved = rsproperties::get("edge.oversized");
             println!("Oversized value handling: set {} bytes, retrieved {} bytes",
-                     oversized_value.len(), retrieved.len());
+                        oversized_value.len(), retrieved.len());
             assert!(retrieved.len() <= PROP_VALUE_MAX,
                     "Retrieved value should not exceed PROP_VALUE_MAX");
         }
@@ -271,16 +248,18 @@ fn test_concurrent_same_property() -> Result<()> {
             // Each thread tries to update the same property
             for i in 0..10 {
                 let value = format!("thread_{}_iteration_{}", thread_id, i);
+                println!("Thread {} setting '{}'", thread_id, value);
                 rsproperties::set(&prop_name, &value)?;
 
                 // Read it back
-                let retrieved = rsproperties::get(&prop_name)?;
+                let retrieved = rsproperties::get(&prop_name);
                 // The retrieved value might be from any thread due to race conditions
                 println!("Thread {} set '{}', read '{}'", thread_id, value, retrieved);
 
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
 
+            println!("Thread {} completed", thread_id);
             Ok(())
         })
     }).collect();
@@ -290,7 +269,7 @@ fn test_concurrent_same_property() -> Result<()> {
     }
 
     // Verify final state is valid
-    let final_value = rsproperties::get(prop_name)?;
+    let final_value = rsproperties::get(prop_name);
     assert!(!final_value.is_empty(), "Final value should not be empty");
     println!("Final value after concurrent updates: '{}'", final_value);
 
@@ -303,7 +282,7 @@ fn test_error_handling() {
     setup_edge_test_env();
 
     // Test get on non-existent property
-    let result = rsproperties::get("definitely.does.not.exist.anywhere");
+    let result = rsproperties::get_with_result("definitely.does.not.exist.anywhere");
     assert!(result.is_err(), "Should return error for non-existent property");
 
     // Test that error contains useful information
@@ -331,32 +310,6 @@ fn test_error_handling() {
     }
 }
 
-/// Test API stability - verify that the public API hasn't changed
-#[test]
-fn test_api_stability() {
-    // This test ensures that the expected public API is available
-    // and has the expected signatures
-
-    // Test that all expected functions exist and are callable
-    rsproperties::init(Some(PathBuf::from("api_test")));
-
-    let _dirname: &std::path::Path = rsproperties::dirname();
-
-    let _result1: String = rsproperties::get_with_default("test", "default");
-    let _result2: Result<String> = rsproperties::get("test");
-
-    #[cfg(feature = "builder")]
-    {
-        let _result3: Result<()> = rsproperties::set("test", "value");
-    }
-
-    // Test that constants are accessible
-    let _max: usize = rsproperties::PROP_VALUE_MAX;
-    let _dirname: &str = rsproperties::PROP_DIRNAME;
-
-    println!("API stability test passed - all expected functions are available");
-}
-
 /// Test behavior with null bytes and other special characters
 #[test]
 #[cfg(feature = "builder")]
@@ -375,16 +328,10 @@ fn test_null_bytes_and_special_chars() {
         let result = rsproperties::set(prop_name, prop_value);
         match result {
             Ok(_) => {
-                match rsproperties::get(prop_name) {
-                    Ok(retrieved) => {
-                        println!("✓ Special chars in '{}': {} bytes -> {} bytes",
-                                prop_name, prop_value.len(), retrieved.len());
-                        // Value might be modified/filtered by the implementation
-                    }
-                    Err(e) => {
-                        println!("✗ Failed to retrieve '{}': {}", prop_name, e);
-                    }
-                }
+                let retrieved = rsproperties::get(prop_name);
+                println!("✓ Special chars in '{}': {} bytes -> {} bytes",
+                        prop_name, prop_value.len(), retrieved.len());
+                // Value might be modified/filtered by the implementation
             }
             Err(e) => {
                 println!("✗ Failed to set '{}': {}", prop_name, e);

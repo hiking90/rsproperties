@@ -8,17 +8,18 @@
 
 #![cfg(feature = "builder")]
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use std::thread;
 use std::sync::{Arc, Barrier};
 use rsproperties::{self, Result};
 
-const PERF_TEST_DIR: &str = "perf_test_properties";
+#[path = "common.rs"]
+mod common;
+use common::init_test;
 
 fn setup_perf_test_env() {
     let _ = env_logger::builder().is_test(true).try_init();
-    rsproperties::init(Some(PathBuf::from(PERF_TEST_DIR)));
+    init_test();
 }
 
 #[test]
@@ -44,7 +45,7 @@ fn test_property_get_performance() -> Result<()> {
 
     for i in 0..iterations {
         let prop_name = &test_props[i % test_props.len()].0;
-        let _value = rsproperties::get(prop_name)?;
+        let _value = rsproperties::get(prop_name);
     }
 
     let elapsed = start.elapsed();
@@ -140,7 +141,7 @@ fn test_large_property_values() -> Result<()> {
         let set_time = start.elapsed();
 
         let start = Instant::now();
-        let retrieved = rsproperties::get(&prop_name)?;
+        let retrieved = rsproperties::get(&prop_name);
         let get_time = start.elapsed();
 
         assert_eq!(retrieved, large_value);
@@ -177,7 +178,7 @@ fn test_many_properties() -> Result<()> {
     for i in 0..num_props {
         let prop_name = format!("stress.many.prop.{:04}", i);
         let expected_value = format!("value_{}", i);
-        let retrieved = rsproperties::get(&prop_name)?;
+        let retrieved = rsproperties::get(&prop_name);
         assert_eq!(retrieved, expected_value);
     }
     let get_all_time = start.elapsed();
@@ -217,8 +218,8 @@ fn test_concurrent_reads() -> Result<()> {
             for i in 0..reads_per_thread {
                 let prop_name = format!("concurrent.read.prop.{}", i % num_props);
                 let expected = format!("value_{}", i % num_props);
-                let value = rsproperties::get(&prop_name).expect("Failed to get property");
-                assert_eq!(value, expected);
+                let value = rsproperties::get(&prop_name);
+                assert_eq!(value, expected, "Failed to get property {}", prop_name);
             }
             let elapsed = start.elapsed();
 
@@ -280,7 +281,7 @@ fn test_concurrent_writes() -> Result<()> {
         for i in 0..writes_per_thread {
             let prop_name = format!("concurrent.write.{}.prop.{}", thread_id, i);
             let expected = format!("thread_{}_value_{}", thread_id, i);
-            let value = rsproperties::get(&prop_name)?;
+            let value = rsproperties::get(&prop_name);
             assert_eq!(value, expected);
         }
     }
@@ -323,7 +324,7 @@ fn test_mixed_read_write_workload() -> Result<()> {
                 } else {
                     // Read operation
                     let prop_name = format!("mixed.initial.prop.{}", i % 50);
-                    let _value = rsproperties::get(&prop_name)?;
+                    let _value = rsproperties::get(&prop_name);
                 }
             }
             let elapsed = start.elapsed();
@@ -366,7 +367,7 @@ fn test_property_name_patterns() -> Result<()> {
         // Measure get performance for this pattern
         let start = Instant::now();
         for _ in 0..iterations {
-            let _value = rsproperties::get(prop_name)?;
+            let _value = rsproperties::get(prop_name);
         }
         let elapsed = start.elapsed();
 
@@ -374,7 +375,7 @@ fn test_property_name_patterns() -> Result<()> {
                  prop_name, iterations, elapsed, elapsed / iterations);
 
         // Verify correctness
-        let retrieved = rsproperties::get(prop_name)?;
+        let retrieved = rsproperties::get(prop_name);
         assert_eq!(retrieved, *prop_value);
     }
 
@@ -403,7 +404,7 @@ fn test_memory_usage_stability() -> Result<()> {
         for i in 0..props_per_cycle {
             let prop_name = format!("memory.test.cycle.{}.prop.{}", cycle, i);
             let expected = format!("cycle_{}_value_{}", cycle, i);
-            let retrieved = rsproperties::get(&prop_name)?;
+            let retrieved = rsproperties::get(&prop_name);
             assert_eq!(retrieved, expected);
         }
 

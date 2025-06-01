@@ -7,6 +7,10 @@ extern crate rsproperties;
 
 use rsproperties::{PROP_VALUE_MAX, PROP_DIRNAME};
 
+#[path = "common.rs"]
+mod common;
+use common::init_test;
+
 #[test]
 fn test_constants() {
     assert_eq!(PROP_VALUE_MAX, 92);
@@ -17,8 +21,7 @@ fn test_constants() {
 #[test]
 fn test_basic_functionality() {
     // Initialize with the existing __properties__ directory
-    let props_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("__properties__");
-    rsproperties::init(Some(props_dir));
+    init_test();
 
     // Test get_with_default
     let result = rsproperties::get_with_default("test.nonexistent", "default");

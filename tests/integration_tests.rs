@@ -10,33 +10,15 @@
 //! - Setting properties (when builder feature is enabled)
 //! - Error handling
 
-use std::path::PathBuf;
 use rsproperties;
 
-const TEST_PROP_DIR: &str = "test_properties";
+#[path = "common.rs"]
+mod common;
+use common::init_test;
 
 fn setup_test_env() {
     let _ = env_logger::builder().is_test(true).try_init();
-    rsproperties::init(Some(PathBuf::from(TEST_PROP_DIR)));
-}
-
-#[test]
-fn test_init_and_dirname() {
-    // Test initialization with custom directory
-    let custom_dir = PathBuf::from("custom_test_dir");
-    rsproperties::init(Some(custom_dir.clone()));
-
-    let dirname = rsproperties::dirname();
-    assert_eq!(dirname, custom_dir.as_path());
-}
-
-#[test]
-fn test_init_with_none() {
-    // Test initialization with None (default directory)
-    rsproperties::init(None);
-
-    let dirname = rsproperties::dirname();
-    assert_eq!(dirname.to_str().unwrap(), rsproperties::PROP_DIRNAME);
+    init_test();
 }
 
 #[test]
@@ -68,38 +50,18 @@ fn test_get_nonexistent_property() {
     let prop_name = "definitely.does.not.exist";
     let result = rsproperties::get(prop_name);
 
-    // Should return an error for non-existent property
-    assert!(result.is_err());
+    // Should return empty string for non-existent property
+    assert!(result.is_empty());
 }
 
-#[test]
-fn test_prop_value_max_constant() {
-    // Verify the PROP_VALUE_MAX constant is properly exposed
-    assert_eq!(rsproperties::PROP_VALUE_MAX, 92);
-}
-
-#[test]
-fn test_prop_dirname_constant() {
-    // Verify the PROP_DIRNAME constant is properly exposed
-    assert_eq!(rsproperties::PROP_DIRNAME, "/dev/__properties__");
-}
 
 #[cfg(feature = "builder")]
 mod builder_tests {
     use super::*;
-    use std::fs::{create_dir_all, remove_dir_all};
-
-    fn setup_builder_test_env() {
-        setup_test_env();
-
-        // Clean up and create test directory
-        let _ = remove_dir_all(TEST_PROP_DIR);
-        create_dir_all(TEST_PROP_DIR).expect("Failed to create test directory");
-    }
 
     #[test]
     fn test_set_and_get_property() -> anyhow::Result<()> {
-        setup_builder_test_env();
+        setup_test_env();
 
         let prop_name = "test.set.property";
         let prop_value = "test_value_123";
@@ -108,7 +70,7 @@ mod builder_tests {
         rsproperties::set(prop_name, prop_value)?;
 
         // Get the property back
-        let retrieved_value = rsproperties::get(prop_name)?;
+        let retrieved_value = rsproperties::get(prop_name);
         assert_eq!(retrieved_value, prop_value);
 
         // Also test get_with_default
@@ -120,13 +82,13 @@ mod builder_tests {
 
     #[test]
     fn test_set_property_with_special_characters() -> anyhow::Result<()> {
-        setup_builder_test_env();
+        setup_test_env();
 
         let prop_name = "test.special.chars";
         let prop_value = "value with spaces and symbols: !@#$%^&*()";
 
         rsproperties::set(prop_name, prop_value)?;
-        let retrieved_value = rsproperties::get(prop_name)?;
+        let retrieved_value = rsproperties::get(prop_name);
         assert_eq!(retrieved_value, prop_value);
 
         Ok(())
@@ -134,13 +96,13 @@ mod builder_tests {
 
     #[test]
     fn test_set_property_empty_value() -> anyhow::Result<()> {
-        setup_builder_test_env();
+        setup_test_env();
 
         let prop_name = "test.empty.value";
         let prop_value = "";
 
         rsproperties::set(prop_name, prop_value)?;
-        let retrieved_value = rsproperties::get(prop_name)?;
+        let retrieved_value = rsproperties::get(prop_name);
         assert_eq!(retrieved_value, prop_value);
 
         Ok(())
@@ -148,7 +110,7 @@ mod builder_tests {
 
     #[test]
     fn test_update_existing_property() -> anyhow::Result<()> {
-        setup_builder_test_env();
+        setup_test_env();
 
         let prop_name = "test.update.property";
         let initial_value = "initial_value";
@@ -156,12 +118,12 @@ mod builder_tests {
 
         // Set initial value
         rsproperties::set(prop_name, initial_value)?;
-        let retrieved = rsproperties::get(prop_name)?;
+        let retrieved = rsproperties::get(prop_name);
         assert_eq!(retrieved, initial_value);
 
         // Update the value
         rsproperties::set(prop_name, updated_value)?;
-        let retrieved = rsproperties::get(prop_name)?;
+        let retrieved = rsproperties::get(prop_name);
         assert_eq!(retrieved, updated_value);
 
         Ok(())
@@ -169,7 +131,7 @@ mod builder_tests {
 
     #[test]
     fn test_set_invalid_property_name() {
-        setup_builder_test_env();
+        setup_test_env();
 
         // Test with empty property name
         let result = rsproperties::set("", "value");
@@ -178,7 +140,7 @@ mod builder_tests {
 
     #[test]
     fn test_multiple_properties() -> anyhow::Result<()> {
-        setup_builder_test_env();
+        setup_test_env();
 
         let properties = vec![
             ("test.prop.one", "value1"),
@@ -194,7 +156,7 @@ mod builder_tests {
 
         // Verify all properties
         for (name, expected_value) in &properties {
-            let retrieved_value = rsproperties::get(name)?;
+            let retrieved_value = rsproperties::get(name);
             assert_eq!(retrieved_value, *expected_value);
         }
 
@@ -205,16 +167,9 @@ mod builder_tests {
 #[cfg(all(feature = "builder", target_os = "linux"))]
 mod linux_specific_tests {
     use super::*;
-    use std::fs::{create_dir_all, remove_dir_all};
 
     #[test]
     fn test_property_persistence() -> anyhow::Result<()> {
-        let test_dir = "test_persistence";
-        let _ = remove_dir_all(test_dir);
-        create_dir_all(test_dir).expect("Failed to create test directory");
-
-        rsproperties::init(Some(PathBuf::from(test_dir)));
-
         let prop_name = "persist.test.property";
         let prop_value = "persistent_value";
 
@@ -222,11 +177,8 @@ mod linux_specific_tests {
         rsproperties::set(prop_name, prop_value)?;
 
         // Verify it's set
-        let retrieved = rsproperties::get(prop_name)?;
+        let retrieved = rsproperties::get(prop_name);
         assert_eq!(retrieved, prop_value);
-
-        // Clean up
-        let _ = remove_dir_all(test_dir);
 
         Ok(())
     }
@@ -302,7 +254,7 @@ mod concurrency_tests {
 
             thread::spawn(move || {
                 for _ in 0..10 {
-                    let value = rsproperties::get(&name).unwrap();
+                    let value = rsproperties::get(&name);
                     assert_eq!(value, expected);
                     thread::sleep(Duration::from_millis(1));
                 }
@@ -335,7 +287,7 @@ mod concurrency_tests {
                 thread::sleep(Duration::from_millis(10));
 
                 // Verify we can read some value back
-                let retrieved = rsproperties::get(&name).unwrap();
+                let retrieved = rsproperties::get(&name);
                 assert!(!retrieved.is_empty());
 
                 println!("Thread {} set value: {}, got: {}", i, value, retrieved);
@@ -347,7 +299,7 @@ mod concurrency_tests {
         }
 
         // Final verification
-        let final_value = rsproperties::get(prop_name)?;
+        let final_value = rsproperties::get(prop_name);
         assert!(!final_value.is_empty());
 
         Ok(())

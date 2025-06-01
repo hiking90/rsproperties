@@ -10,16 +10,14 @@
 extern crate rsproperties;
 
 use rsproperties::{PROP_VALUE_MAX, PROP_DIRNAME};
-use std::sync::Once;
 
-static INIT_ONCE: Once = Once::new();
+#[path = "common.rs"]
+mod common;
+use common::init_test;
 
 /// Ensure rsproperties is initialized only once with the real property system
 fn ensure_init() {
-    INIT_ONCE.call_once(|| {
-        let props_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("__properties__");
-        rsproperties::init(Some(props_dir));
-    });
+    init_test();
 }
 
 #[test]
@@ -71,7 +69,7 @@ fn test_get_nonexistent_properties() {
     ];
 
     for property in &nonexistent_properties {
-        let result = rsproperties::get(property);
+        let result = rsproperties::get_with_result(property);
         assert!(result.is_err(), "Property '{}' should not exist", property);
     }
 
@@ -278,13 +276,9 @@ mod builder_tests {
                 println!("✓ Property set successfully");
 
                 // Try to read it back
-                match rsproperties::get("test.basic.set") {
-                    Ok(value) => {
-                        assert_eq!(value, "test_value");
-                        println!("✓ Property read back successfully: '{}'", value);
-                    }
-                    Err(e) => println!("⚠ Could not read back property: {}", e),
-                }
+                let value = rsproperties::get("test.basic.set");
+                assert_eq!(value, "test_value");
+                println!("✓ Property read back successfully: '{}'", value);
             }
             Err(e) => {
                 println!("⚠ Property set failed (expected without property service): {}", e);
@@ -359,13 +353,9 @@ mod builder_tests {
                         println!("✓ Updated property value");
 
                         // Verify the update
-                        match rsproperties::get(property_name) {
-                            Ok(value) => {
-                                assert_eq!(value, "updated_value");
-                                println!("✓ Property update verified: '{}'", value);
-                            }
-                            Err(e) => println!("⚠ Could not verify property update: {}", e),
-                        }
+                        let value = rsproperties::get(property_name);
+                        assert_eq!(value, "updated_value");
+                        println!("✓ Property update verified: '{}'", value);
                     }
                     Err(e) => println!("⚠ Property update failed: {}", e),
                 }
@@ -395,16 +385,12 @@ mod builder_tests {
                         println!("Thread {}: Set property '{}' = '{}'", thread_id, property_name, property_value);
 
                         // Try to read it back
-                        match rsproperties::get(&property_name) {
-                            Ok(value) => {
-                                println!("Thread {}: Read back value: '{}'", thread_id, value);
-                                if value == property_value {
-                                    println!("Thread {}: ✓ Value matches", thread_id);
-                                } else {
-                                    println!("Thread {}: ⚠ Value mismatch", thread_id);
-                                }
-                            }
-                            Err(e) => println!("Thread {}: ⚠ Read failed: {}", thread_id, e),
+                        let value = rsproperties::get(&property_name);
+                        println!("Thread {}: Read back value: '{}'", thread_id, value);
+                        if value == property_value {
+                            println!("Thread {}: ✓ Value matches", thread_id);
+                        } else {
+                            println!("Thread {}: ⚠ Value mismatch", thread_id);
                         }
                     }
                     Err(e) => println!("Thread {}: ⚠ Set failed: {}", thread_id, e),
@@ -452,7 +438,7 @@ fn test_integration_comprehensive() {
 
     // Test error conditions
     for property in &test_properties {
-        let result = rsproperties::get(property);
+        let result = rsproperties::get_with_result(property);
         assert!(result.is_err());
     }
 

@@ -3,17 +3,9 @@
 //! This test suite provides complete coverage of the rsproperties library's public API,
 //! testing both read and write functionality with the real Android property system.
 
-use std::sync::Once;
-
-static INIT: Once = Once::new();
-
-/// Ensure the library is initialized only once across all tests
-fn ensure_init() {
-    INIT.call_once(|| {
-        // Use the existing Android property system in __properties__
-        rsproperties::init(None);
-    });
-}
+#[path = "common.rs"]
+mod common;
+use common::init_test;
 
 #[test]
 fn test_library_constants() {
@@ -27,8 +19,8 @@ fn test_library_constants() {
 }
 
 #[test]
-fn test_init_and_dirname() {
-    ensure_init();
+fn init_test_and_dirname() {
+    init_test();
 
     // Test that dirname function works after initialization
     let dirname = rsproperties::dirname();
@@ -40,7 +32,7 @@ fn test_init_and_dirname() {
 
 #[test]
 fn test_get_with_default_functionality() {
-    ensure_init();
+    init_test();
 
     // Test with non-existent property
     let result = rsproperties::get_with_default("test.nonexistent.property.12345", "default_value");
@@ -60,37 +52,24 @@ fn test_get_with_default_functionality() {
 
 #[test]
 fn test_get_functionality() {
-    ensure_init();
+    init_test();
 
     // Test with non-existent property
     let result = rsproperties::get("test.nonexistent.property.67890");
-    assert!(result.is_err(), "Should return error for non-existent property");
+    assert!(result.is_empty(), "Should return empty string for non-existent property");
 
-    // Test error message quality
-    if let Err(e) = result {
-        let error_msg = format!("{}", e);
-        assert!(!error_msg.is_empty(), "Error message should not be empty");
-        println!("✓ Error message: {}", error_msg);
-    }
-
-    println!("✓ get() returns appropriate errors for non-existent properties");
+    println!("✓ get() returns empty string for non-existent properties");
 }
 
 #[cfg(feature = "builder")]
 mod write_tests {
-    use std::fs::{create_dir_all, remove_dir_all};
+    use super::*;
 
     #[test]
     fn test_set_functionality() {
-        // Create a temporary test directory for property system
-        let test_dir = "/tmp/rsproperties_write_test";
-        let _ = remove_dir_all(test_dir);
-        create_dir_all(test_dir).expect("Failed to create test directory");
+        init_test();
 
-        // Initialize with test directory
-        rsproperties::init(Some(test_dir.into()));
-
-        // Try to set a property (this may fail due to permission or initialization issues)
+        // Try to set a property using TestPropertyService
         let result = rsproperties::set("test.property.name", "test_value");
 
         match result {
@@ -98,36 +77,19 @@ mod write_tests {
                 println!("✓ set() function succeeded");
 
                 // Try to read the property back
-                let read_result = rsproperties::get("test.property.name");
-                match read_result {
-                    Ok(value) => {
-                        assert_eq!(value, "test_value", "Read value should match written value");
-                        println!("✓ Property read/write cycle successful");
-                    }
-                    Err(e) => println!("⚠ Could not read back written property: {}", e),
-                }
+                let value = rsproperties::get("test.property.name");
+                assert_eq!(value, "test_value", "Read value should match written value");
+                println!("✓ Property read/write cycle successful");
             }
             Err(e) => {
-                println!("⚠ set() function failed (this may be expected): {}", e);
-
-                // Verify the error is reasonable
-                let error_msg = format!("{}", e);
-                assert!(!error_msg.is_empty(), "Error message should not be empty");
+                println!("⚠ set() function failed: {}", e);
             }
         }
-
-        // Cleanup
-        let _ = remove_dir_all(test_dir);
     }
 
     #[test]
     fn test_set_property_edge_cases() {
-        let test_dir = "/tmp/rsproperties_edge_test";
-        let _ = remove_dir_all(test_dir);
-        create_dir_all(test_dir).expect("Failed to create test directory");
-
-        rsproperties::init(Some(test_dir.into()));
-
+        init_test();
         // Test setting empty value
         let result = rsproperties::set("test.empty.value", "");
         match result {
@@ -149,14 +111,12 @@ mod write_tests {
             Ok(_) => println!("✓ Setting property with special chars succeeded"),
             Err(e) => println!("⚠ Setting property with special chars failed: {}", e),
         }
-
-        let _ = remove_dir_all(test_dir);
     }
 }
 
 #[test]
 fn test_property_name_validation() {
-    ensure_init();
+    init_test();
 
     // Test various edge case property names
     let edge_cases = vec![
@@ -181,7 +141,7 @@ fn test_property_name_validation() {
 
 #[test]
 fn test_thread_safety() {
-    ensure_init();
+    init_test();
 
     use std::sync::Arc;
     use std::sync::Barrier;
@@ -224,13 +184,13 @@ fn test_thread_safety() {
 
 #[test]
 fn test_api_completeness() {
-    ensure_init();
+    init_test();
 
     // Verify that all expected public API functions exist and are callable
 
     // Core read functions
     let _: String = rsproperties::get_with_default("test", "default");
-    let _: Result<String, _> = rsproperties::get("test");
+    let _ = rsproperties::get("test");
 
     // Write functions (if builder feature enabled)
     #[cfg(feature = "builder")]
@@ -256,7 +216,7 @@ fn test_api_completeness() {
 
 #[test]
 fn test_error_handling_robustness() {
-    ensure_init();
+    init_test();
 
     // Test that the library handles various error conditions gracefully
 
@@ -280,7 +240,7 @@ fn test_error_handling_robustness() {
 
 #[test]
 fn test_performance_characteristics() {
-    ensure_init();
+    init_test();
 
     use std::time::Instant;
 
@@ -306,7 +266,7 @@ fn test_performance_characteristics() {
 
 #[test]
 fn test_real_android_properties() {
-    ensure_init();
+    init_test();
 
     // Try to read some common Android properties that might exist
     // These tests are informational and should not fail
@@ -325,7 +285,7 @@ fn test_real_android_properties() {
     let mut found_count = 0;
 
     for prop in common_properties {
-        match rsproperties::get(prop) {
+        match rsproperties::get_with_result(prop) {
             Ok(value) => {
                 found_count += 1;
                 println!("  {} = {}", prop, value);

@@ -120,10 +120,9 @@ impl SystemProperties {
     fn read_mutable_property_value(&self, prop_info: &PropertyInfo) -> Result<(u32, String)> {
         log::debug!("Reading mutable property value for: {:?}", prop_info.name());
 
-        let new_serial = prop_info.serial.load(std::sync::atomic::Ordering::Acquire);
-        let mut serial;
         loop {
-            serial = new_serial;
+            // Read current serial at the beginning of each iteration
+            let serial = prop_info.serial.load(Ordering::Acquire);
             let _len: u32 = serial_value_len(serial);
             log::trace!("Property serial: {}, length: {}, dirty: {}", serial, _len, serial_dirty(serial));
 
@@ -150,14 +149,19 @@ impl SystemProperties {
                 let value = prop_info.value();
                 value.as_str().map_err(Error::from)?.to_owned()
             };
+
+            // Ensure all previous loads are completed before checking serial again
             fence(Ordering::Acquire);
-            let new_serial = prop_info.serial.load(std::sync::atomic::Ordering::Acquire);
-            if new_serial == serial {
+
+            // Check if serial hasn't changed during our read operation
+            let final_serial = prop_info.serial.load(Ordering::Acquire);
+            if final_serial == serial {
                 log::debug!("Successfully read property value: {} (length: {})", value, value.len());
                 return Ok((serial, value));
             }
-            log::trace!("Serial changed during read, retrying...");
-            fence(Ordering::Acquire);
+
+            log::trace!("Serial changed during read ({} -> {}), retrying...", serial, final_serial);
+            // No need for additional fence here as we'll acquire again at loop start
         }
     }
 
@@ -174,8 +178,8 @@ impl SystemProperties {
         Ok((name, value))
     }
 
-    /// Get the value of a system property
-    pub fn get(&self, name: &str) -> Result<String> {
+    /// Internal function to get property value that returns error for missing properties
+    pub fn get_with_result(&self, name: &str) -> Result<String> {
         log::debug!("Getting property value for: {}", name);
 
         let res = match self.contexts.prop_area_for_name(name) {
@@ -204,8 +208,32 @@ impl SystemProperties {
                 Ok(value)
             }
             Err(e) => {
-                log::warn!("Property {} not found, returning empty string: {}", name, e);
-                Ok("".to_owned())
+                log::debug!("Property {} not found: {}", name, e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Get the value of a system property
+    /// Returns empty string if property is not found (Android compatible behavior)
+    pub fn get(&self, name: &str) -> String {
+        match self.get_with_result(name) {
+            Ok(value) => value,
+            Err(_) => {
+                log::warn!("Property {} not found, returning empty string", name);
+                "".to_owned()
+            }
+        }
+    }
+
+    /// Get the value of a system property with a default value
+    /// Returns the default value if property is not found or on error
+    pub fn get_with_default(&self, name: &str, default: &str) -> String {
+        match self.get_with_result(name) {
+            Ok(value) => value,
+            Err(_) => {
+                log::debug!("Property {} not found, returning default: {}", name, default);
+                default.to_owned()
             }
         }
     }
@@ -513,7 +541,7 @@ mod tests {
         let system_properties = SystemProperties::new(&Path::new(crate::PROP_DIRNAME)).unwrap();
 
         let handle = std::thread::spawn(move || {
-            let version1 = system_properties.get(VERSION_PROPERTY).unwrap();
+            let version1 = system_properties.get(VERSION_PROPERTY);
             let version2 = AndroidSystemProperties::new().get(VERSION_PROPERTY).unwrap();
             assert_eq!(version1, version2);
         });

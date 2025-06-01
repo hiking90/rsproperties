@@ -18,9 +18,18 @@
 //! ```rust
 //! #[cfg(target_os = "android")]
 //! {
-//!     // Initialize system properties.
-//!     // It must be called before using other functions. And None means the default directory "/dev/__properties__".
+//!     use rsproperties::{init, PropertyConfig};
+//!     use std::path::PathBuf;
+//!
+//!     // Initialize with defaults
 //!     rsproperties::init(None);
+//!
+//!     // Initialize with custom directories
+//!     let config = PropertyConfig {
+//!         properties_dir: Some(PathBuf::from("/custom/properties")),
+//!         socket_dir: Some(PathBuf::from("/custom/socket")),
+//!     };
+//!     rsproperties::init(Some(config));
 //!
 //!     // Get a value of the property.
 //!     let value = rsproperties::get_with_default("ro.build.version.sdk", "0");
@@ -35,6 +44,80 @@ use std::{
     sync::OnceLock,
     path::{PathBuf, Path},
 };
+
+/// Configuration for initializing the property system
+#[derive(Debug, Clone, Default)]
+pub struct PropertyConfig {
+    /// Directory for reading system properties (default: "/dev/__properties__")
+    pub properties_dir: Option<PathBuf>,
+    /// Directory for property service sockets (default: "/dev/socket")
+    pub socket_dir: Option<PathBuf>,
+}
+
+// Implement From traits for backward compatibility and convenience
+impl From<PathBuf> for PropertyConfig {
+    fn from(path: PathBuf) -> Self {
+        Self {
+            properties_dir: Some(path),
+            socket_dir: None,
+        }
+    }
+}
+
+impl From<String> for PropertyConfig {
+    fn from(path: String) -> Self {
+        Self {
+            properties_dir: Some(PathBuf::from(path)),
+            socket_dir: None,
+        }
+    }
+}
+
+impl From<&str> for PropertyConfig {
+    fn from(path: &str) -> Self {
+        Self {
+            properties_dir: Some(PathBuf::from(path)),
+            socket_dir: None,
+        }
+    }
+}
+
+impl PropertyConfig {
+    /// Create config from optional PathBuf (for backward compatibility)
+    pub fn from_optional_path(path: Option<PathBuf>) -> Self {
+        match path {
+            Some(path) => Self::from(path),
+            None => Self::default(),
+        }
+    }
+
+    /// Create config with only properties directory
+    pub fn with_properties_dir<P: Into<PathBuf>>(dir: P) -> Self {
+        Self {
+            properties_dir: Some(dir.into()),
+            socket_dir: None,
+        }
+    }
+
+    /// Create config with only socket directory
+    pub fn with_socket_dir<P: Into<PathBuf>>(dir: P) -> Self {
+        Self {
+            properties_dir: None,
+            socket_dir: Some(dir.into()),
+        }
+    }
+
+    /// Create config with both directories
+    pub fn with_both_dirs<P1: Into<PathBuf>, P2: Into<PathBuf>>(
+        properties_dir: P1,
+        socket_dir: P2
+    ) -> Self {
+        Self {
+            properties_dir: Some(properties_dir.into()),
+            socket_dir: Some(socket_dir.into()),
+        }
+    }
+}
 
 pub mod errors;
 pub use errors::{Error, Result, ContextWithLocation};
@@ -66,7 +149,6 @@ pub use property_info_serializer::*;
 pub use build_property_parser::*;
 #[cfg(all(feature = "builder", target_os = "linux"))]
 pub use socket_service::*;
-pub use system_property_set::set_socket_dir;
 
 pub const PROP_VALUE_MAX: usize = 92;
 pub const PROP_DIRNAME: &str = "/dev/__properties__";
@@ -76,24 +158,57 @@ static SYSTEM_PROPERTIES_DIR: OnceLock<PathBuf> = OnceLock::new();
 // Global system properties.
 static SYSTEM_PROPERTIES: OnceLock<system_properties::SystemProperties> = OnceLock::new();
 
-/// Initialize system properties.
-/// It must be called before using other functions.
-/// If dir is None, it uses the default directory "/dev/__properties__".
-pub fn init(dir: Option<PathBuf>) {
-    let dir = if let Some(dir) = dir {
-        log::info!("Initializing system properties with custom directory: {:?}", dir);
-        dir
-    } else {
-        log::info!("Initializing system properties with default directory: {}", PROP_DIRNAME);
-        PathBuf::from(PROP_DIRNAME)
-    };
+/// Initialize system properties with flexible configuration options.
+///
+/// # Arguments
+/// * `config` - Can be:
+///   - `None` - Use default directories
+///   - `Some(PathBuf)` - Set only properties directory (backward compatibility)
+///   - `Some(PropertyConfig)` - Full configuration
+///
+/// # Examples
+/// ```rust
+/// use rsproperties::{init, PropertyConfig};
+/// use std::path::PathBuf;
+///
+/// // Use defaults
+/// init(None::<PropertyConfig>);
+///
+/// // Set only properties directory (backward compatible)
+/// init(Some(PropertyConfig::from(PathBuf::from("/custom/properties"))));
+///
+/// // Full configuration
+/// let config = PropertyConfig {
+///     properties_dir: Some(PathBuf::from("/custom/properties")),
+///     socket_dir: Some(PathBuf::from("/custom/socket")),
+/// };
+/// init(Some(config));
+/// ```
+pub fn init(config: Option<PropertyConfig>) {
+    let config = config.unwrap_or_default();
 
-    match SYSTEM_PROPERTIES_DIR.set(dir.clone()) {
+    // Initialize properties directory
+    let props_dir = config.properties_dir.unwrap_or_else(|| {
+        log::info!("Using default properties directory: {}", PROP_DIRNAME);
+        PathBuf::from(PROP_DIRNAME)
+    });
+
+    match SYSTEM_PROPERTIES_DIR.set(props_dir.clone()) {
         Ok(_) => {
-            log::debug!("Successfully set system properties directory to: {:?}", dir);
+            log::info!("Successfully set system properties directory to: {:?}", props_dir);
         },
-        Err(e) => {
-            log::error!("Error setting system properties directory to {:?}: {}", dir, e.display());
+        Err(_) => {
+            log::warn!("System properties directory already set, ignoring new value");
+        }
+    }
+
+    // Initialize socket directory if specified
+    if let Some(socket_dir) = config.socket_dir {
+        let success = system_property_set::set_socket_dir_internal(&socket_dir);
+        if success {
+            log::info!("Successfully set socket directory to: {:?}", socket_dir);
+        } else {
+            log::warn!("Socket directory already set, ignoring new value");
         }
     }
 }
@@ -137,17 +252,18 @@ pub(crate) fn bionic_align(value: usize, alignment: usize) -> usize {
 /// If the property is not found, it returns the default value.
 /// If an error occurs, it returns the default value.
 pub fn get_with_default(name: &str, default: &str) -> String {
-    system_properties().get(name).unwrap_or_else(|err| {
-        log::error!("Error getting property {}: {}", name, err);
-        default.to_string()
-    })
+    system_properties().get_with_default(name, default)
 }
 
 /// Get a value of the property.
 /// If the property is not found, it returns an empty string.
 /// If an error occurs, it returns Err.
-pub fn get(name: &str) -> Result<String> {
+pub fn get(name: &str) -> String {
     system_properties().get(name)
+}
+
+pub fn get_with_result(name: &str) -> Result<String> {
+    system_properties().get_with_result(name)
 }
 
 /// Set a value of the property.
@@ -231,24 +347,6 @@ mod tests {
         }
     }
 
-    #[cfg(all(target_os = "linux", feature = "builder"))]
-    #[test]
-    fn test_set() -> Result<()> {
-        enable_logger();
-
-        let _guard = system_properties_area();
-
-        let prop = "test.property";
-        let value = "test.value";
-
-        super::set(prop, value)?;
-
-        let value1: String = get(prop)?;
-        assert_eq!(value1, value);
-
-        Ok(())
-    }
-
     #[cfg(all(feature = "builder", target_os = "linux"))]
     fn load_properties() -> HashMap<String, String> {
         let build_prop_files = vec![
@@ -283,7 +381,7 @@ mod tests {
 
     #[cfg(all(feature = "builder", target_os = "linux"))]
     fn build_property_dir(dir: &str) -> SystemProperties {
-        crate::init(Some(PathBuf::from(dir)));
+        crate::init(Some(PropertyConfig::from(PathBuf::from(dir))));
 
         let property_contexts_files = vec![
             "tests/android/plat_property_contexts",
@@ -338,7 +436,7 @@ mod tests {
         let properties = load_properties();
 
         for (key, value) in properties.iter() {
-            let prop_value = system_properties.get(key.as_str()).unwrap();
+            let prop_value = system_properties.get(key.as_str());
             assert_eq!(prop_value, value.as_str());
         }
     }

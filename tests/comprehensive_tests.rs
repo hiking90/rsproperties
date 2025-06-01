@@ -15,7 +15,8 @@ fn ensure_init() {
     INIT_ONCE.call_once(|| {
         // Initialize with the existing __properties__ directory
         let props_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("__properties__");
-        rsproperties::init(Some(props_dir));
+        let config = rsproperties::PropertyConfig::with_properties_dir(props_dir);
+        rsproperties::init(Some(config));
     });
 }
 
@@ -68,7 +69,7 @@ fn test_get_nonexistent_properties() {
     ];
 
     for prop in &nonexistent_props {
-        let result = rsproperties::get(prop);
+        let result = rsproperties::get_with_result(prop);
         assert!(result.is_err(), "Getting non-existent property '{}' should return error", prop);
     }
 
@@ -123,7 +124,7 @@ fn test_property_name_validation() {
     ];
 
     for name in &invalid_names {
-        let result = rsproperties::get(name);
+        let result = rsproperties::get_with_result(name);
         // Most should fail, but we don't enforce strict requirements
         // since behavior may vary by implementation
         println!("Tested invalid name '{}': {:?}", name, result.is_err());
@@ -215,13 +216,9 @@ mod builder_tests {
                 println!("✓ Property set successfully");
 
                 // Try to read it back
-                match rsproperties::get("test.basic.property") {
-                    Ok(value) => {
-                        assert_eq!(value, "test_value");
-                        println!("✓ Property read back successfully: {}", value);
-                    }
-                    Err(e) => println!("⚠ Could not read back property: {}", e),
-                }
+                let value = rsproperties::get("test.basic.property");
+                assert_eq!(value, "test_value");
+                println!("✓ Property read back successfully: {}", value);
             }
             Err(e) => {
                 println!("⚠ Property set failed (expected without property service): {}", e);
@@ -294,13 +291,9 @@ mod builder_tests {
                         println!("✓ Updated property value");
 
                         // Verify the update
-                        match rsproperties::get(prop_name) {
-                            Ok(value) => {
-                                assert_eq!(value, "updated");
-                                println!("✓ Property update verified: {}", value);
-                            }
-                            Err(e) => println!("⚠ Could not verify property update: {}", e),
-                        }
+                        let value = rsproperties::get(prop_name);
+                        assert_eq!(value, "updated");
+                        println!("✓ Property update verified: {}", value);
                     }
                     Err(e) => println!("⚠ Property update failed: {}", e),
                 }
@@ -312,7 +305,6 @@ mod builder_tests {
     #[test]
     fn test_concurrent_property_operations() {
         use std::thread;
-        use std::sync::Arc;
 
         ensure_init();
 
@@ -329,10 +321,8 @@ mod builder_tests {
                         println!("Thread {}: Set property {} = {}", i, prop_name, prop_value);
 
                         // Try to read it back
-                        match rsproperties::get(&prop_name) {
-                            Ok(value) => println!("Thread {}: Read back: {}", i, value),
-                            Err(e) => println!("Thread {}: Read failed: {}", i, e),
-                        }
+                        let value = rsproperties::get(&prop_name);
+                        println!("Thread {}: Read back: {}", i, value);
                     }
                     Err(e) => println!("Thread {}: Set failed: {}", i, e),
                 }
@@ -357,7 +347,7 @@ fn test_error_handling() {
 
     // Very long property name
     let long_name = "test.".repeat(100) + "property";
-    let result = rsproperties::get(&long_name);
+    let result = rsproperties::get_with_result(&long_name);
     // This may or may not fail depending on implementation limits
     println!("Long property name test: {:?}", result.is_err());
 
@@ -365,7 +355,7 @@ fn test_error_handling() {
     // Note: Rust strings are UTF-8 and don't allow null bytes normally
 
     // Empty property name
-    let result = rsproperties::get("");
+    let result = rsproperties::get_with_result("");
     println!("Empty property name test: {:?}", result.is_err());
 
     println!("✓ Error handling tests completed");
@@ -386,7 +376,7 @@ fn test_real_android_properties() {
     ];
 
     for prop in &common_props {
-        match rsproperties::get(prop) {
+        match rsproperties::get_with_result(prop) {
             Ok(value) => println!("Found property {} = {}", prop, value),
             Err(_) => {
                 // Use get_with_default to test the functionality

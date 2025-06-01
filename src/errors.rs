@@ -118,6 +118,58 @@ where
     }
 }
 
+/// Validates file metadata for system property files.
+///
+/// In test and debug modes, only checks file permissions and size.
+/// In production mode, also enforces that the file is owned by root (uid=0, gid=0).
+pub fn validate_file_metadata(
+    metadata: &std::fs::Metadata,
+    path: &std::path::Path,
+    min_size: u64
+) -> Result<()> {
+    // Platform-specific MetadataExt imports
+    #[cfg(target_os = "macos")]
+    use std::os::macos::fs::MetadataExt;
+    #[cfg(target_os = "android")]
+    use std::os::android::fs::MetadataExt;
+    #[cfg(target_os = "linux")]
+    use std::os::linux::fs::MetadataExt;
+
+    use rustix::fs;
+
+    log::trace!("Validating file metadata: uid={}, gid={}, mode={:#o}, size={} for {:?}",
+               metadata.st_uid(), metadata.st_gid(), metadata.st_mode(), metadata.st_size(), path);
+
+    // Check file size first (applies to all modes)
+    if metadata.st_size() < min_size {
+        let error_msg = format!("File too small: size={}, min_size={} for {:?}",
+                               metadata.st_size(), min_size, path);
+        log::error!("{}", error_msg);
+        return Err(Error::new_context(error_msg).into());
+    }
+
+    // Check write permissions (applies to all modes)
+    if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 {
+        let error_msg = format!("File has group or other write permissions: mode={:#o} for {:?}",
+                               metadata.st_mode(), path);
+        log::error!("{}", error_msg);
+        return Err(Error::new_context("Invalid file metadata".to_string()).into());
+    }
+
+    // In production mode, also check ownership
+    if !cfg!(test) && !cfg!(debug_assertions) {
+        if metadata.st_uid() != 0 || metadata.st_gid() != 0 {
+            let error_msg = format!("File not owned by root: uid={}, gid={} for {:?}",
+                                   metadata.st_uid(), metadata.st_gid(), path);
+            log::error!("{}", error_msg);
+            return Err(Error::new_context("Invalid file metadata".to_string()).into());
+        }
+    }
+
+    log::debug!("File metadata validation passed for {:?}", path);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
