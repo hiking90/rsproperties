@@ -211,10 +211,13 @@ pub fn init(config: PropertyConfig) {
 }
 
 /// Get the system properties directory.
-/// It returns None if init() is not called.
-/// It returns Some(&PathBuf) if init() is called.
+/// Returns the configured directory if init() was called,
+/// otherwise returns the default PROP_DIRNAME (/dev/__properties__).
 pub fn properties_dir() -> &'static Path {
-    let path = SYSTEM_PROPERTIES_DIR.get().expect("Call init() first.").as_path();
+    let path = SYSTEM_PROPERTIES_DIR.get_or_init(|| {
+        log::info!("Using default properties directory: {}", PROP_DIRNAME);
+        PathBuf::from(PROP_DIRNAME)
+    }).as_path();
     log::trace!("Getting system properties directory: {:?}", path);
     path
 }
