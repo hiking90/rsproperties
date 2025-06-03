@@ -7,6 +7,8 @@ A pure Rust implementation of Android's property system for Linux and Android.
 - **`rsproperties`**: Core library for getting/setting Android properties
 - **`rsproperties-service`**: Full property service for Linux
 
+**Note:** This project is actively evolving. While core APIs are stable, some features may be refined in future releases.
+
 ## Features
 
 - Direct memory-mapped property access
