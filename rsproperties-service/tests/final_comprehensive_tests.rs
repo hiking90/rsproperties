@@ -15,11 +15,6 @@ use rsproperties::{PROP_VALUE_MAX, PROP_DIRNAME};
 mod common;
 use common::init_test;
 
-/// Ensure rsproperties is initialized only once with the real property system
-fn ensure_init() {
-    init_test();
-}
-
 #[test]
 fn test_api_constants() {
     // Verify Android system property constants are correct
@@ -31,9 +26,9 @@ fn test_api_constants() {
     println!("  PROP_DIRNAME = '{}'", PROP_DIRNAME);
 }
 
-#[test]
-fn test_get_with_default_comprehensive() {
-    ensure_init();
+#[tokio::test]
+async fn test_get_with_default_comprehensive() {
+    init_test().await;
 
     // Test cases for get_with_default function
     let test_cases = [
@@ -54,9 +49,9 @@ fn test_get_with_default_comprehensive() {
     println!("✓ get_with_default comprehensive tests passed ({} cases)", test_cases.len());
 }
 
-#[test]
-fn test_get_nonexistent_properties() {
-    ensure_init();
+#[tokio::test]
+async fn test_get_nonexistent_properties() {
+    init_test().await;
 
     // Test that getting non-existent properties returns errors
     let nonexistent_properties = [
@@ -77,11 +72,11 @@ fn test_get_nonexistent_properties() {
              nonexistent_properties.len());
 }
 
-#[test]
-fn test_dirname_functionality() {
-    ensure_init();
+#[tokio::test]
+async fn test_dirname_functionality() {
+    init_test().await;
 
-    let dirname = rsproperties::dirname();
+    let dirname = rsproperties::properties_dir();
     let dirname_str = dirname.to_string_lossy();
 
     // Verify dirname is not empty and looks like a path
@@ -93,9 +88,9 @@ fn test_dirname_functionality() {
     println!("  Current dirname: '{}'", dirname_str);
 }
 
-#[test]
-fn test_property_name_validation() {
-    ensure_init();
+#[tokio::test]
+async fn test_property_name_validation() {
+    init_test().await;
 
     // Test various property name formats
     let valid_format_names = [
@@ -136,8 +131,8 @@ fn test_property_name_validation() {
     println!("  Tested {} edge case names", edge_case_names.len());
 }
 
-#[test]
-fn test_property_value_length_limits() {
+#[tokio::test]
+async fn test_property_value_length_limits() {
     // Test maximum value length constant
     let max_length_value = "x".repeat(PROP_VALUE_MAX);
     assert_eq!(max_length_value.len(), PROP_VALUE_MAX);
@@ -145,7 +140,7 @@ fn test_property_value_length_limits() {
     let too_long_value = "x".repeat(PROP_VALUE_MAX + 1);
     assert_eq!(too_long_value.len(), PROP_VALUE_MAX + 1);
 
-    ensure_init();
+    init_test().await;
 
     // Test with get_with_default (should work regardless of length)
     let result1 = rsproperties::get_with_default("test.max.length", &max_length_value);
@@ -159,13 +154,13 @@ fn test_property_value_length_limits() {
     println!("  Tested values of length {} and {}", max_length_value.len(), too_long_value.len());
 }
 
-#[test]
-fn test_thread_safety() {
+#[tokio::test]
+async fn test_thread_safety() {
     use std::thread;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    ensure_init();
+    init_test().await;
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let mut handles = vec![];
@@ -190,7 +185,7 @@ fn test_thread_safety() {
                 success_count_clone.fetch_add(1, Ordering::SeqCst);
 
                 // Test dirname (should always work)
-                let _dirname = rsproperties::dirname();
+                let _dirname = rsproperties::properties_dir();
                 success_count_clone.fetch_add(1, Ordering::SeqCst);
             }
         });
@@ -211,9 +206,9 @@ fn test_thread_safety() {
     println!("  {} threads × 5 operations × 3 calls = {} total operations", 10, expected_count);
 }
 
-#[test]
-fn test_error_handling() {
-    ensure_init();
+#[tokio::test]
+async fn test_error_handling() {
+    init_test().await;
 
     // Test various error conditions
 
@@ -234,11 +229,11 @@ fn test_error_handling() {
     println!("  Tested various edge cases for error conditions");
 }
 
-#[test]
-fn test_performance_basic() {
+#[tokio::test]
+async fn test_performance_basic() {
     use std::time::Instant;
 
-    ensure_init();
+    init_test().await;
 
     // Test performance of get_with_default
     let start = Instant::now();
@@ -261,13 +256,12 @@ fn test_performance_basic() {
 }
 
 // Tests that require the builder feature
-#[cfg(feature = "builder")]
 mod builder_tests {
     use super::*;
 
-    #[test]
-    fn test_set_property_basic() {
-        ensure_init();
+    #[tokio::test]
+    async fn test_set_property_basic() {
+        init_test().await;
 
         let result = rsproperties::set("test.basic.set", "test_value");
 
@@ -287,9 +281,9 @@ mod builder_tests {
         }
     }
 
-    #[test]
-    fn test_set_property_various_values() {
-        ensure_init();
+    #[tokio::test]
+    async  fn test_set_property_various_values() {
+        init_test().await;
 
         let test_cases = [
             ("test.empty.value", ""),
@@ -310,9 +304,9 @@ mod builder_tests {
         println!("✓ Set property various values test completed");
     }
 
-    #[test]
-    fn test_set_property_length_limits() {
-        ensure_init();
+    #[tokio::test]
+    async fn test_set_property_length_limits() {
+        init_test().await;
 
         // Test setting property with maximum allowed length
         let max_value = "x".repeat(PROP_VALUE_MAX);
@@ -336,9 +330,9 @@ mod builder_tests {
         println!("✓ Set property length limits test completed");
     }
 
-    #[test]
-    fn test_property_update() {
-        ensure_init();
+    #[tokio::test]
+    async fn test_property_update() {
+        init_test().await;
 
         let property_name = "test.update.property";
 
@@ -366,11 +360,11 @@ mod builder_tests {
         println!("✓ Property update test completed");
     }
 
-    #[test]
-    fn test_concurrent_property_sets() {
+    #[tokio::test]
+    async fn test_concurrent_property_sets() {
         use std::thread;
 
-        ensure_init();
+        init_test().await;
 
         let mut handles = vec![];
 
@@ -409,9 +403,9 @@ mod builder_tests {
     }
 }
 
-#[test]
-fn test_integration_comprehensive() {
-    ensure_init();
+#[tokio::test]
+async fn test_integration_comprehensive() {
+    init_test().await;
 
     // Comprehensive integration test combining multiple operations
 
@@ -420,7 +414,7 @@ fn test_integration_comprehensive() {
     assert_eq!(PROP_DIRNAME, "/dev/__properties__");
 
     // Test dirname
-    let dirname = rsproperties::dirname();
+    let dirname = rsproperties::properties_dir();
     assert!(!dirname.to_string_lossy().is_empty());
 
     // Test multiple get_with_default calls

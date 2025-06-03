@@ -86,7 +86,7 @@ fn test_get_nonexistent_returns_error() {
 fn test_dirname_function() {
     init_properties();
 
-    let dirname = rsproperties::dirname();
+    let dirname = rsproperties::properties_dir();
     let dirname_str = dirname.to_string_lossy();
 
     // Verify dirname returns a valid path
@@ -146,7 +146,7 @@ fn test_thread_safety_basic() {
                 counter_clone.fetch_add(1, Ordering::SeqCst);
 
                 // Test dirname
-                let _dirname = rsproperties::dirname();
+                let _dirname = rsproperties::properties_dir();
                 counter_clone.fetch_add(1, Ordering::SeqCst);
             }
         });
@@ -296,7 +296,7 @@ fn test_comprehensive_integration() {
     assert_eq!(PROP_DIRNAME, "/dev/__properties__");
 
     // 2. Test dirname
-    let dirname = rsproperties::dirname();
+    let dirname = rsproperties::properties_dir();
     assert!(!dirname.to_string_lossy().is_empty());
 
     // 3. Test get_with_default for multiple properties

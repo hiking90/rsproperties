@@ -1,15 +1,23 @@
-[package]
-name = "rsproperties"
+[workspace]
+members = [
+    "rsproperties",
+    "rsproperties-service",
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+authors = ["Jeff Kim <hiking90@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/yourusername/rsproperties"
+homepage = "https://github.com/yourusername/rsproperties"
+documentation = "https://docs.rs/rsproperties"
+keywords = ["android", "properties", "system"]
+categories = ["os", "api-bindings"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[features]
-default = ["builder"]
-builder = []
-
-[dependencies]
+[workspace.dependencies]
+# Common dependencies shared across workspace
 rustix = { version = "1.0", features = ["fs", "mm", "thread", "process", "net"] }
 log = "0.4"
 zerocopy = "0.8"
@@ -17,15 +25,10 @@ zerocopy-derive = "0.8"
 thiserror = "2.0"
 anyhow = "1.0"
 pretty-hex = "0.4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util"] }
+rsactor = "0.7"
 
-[dev-dependencies]
+# Dev dependencies
 android_system_properties = "0.1"
 env_logger = "0.11"
-
-[[example]]
-name = "socket_service_client"
-required-features = ["builder"]
-
-[[example]]
-name = "socket_service_server"
-required-features = ["builder"]
+ctrlc = "3.4"

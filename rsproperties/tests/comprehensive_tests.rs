@@ -16,7 +16,7 @@ fn ensure_init() {
         // Initialize with the existing __properties__ directory
         let props_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("__properties__");
         let config = rsproperties::PropertyConfig::with_properties_dir(props_dir);
-        rsproperties::init(Some(config));
+        rsproperties::init(config);
     });
 }
 
@@ -80,7 +80,7 @@ fn test_get_nonexistent_properties() {
 fn test_dirname_function() {
     ensure_init();
 
-    let dirname = rsproperties::dirname();
+    let dirname = rsproperties::properties_dir();
     let dirname_str = dirname.to_string_lossy();
 
     // Should not be empty
@@ -161,7 +161,7 @@ fn test_thread_safety() {
                 counter_clone.fetch_add(1, Ordering::SeqCst);
 
                 // Test dirname
-                let _dirname = rsproperties::dirname();
+                let _dirname = rsproperties::properties_dir();
                 counter_clone.fetch_add(1, Ordering::SeqCst);
             }
         });

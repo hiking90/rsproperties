@@ -13,10 +13,10 @@ mod common;
 use common::init_test;
 
 /// Basic usage example - demonstrates the most common patterns
-#[test]
-fn example_basic_usage() -> Result<()> {
+#[tokio::test]
+async fn example_basic_usage() -> Result<()> {
     // Initialize the library with a test directory
-    init_test();
+    init_test().await;
 
     // Reading a property that doesn't exist - use get_with_default
     let sdk_version = rsproperties::get_with_default("ro.build.version.sdk", "unknown");
@@ -34,11 +34,10 @@ fn example_basic_usage() -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "builder")]
-#[test]
-fn example_setting_properties() -> Result<()> {
+#[tokio::test]
+async fn example_setting_properties() -> Result<()> {
     // Initialize for testing
-    init_test();
+    init_test().await;
 
     // Set a simple property
     rsproperties::set("my.app.version", "1.0.0")?;
@@ -76,9 +75,9 @@ fn example_setting_properties() -> Result<()> {
 }
 
 /// Example showing error handling patterns
-#[test]
-fn example_error_handling() {
-    init_test();
+#[tokio::test]
+async fn example_error_handling() {
+    init_test().await;
 
     // Safe way - always get a value, using default for missing properties
     let timeout = rsproperties::get_with_default("network.timeout", "30");
@@ -111,9 +110,9 @@ fn example_error_handling() {
 }
 
 /// Example showing different property patterns used in Android
-#[test]
-fn example_android_property_patterns() {
-    init_test();
+#[tokio::test]
+async fn example_android_property_patterns() {
+    init_test().await;
 
     // Common Android property patterns and their typical usage
     let android_properties = vec![
@@ -162,10 +161,9 @@ fn example_android_property_patterns() {
     }
 }
 
-#[cfg(feature = "builder")]
-#[test]
-fn example_configuration_management() -> Result<()> {
-    init_test();
+#[tokio::test]
+async fn example_configuration_management() -> Result<()> {
+    init_test().await;
 
     // Example: Managing application configuration through properties
 
@@ -226,9 +224,9 @@ fn example_configuration_management() -> Result<()> {
 }
 
 /// Example showing property watching patterns (conceptual)
-#[test]
-fn example_property_monitoring() {
-    init_test();
+#[tokio::test]
+async fn example_property_monitoring() {
+    init_test().await;
 
     // This demonstrates how you might monitor properties in a real application
     // Note: Actual watching would require the wait functionality from SystemProperties
@@ -256,16 +254,17 @@ fn example_property_monitoring() {
 }
 
 /// Example demonstrating best practices
-#[test]
-fn example_best_practices() -> Result<()> {
-    init_test();
+#[tokio::test]
+async fn example_best_practices() {
+    init_test().await;
 
     // ✅ Good: Use meaningful property names with clear hierarchy
-    #[cfg(feature = "builder")]
     {
-        rsproperties::set("com.myapp.feature.cache.enabled", "true")?;
-        rsproperties::set("com.myapp.network.retry.count", "3")?;
-        rsproperties::set("com.myapp.ui.theme", "dark")?;
+        println!("Setting up application properties...");
+        rsproperties::set("com.myapp.feature.cache.enabled", "true").unwrap();
+        rsproperties::set("com.myapp.network.retry.count", "3").unwrap();
+        rsproperties::set("com.myapp.ui.theme", "dark").unwrap();
+        println!("Properties set successfully.");
     }
 
     // ✅ Good: Always provide sensible defaults
@@ -305,6 +304,4 @@ fn example_best_practices() -> Result<()> {
     let telemetry_enabled = rsproperties::get_with_default(FEATURE_FLAG_TELEMETRY, "false") == "true";
 
     println!("Analytics: {}, Telemetry: {}", analytics_enabled, telemetry_enabled);
-
-    Ok(())
 }

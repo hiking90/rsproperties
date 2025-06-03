@@ -14,8 +14,8 @@ use anyhow::Context;
 use crate::errors::*;
 
 const DEFAULT_SOCKET_DIR: &str = "/dev/socket";
-const PROPERTY_SERVICE_SOCKET_NAME: &str = "property_service";
-const PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME: &str = "property_service_for_system";
+pub const PROPERTY_SERVICE_SOCKET_NAME: &str = "property_service";
+pub const PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME: &str = "property_service_for_system";
 const PROP_SERVICE_NAME: &str = "property_service";
 // const PROP_SERVICE_FOR_SYSTEM_NAME: &str = "property_service_for_system";
 
@@ -38,7 +38,7 @@ static SOCKET_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// # Returns
 /// * `true` if the directory was successfully set (first call)
 /// * `false` if the directory was already set (subsequent calls)
-pub(crate) fn set_socket_dir_internal<P: AsRef<Path>>(dir: P) -> bool {
+pub(crate) fn set_socket_dir<P: AsRef<Path>>(dir: P) -> bool {
     let dir_path = dir.as_ref().to_path_buf();
     log::info!("Attempting to set socket directory to: {}", dir_path.display());
 
@@ -61,7 +61,7 @@ pub(crate) fn set_socket_dir_internal<P: AsRef<Path>>(dir: P) -> bool {
 /// 1. Directory set via `set_socket_dir()`
 /// 2. `PROPERTY_SERVICE_SOCKET_DIR` environment variable
 /// 3. Default directory: `/dev/socket`
-pub(crate) fn get_socket_dir() -> &'static PathBuf {
+pub fn socket_dir() -> &'static PathBuf {
     SOCKET_DIR.get_or_init(|| {
         let dir = env::var("PROPERTY_SERVICE_SOCKET_DIR")
             .unwrap_or_else(|_| DEFAULT_SOCKET_DIR.to_string());
@@ -73,14 +73,14 @@ pub(crate) fn get_socket_dir() -> &'static PathBuf {
 
 /// Get the full path to the property service socket
 fn get_property_service_socket() -> String {
-    let socket_path = get_socket_dir().join(PROPERTY_SERVICE_SOCKET_NAME);
+    let socket_path = socket_dir().join(PROPERTY_SERVICE_SOCKET_NAME);
     log::trace!("Property service socket path: {}", socket_path.display());
     socket_path.to_string_lossy().into_owned()
 }
 
 /// Get the full path to the system property service socket
 fn get_property_service_for_system_socket() -> String {
-    let socket_path = get_socket_dir().join(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
+    let socket_path = socket_dir().join(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
     log::trace!("System property service socket path: {}", socket_path.display());
     socket_path.to_string_lossy().into_owned()
 }
@@ -121,9 +121,10 @@ impl ServiceConnection {
 
     fn recv_i32(&mut self) -> Result<i32> {
         log::trace!("Receiving i32 response from property service");
-        let value: i32 = 0;
-        self.stream.read_exact(&mut value.to_ne_bytes())
+        let mut buf = [0u8; 4];
+        self.stream.read_exact(&mut buf)
             .context("Unable to read i32 from property service")?;
+        let value = i32::from_ne_bytes(buf);
         log::debug!("Received i32 response from property service: {}", value);
         Ok(value)
     }

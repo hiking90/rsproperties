@@ -23,7 +23,7 @@ fn init_test_and_dirname() {
     init_test();
 
     // Test that dirname function works after initialization
-    let dirname = rsproperties::dirname();
+    let dirname = rsproperties::properties_dir();
     assert!(!dirname.to_string_lossy().is_empty(), "dirname should not be empty after init");
 
     println!("✓ init() and dirname() work correctly");
@@ -199,7 +199,7 @@ fn test_api_completeness() {
     }
 
     // Utility functions
-    let _: std::path::PathBuf = rsproperties::dirname().to_path_buf();
+    let _: std::path::PathBuf = rsproperties::properties_dir().to_path_buf();
 
     // Constants
     let _: usize = rsproperties::PROP_VALUE_MAX;

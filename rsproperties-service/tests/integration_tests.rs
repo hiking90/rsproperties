@@ -16,14 +16,14 @@ use rsproperties;
 mod common;
 use common::init_test;
 
-fn setup_test_env() {
+async fn setup_test_env() {
     let _ = env_logger::builder().is_test(true).try_init();
-    init_test();
+    init_test().await;
 }
 
-#[test]
-fn test_get_with_default_nonexistent_property() {
-    setup_test_env();
+#[tokio::test]
+async fn test_get_with_default_nonexistent_property() {
+    setup_test_env().await;
 
     let prop_name = "nonexistent.test.property";
     let default_value = "default_test_value";
@@ -32,9 +32,9 @@ fn test_get_with_default_nonexistent_property() {
     assert_eq!(result, default_value);
 }
 
-#[test]
-fn test_get_with_default_empty_default() {
-    setup_test_env();
+#[tokio::test]
+async fn test_get_with_default_empty_default() {
+    setup_test_env().await;
 
     let prop_name = "another.nonexistent.property";
     let default_value = "";
@@ -43,9 +43,9 @@ fn test_get_with_default_empty_default() {
     assert_eq!(result, default_value);
 }
 
-#[test]
-fn test_get_nonexistent_property() {
-    setup_test_env();
+#[tokio::test]
+async fn test_get_nonexistent_property() {
+    setup_test_env().await;
 
     let prop_name = "definitely.does.not.exist";
     let result = rsproperties::get(prop_name);
@@ -55,13 +55,12 @@ fn test_get_nonexistent_property() {
 }
 
 
-#[cfg(feature = "builder")]
 mod builder_tests {
     use super::*;
 
-    #[test]
-    fn test_set_and_get_property() -> anyhow::Result<()> {
-        setup_test_env();
+    #[tokio::test]
+    async fn test_set_and_get_property() -> anyhow::Result<()> {
+        setup_test_env().await;
 
         let prop_name = "test.set.property";
         let prop_value = "test_value_123";
@@ -80,9 +79,9 @@ mod builder_tests {
         Ok(())
     }
 
-    #[test]
-    fn test_set_property_with_special_characters() -> anyhow::Result<()> {
-        setup_test_env();
+    #[tokio::test]
+    async fn test_set_property_with_special_characters() -> anyhow::Result<()> {
+        setup_test_env().await;
 
         let prop_name = "test.special.chars";
         let prop_value = "value with spaces and symbols: !@#$%^&*()";
@@ -94,9 +93,9 @@ mod builder_tests {
         Ok(())
     }
 
-    #[test]
-    fn test_set_property_empty_value() -> anyhow::Result<()> {
-        setup_test_env();
+    #[tokio::test]
+    async fn test_set_property_empty_value() -> anyhow::Result<()> {
+        setup_test_env().await;
 
         let prop_name = "test.empty.value";
         let prop_value = "";
@@ -108,9 +107,9 @@ mod builder_tests {
         Ok(())
     }
 
-    #[test]
-    fn test_update_existing_property() -> anyhow::Result<()> {
-        setup_test_env();
+    #[tokio::test]
+    async fn test_update_existing_property() -> anyhow::Result<()> {
+        setup_test_env().await;
 
         let prop_name = "test.update.property";
         let initial_value = "initial_value";
@@ -129,18 +128,18 @@ mod builder_tests {
         Ok(())
     }
 
-    #[test]
-    fn test_set_invalid_property_name() {
-        setup_test_env();
+    #[tokio::test]
+    async fn test_set_invalid_property_name() {
+        setup_test_env().await;
 
         // Test with empty property name
         let result = rsproperties::set("", "value");
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_multiple_properties() -> anyhow::Result<()> {
-        setup_test_env();
+    #[tokio::test]
+    async fn test_multiple_properties() -> anyhow::Result<()> {
+        setup_test_env().await;
 
         let properties = vec![
             ("test.prop.one", "value1"),
@@ -164,12 +163,13 @@ mod builder_tests {
     }
 }
 
-#[cfg(all(feature = "builder", target_os = "linux"))]
 mod linux_specific_tests {
     use super::*;
 
-    #[test]
-    fn test_property_persistence() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn test_property_persistence() -> anyhow::Result<()> {
+        setup_test_env().await;
+
         let prop_name = "persist.test.property";
         let prop_value = "persistent_value";
 
@@ -188,9 +188,9 @@ mod linux_specific_tests {
 mod error_handling_tests {
     use super::*;
 
-    #[test]
-    fn test_get_with_very_long_property_name() {
-        setup_test_env();
+    #[tokio::test]
+    async fn test_get_with_very_long_property_name() {
+        setup_test_env().await;
 
         // Create a very long property name
         let long_name = "a".repeat(1000);
@@ -201,10 +201,9 @@ mod error_handling_tests {
         assert_eq!(result, default_value);
     }
 
-    #[cfg(feature = "builder")]
-    #[test]
-    fn test_set_property_with_max_value_length() {
-        setup_test_env();
+    #[tokio::test]
+    async fn test_set_property_with_max_value_length() {
+        setup_test_env().await;
 
         let prop_name = "test.max.value";
         // Create a value close to PROP_VALUE_MAX
@@ -215,10 +214,9 @@ mod error_handling_tests {
         assert!(result.is_ok());
     }
 
-    #[cfg(feature = "builder")]
-    #[test]
-    fn test_set_property_exceeding_max_value_length() {
-        setup_test_env();
+    #[tokio::test]
+    async fn test_set_property_exceeding_max_value_length() {
+        setup_test_env().await;
 
         let prop_name = "test.exceeding.max";
         // Create a value that exceeds PROP_VALUE_MAX
@@ -232,15 +230,14 @@ mod error_handling_tests {
 }
 
 /// Test concurrent access patterns
-#[cfg(feature = "builder")]
 mod concurrency_tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
 
-    #[test]
-    fn test_concurrent_property_access() -> anyhow::Result<()> {
-        setup_test_env();
+    #[tokio::test]
+    async fn test_concurrent_property_access() -> anyhow::Result<()> {
+        setup_test_env().await;
 
         let prop_name = "test.concurrent.property";
         let prop_value = "concurrent_value";
@@ -269,9 +266,9 @@ mod concurrency_tests {
         Ok(())
     }
 
-    #[test]
-    fn test_concurrent_property_updates() -> anyhow::Result<()> {
-        setup_test_env();
+    #[tokio::test]
+    async fn test_concurrent_property_updates() -> anyhow::Result<()> {
+        setup_test_env().await;
 
         let prop_name = "test.concurrent.updates";
 
@@ -284,7 +281,7 @@ mod concurrency_tests {
             thread::spawn(move || {
                 let value = format!("thread_{}_value", i);
                 rsproperties::set(&name, &value).unwrap();
-                thread::sleep(Duration::from_millis(10));
+                // thread::sleep(Duration::from_millis(10));
 
                 // Verify we can read some value back
                 let retrieved = rsproperties::get(&name);

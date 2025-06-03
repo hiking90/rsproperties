@@ -54,7 +54,7 @@ fn system_properties_area() -> MutexGuard<'static, Option<SystemProperties>> {
 
 fn build_property_dir(dir: &str) -> SystemProperties {
     let config = rsproperties::PropertyConfig::with_properties_dir(PathBuf::from(dir));
-    rsproperties::init(Some(config));
+    rsproperties::init(config);
 
     let property_contexts_files = vec![
         "tests/android/plat_property_contexts",
@@ -76,7 +76,7 @@ fn build_property_dir(dir: &str) -> SystemProperties {
     let data = build_trie(&property_infos, "u:object_r:build_prop:s0", "string")
         .expect("Failed to build trie");
 
-    let dir_path = rsproperties::dirname();
+    let dir_path = rsproperties::properties_dir();
     let _ = remove_dir_all(dir_path);
     create_dir(dir_path).expect("Failed to create directory");
     File::create(dir_path.join("property_info"))

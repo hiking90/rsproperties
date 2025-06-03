@@ -75,11 +75,6 @@ fn run_property_server() -> Result<()> {
     println!("   property_service socket: {}/property_service", socket_dir().display());
     println!("   property_service_for_system socket: {}/property_service_for_system", socket_dir().display());
 
-    socket_service.run()?;
-
-
-
-
     // Start socket service in background thread
     let shutdown_socket = shutdown.clone();
     let service_handle = thread::spawn(move || {

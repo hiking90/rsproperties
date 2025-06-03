@@ -1,0 +1,30 @@
+[package]
+name = "rsproperties"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Android system properties library for Rust"
+
+[features]
+default = ["builder"]
+builder = []
+
+[dependencies]
+rustix.workspace = true
+log.workspace = true
+zerocopy.workspace = true
+zerocopy-derive.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+pretty-hex.workspace = true
+
+[dev-dependencies]
+android_system_properties.workspace = true
+env_logger.workspace = true
+

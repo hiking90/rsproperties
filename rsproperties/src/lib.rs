@@ -29,7 +29,7 @@
 //!         properties_dir: Some(PathBuf::from("/custom/properties")),
 //!         socket_dir: Some(PathBuf::from("/custom/socket")),
 //!     };
-//!     rsproperties::init(Some(config));
+//!     rsproperties::init(config);
 //!
 //!     // Get a value of the property.
 //!     let value = rsproperties::get_with_default("ro.build.version.sdk", "0");
@@ -139,16 +139,18 @@ mod trie_serializer;
 mod trie_node_arena;
 #[cfg(all(feature = "builder", target_os = "linux"))]
 mod build_property_parser;
-#[cfg(all(feature = "builder", target_os = "linux"))]
-mod socket_service;
 
 pub use system_properties::SystemProperties;
 #[cfg(all(feature = "builder", target_os = "linux"))]
 pub use property_info_serializer::*;
 #[cfg(all(feature = "builder", target_os = "linux"))]
 pub use build_property_parser::*;
-#[cfg(all(feature = "builder", target_os = "linux"))]
-pub use socket_service::*;
+pub use system_property_set::socket_dir;
+
+pub use system_property_set::{
+    PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME,
+    PROPERTY_SERVICE_SOCKET_NAME,
+};
 
 pub const PROP_VALUE_MAX: usize = 92;
 pub const PROP_DIRNAME: &str = "/dev/__properties__";
@@ -171,22 +173,17 @@ static SYSTEM_PROPERTIES: OnceLock<system_properties::SystemProperties> = OnceLo
 /// use rsproperties::{init, PropertyConfig};
 /// use std::path::PathBuf;
 ///
-/// // Use defaults
-/// init(None::<PropertyConfig>);
-///
 /// // Set only properties directory (backward compatible)
-/// init(Some(PropertyConfig::from(PathBuf::from("/custom/properties"))));
+/// init(PropertyConfig::from(PathBuf::from("/custom/properties")));
 ///
 /// // Full configuration
 /// let config = PropertyConfig {
 ///     properties_dir: Some(PathBuf::from("/custom/properties")),
 ///     socket_dir: Some(PathBuf::from("/custom/socket")),
 /// };
-/// init(Some(config));
+/// init(config);
 /// ```
-pub fn init(config: Option<PropertyConfig>) {
-    let config = config.unwrap_or_default();
-
+pub fn init(config: PropertyConfig) {
     // Initialize properties directory
     let props_dir = config.properties_dir.unwrap_or_else(|| {
         log::info!("Using default properties directory: {}", PROP_DIRNAME);
@@ -204,7 +201,7 @@ pub fn init(config: Option<PropertyConfig>) {
 
     // Initialize socket directory if specified
     if let Some(socket_dir) = config.socket_dir {
-        let success = system_property_set::set_socket_dir_internal(&socket_dir);
+        let success = system_property_set::set_socket_dir(&socket_dir);
         if success {
             log::info!("Successfully set socket directory to: {:?}", socket_dir);
         } else {
@@ -216,7 +213,7 @@ pub fn init(config: Option<PropertyConfig>) {
 /// Get the system properties directory.
 /// It returns None if init() is not called.
 /// It returns Some(&PathBuf) if init() is called.
-pub fn dirname() -> &'static Path {
+pub fn properties_dir() -> &'static Path {
     let path = SYSTEM_PROPERTIES_DIR.get().expect("Call init() first.").as_path();
     log::trace!("Getting system properties directory: {:?}", path);
     path
@@ -227,7 +224,7 @@ pub fn dirname() -> &'static Path {
 /// It panics if init() is not called or the system properties cannot be opened.
 pub fn system_properties() -> &'static system_properties::SystemProperties {
     SYSTEM_PROPERTIES.get_or_init(|| {
-        let dir = dirname();
+        let dir = properties_dir();
         log::info!("Initializing global SystemProperties instance from: {:?}", dir);
 
         match system_properties::SystemProperties::new(dir) {
@@ -236,8 +233,7 @@ pub fn system_properties() -> &'static system_properties::SystemProperties {
                 props
             },
             Err(e) => {
-                log::error!("Failed to initialize SystemProperties from {:?}: {}", dir, e);
-                panic!("Cannot open system properties. Please check if \"{dir:?}\" exists.")
+                panic!("Failed to initialize SystemProperties from {:?}: {}", dir, e);
             }
         }
     })
@@ -381,7 +377,7 @@ mod tests {
 
     #[cfg(all(feature = "builder", target_os = "linux"))]
     fn build_property_dir(dir: &str) -> SystemProperties {
-        crate::init(Some(PropertyConfig::from(PathBuf::from(dir))));
+        crate::init(PropertyConfig::from(PathBuf::from(dir)));
 
         let property_contexts_files = vec![
             "tests/android/plat_property_contexts",
@@ -400,14 +396,14 @@ mod tests {
 
         let data: Vec<u8> = build_trie(&property_infos, "u:object_r:build_prop:s0", "string").unwrap();
 
-        let dir = dirname();
+        let dir = properties_dir();
         remove_dir_all(dir).unwrap_or_default();
         create_dir(dir).unwrap_or_default();
         File::create(dir.join("property_info")).unwrap().write_all(&data).unwrap();
 
         let properties = load_properties();
 
-        let dir = dirname();
+        let dir = properties_dir();
         let mut system_properties = SystemProperties::new_area(dir)
             .unwrap_or_else(|e| panic!("Cannot create system properties: {}. Please check if {dir:?} exists.", e));
         for (key, value) in properties.iter() {

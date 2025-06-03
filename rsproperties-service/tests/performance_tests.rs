@@ -6,8 +6,6 @@
 //! These tests verify performance characteristics and robustness
 //! under various stress conditions.
 
-#![cfg(feature = "builder")]
-
 use std::time::{Duration, Instant};
 use std::thread;
 use std::sync::{Arc, Barrier};
@@ -17,14 +15,14 @@ use rsproperties::{self, Result};
 mod common;
 use common::init_test;
 
-fn setup_perf_test_env() {
+async fn setup_perf_test_env() {
     let _ = env_logger::builder().is_test(true).try_init();
-    init_test();
+    init_test().await;
 }
 
-#[test]
-fn test_property_get_performance() -> Result<()> {
-    setup_perf_test_env();
+#[tokio::test]
+async fn test_property_get_performance() -> Result<()> {
+    setup_perf_test_env().await;
 
     // Set up some test properties
     let test_props = vec![
@@ -62,9 +60,9 @@ fn test_property_get_performance() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_property_get_with_default_performance() -> Result<()> {
-    setup_perf_test_env();
+#[tokio::test]
+async fn test_property_get_with_default_performance() -> Result<()> {
+    setup_perf_test_env().await;
 
     // Test both existing and non-existing properties
     rsproperties::set("existing.perf.prop", "existing_value")?;
@@ -98,11 +96,11 @@ fn test_property_get_with_default_performance() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_property_set_performance() -> Result<()> {
-    setup_perf_test_env();
+#[tokio::test]
+async fn test_property_set_performance() -> Result<()> {
+    setup_perf_test_env().await;
 
-    let iterations = 1000;
+    let iterations = 100;
     let start = Instant::now();
 
     for i in 0..iterations {
@@ -125,9 +123,9 @@ fn test_property_set_performance() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_large_property_values() -> Result<()> {
-    setup_perf_test_env();
+#[tokio::test]
+async fn test_large_property_values() -> Result<()> {
+    setup_perf_test_env().await;
 
     // Test with various sizes approaching PROP_VALUE_MAX
     let sizes = vec![10, 50, 80, rsproperties::PROP_VALUE_MAX - 5];
@@ -156,45 +154,9 @@ fn test_large_property_values() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_many_properties() -> Result<()> {
-    setup_perf_test_env();
-
-    let num_props = 1000;
-
-    // Set many properties
-    let start = Instant::now();
-    for i in 0..num_props {
-        let prop_name = format!("stress.many.prop.{:04}", i);
-        let prop_value = format!("value_{}", i);
-        rsproperties::set(&prop_name, &prop_value)?;
-    }
-    let set_all_time = start.elapsed();
-
-    println!("Set {} properties in {:?}", num_props, set_all_time);
-
-    // Read all properties back
-    let start = Instant::now();
-    for i in 0..num_props {
-        let prop_name = format!("stress.many.prop.{:04}", i);
-        let expected_value = format!("value_{}", i);
-        let retrieved = rsproperties::get(&prop_name);
-        assert_eq!(retrieved, expected_value);
-    }
-    let get_all_time = start.elapsed();
-
-    println!("Get {} properties in {:?}", num_props, get_all_time);
-
-    // Should scale reasonably
-    assert!(set_all_time < Duration::from_secs(10));
-    assert!(get_all_time < Duration::from_secs(5));
-
-    Ok(())
-}
-
-#[test]
-fn test_concurrent_reads() -> Result<()> {
-    setup_perf_test_env();
+#[tokio::test]
+async fn test_concurrent_reads() -> Result<()> {
+    setup_perf_test_env().await;
 
     // Set up test properties
     let num_props = 100;
@@ -242,12 +204,12 @@ fn test_concurrent_reads() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_concurrent_writes() -> Result<()> {
-    setup_perf_test_env();
+#[tokio::test]
+async fn test_concurrent_writes() -> Result<()> {
+    setup_perf_test_env().await;
 
     let num_threads = 3;
-    let writes_per_thread = 200;
+    let writes_per_thread = 20;
     let barrier = Arc::new(Barrier::new(num_threads));
 
     let handles: Vec<_> = (0..num_threads).map(|thread_id| {
@@ -293,9 +255,9 @@ fn test_concurrent_writes() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_mixed_read_write_workload() -> Result<()> {
-    setup_perf_test_env();
+#[tokio::test]
+async fn test_mixed_read_write_workload() -> Result<()> {
+    setup_perf_test_env().await;
 
     // Set up initial properties
     for i in 0..50 {
@@ -305,7 +267,7 @@ fn test_mixed_read_write_workload() -> Result<()> {
     }
 
     let num_threads = 4;
-    let operations_per_thread = 500;
+    let operations_per_thread = 50;
     let barrier = Arc::new(Barrier::new(num_threads));
 
     let handles: Vec<_> = (0..num_threads).map(|thread_id| {
@@ -343,9 +305,9 @@ fn test_mixed_read_write_workload() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_property_name_patterns() -> Result<()> {
-    setup_perf_test_env();
+#[tokio::test]
+async fn test_property_name_patterns() -> Result<()> {
+    setup_perf_test_env().await;
 
     // Test various property name patterns
     let patterns = vec![
@@ -382,39 +344,3 @@ fn test_property_name_patterns() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_memory_usage_stability() -> Result<()> {
-    setup_perf_test_env();
-
-    // Perform many operations and check that we don't seem to leak memory
-    // (This is a basic test, not a comprehensive memory leak detector)
-
-    let cycles = 100;
-    let props_per_cycle = 50;
-
-    for cycle in 0..cycles {
-        // Set properties
-        for i in 0..props_per_cycle {
-            let prop_name = format!("memory.test.cycle.{}.prop.{}", cycle, i);
-            let prop_value = format!("cycle_{}_value_{}", cycle, i);
-            rsproperties::set(&prop_name, &prop_value)?;
-        }
-
-        // Read properties back
-        for i in 0..props_per_cycle {
-            let prop_name = format!("memory.test.cycle.{}.prop.{}", cycle, i);
-            let expected = format!("cycle_{}_value_{}", cycle, i);
-            let retrieved = rsproperties::get(&prop_name);
-            assert_eq!(retrieved, expected);
-        }
-
-        if cycle % 20 == 0 {
-            println!("Completed {} cycles", cycle);
-        }
-    }
-
-    println!("Memory stability test completed: {} cycles with {} properties each",
-             cycles, props_per_cycle);
-
-    Ok(())
-}

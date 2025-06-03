@@ -1,0 +1,32 @@
+[package]
+name = "rsproperties-service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Service implementation for Android system properties"
+
+[dependencies]
+rsproperties = { path = "../rsproperties", features = ["builder"] }
+log.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+rsactor.workspace = true
+
+[dev-dependencies]
+env_logger.workspace = true
+ctrlc.workspace = true
+
+[[example]]
+name = "socket_service_client"
+required-features = ["builder"]
+
+[[example]]
+name = "socket_service_server"
+required-features = ["builder"]

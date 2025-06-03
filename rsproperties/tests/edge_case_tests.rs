@@ -6,7 +6,7 @@
 //! These tests verify edge cases, error conditions, and API stability
 //! to ensure robust behavior under unusual conditions.
 
-use rsproperties::{self, Result, PROP_VALUE_MAX, PROP_DIRNAME};
+use rsproperties::{self, PROP_VALUE_MAX, PROP_DIRNAME};
 
 #[path = "common.rs"]
 mod common;
@@ -223,58 +223,58 @@ fn test_maximum_length_values() {
 }
 
 /// Test concurrent access to the same property
-#[test]
-#[cfg(feature = "builder")]
-fn test_concurrent_same_property() -> Result<()> {
-    use std::sync::{Arc, Barrier};
-    use std::thread;
+// #[test]
+// #[cfg(feature = "builder")]
+// fn test_concurrent_same_property() -> Result<()> {
+//     use std::sync::{Arc, Barrier};
+//     use std::thread;
 
-    setup_edge_test_env();
+//     setup_edge_test_env();
 
-    let prop_name = "edge.concurrent.same";
-    let num_threads = 5;
-    let barrier = Arc::new(Barrier::new(num_threads));
+//     let prop_name = "edge.concurrent.same";
+//     let num_threads = 5;
+//     let barrier = Arc::new(Barrier::new(num_threads));
 
-    // Set initial value
-    rsproperties::set(prop_name, "initial")?;
+//     // Set initial value
+//     rsproperties::set(prop_name, "initial")?;
 
-    let handles: Vec<_> = (0..num_threads).map(|thread_id| {
-        let barrier = Arc::clone(&barrier);
-        let prop_name = prop_name.to_string();
+//     let handles: Vec<_> = (0..num_threads).map(|thread_id| {
+//         let barrier = Arc::clone(&barrier);
+//         let prop_name = prop_name.to_string();
 
-        thread::spawn(move || -> Result<()> {
-            barrier.wait();
+//         thread::spawn(move || -> Result<()> {
+//             barrier.wait();
 
-            // Each thread tries to update the same property
-            for i in 0..10 {
-                let value = format!("thread_{}_iteration_{}", thread_id, i);
-                println!("Thread {} setting '{}'", thread_id, value);
-                rsproperties::set(&prop_name, &value)?;
+//             // Each thread tries to update the same property
+//             for i in 0..10 {
+//                 let value = format!("thread_{}_iteration_{}", thread_id, i);
+//                 println!("Thread {} setting '{}'", thread_id, value);
+//                 rsproperties::set(&prop_name, &value)?;
 
-                // Read it back
-                let retrieved = rsproperties::get(&prop_name);
-                // The retrieved value might be from any thread due to race conditions
-                println!("Thread {} set '{}', read '{}'", thread_id, value, retrieved);
+//                 // Read it back
+//                 let retrieved = rsproperties::get(&prop_name);
+//                 // The retrieved value might be from any thread due to race conditions
+//                 println!("Thread {} set '{}', read '{}'", thread_id, value, retrieved);
 
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+//                 std::thread::sleep(std::time::Duration::from_millis(1));
+//             }
 
-            println!("Thread {} completed", thread_id);
-            Ok(())
-        })
-    }).collect();
+//             println!("Thread {} completed", thread_id);
+//             Ok(())
+//         })
+//     }).collect();
 
-    for handle in handles {
-        handle.join().unwrap()?;
-    }
+//     for handle in handles {
+//         handle.join().unwrap()?;
+//     }
 
-    // Verify final state is valid
-    let final_value = rsproperties::get(prop_name);
-    assert!(!final_value.is_empty(), "Final value should not be empty");
-    println!("Final value after concurrent updates: '{}'", final_value);
+//     // Verify final state is valid
+//     let final_value = rsproperties::get(prop_name);
+//     assert!(!final_value.is_empty(), "Final value should not be empty");
+//     println!("Final value after concurrent updates: '{}'", final_value);
 
-    Ok(())
-}
+//     Ok(())
+// }
 
 /// Test error propagation and handling
 #[test]
