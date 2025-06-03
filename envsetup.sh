@@ -21,7 +21,7 @@ fi
 
 function ndk_build() {
     read_remote_android
-    cargo ndk --no-strip -t $ndk_target -- test --no-run
+    cargo ndk --no-strip -t $cargo_ndk_target build && cargo ndk --no-strip -t $cargo_ndk_target -- test --no-run
 }
 
 function ndk_sync() {
@@ -29,10 +29,10 @@ function ndk_sync() {
 
     if [[ "$OSTYPE" == "darwin"* ]]; then
         # macOS
-        find_command="find \"$source_directory\" -maxdepth 2 -type f -perm +111"
+        find_command="find \"$source_directory\" -maxdepth 1 -type f -perm +111"
     else
         # Linux
-        find_command="find \"$source_directory\" -maxdepth 2 -type f -executable"
+        find_command="find \"$source_directory\" -maxdepth 1 -type f -executable"
     fi
 
     eval $find_command | while read file; do
@@ -51,12 +51,14 @@ function read_remote_android() {
         echo "and the remote directory information on the second line."
         echo
         echo "Example:"
-        echo "x86_64"
-        echo "/data/rsproperties"
+        echo "arm64-v8a"
+        echo "aarch64"
+        echo "/data/rsbinder"
         exit 1
     fi
 
     {
+        read cargo_ndk_target
         read ndk_target
         read remote_directory
     } <"$file"
@@ -74,70 +76,6 @@ function ndk_prepare() {
         echo "Directory does not exist, creating: $remote_directory"
         adb shell mkdir -p $remote_directory
     fi
-}
-
-function aidl_gen_rust() {
-    aidl --lang=rust -I $TOP_DIR/aidl $1 -o gen
-}
-
-function read_remote_linux() {
-    file="REMOTE_LINUX"
-
-    if [ ! -f "$file" ]; then
-        echo "The file '$file' does not exist."
-        echo "Please create the '$file' file with the following format:"
-        echo
-        echo "userid@remote-ip-address"
-        echo "/path/to/remote/directory"
-        echo
-        echo "Example:"
-        echo "alice@192.168.1.100"
-        echo "/home/alice/work"
-        exit 1
-    fi
-
-    {
-        read remote_user_host
-        read remote_directory
-    } <"$file"
-}
-
-function remote_sync() {
-    read_remote_linux
-    command rsync -avz --exclude-from='.gitignore' --exclude '.git' $TOP_DIR/ "$remote_user_host:$remote_directory"
-}
-
-function remote_shell() {
-    read_remote_linux
-    command ssh "$remote_user_host" -t "cd $remote_directory; bash"
-}
-
-declare -a publish_dirs=("./")
-
-function publish() {
-    local cargo_options=()
-    if [[ "$1" == "--dry-run" ]]; then
-        cargo_options=("$1" "--allow-dirty")
-    fi
-
-    for dir in "${publish_dirs[@]}"; do
-        echo "Publishing $dir with options: $cargo_options"
-        pushd "$dir" > /dev/null
-
-        cargo publish "${cargo_options[@]}"
-        local result=$?
-
-        popd > /dev/null
-        if [ $result -ne 0 ]; then
-            echo "Error occurred in $dir, exiting..."
-            return $result
-        fi
-    done
-    return 0
-}
-
-function publish_dry_run() {
-    publish --dry-run
 }
 
 function version_update() {
