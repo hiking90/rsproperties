@@ -129,21 +129,21 @@ mod property_area;
 mod context_node;
 mod property_info;
 mod system_property_set;
-#[cfg(all(feature = "builder", target_os = "linux"))]
+#[cfg(feature = "builder")]
 mod property_info_serializer;
-#[cfg(all(feature = "builder", target_os = "linux"))]
+#[cfg(feature = "builder")]
 mod trie_builder;
-#[cfg(all(feature = "builder", target_os = "linux"))]
+#[cfg(feature = "builder")]
 mod trie_serializer;
-#[cfg(all(feature = "builder", target_os = "linux"))]
+#[cfg(feature = "builder")]
 mod trie_node_arena;
-#[cfg(all(feature = "builder", target_os = "linux"))]
+#[cfg(feature = "builder")]
 mod build_property_parser;
 
 pub use system_properties::SystemProperties;
-#[cfg(all(feature = "builder", target_os = "linux"))]
+#[cfg(feature = "builder")]
 pub use property_info_serializer::*;
-#[cfg(all(feature = "builder", target_os = "linux"))]
+#[cfg(feature = "builder")]
 pub use build_property_parser::*;
 pub use system_property_set::socket_dir;
 
@@ -346,7 +346,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "builder", target_os = "linux"))]
+    #[cfg(feature = "builder")]
     fn load_properties() -> HashMap<String, String> {
         let build_prop_files = vec![
             "tests/android/product_build.prop",
@@ -367,7 +367,7 @@ mod tests {
         properties
     }
 
-    #[cfg(all(feature = "builder", target_os = "linux"))]
+    #[cfg(feature = "builder")]
     fn system_properties_area() -> MutexGuard<'static, Option<SystemProperties>> {
         static SYSTEM_PROPERTIES: Mutex<Option<SystemProperties>> = Mutex::new(None);
         let mut system_properties_guard = SYSTEM_PROPERTIES.lock().unwrap();
@@ -378,7 +378,7 @@ mod tests {
         system_properties_guard
     }
 
-    #[cfg(all(feature = "builder", target_os = "linux"))]
+    #[cfg(feature = "builder")]
     fn build_property_dir(dir: &str) -> SystemProperties {
         crate::init(PropertyConfig::from(PathBuf::from(dir)));
 
@@ -423,7 +423,7 @@ mod tests {
         system_properties
     }
 
-    #[cfg(all(feature = "builder", target_os = "linux"))]
+    #[cfg(feature = "builder")]
     #[test]
     fn test_property_info() {
         enable_logger();
@@ -440,7 +440,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "builder", target_os = "linux"))]
+    #[cfg(feature = "builder")]
     #[test]
     fn test_wait() {
         enable_logger();

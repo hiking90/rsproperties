@@ -18,8 +18,9 @@ use crate::errors::*;
 use crate::property_info::{
     PropertyInfo,
     name_from_trailing_data,
-    init_name_with_trailing_data,
 };
+#[cfg(feature = "builder")]
+use crate::property_info::init_name_with_trailing_data;
 
 const PA_SIZE: u64 = 128 * 1024;
 const PROP_AREA_MAGIC: u32 = 0x504f5250;
@@ -35,6 +36,7 @@ pub(crate) struct PropertyTrieNode {
 }
 
 impl PropertyTrieNode {
+    #[cfg(feature = "builder")]
     fn init(&mut self, name: &str) {
         self.prop.store(0, std::sync::atomic::Ordering::Relaxed);
         self.left.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -100,6 +102,7 @@ impl PropertyArea {
 pub(crate) struct PropertyAreaMap {
     mmap: MemoryMap,
     data_offset: usize,
+    #[allow(dead_code)]
     pa_data_size: usize,
 }
 
@@ -252,6 +255,7 @@ impl PropertyAreaMap {
     }
 
     // Add the property information with the given name and value.
+    #[cfg(feature = "builder")]
     pub(crate) fn add(&mut self, name: &str, value: &str) -> Result<()> {
         debug!("Adding property: '{}' = '{}'", name, value);
 
@@ -331,6 +335,7 @@ impl PropertyAreaMap {
 
     // Set the dirty backup area.
     // It is used to store the backup of the property area.
+    #[cfg(feature = "builder")]
     pub(crate) fn set_dirty_backup_area(&mut self, value: &CStr) -> Result<()> {
         debug!("Setting dirty backup area: {:?}", value);
 
@@ -352,6 +357,7 @@ impl PropertyAreaMap {
 
     // Add a new property trie node with the given name to the given trie node.
     // It uses trie offset to avoid the life time issue of the current trie node.
+    #[cfg(feature = "builder")]
     fn add_prop_trie_node(&mut self, trie_offset: u32, name: &str) -> Result<u32> {
         trace!("Adding trie node '{}' at offset {}", name, trie_offset);
 
@@ -447,6 +453,7 @@ impl PropertyAreaMap {
         Ok(current)
     }
 
+    #[cfg(feature = "builder")]
     fn allocate_obj(&mut self, size: usize) -> Result<u32> {
         let aligned = crate::bionic_align(size, mem::size_of::<u32>());
         let offset = self.property_area().bytes_used;
@@ -463,6 +470,7 @@ impl PropertyAreaMap {
         Ok(offset)
     }
 
+    #[cfg(feature = "builder")]
     pub(crate) fn new_prop_trie_node(&mut self, name: &str) -> Result<u32> {
         debug!("Creating new property trie node: '{}'", name);
 
@@ -474,6 +482,7 @@ impl PropertyAreaMap {
         Ok(new_offset)
     }
 
+    #[cfg(feature = "builder")]
     pub(crate) fn new_prop_info(&mut self, name: &str, value: &str) -> Result<u32> {
         debug!("Creating new property info: '{}' = '{}' (value_len={})", name, value, value.len());
 
@@ -561,6 +570,7 @@ impl MemoryMap {
         })
     }
 
+    #[cfg(feature = "builder")]
     pub(crate) fn data_mut(&mut self, offset: usize, base: usize, size: usize) -> Result<&mut [u8]> {
         let offset = offset + base;
         self.check_size(offset, size)?;

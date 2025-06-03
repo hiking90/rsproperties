@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::path::PathBuf;
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{RwLock, RwLockReadGuard};
+#[cfg(feature = "builder")]
+use std::sync::RwLockWriteGuard;
+
 use log::{debug, info, error, trace};
 
 use crate::property_area::PropertyAreaMap;
@@ -75,6 +78,7 @@ impl ContextNode {
         }
     }
 
+    #[cfg(feature = "builder")]
     pub(crate) fn property_area_mut(&self) -> Result<PropertyAreaMutGuard<'_>> {
         debug!("Accessing mutable property area for context: {:?}", self.filename);
         self.property_area()?;
@@ -99,10 +103,12 @@ impl<'a> PropertyAreaGuard<'a> {
 // Option<PropertyAreaMap> is initialized when the PropertyAreaMap is first accessed.
 // After that, the PropertyAreaMap is never replaced.
 // This is to ensure that the PropertyAreaMap is not replaced by another PropertyAreaMap.
+#[cfg(feature = "builder")]
 pub(crate) struct PropertyAreaMutGuard<'a> {
     guard: RwLockWriteGuard<'a, Option<PropertyAreaMap>>
 }
 
+#[cfg(feature = "builder")]
 impl<'a> PropertyAreaMutGuard<'a> {
     pub(crate) fn property_area_mut(&mut self) -> &mut PropertyAreaMap {
         trace!("Getting mutable property area reference from guard");

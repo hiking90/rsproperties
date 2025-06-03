@@ -8,7 +8,9 @@ use rustix::fs;
 use log::{trace, debug, info, warn, error};
 use crate::errors::*;
 
-use crate::context_node::{ContextNode, PropertyAreaGuard, PropertyAreaMutGuard};
+use crate::context_node::{ContextNode, PropertyAreaGuard};
+#[cfg(feature = "builder")]
+use crate::context_node::PropertyAreaMutGuard;
 use crate::property_area::{PropertyArea, PropertyAreaMap};
 use crate::property_info_parser::PropertyInfoAreaFile;
 
@@ -128,7 +130,7 @@ impl ContextsSerialized {
         }
     }
 
-    #[cfg(all(feature = "builder", target_os = "linux"))]
+    #[cfg(feature = "builder")]
     pub(crate) fn prop_area_mut_for_name(&self, name: &str) -> Result<(PropertyAreaMutGuard<'_>, u32)> {
         trace!("Looking up mutable property area for name: {}", name);
 
@@ -188,7 +190,7 @@ impl ContextsSerialized {
         }
     }
 
-    #[cfg(all(feature = "builder", target_os = "linux"))]
+    #[cfg(feature = "builder")]
     pub(crate) fn prop_area_mut_with_index(&self, context_index: u32) -> Result<PropertyAreaMutGuard<'_>> {
         trace!("Getting mutable property area for context index: {}", context_index);
 

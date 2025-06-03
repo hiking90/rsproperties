@@ -12,7 +12,7 @@ categories.workspace = true
 description = "Android system properties library for Rust"
 
 [features]
-default = ["builder"]
+default = []
 builder = []
 
 [dependencies]
@@ -27,4 +27,5 @@ pretty-hex.workspace = true
 android_system_properties.workspace = true
 env_logger.workspace = true
 anyhow.workspace = true
+clap.workspace = true
 

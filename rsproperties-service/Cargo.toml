@@ -11,6 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Service implementation for Android system properties"
 
+[features]
+builder = ["rsproperties/builder"]
+
 [dependencies]
 rsproperties = { path = "../rsproperties", features = ["builder"] }
 log.workspace = true
@@ -22,11 +25,7 @@ rsactor.workspace = true
 env_logger.workspace = true
 ctrlc.workspace = true
 anyhow.workspace = true
+clap.workspace = true
 
 [[example]]
-name = "socket_service_client"
-required-features = ["builder"]
-
-[[example]]
-name = "socket_service_server"
-required-features = ["builder"]
+name = "example_service"

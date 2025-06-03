@@ -29,6 +29,7 @@ fn serial_dirty(serial: u32) -> bool {
     (serial & 1) != 0
 }
 
+#[cfg(feature = "builder")]
 fn futex_wake(_addr: &AtomicU32) -> Result<usize> {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     {
@@ -96,7 +97,7 @@ impl SystemProperties {
 
     // Create a new area for system properties
     // The new area is used by the property service to store system properties.
-    #[cfg(all(feature = "builder", target_os = "linux"))]
+    #[cfg(feature = "builder")]
     pub fn new_area(dirname: &Path) -> Result<Self> {
         log::info!("Creating SystemProperties area from directory: {:?}", dirname);
 
@@ -277,7 +278,7 @@ impl SystemProperties {
     /// If the property value is too long, it returns an error.
     /// If the property is read-only, it returns an error.
     /// If the property is updated successfully, it returns Ok(()).
-    #[cfg(all(feature = "builder", target_os = "linux"))]
+    #[cfg(feature = "builder")]
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         log::info!("Setting property: {} = {}", key, value);
 
@@ -311,7 +312,7 @@ impl SystemProperties {
         Ok(())
     }
 
-    #[cfg(all(feature = "builder", target_os = "linux"))]
+    #[cfg(feature = "builder")]
     pub fn update(&mut self, index: &PropertyIndex, value: &str) -> Result<bool> {
         log::debug!("Updating property at index context={}, property={} with value: {}",
                    index.context_index, index.property_index, value);
@@ -406,7 +407,7 @@ impl SystemProperties {
         Ok(true)
     }
 
-    #[cfg(all(feature = "builder", target_os = "linux"))]
+    #[cfg(feature = "builder")]
     pub fn add(&mut self, name: &str, value: &str) -> Result<()> {
         log::info!("Adding new property: {} = {}", name, value);
 
@@ -551,7 +552,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(all(feature = "builder", target_os = "linux"))]
+    #[cfg(feature = "builder")]
     #[test]
     fn test_property_update() -> Result<()> {
         Ok(())

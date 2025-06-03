@@ -2,15 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::atomic::AtomicU32;
-use std::{ptr, mem};
+use std::mem;
+#[cfg(feature = "builder")]
+use std::ptr;
 use std::ffi::CStr;
-use log::{trace, debug, warn};
+use log::trace;
+#[cfg(feature = "builder")]
+use log::{debug, warn};
 
 use crate::system_properties::PROP_VALUE_MAX;
 
+#[cfg(feature = "builder")]
 const LONG_LEGACY_ERROR: &str = "Must use __system_property_read_callback() to read";
-// static_assert(sizeof(kLongLegacyError) < prop_info::kLongLegacyErrorBufferSize,
-//               "Error message for long properties read by legacy libc must fit within 56 chars");
 
 const LONG_FLAG: usize = 1 << 16;
 const LONG_LEGACY_ERROR_BUFFER_SIZE: usize = 56;
@@ -34,6 +37,7 @@ pub struct PropertyInfo {
 }
 
 impl PropertyInfo {
+    #[cfg(feature = "builder")]
     pub(crate) fn init_with_long_offset(&mut self, name: &str, offset: u32) {
         debug!("Initializing property {} with long offset: {}", name, offset);
 
@@ -53,6 +57,7 @@ impl PropertyInfo {
         trace!("Successfully initialized long property {} with offset {}", name, offset);
     }
 
+    #[cfg(feature = "builder")]
     pub(crate) fn init_with_value(&mut self, name: &str, value: &str) {
         debug!("Initializing property {} with value: {}", name, value);
 
@@ -109,6 +114,7 @@ impl PropertyInfo {
     }
 
     // TODO: self must be mutable. The current implementation is a workaround.
+    #[cfg(feature = "builder")]
     pub(crate) fn set_value(&self, value: &str) {
         debug!("Setting property value to: {} (length={})", value, value.len());
 
@@ -154,6 +160,7 @@ pub(crate) fn name_from_trailing_data<I: Sized>(thiz: &I, len: Option<usize>) ->
     }
 }
 
+#[cfg(feature = "builder")]
 #[inline(always)]
 pub(crate) fn init_name_with_trailing_data<I: Sized>(thiz: &mut I, name: &str) {
     trace!("Initializing name with trailing data: {} (length={})", name, name.len());

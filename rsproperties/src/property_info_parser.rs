@@ -236,6 +236,7 @@ impl<'a> PropertyInfoArea<'a> {
         self.u32_slice_from(self.header().contexts_offset as usize)[0] as _
     }
 
+    #[cfg(feature = "builder")]
     #[inline]
     pub(crate) fn num_types(&self) -> usize {
         self.u32_slice_from(self.header().types_offset as usize)[0] as _
@@ -250,6 +251,7 @@ impl<'a> PropertyInfoArea<'a> {
         self.u32_slice_from(context_array_offset)[index] as _
     }
 
+    #[cfg(feature = "builder")]
     pub(crate) fn type_offset(&self, index: usize) -> usize {
         let type_array_offset = self.header().types_offset as usize + size_of::<u32>();
         self.u32_slice_from(type_array_offset)[index] as _
@@ -380,14 +382,14 @@ impl<'a> PropertyInfoArea<'a> {
     //     (context_cstr, type_cstr)
     // }
 
-    #[cfg(all(feature = "builder", target_os = "linux"))]
+    #[cfg(feature = "builder")]
     pub(crate) fn find_context_index(&self, context: &str) -> i32 {
         find(self.num_contexts() as _, |i| {
             self.cstr(self.context_offset(i as _)).to_str().unwrap().cmp(context)
         })
     }
 
-    #[cfg(all(feature = "builder", target_os = "linux"))]
+    #[cfg(feature = "builder")]
     pub(crate) fn find_type_index(&self, rtype: &str) -> i32 {
         find(self.num_types() as _, |i| {
             self.cstr(self.type_offset(i as _)).to_str().unwrap().cmp(rtype)
@@ -449,7 +451,7 @@ impl PropertyInfoAreaFile {
 //         Ok(())
 //     }
 
-//     #[cfg(all(feature = "builder", target_os = "linux"))]
+//     #[cfg(feature = "builder")]
 //     #[test]
 //     fn test_property_info_area_with_builder() -> Result<()> {
 //         let entries = crate::property_info_serializer::PropertyInfoEntry::parse_from_file(Path::new("tests/android/plat_property_contexts"), false).unwrap();
