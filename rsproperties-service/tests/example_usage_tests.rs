@@ -98,7 +98,7 @@ async fn example_error_handling() {
     fn get_required_config() -> Result<String> {
         let config = rsproperties::get("app.required.config");
         if config.is_empty() {
-            return Err(rsproperties::Error::new_context("Config cannot be empty".into()).into());
+            return Err(rsproperties::Error::new_not_found("app.required.config".to_string()).into());
         }
         Ok(config)
     }

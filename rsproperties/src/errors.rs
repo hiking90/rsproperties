@@ -1,106 +1,133 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{num::ParseIntError, panic::Location};
-use anyhow::Context;
+use std::num::ParseIntError;
 
-pub type Result<T> = std::result::Result<T, anyhow::Error>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("I/O error - {0} at {1}")]
-    Io(std::io::Error, &'static Location<'static>),
+    #[error("I/O error: {0}")]
+    Io(std::io::Error),
 
-    #[error("Errno error - {0} at {1}")]
-    Errno(rustix::io::Errno, &'static Location<'static>),
+    #[error("System error: {0}")]
+    Errno(rustix::io::Errno),
 
-    #[error("NotFound error - Key: {0} at {1}")]
-    NotFound(String, &'static Location<'static>),
+    #[error("Property not found: {0}")]
+    NotFound(String),
 
-    #[error("Context error - {0} at {1}")]
-    Context(String, &'static Location<'static>),
+    #[error("Encoding error: {0}")]
+    Encoding(String),
+
+    #[error("Parse error: {0}")]
+    Parse(String),
+
+    #[error("File validation error: {0}")]
+    FileValidation(String),
+
+    #[error("Conversion error: {0}")]
+    Conversion(String),
+
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+
+    #[error("File size error: {0}")]
+    FileSize(String),
+
+    #[error("File ownership error: {0}")]
+    FileOwnership(String),
 }
 
 impl Error {
-    #[track_caller]
     pub fn new_not_found(key: String) -> Error {
-        let error = Error::NotFound(key.clone(), Location::caller());
-        // log::error!("Property not found: {} at {}", key, Location::caller());
-        error
+        Error::NotFound(key)
     }
 
-    #[track_caller]
-    pub fn new_context(context: String) -> Error {
-        let error = Error::Context(context.clone(), Location::caller());
-        // log::error!("Context error: {} at {}", context, Location::caller());
-        error
+    pub fn new_encoding(msg: String) -> Error {
+        Error::Encoding(msg)
     }
 
-    #[track_caller]
+    pub fn new_parse(msg: String) -> Error {
+        Error::Parse(msg)
+    }
+
+    pub fn new_file_validation(msg: String) -> Error {
+        Error::FileValidation(msg)
+    }
+
+    pub fn new_conversion(msg: String) -> Error {
+        Error::Conversion(msg)
+    }
+
+    pub fn new_permission_denied(msg: String) -> Error {
+        Error::PermissionDenied(msg)
+    }
+
+    pub fn new_file_size(msg: String) -> Error {
+        Error::FileSize(msg)
+    }
+
+    pub fn new_file_ownership(msg: String) -> Error {
+        Error::FileOwnership(msg)
+    }
+
     pub fn new_io(io_error: std::io::Error) -> Error {
-        let error = Error::Io(io_error, Location::caller());
-        log::error!("I/O error: {} at {}", error, Location::caller());
+        let error = Error::Io(io_error);
+        log::error!("I/O error: {}", error);
         error
     }
 
-    #[track_caller]
     pub fn new_errno(errno: rustix::io::Errno) -> Error {
-        let error = Error::Errno(errno, Location::caller());
-        log::error!("Errno error: {} at {}", error, Location::caller());
+        let error = Error::Errno(errno);
+        log::error!("System error: {}", error);
         error
     }
 }
 
 impl From<rustix::io::Errno> for Error {
-    #[track_caller]
     fn from(source: rustix::io::Errno) -> Self {
-        let error = Error::Errno(source, Location::caller());
-        log::error!("Converting errno to Error: {} at {}", source, Location::caller());
+        let error = Error::Errno(source);
+        log::error!("Converting errno to Error: {}", source);
         error
     }
 }
 
 impl From<std::io::Error> for Error {
-    #[track_caller]
     fn from(source: std::io::Error) -> Self {
-        let error = Error::Io(source, Location::caller());
-        log::error!("Converting I/O error to Error: {} at {}", error, Location::caller());
+        let error = Error::Io(source);
+        log::error!("Converting I/O error to Error: {}", error);
         error
     }
 }
 
 impl From<std::str::Utf8Error> for Error {
-    #[track_caller]
     fn from(source: std::str::Utf8Error) -> Self {
         let error_msg = format!("UTF-8 conversion error: {}", source);
-        log::error!("{} at {}", error_msg, Location::caller());
-        Error::Context(error_msg, Location::caller())
+        log::error!("{}", error_msg);
+        Error::Encoding(error_msg)
     }
 }
 
 impl From<std::ffi::OsString> for Error {
-    #[track_caller]
     fn from(source: std::ffi::OsString) -> Self {
         let error_msg = format!("OsString conversion error: {:?}", source);
-        log::error!("{} at {}", error_msg, Location::caller());
-        Error::Context(error_msg, Location::caller())
+        log::error!("{}", error_msg);
+        Error::Conversion(error_msg)
     }
 }
 
 impl From<&str> for Error {
-    #[track_caller]
     fn from(source: &str) -> Self {
-        log::error!("String error: {} at {}", source, Location::caller());
-        Error::Context(source.to_owned(), Location::caller())
+        log::error!("String error: {}", source);
+        Error::Parse(source.to_owned())
     }
 }
 
 impl From<ParseIntError> for Error {
-    #[track_caller]
     fn from(source: ParseIntError) -> Self {
         let error_msg = format!("Parse integer error: {}", source);
-        log::error!("{} at {}", error_msg, Location::caller());
-        Error::Context(error_msg, Location::caller())
+        log::error!("{}", error_msg);
+        Error::Parse(error_msg)
     }
 }
 
@@ -110,11 +137,10 @@ pub trait ContextWithLocation<T> {
 
 impl<T, E> ContextWithLocation<T> for std::result::Result<T, E>
 where
-    E: Into<anyhow::Error>,
+    E: Into<Error>,
 {
-    #[track_caller]
     fn context_with_location(self, msg: impl Into<String>) -> Result<T> {
-        self.map_err(|e| e.into()).context(msg.into())
+        self.map_err(|e| e.into()).map_err(|_| Error::new_file_validation(msg.into()))
     }
 }
 
@@ -145,7 +171,7 @@ pub fn validate_file_metadata(
         let error_msg = format!("File too small: size={}, min_size={} for {:?}",
                                metadata.st_size(), min_size, path);
         log::error!("{}", error_msg);
-        return Err(Error::new_context(error_msg).into());
+        return Err(Error::new_file_size(error_msg));
     }
 
     // Check write permissions (applies to all modes)
@@ -153,7 +179,7 @@ pub fn validate_file_metadata(
         let error_msg = format!("File has group or other write permissions: mode={:#o} for {:?}",
                                metadata.st_mode(), path);
         log::error!("{}", error_msg);
-        return Err(Error::new_context("Invalid file metadata".to_string()).into());
+        return Err(Error::new_permission_denied(error_msg));
     }
 
     // In production mode, also check ownership
@@ -162,7 +188,7 @@ pub fn validate_file_metadata(
             let error_msg = format!("File not owned by root: uid={}, gid={} for {:?}",
                                    metadata.st_uid(), metadata.st_gid(), path);
             log::error!("{}", error_msg);
-            return Err(Error::new_context("Invalid file metadata".to_string()).into());
+            return Err(Error::new_file_ownership(error_msg));
         }
     }
 

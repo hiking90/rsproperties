@@ -208,20 +208,20 @@ fn validate_property(key: &str, value: &str) -> Result<()> {
     use rsproperties::errors::Error;
 
     if key.is_empty() {
-        return Err(Error::new_context("Property name cannot be empty".to_string()).into());
+        return Err(Error::new_file_validation("Property name cannot be empty".to_string()).into());
     }
 
     if key.len() > 256 {
-        return Err(Error::new_context("Property name too long".to_string()).into());
+        return Err(Error::new_file_validation("Property name too long".to_string()).into());
     }
 
     if value.len() > 8192 {
-        return Err(Error::new_context("Property value too long".to_string()).into());
+        return Err(Error::new_file_validation("Property value too long".to_string()).into());
     }
 
     // Check for invalid characters in property name
     if !key.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-') {
-        return Err(Error::new_context("Invalid characters in property name".to_string()).into());
+        return Err(Error::new_file_validation("Invalid characters in property name".to_string()).into());
     }
 
     Ok(())

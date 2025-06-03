@@ -8,7 +8,6 @@ use std::io::{BufRead, BufReader};
 use log::{trace, debug, info, warn, error};
 
 use rustix::process::{Pid, Uid, Gid};
-use anyhow::Error;
 use crate::errors::*;
 
 #[cfg(any(target_os = "android", target_os = "linux"))]

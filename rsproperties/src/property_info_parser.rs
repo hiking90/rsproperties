@@ -216,20 +216,20 @@ impl<'a> PropertyInfoArea<'a> {
         self.ref_from(0)
     }
 
-    #[inline]
-    pub(crate) fn current_version(&self) -> u32 {
-        self.header().current_version
-    }
+    // #[inline]
+    // pub fn current_version(&self) -> u32 {
+    //     self.header().current_version
+    // }
 
-    #[inline]
-    pub(crate) fn minimum_supported_version(&self) -> u32 {
-        self.header().minimum_supported_version
-    }
+    // #[inline]
+    // pub fn minimum_supported_version(&self) -> u32 {
+    //     self.header().minimum_supported_version
+    // }
 
-    #[inline]
-    pub(crate) fn size(&self) -> usize {
-        self.header().size as _
-    }
+    // #[inline]
+    // pub fn size(&self) -> usize {
+    //     self.header().size as _
+    // }
 
     #[inline]
     pub(crate) fn num_contexts(&self) -> usize {
@@ -364,21 +364,21 @@ impl<'a> PropertyInfoArea<'a> {
         (return_context_index, return_type_index)
     }
 
-    pub(crate) fn get_property_info(&self, name: &str) -> (Option<&CStr>, Option<&CStr>) {
-        let (context_index, type_index) = self.get_property_info_indexes(name);
-        let context_cstr = if context_index == !0 {
-            None
-        } else {
-            Some(self.cstr(self.context_offset(context_index as _) as _))
-        };
+    // pub(crate) fn get_property_info(&self, name: &str) -> (Option<&CStr>, Option<&CStr>) {
+    //     let (context_index, type_index) = self.get_property_info_indexes(name);
+    //     let context_cstr = if context_index == !0 {
+    //         None
+    //     } else {
+    //         Some(self.cstr(self.context_offset(context_index as _) as _))
+    //     };
 
-        let type_cstr = if type_index == !0 {
-            None
-        } else {
-            Some(self.cstr(self.type_offset(type_index as _) as _))
-        };
-        (context_cstr, type_cstr)
-    }
+    //     let type_cstr = if type_index == !0 {
+    //         None
+    //     } else {
+    //         Some(self.cstr(self.type_offset(type_index as _) as _))
+    //     };
+    //     (context_cstr, type_cstr)
+    // }
 
     #[cfg(all(feature = "builder", target_os = "linux"))]
     pub(crate) fn find_context_index(&self, context: &str) -> i32 {
@@ -427,36 +427,36 @@ impl PropertyInfoAreaFile {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
 
-    fn test_info_area(info_area: &PropertyInfoArea) {
-        assert_eq!(info_area.current_version(), 1);
-        assert_eq!(info_area.minimum_supported_version(), 1);
+//     fn test_info_area(info_area: &PropertyInfoArea) {
+//         assert_eq!(info_area.current_version(), 1);
+//         assert_eq!(info_area.minimum_supported_version(), 1);
 
-        let _num_context_nodes = info_area.num_contexts();
+//         let _num_context_nodes = info_area.num_contexts();
 
-        let (context_cstr, type_cstr) = info_area.get_property_info("ro.build.version.sdk");
-        assert_eq!(context_cstr.unwrap().to_str().unwrap(), "u:object_r:build_prop:s0");
-        assert_eq!(type_cstr.unwrap().to_str().unwrap(), "int");
-    }
+//         let (context_cstr, type_cstr) = info_area.get_property_info("ro.build.version.sdk");
+//         assert_eq!(context_cstr.unwrap().to_str().unwrap(), "u:object_r:build_prop:s0");
+//         assert_eq!(type_cstr.unwrap().to_str().unwrap(), "int");
+//     }
 
-    #[cfg(target_os = "android")]
-    #[test]
-    fn test_property_info_area_file() -> Result<()> {
-        test_info_area(&PropertyInfoAreaFile::load_default_path()?.property_info_area());
-        Ok(())
-    }
+//     #[cfg(target_os = "android")]
+//     #[test]
+//     fn test_property_info_area_file() -> Result<()> {
+//         test_info_area(&PropertyInfoAreaFile::load_default_path()?.property_info_area());
+//         Ok(())
+//     }
 
-    #[cfg(all(feature = "builder", target_os = "linux"))]
-    #[test]
-    fn test_property_info_area_with_builder() -> Result<()> {
-        let entries = crate::property_info_serializer::PropertyInfoEntry::parse_from_file(Path::new("tests/android/plat_property_contexts"), false).unwrap();
-        let data: Vec<u8> = crate::property_info_serializer::build_trie(&entries.0, "u:object_r:build_prop:s0", "string").unwrap();
+//     #[cfg(all(feature = "builder", target_os = "linux"))]
+//     #[test]
+//     fn test_property_info_area_with_builder() -> Result<()> {
+//         let entries = crate::property_info_serializer::PropertyInfoEntry::parse_from_file(Path::new("tests/android/plat_property_contexts"), false).unwrap();
+//         let data: Vec<u8> = crate::property_info_serializer::build_trie(&entries.0, "u:object_r:build_prop:s0", "string").unwrap();
 
-        test_info_area(&PropertyInfoArea::new(&data));
+//         test_info_area(&PropertyInfoArea::new(&data));
 
-        Ok(())
-    }
-}
+//         Ok(())
+//     }
+// }

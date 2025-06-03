@@ -12,7 +12,6 @@ use std::{
 };
 
 use rustix::{fs, mm};
-use anyhow::Context;
 use log::{debug, info, warn, error, trace};
 use crate::errors::*;
 
@@ -116,7 +115,7 @@ impl PropertyAreaMap {
             .custom_flags((fs::OFlags::NOFOLLOW.bits() | fs::OFlags::EXCL.bits()) as _) // additional flags
             .mode(0o444)              // permission: 0444
             .open(filename)
-            .context(format!("Failed to open to {filename:?}"))?;
+            .map_err(|e| Error::new_io(e))?;
 
         if let Some(context) = context {
             debug!("Setting SELinux context: {:?}", context);
@@ -182,7 +181,7 @@ impl PropertyAreaMap {
            thiz.property_area().version != PROP_AREA_VERSION {
             error!("Invalid magic ({:#x} != {:#x}) or version ({:#x} != {:#x}) for {:?}",
                    pa.magic, PROP_AREA_MAGIC, pa.version, PROP_AREA_VERSION, filename);
-            Err(Error::new_context("Invalid magic or version".to_string()).into())
+            Err(Error::new_file_validation("Invalid magic or version".to_string()).into())
         } else {
             info!("Successfully opened read-only property area map: {:?}", filename);
             Ok(thiz)
@@ -214,7 +213,7 @@ impl PropertyAreaMap {
 
             if substr_size == 0 {
                 error!("Invalid property name (empty segment): '{}'", name);
-                anyhow::bail!("Invalid property name: {name}");
+                return Err(Error::new_parse(format!("Invalid property name: {name}")));
             }
 
             let subname = &remaining_name[0..substr_size];
@@ -267,7 +266,7 @@ impl PropertyAreaMap {
 
             if substr_size == 0 {
                 error!("Invalid property name (empty segment): '{}'", name);
-                return Err(Error::new_context(format!("Invalid property name: {name}")).into());
+                return Err(Error::new_parse(format!("Invalid property name: {name}")).into());
             }
 
             let subname = &remaining_name[0..substr_size];
@@ -342,7 +341,7 @@ impl PropertyAreaMap {
 
         if bytes.len() + offset > self.pa_data_size {
             error!("Backup area overflow: {} + {} > {}", bytes.len(), offset, self.pa_data_size);
-            return Err(Error::new_context("Invalid offset".to_string()).into());
+            return Err(Error::new_file_validation("Invalid offset".to_string()).into());
         }
 
         self.mmap.data_mut(offset, self.data_offset, bytes.len())?.copy_from_slice(bytes);
@@ -456,7 +455,7 @@ impl PropertyAreaMap {
 
         if offset + (aligned as u32) > self.pa_data_size as u32 {
             error!("Out of memory: {} + {} > {}", offset, aligned, self.pa_data_size);
-            return Err(Error::new_context("Out of memory".to_string()).into());
+            return Err(Error::new_file_size("Out of memory".to_string()).into());
         }
 
         self.property_area_mut().bytes_used += aligned as u32;
@@ -574,7 +573,7 @@ impl MemoryMap {
     fn check_size(&self, offset: usize, size: usize) -> Result<()> {
         if offset + size > self.size {
             error!("Memory access out of bounds: {} + {} > {} (ptr={:p})", offset, size, self.size, self.data);
-            return Err(Error::new_context(format!("Invalid offset: {} > {}", offset + size, self.size)).into());
+            return Err(Error::new_file_validation(format!("Invalid offset: {} > {}", offset + size, self.size)).into());
         }
         trace!("Memory access check passed: offset={}, size={}, total_size={}", offset, size, self.size);
         Ok(())

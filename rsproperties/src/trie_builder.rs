@@ -75,7 +75,7 @@ impl TrieBuilderNode {
             Ok(())
         } else {
             error!("Exact match already exists for '{}'", name);
-            Err(Error::new_context(format!("Exact match already exists for '{name}'")).into())
+            Err(Error::new_file_validation(format!("Exact match already exists for '{name}'")).into())
         }
     }
 
@@ -93,7 +93,7 @@ impl TrieBuilderNode {
             Ok(())
         } else {
             error!("Prefix already exists for '{}'", name);
-            Err(Error::new_context(format!("Prefix already exists for '{name}'")).into())
+            Err(Error::new_file_validation(format!("Prefix already exists for '{name}'")).into())
         }
     }
 
@@ -160,7 +160,7 @@ impl TrieBuilder {
         };
 
         let last_name: &str = name_parts.pop()
-            .ok_or(Error::new_context(format!("No name parts for '{name}'")))?;
+            .ok_or(Error::new_parse(format!("No name parts for '{name}'")))?;
 
         trace!("Navigating trie path: {:?}, final part: {}", name_parts, last_name);
 
@@ -192,7 +192,7 @@ impl TrieBuilder {
 
             if child.context().is_some() || child.rtype().is_some() {
                 error!("Duplicate prefix match detected for '{}'", name);
-                return Err(Error::new_context(format!("Duplicate prefix match detected for '{name}'")).into());
+                return Err(Error::new_file_validation(format!("Duplicate prefix match detected for '{name}'")).into());
             }
 
             child.set_context(context);

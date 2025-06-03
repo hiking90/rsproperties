@@ -9,8 +9,6 @@ use std::sync::OnceLock;
 use zerocopy_derive::*;
 use zerocopy::IntoBytes;
 
-use anyhow::Context;
-
 use crate::errors::*;
 
 const DEFAULT_SOCKET_DIR: &str = "/dev/socket";
@@ -113,7 +111,7 @@ impl ServiceConnection {
 
         log::trace!("Connecting to Unix domain socket: {}", socket_name);
         let stream: UnixStream = UnixStream::connect(&socket_name)
-            .context("Unable to connect to property service")?;
+            .map_err(|e| Error::new_io(e))?;
 
         log::debug!("Successfully connected to property service socket: {}", socket_name);
         Ok(Self { stream })
@@ -123,7 +121,7 @@ impl ServiceConnection {
         log::trace!("Receiving i32 response from property service");
         let mut buf = [0u8; 4];
         self.stream.read_exact(&mut buf)
-            .context("Unable to read i32 from property service")?;
+            .map_err(|e| Error::new_io(e))?;
         let value = i32::from_ne_bytes(buf);
         log::debug!("Received i32 response from property service: {}", value);
         Ok(value)
@@ -164,10 +162,10 @@ impl<'a> ServiceWriter<'a> {
     fn send(self, conn: &mut ServiceConnection) -> Result<()> {
         log::debug!("Sending {} buffers to property service", self.buffers.len());
         conn.stream.write_vectored(&self.buffers)
-            .context("Unable to write to property service")?;
+            .map_err(|e| Error::new_io(e))?;
         log::trace!("Flushing property service connection");
         conn.stream.flush()
-            .context("Unable to flush property service")?;
+            .map_err(|e| Error::new_io(e))?;
         log::debug!("Successfully sent data to property service");
         Ok(())
     }
@@ -269,12 +267,12 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
 
             if name.len() >= PROP_NAME_MAX {
                 log::error!("Property name too long for V1 protocol: {} >= {}", name.len(), PROP_NAME_MAX);
-                return Err(Error::new_context(format!("Property name is too long: {}", name.len())).into());
+                return Err(Error::new_file_validation(format!("Property name is too long: {}", name.len())).into());
             }
 
             if value.len() >= PROP_VALUE_MAX {
                 log::error!("Property value too long for V1 protocol: {} >= {}", value.len(), PROP_VALUE_MAX);
-                return Err(Error::new_context(format!("Property value is too long: {}", value.len())).into());
+                return Err(Error::new_file_validation(format!("Property value is too long: {}", value.len())).into());
             }
 
             log::trace!("Creating service connection for V1 protocol");
@@ -302,7 +300,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
 
             if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
                 log::error!("Property value too long for V2 protocol (non-ro property): {} >= {}", value.len(), PROP_VALUE_MAX);
-                return Err(Error::new_context(format!("Property value is too long: {}", value.len())).into());
+                return Err(Error::new_file_validation(format!("Property value is too long: {}", value.len())).into());
             }
 
             log::trace!("Creating service connection for V2 protocol with property name: {}", name);
@@ -320,7 +318,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
 
             if res != PROP_SUCCESS {
                 log::error!("Property service returned error for '{}' = '{}': 0x{:X}", name, value, res);
-                return Err(Error::new_context(format!("Unable to set property \"{name}\" to \"{value}\": error code: 0x{res:X}")).into());
+                return Err(Error::new_io(std::io::Error::new(std::io::ErrorKind::Other, format!("Unable to set property \"{name}\" to \"{value}\": error code: 0x{res:X}"))).into());
             }
 
             log::info!("Successfully set property '{}' using V2 protocol", name);

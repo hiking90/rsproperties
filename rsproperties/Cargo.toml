@@ -21,10 +21,10 @@ log.workspace = true
 zerocopy.workspace = true
 zerocopy-derive.workspace = true
 thiserror.workspace = true
-anyhow.workspace = true
 pretty-hex.workspace = true
 
 [dev-dependencies]
 android_system_properties.workspace = true
 env_logger.workspace = true
+anyhow.workspace = true
 

@@ -3,7 +3,6 @@
 
 use std::{fs, path::PathBuf};
 
-use anyhow::Context;
 use log::{debug, error, info, trace, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixStream, UnixListener};
@@ -46,14 +45,14 @@ pub struct SocketService {
 
 impl Actor for SocketService {
     type Args = SocketServiceArgs;
-    type Error = anyhow::Error;
+    type Error = rsproperties::errors::Error;
 
     async fn on_start(args: Self::Args, _actor_ref: &ActorRef<Self>) -> std::result::Result<Self, Self::Error> {
         // Create parent directory if it doesn't exist
         if !args.socket_dir.exists() {
             debug!("Creating parent directory: {:?}", args.socket_dir);
             fs::create_dir_all(&args.socket_dir)
-                .context("Failed to create parent directory for socket")?;
+                .map_err(|e| rsproperties::errors::Error::new_io(e))?;
         }
 
         let property_socket_path = args.socket_dir.join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
@@ -62,22 +61,22 @@ impl Actor for SocketService {
         if property_socket_path.exists() {
             debug!("Removing existing property socket file: {}", property_socket_path.display());
             fs::remove_file(&property_socket_path)
-                .context("Failed to remove existing property socket file")?;
+                .map_err(|e| rsproperties::errors::Error::new_io(e))?;
         }
         if system_socket_path.exists() {
             debug!("Removing existing system socket file: {}", system_socket_path.display());
             fs::remove_file(&system_socket_path)
-                .context("Failed to remove existing system socket file")?;
+                .map_err(|e| rsproperties::errors::Error::new_io(e))?;
         }
         info!("Property socket services successfully created at: {} and {}",
               property_socket_path.display(), system_socket_path.display());
         // Bind both sockets
         trace!("Binding property service Unix domain socket: {}", property_socket_path.display());
         let property_listener = UnixListener::bind(&property_socket_path)
-            .context("Failed to bind property service Unix domain socket")?;
+            .map_err(|e| rsproperties::errors::Error::new_io(e))?;
         trace!("Binding system property service Unix domain socket: {}", system_socket_path.display());
         let system_listener = UnixListener::bind(&system_socket_path)
-            .context("Failed to bind system property service Unix domain socket")?;
+            .map_err(|e| rsproperties::errors::Error::new_io(e))?;
         info!("AsyncPropertySocketService started successfully");
 
         Ok(Self {
@@ -167,7 +166,7 @@ impl SocketService {
         // Read the command (u32)
         let mut cmd_buf = [0u8; 4];
         stream.read_exact(&mut cmd_buf).await
-            .context("Failed to read command from client")?;
+            .map_err(|e| rsproperties::errors::Error::new_io(e))?;
         let cmd = u32::from_ne_bytes(cmd_buf);
 
         debug!("Received command: 0x{:08X}", cmd);
@@ -180,7 +179,7 @@ impl SocketService {
             _ => {
                 warn!("Unknown command received: 0x{:08X}", cmd);
                 Self::send_response(&mut stream, PROP_ERROR).await?;
-                return Err(rsproperties::errors::Error::new_context(
+                return Err(rsproperties::errors::Error::new_parse(
                     format!("Unknown command: 0x{:08X}", cmd)
                 ).into());
             }
@@ -198,39 +197,35 @@ impl SocketService {
         trace!("Handling SETPROP2 request");
 
         // Read name length and name
-        let name_len = Self::read_u32(stream).await
-            .context("Failed to read name length")?;
+        let name_len = Self::read_u32(stream).await?;
         trace!("Name length: {}", name_len);
 
         if name_len > 1024 {
             // Reasonable limit
             error!("Name length too large: {}", name_len);
             Self::send_response(stream, PROP_ERROR).await?;
-            return Err(rsproperties::errors::Error::new_context(
+            return Err(rsproperties::errors::Error::new_file_validation(
                 format!("Name length too large: {}", name_len)
             ).into());
         }
 
-        let name = Self::read_string(stream, name_len as usize).await
-            .context("Failed to read property name")?;
+        let name = Self::read_string(stream, name_len as usize).await?;
         debug!("Property name: '{}'", name);
 
         // Read value length and value
-        let value_len = Self::read_u32(stream).await
-            .context("Failed to read value length")?;
+        let value_len = Self::read_u32(stream).await?;
         trace!("Value length: {}", value_len);
 
         if value_len > 8192 {
             // Reasonable limit for property values
             error!("Value length too large: {}", value_len);
             Self::send_response(stream, PROP_ERROR).await?;
-            return Err(rsproperties::errors::Error::new_context(
+            return Err(rsproperties::errors::Error::new_file_validation(
                 format!("Value length too large: {}", value_len)
             ).into());
         }
 
-        let value = Self::read_string(stream, value_len as usize).await
-            .context("Failed to read property value")?;
+        let value = Self::read_string(stream, value_len as usize).await?;
         debug!("Property value: '{}'", value);
 
         // Process the property setting
@@ -266,7 +261,7 @@ impl SocketService {
     async fn read_u32(stream: &mut UnixStream) -> Result<u32> {
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf).await
-            .context("Failed to read u32")?;
+            .map_err(|e| rsproperties::errors::Error::new_io(e))?;
         Ok(u32::from_ne_bytes(buf))
     }
 
@@ -278,7 +273,7 @@ impl SocketService {
 
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf).await
-            .context("Failed to read string data")?;
+            .map_err(|e| rsproperties::errors::Error::new_io(e))?;
 
         // Remove null terminator if present
         if let Some(null_pos) = buf.iter().position(|&x| x == 0) {
@@ -286,16 +281,16 @@ impl SocketService {
         }
 
         String::from_utf8(buf)
-            .context("Invalid UTF-8 in string data")
+            .map_err(|e| rsproperties::errors::Error::new_encoding(e.to_string()))
     }
 
     /// Sends a response to the client
     async fn send_response(stream: &mut UnixStream, response: i32) -> Result<()> {
         trace!("Sending response: {}", response);
         stream.write_all(&response.to_ne_bytes()).await
-            .context("Failed to send response")?;
+            .map_err(|e| rsproperties::errors::Error::new_io(e))?;
         stream.flush().await
-            .context("Failed to flush response")?;
+            .map_err(|e| rsproperties::errors::Error::new_io(e))?;
         trace!("Response sent successfully");
         Ok(())
     }

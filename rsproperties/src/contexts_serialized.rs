@@ -5,7 +5,6 @@ use std::path::Path;
 use std::ffi::CStr;
 
 use rustix::fs;
-use anyhow::Context;
 use log::{trace, debug, info, warn, error};
 use crate::errors::*;
 
@@ -55,8 +54,7 @@ impl ContextsSerialized {
             if !dirname.is_dir() {
                 info!("Creating directory: {:?}", dirname);
                 fs::mkdir(dirname.as_path(), fs::Mode::RWXU | fs::Mode::XGRP | fs::Mode::XOTH)
-                    .map_err(Error::from)
-                    .context(format!("mkdir is failed in: {dirname:?}"))?;
+                    .map_err(Error::from)?;
             }
 
             *fsetxattr_failed = false;
@@ -142,7 +140,7 @@ impl ContextsSerialized {
 
         if index == u32::MAX || index >= self.context_nodes.len() as u32 {
             error!("Could not find context for property {}: index={}, max_contexts={}", name, index, self.context_nodes.len());
-            return Err(Error::new_context(format!("Could not find context for property {name}")).into());
+            return Err(Error::new_not_found(format!("Could not find context for property {name}")).into());
         }
 
         let context_node = &self.context_nodes[index as usize];
@@ -174,7 +172,7 @@ impl ContextsSerialized {
 
         if context_index >= self.context_nodes.len() as u32 {
             error!("Invalid context index {}: max={}", context_index, self.context_nodes.len());
-            return Err(Error::new_context(format!("Invalid context index: {}", context_index)).into());
+            return Err(Error::new_parse(format!("Invalid context index: {}", context_index)).into());
         }
 
         let context_node = &self.context_nodes[context_index as usize];
@@ -196,7 +194,7 @@ impl ContextsSerialized {
 
         if context_index >= self.context_nodes.len() as u32 {
             error!("Invalid context index {}: max={}", context_index, self.context_nodes.len());
-            return Err(Error::new_context(format!("Invalid context index: {}", context_index)).into());
+            return Err(Error::new_parse(format!("Invalid context index: {}", context_index)).into());
         }
 
         let context_node = &self.context_nodes[context_index as usize];

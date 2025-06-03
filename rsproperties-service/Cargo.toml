@@ -14,7 +14,6 @@ description = "Service implementation for Android system properties"
 [dependencies]
 rsproperties = { path = "../rsproperties", features = ["builder"] }
 log.workspace = true
-anyhow.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 rsactor.workspace = true
@@ -22,6 +21,7 @@ rsactor.workspace = true
 [dev-dependencies]
 env_logger.workspace = true
 ctrlc.workspace = true
+anyhow.workspace = true
 
 [[example]]
 name = "socket_service_client"

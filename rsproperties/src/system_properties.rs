@@ -319,7 +319,7 @@ impl SystemProperties {
         if value.len() >= PROP_VALUE_MAX {
             let error_msg = format!("Value too long: {} (max: {})", value.len(), PROP_VALUE_MAX);
             log::error!("{}", error_msg);
-            return Err(Error::new_context(error_msg).into());
+            return Err(Error::new_file_validation(error_msg).into());
         }
 
         let mut res = match self.contexts.prop_area_mut_with_index(index.context_index) {
@@ -342,7 +342,7 @@ impl SystemProperties {
         if !name.is_empty() && &name[0..3] == b"ro." {
             let error_msg = format!("Try to update the read-only property: {name:?}");
             log::error!("{}", error_msg);
-            return Err(Error::new_context(error_msg).into());
+            return Err(Error::new_permission_denied(error_msg).into());
         }
 
         let mut serial = pi.serial.load(Ordering::Relaxed);
@@ -414,7 +414,7 @@ impl SystemProperties {
             let error_msg = format!("Value too long: {} (max: {}) for property: {}",
                                    value.len(), PROP_VALUE_MAX, name);
             log::error!("{}", error_msg);
-            return Err(Error::new_context(error_msg).into());
+            return Err(Error::new_file_validation(error_msg).into());
         }
 
         let mut res = match self.contexts.prop_area_mut_for_name(name) {
