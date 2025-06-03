@@ -6,9 +6,8 @@ use std::mem;
 #[cfg(feature = "builder")]
 use std::ptr;
 use std::ffi::CStr;
-use log::trace;
 #[cfg(feature = "builder")]
-use log::{debug, warn};
+use log::warn;
 
 use crate::system_properties::PROP_VALUE_MAX;
 
@@ -39,13 +38,10 @@ pub struct PropertyInfo {
 impl PropertyInfo {
     #[cfg(feature = "builder")]
     pub(crate) fn init_with_long_offset(&mut self, name: &str, offset: u32) {
-        debug!("Initializing property {} with long offset: {}", name, offset);
-
         init_name_with_trailing_data(self, name);
         let error_value_len = LONG_LEGACY_ERROR.len();
         let serial_value = (error_value_len << 24 | LONG_FLAG) as u32;
 
-        trace!("Setting serial to {} (error_len={}, LONG_FLAG={})", serial_value, error_value_len, LONG_FLAG);
         self.serial.store(serial_value, std::sync::atomic::Ordering::Relaxed);
 
         // Safe memory copy with proper bounds checking
@@ -57,7 +53,7 @@ impl PropertyInfo {
             // Always use safe bounds-checked copy
             let dest_slice = &mut long_property.error_message[..copy_len];
             dest_slice.copy_from_slice(&error_bytes[..copy_len]);
-            
+
             // Clear remaining bytes if needed
             if copy_len < long_property.error_message.len() {
                 long_property.error_message[copy_len..].fill(0);
@@ -65,18 +61,13 @@ impl PropertyInfo {
 
             long_property.offset = offset;
         }
-
-        trace!("Successfully initialized long property {} with offset {}", name, offset);
     }
 
     #[cfg(feature = "builder")]
     pub(crate) fn init_with_value(&mut self, name: &str, value: &str) {
-        debug!("Initializing property {} with value: {}", name, value);
-
         init_name_with_trailing_data(self, name);
         let serial_value = (value.len() << 24) as u32;
 
-        trace!("Setting serial to {} (value_len={})", serial_value, value.len());
         self.serial.store(serial_value, std::sync::atomic::Ordering::Relaxed);
 
         // Safe memory copy with bounds checking
@@ -93,8 +84,6 @@ impl PropertyInfo {
                 self.data.value[copy_len] = 0;
             }
         }
-
-        trace!("Successfully initialized property {} with value length {}", name, value.len());
     }
 /*
     pub(crate) fn set_name(&mut self, name: &str) {
@@ -107,20 +96,16 @@ impl PropertyInfo {
     }
 */
     pub(crate) fn name(&self) -> &CStr {
-        trace!("Getting property name");
         name_from_trailing_data(self, None)
     }
 
     pub(crate) fn value(&self) -> &CStr {
-        trace!("Getting property value (is_long={})", self.is_long());
-
         if self.is_long() {
             unsafe {
                 let long_property = &self.data.long_property;
                 let self_ptr = self as *const _ as *const u8;
                 let value_ptr = self_ptr.add(long_property.offset as usize) as *const i8;
 
-                trace!("Reading long property value at offset {}", long_property.offset);
                 // Don't know the length of the long property value, so it depends on the null terminator.
                 CStr::from_ptr(value_ptr)
             }
@@ -137,8 +122,6 @@ impl PropertyInfo {
     // TODO: self must be mutable. The current implementation is a workaround.
     #[cfg(feature = "builder")]
     pub(crate) fn set_value(&self, value: &str) {
-        debug!("Setting property value to: {} (length={})", value, value.len());
-
         if self.is_long() {
             warn!("Attempting to set value on long property - this may not work correctly");
         }
@@ -158,33 +141,25 @@ impl PropertyInfo {
                 *dest_ptr.add(copy_len) = 0;
             }
         }
-
-        trace!("Successfully set property value with length {}", value.len());
     }
 
     pub(crate) fn is_long(&self) -> bool {
         let serial = self.serial.load(std::sync::atomic::Ordering::Relaxed);
-        let is_long = serial & (LONG_FLAG as u32) != 0;
-        trace!("Checking if property is long: {} (serial={})", is_long, serial);
-        is_long
+        serial & (LONG_FLAG as u32) != 0
     }
 }
 
 #[inline(always)]
 pub(crate) fn name_from_trailing_data<I: Sized>(thiz: &I, len: Option<usize>) -> &CStr {
-    trace!("Getting name from trailing data (len={:?})", len);
-
     unsafe {
         let thiz_ptr = thiz as *const _ as *const u8;
         let name_ptr = thiz_ptr.add(mem::size_of::<I>()) as _;
         match len {
             Some(len) => {
-                trace!("Reading name with known length: {}", len);
                 CStr::from_bytes_until_nul(std::slice::from_raw_parts(name_ptr, len + 1))
                     .expect("Failed to convert name to CStr")
             }
             None => {
-                trace!("Reading null-terminated name");
                 CStr::from_ptr(name_ptr as *const i8)
             }
         }
@@ -194,8 +169,6 @@ pub(crate) fn name_from_trailing_data<I: Sized>(thiz: &I, len: Option<usize>) ->
 #[cfg(feature = "builder")]
 #[inline(always)]
 pub(crate) fn init_name_with_trailing_data<I: Sized>(thiz: &mut I, name: &str) {
-    trace!("Initializing name with trailing data: {} (length={})", name, name.len());
-
     unsafe {
         let thiz_ptr = thiz as *mut _ as *mut u8;
         let name_ptr = thiz_ptr.add(mem::size_of::<I>()) as _;
@@ -203,6 +176,4 @@ pub(crate) fn init_name_with_trailing_data<I: Sized>(thiz: &mut I, name: &str) {
         ptr::copy_nonoverlapping(name.as_ptr(), name_ptr, name.len());
         *name_ptr.add(name.len()) = 0; // Add null terminator
     }
-
-    trace!("Successfully initialized name: {}", name);
 }

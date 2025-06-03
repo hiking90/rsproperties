@@ -5,7 +5,7 @@ use std::{
     cmp::Ordering, ffi::CStr, fs::File, mem::size_of, path::Path
 };
 
-use log::{debug, info, trace};
+use log::info;
 
 use zerocopy_derive::*;
 
@@ -16,7 +16,6 @@ fn find<F>(array_length: u32, f: F) -> i32
 where
     F: Fn(i32) -> Ordering,
 {
-    trace!("Binary search in array of length {}", array_length);
     let mut bottom = 0;
     let mut top = array_length as i32 - 1;
     while top >= bottom {
@@ -24,20 +23,16 @@ where
 
         match f(search) {
             Ordering::Equal => {
-                trace!("Found match at index {}", search);
                 return search;
             },
             Ordering::Less => {
-                trace!("Search {} too small, moving to upper half", search);
                 bottom = search + 1;
             },
             Ordering::Greater => {
-                trace!("Search {} too large, moving to lower half", search);
                 top = search - 1;
             },
         };
     }
-    trace!("No match found in binary search");
     -1
 }
 
@@ -125,20 +120,15 @@ impl<'a> TrieNode<'a> {
     }
 
     fn find_child_for_string(&self, input: &str) -> Option<TrieNode> {
-        trace!("Finding child node for string: '{}'", input);
-
         let node_index = find(self.num_child_nodes(), |i| {
             let child = self.child_node(i as _);
             let child_name = child.name().to_str().unwrap();
-            trace!("Comparing '{}' with child '{}'", input, child_name);
             child_name.cmp(input)
         });
 
         if node_index < 0 {
-            debug!("No child found for string: '{}'", input);
             None
         } else {
-            debug!("Found child at index {} for string: '{}'", node_index, input);
             Some(self.child_node(node_index as _))
         }
     }
@@ -271,54 +261,39 @@ impl<'a> PropertyInfoArea<'a> {
 
     fn check_prefix_match(&self, remaining_name: &str, trie_node: &TrieNode,
         context_index: &mut u32, type_index: &mut u32) {
-        trace!("Checking prefix matches for: '{}' (node has {} prefixes)", remaining_name, trie_node.num_prefixes());
-
         let remaining_name_size = remaining_name.len();
         for i in 0..trie_node.num_prefixes() {
             let prefix = trie_node.prefix(i as _);
             if prefix.namelen > remaining_name_size as u32 {
-                trace!("Prefix {} too long: {} > {}", i, prefix.namelen, remaining_name_size);
                 continue;
             }
             let prefix_name = prefix.name(self).to_str().unwrap();
-            trace!("Checking prefix {}: '{}'", i, prefix_name);
 
             if remaining_name.starts_with(prefix_name) {
-                debug!("Found matching prefix: '{}' for remaining name: '{}'", prefix_name, remaining_name);
-
                 if prefix.context_index != !0 {
-                    trace!("Updating context_index from {} to {}", *context_index, prefix.context_index);
                     *context_index = prefix.context_index;
                 }
 
                 if prefix.type_index != !0 {
-                    trace!("Updating type_index from {} to {}", *type_index, prefix.type_index);
                     *type_index = prefix.type_index;
                 }
                 return;
             }
         }
-        trace!("No matching prefix found for: '{}'", remaining_name);
     }
 
     pub(crate) fn get_property_info_indexes(&self, name: &str) -> (u32, u32) {
-        debug!("Getting property info indexes for: '{}'", name);
-
         let mut return_context_index: u32 = !0;
         let mut return_type_index: u32 = !0;
         let mut remaining_name = name;
         let mut trie_node = self.root_node();
 
-        trace!("Starting traversal with root node");
-
         loop {
             if trie_node.context_index() != !0 {
-                trace!("Node has context_index: {}", trie_node.context_index());
                 return_context_index = trie_node.context_index();
             }
 
             if trie_node.type_index() != !0 {
-                trace!("Node has type_index: {}", trie_node.type_index());
                 return_type_index = trie_node.type_index();
             }
 
@@ -327,35 +302,27 @@ impl<'a> PropertyInfoArea<'a> {
             match remaining_name.find('.') {
                 Some(index) => {
                     let segment = &remaining_name[..index];
-                    trace!("Processing segment: '{}' from remaining: '{}'", segment, remaining_name);
 
                     match trie_node.find_child_for_string(segment) {
                         Some(node) => {
                             remaining_name = &remaining_name[index + 1..];
-                            trace!("Found child node, remaining name: '{}'", remaining_name);
                             trie_node = self.clone_trie_node(&node);
                         }
                         None => {
-                            debug!("No child found for segment: '{}', stopping traversal", segment);
                             break;
                         },
                     };
                 }
                 None => {
-                    trace!("No more segments to process, checking exact matches");
                     break;
                 },
             }
         }
 
-        trace!("Checking {} exact matches for final segment: '{}'", trie_node.num_exact_matches(), remaining_name);
         for i in 0..trie_node.num_exact_matches() {
             let exact_match = trie_node.exact_match(i as _);
             let exact_match_name = exact_match.name(self).to_str().unwrap();
-            trace!("Checking exact match {}: '{}'", i, exact_match_name);
             if exact_match_name == remaining_name {
-                debug!("Found exact match: '{}' at index {}", exact_match_name, i);
-
                 let context_index = if exact_match.context_index != !0 {
                     exact_match.context_index
                 } else {
@@ -373,7 +340,6 @@ impl<'a> PropertyInfoArea<'a> {
             }
         }
 
-        debug!("No exact match found, using accumulated indexes: context={}, type={}", return_context_index, return_type_index);
         self.check_prefix_match(remaining_name, &trie_node, &mut return_context_index, &mut return_type_index);
         (return_context_index, return_type_index)
     }
@@ -415,13 +381,10 @@ pub struct PropertyInfoAreaFile {
 
 impl PropertyInfoAreaFile {
     pub(crate) fn load_default_path() -> Result<Self> {
-        debug!("Loading property info area from default path");
         Self::load_path(Path::new(crate::system_properties::PROP_TREE_FILE))
     }
 
     pub(crate) fn load_path(path: &Path) -> Result<Self> {
-        debug!("Loading property info area from path: {:?}", path);
-
         let file: File = File::open(path)
             .context_with_location(format!("File open is failed in: {path:?}"))?;
 

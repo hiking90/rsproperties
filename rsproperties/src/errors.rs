@@ -163,9 +163,6 @@ pub fn validate_file_metadata(
 
     use rustix::fs;
 
-    log::trace!("Validating file metadata: uid={}, gid={}, mode={:#o}, size={} for {:?}",
-               metadata.st_uid(), metadata.st_gid(), metadata.st_mode(), metadata.st_size(), path);
-
     // Check file size first (applies to all modes)
     if metadata.st_size() < min_size {
         let error_msg = format!("File too small: size={}, min_size={} for {:?}",
@@ -192,7 +189,6 @@ pub fn validate_file_metadata(
         }
     }
 
-    log::debug!("File metadata validation passed for {:?}", path);
     Ok(())
 }
 

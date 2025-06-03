@@ -252,7 +252,6 @@ pub fn properties_dir() -> &'static Path {
         log::info!("Using default properties directory: {}", PROP_DIRNAME);
         PathBuf::from(PROP_DIRNAME)
     }).as_path();
-    log::trace!("Getting system properties directory: {:?}", path);
     path
 }
 
@@ -262,14 +261,15 @@ pub fn properties_dir() -> &'static Path {
 pub fn system_properties() -> &'static system_properties::SystemProperties {
     SYSTEM_PROPERTIES.get_or_init(|| {
         let dir = properties_dir();
-        log::info!("Initializing global SystemProperties instance from: {:?}", dir);
+        log::debug!("Initializing global SystemProperties instance from: {:?}", dir);
 
         match system_properties::SystemProperties::new(dir) {
             Ok(props) => {
-                log::info!("Successfully initialized global SystemProperties instance");
+                log::debug!("Successfully initialized global SystemProperties instance");
                 props
             },
             Err(e) => {
+                log::error!("Failed to initialize SystemProperties from {:?}: {}", dir, e);
                 panic!("Failed to initialize SystemProperties from {:?}: {}", dir, e);
             }
         }

@@ -76,20 +76,14 @@ pub struct SystemProperties {
 impl SystemProperties {
     // Create a new system properties to read system properties from a file or a directory.
     pub(crate) fn new(filename: &Path) -> Result<Self> {
-        log::info!("Creating SystemProperties from path: {:?}", filename);
-
         let contexts = match ContextsSerialized::new(false, filename, &mut false, false) {
-            Ok(contexts) => {
-                log::info!("Successfully loaded contexts from: {:?}", filename);
-                contexts
-            },
+            Ok(contexts) => contexts,
             Err(e) => {
                 log::error!("Failed to load contexts from {:?}: {}", filename, e);
                 return Err(e);
             }
         };
 
-        log::debug!("SystemProperties created successfully");
         Ok(Self {
             contexts,
         })
@@ -99,36 +93,26 @@ impl SystemProperties {
     // The new area is used by the property service to store system properties.
     #[cfg(feature = "builder")]
     pub fn new_area(dirname: &Path) -> Result<Self> {
-        log::info!("Creating SystemProperties area from directory: {:?}", dirname);
-
         let contexts = match ContextsSerialized::new(true, dirname, &mut false, false) {
-            Ok(contexts) => {
-                log::info!("Successfully created area from: {:?}", dirname);
-                contexts
-            },
+            Ok(contexts) => contexts,
             Err(e) => {
                 log::error!("Failed to create area from {:?}: {}", dirname, e);
                 return Err(e);
             }
         };
 
-        log::debug!("SystemProperties area created successfully");
         Ok(Self {
             contexts,
         })
     }
 
     fn read_mutable_property_value(&self, prop_info: &PropertyInfo) -> Result<(u32, String)> {
-        log::debug!("Reading mutable property value for: {:?}", prop_info.name());
-
         loop {
             // Read current serial at the beginning of each iteration
             let serial = prop_info.serial.load(Ordering::Acquire);
             let _len: u32 = serial_value_len(serial);
-            log::trace!("Property serial: {}, length: {}, dirty: {}", serial, _len, serial_dirty(serial));
 
             let value = if serial_dirty(serial) {
-                log::debug!("Reading dirty property value from backup area");
                 let res = match self.contexts.prop_area_for_name(prop_info.name().to_str()?) {
                     Ok(res) => res,
                     Err(e) => {
@@ -146,7 +130,6 @@ impl SystemProperties {
                 };
                 value.as_str().map_err(Error::from)?.to_owned()
             } else {
-                log::debug!("Reading property value from property info");
                 let value = prop_info.value();
                 value.as_str().map_err(Error::from)?.to_owned()
             };
@@ -157,11 +140,9 @@ impl SystemProperties {
             // Check if serial hasn't changed during our read operation
             let final_serial = prop_info.serial.load(Ordering::Acquire);
             if final_serial == serial {
-                log::debug!("Successfully read property value: {} (length: {})", value, value.len());
                 return Ok((serial, value));
             }
 
-            log::trace!("Serial changed during read ({} -> {}), retrying...", serial, final_serial);
             // No need for additional fence here as we'll acquire again at loop start
         }
     }
@@ -181,13 +162,8 @@ impl SystemProperties {
 
     /// Internal function to get property value that returns error for missing properties
     pub fn get_with_result(&self, name: &str) -> Result<String> {
-        log::debug!("Getting property value for: {}", name);
-
         let res = match self.contexts.prop_area_for_name(name) {
-            Ok(res) => {
-                log::trace!("Found property area for: {}", name);
-                res
-            },
+            Ok(res) => res,
             Err(e) => {
                 log::error!("Failed to find property area for {}: {}", name, e);
                 return Err(e);
@@ -197,7 +173,6 @@ impl SystemProperties {
 
         match pa.find(name) {
             Ok(pi) => {
-                log::trace!("Found property info for: {}", name);
                 let (_name, value) = match self.read(pi.0, false) {
                     Ok(result) => result,
                     Err(e) => {
@@ -205,11 +180,9 @@ impl SystemProperties {
                         return Err(e);
                     }
                 };
-                log::debug!("Successfully retrieved property {}: {}", name, value);
                 Ok(value)
             }
             Err(e) => {
-                log::debug!("Property {} not found: {}", name, e);
                 Err(e)
             }
         }
@@ -220,10 +193,7 @@ impl SystemProperties {
     pub fn get(&self, name: &str) -> String {
         match self.get_with_result(name) {
             Ok(value) => value,
-            Err(_) => {
-                log::warn!("Property {} not found, returning empty string", name);
-                "".to_owned()
-            }
+            Err(_) => "".to_owned()
         }
     }
 
@@ -232,10 +202,7 @@ impl SystemProperties {
     pub fn get_with_default(&self, name: &str, default: &str) -> String {
         match self.get_with_result(name) {
             Ok(value) => value,
-            Err(_) => {
-                log::debug!("Property {} not found, returning default: {}", name, default);
-                default.to_owned()
-            }
+            Err(_) => default.to_owned()
         }
     }
 
@@ -243,13 +210,8 @@ impl SystemProperties {
     /// The property index is used to update the property value.
     /// If the property is not found, it returns Ok(None)
     pub fn find(&self, name: &str) -> Result<Option<PropertyIndex>> {
-        log::debug!("Finding property index for: {}", name);
-
         let res = match self.contexts.prop_area_for_name(name) {
-            Ok(res) => {
-                log::trace!("Found property area for: {}", name);
-                res
-            },
+            Ok(res) => res,
             Err(e) => {
                 log::error!("Failed to find property area for {}: {}", name, e);
                 return Err(e);
@@ -262,12 +224,9 @@ impl SystemProperties {
                     context_index: res.1,
                     property_index: pi.1,
                 };
-                log::debug!("Found property index for {}: context={}, property={}",
-                           name, index.context_index, index.property_index);
                 Ok(Some(index))
             }
-            Err(e) => {
-                log::debug!("Property {} not found: {}", name, e);
+            Err(_) => {
                 Ok(None)
             }
         }
@@ -280,15 +239,10 @@ impl SystemProperties {
     /// If the property is updated successfully, it returns Ok(()).
     #[cfg(feature = "builder")]
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
-        log::info!("Setting property: {} = {}", key, value);
-
         match self.find(key)? {
             Some(prop_ref) => {
-                log::debug!("Property {} exists, updating", key);
                 match self.update(&prop_ref, value) {
-                    Ok(_) => {
-                        log::info!("Successfully updated property: {}", key);
-                    },
+                    Ok(_) => {},
                     Err(e) => {
                         log::error!("Failed to update property {}: {}", key, e);
                         return Err(e);
@@ -296,11 +250,8 @@ impl SystemProperties {
                 }
             },
             None => {
-                log::debug!("Property {} does not exist, creating new", key);
                 match self.add(key, value) {
-                    Ok(_) => {
-                        log::info!("Successfully created property: {}", key);
-                    },
+                    Ok(_) => {},
                     Err(e) => {
                         log::error!("Failed to create property {}: {}", key, e);
                         return Err(e);
@@ -314,9 +265,6 @@ impl SystemProperties {
 
     #[cfg(feature = "builder")]
     pub fn update(&mut self, index: &PropertyIndex, value: &str) -> Result<bool> {
-        log::debug!("Updating property at index context={}, property={} with value: {}",
-                   index.context_index, index.property_index, value);
-
         if value.len() >= PROP_VALUE_MAX {
             let error_msg = format!("Value too long: {} (max: {})", value.len(), PROP_VALUE_MAX);
             log::error!("{}", error_msg);
@@ -348,11 +296,10 @@ impl SystemProperties {
 
         let mut serial = pi.serial.load(Ordering::Relaxed);
         let backup_value = pi.value().to_owned();
-        log::trace!("Current serial: {}, backing up value: {:?}", serial, backup_value);
 
         // Before updating, the property value must be backed up
         match pa.set_dirty_backup_area(&backup_value) {
-            Ok(_) => log::trace!("Backup area set successfully"),
+            Ok(_) => {},
             Err(e) => {
                 log::error!("Failed to set backup area: {}", e);
                 return Err(e);
@@ -370,7 +317,6 @@ impl SystemProperties {
             }
         };
         pi.serial.store(serial, Ordering::Relaxed);
-        log::trace!("Set dirty flag, serial: {}", serial);
 
         // Set the new value
         pi.set_value(value);
@@ -379,10 +325,9 @@ impl SystemProperties {
         // Set the new serial. It is cleared the dirty flag and set the new length of the value.
         let new_serial = (value.len() << 24) as u32 | ((serial + 1) & 0xffffff);
         pi.serial.store(new_serial, std::sync::atomic::Ordering::Relaxed);
-        log::trace!("Updated value and serial: {}", new_serial);
 
         match futex_wake(&pi.serial) {
-            Ok(_) => log::trace!("Property futex wake successful"),
+            Ok(_) => {},
             Err(e) => {
                 log::error!("Failed to wake property futex: {}", e);
                 return Err(e);
@@ -392,25 +337,20 @@ impl SystemProperties {
         let serial_pa = self.contexts.serial_prop_area();
         let old_serial = serial_pa.serial().load(Ordering::Relaxed);
         serial_pa.serial().store(old_serial + 1, Ordering::Release);
-        log::trace!("Updated global serial from {} to {}", old_serial, old_serial + 1);
 
         match futex_wake(&serial_pa.serial()) {
-            Ok(_) => log::trace!("Global serial futex wake successful"),
+            Ok(_) => {},
             Err(e) => {
                 log::error!("Failed to wake global serial futex: {}", e);
                 return Err(e);
             }
         }
 
-        log::info!("Successfully updated property at index context={}, property={}",
-                  index.context_index, index.property_index);
         Ok(true)
     }
 
     #[cfg(feature = "builder")]
     pub fn add(&mut self, name: &str, value: &str) -> Result<()> {
-        log::info!("Adding new property: {} = {}", name, value);
-
         if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
             let error_msg = format!("Value too long: {} (max: {}) for property: {}",
                                    value.len(), PROP_VALUE_MAX, name);
@@ -419,10 +359,7 @@ impl SystemProperties {
         }
 
         let mut res = match self.contexts.prop_area_mut_for_name(name) {
-            Ok(res) => {
-                log::trace!("Got mutable property area for: {}", name);
-                res
-            },
+            Ok(res) => res,
             Err(e) => {
                 log::error!("Failed to get mutable property area for {}: {}", name, e);
                 return Err(e);
@@ -431,9 +368,7 @@ impl SystemProperties {
         let pa = res.0.property_area_mut();
 
         match pa.add(name, value) {
-            Ok(_) => {
-                log::debug!("Successfully added property to area: {}", name);
-            },
+            Ok(_) => {},
             Err(e) => {
                 log::error!("Failed to add property {} to area: {}", name, e);
                 return Err(e);
@@ -443,19 +378,15 @@ impl SystemProperties {
         let serial_pa = self.contexts.serial_prop_area();
         let old_serial = serial_pa.serial().load(Ordering::Relaxed);
         serial_pa.serial().store(old_serial + 1, Ordering::Release);
-        log::trace!("Updated global serial from {} to {} after adding property", old_serial, old_serial + 1);
 
         match futex_wake(&serial_pa.serial()) {
-            Ok(_) => {
-                log::trace!("Global serial futex wake successful after adding property");
-            },
+            Ok(_) => {},
             Err(e) => {
                 log::error!("Failed to wake global serial futex after adding property: {}", e);
                 return Err(e);
             }
         }
 
-        log::info!("Successfully added new property: {}", name);
         Ok(())
     }
 
