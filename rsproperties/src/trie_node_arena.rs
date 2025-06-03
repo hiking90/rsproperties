@@ -26,6 +26,20 @@ impl TrieNodeArena {
     #[inline(always)]
     pub(crate) fn to_object<T>(&mut self, offset: usize) -> &mut T {
         trace!("Getting object at offset {} (type: {})", offset, std::any::type_name::<T>());
+
+        // Bounds checking
+        let size = mem::size_of::<T>();
+        assert!(offset.checked_add(size).unwrap_or(usize::MAX) <= self.data.len(),
+                "Object access out of bounds: offset={}, size={}, data_len={}",
+                offset, size, self.data.len());
+
+        // Alignment checking
+        let align = mem::align_of::<T>();
+        assert!(offset % align == 0,
+                "Object at offset {} is not properly aligned for type {} (alignment={})",
+                offset, std::any::type_name::<T>(), align);
+
+        // SAFETY: We've verified bounds and alignment above
         unsafe { &mut *(self.data.as_mut_ptr().add(offset) as *mut T) }
     }
 
@@ -47,10 +61,25 @@ impl TrieNodeArena {
 
     pub(crate) fn uint32_array(&mut self, offset: usize) -> &mut [u32] {
         trace!("Getting uint32 array at offset {}", offset);
+        
+        // Bounds checking
+        assert!(offset <= self.data.len(), 
+                "Array access out of bounds: offset={}, data_len={}", 
+                offset, self.data.len());
+        
+        // Alignment checking
+        assert!(offset % mem::align_of::<u32>() == 0,
+                "Array at offset {} is not properly aligned for u32 (alignment={})",
+                offset, mem::align_of::<u32>());
+        
+        let remaining_bytes = self.data.len() - offset;
+        let array_len = remaining_bytes / mem::size_of::<u32>();
+        
+        // SAFETY: We've verified bounds and alignment above
         unsafe {
             std::slice::from_raw_parts_mut(
                 self.data.as_mut_ptr().add(offset) as *mut u32,
-                (self.data.len() - offset) / mem::size_of::<u32>(),
+                array_len,
             )
         }
     }
@@ -69,6 +98,7 @@ impl TrieNodeArena {
         let offset = self.allocate_data(mem::size_of::<u32>());
         trace!("Writing uint32 value {} at offset {}", value, offset);
 
+        // SAFETY: We just allocated the space and verified alignment in allocate_data
         unsafe {
             let ptr = self.data.as_mut_ptr().add(offset) as *mut u32;
             *ptr = value;

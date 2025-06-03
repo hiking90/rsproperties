@@ -14,6 +14,16 @@ use crate::context_node::PropertyAreaMutGuard;
 use crate::property_area::{PropertyArea, PropertyAreaMap};
 use crate::property_info_parser::PropertyInfoAreaFile;
 
+// Pre-defined CStr constants to avoid unsafe code at runtime
+// Using const_str macro or safer compile-time construction
+const PROPERTIES_SERIAL_CONTEXT: &CStr = {
+    // Safe compile-time CStr construction
+    match CStr::from_bytes_with_nul(b"u:object_r:properties_serial:s0\0") {
+        Ok(cstr) => cstr,
+        Err(_) => panic!("Invalid CStr constant"),
+    }
+};
+
 pub(crate) struct ContextsSerialized {
     property_info_area_file: PropertyInfoAreaFile,
     context_nodes: Vec<ContextNode>,
@@ -85,9 +95,8 @@ impl ContextsSerialized {
         debug!("Mapping serial property area: {:?}, access_rw={}", serial_filename, access_rw);
 
         let result = if access_rw {
-            let context: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"u:object_r:properties_serial:s0\0") };
             trace!("Creating read-write serial property area with SELinux context");
-            PropertyAreaMap::new_rw(serial_filename, Some(context), fsetxattr_failed)
+            PropertyAreaMap::new_rw(serial_filename, Some(PROPERTIES_SERIAL_CONTEXT), fsetxattr_failed)
         } else {
             trace!("Creating read-only serial property area");
             PropertyAreaMap::new_ro(serial_filename)

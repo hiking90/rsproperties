@@ -91,12 +91,11 @@ pub fn load_properties_from_file(filename: &Path, filter: Option<&str>, context:
                 continue;
             }
 
-            let cr = unsafe {
-                UCred {
-                    pid: Pid::from_raw_unchecked(1),
-                    uid: Uid::from_raw(0),
-                    gid: Gid::from_raw(0),
-                }
+            // Create UCred with safe initialization
+            let cr = UCred {
+                pid: Pid::from_raw(1).expect("Valid PID for init process"),
+                uid: Uid::from_raw(0),
+                gid: Gid::from_raw(0),
             };
 
             match check_permissions(key, value, context, &cr) {

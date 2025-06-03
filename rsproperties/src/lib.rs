@@ -117,6 +117,40 @@ impl PropertyConfig {
             socket_dir: Some(socket_dir.into()),
         }
     }
+
+    /// Create a new builder for PropertyConfig
+    pub fn builder() -> PropertyConfigBuilder {
+        PropertyConfigBuilder::default()
+    }
+}
+
+/// Builder for PropertyConfig with validation
+#[derive(Debug, Clone, Default)]
+pub struct PropertyConfigBuilder {
+    properties_dir: Option<PathBuf>,
+    socket_dir: Option<PathBuf>,
+}
+
+impl PropertyConfigBuilder {
+    /// Set the properties directory
+    pub fn properties_dir<P: Into<PathBuf>>(mut self, dir: P) -> Self {
+        self.properties_dir = Some(dir.into());
+        self
+    }
+
+    /// Set the socket directory
+    pub fn socket_dir<P: Into<PathBuf>>(mut self, dir: P) -> Self {
+        self.socket_dir = Some(dir.into());
+        self
+    }
+
+    /// Build the PropertyConfig
+    pub fn build(self) -> PropertyConfig {
+        PropertyConfig {
+            properties_dir: self.properties_dir,
+            socket_dir: self.socket_dir,
+        }
+    }
 }
 
 pub mod errors;

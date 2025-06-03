@@ -205,10 +205,22 @@ impl<'a> PropertyInfoArea<'a> {
 
     #[inline]
     fn u32_slice_from(&self, offset: usize) -> &[u32] {
-        let (prefix, u32_slice, suffix) = unsafe { self.data_base[offset..].align_to::<u32>() };
-        assert!(prefix.is_empty() && suffix.is_empty());
+        // Check bounds first
+        if offset >= self.data_base.len() {
+            return &[];
+        }
+
+        let slice = &self.data_base[offset..];
+        let (prefix, u32_slice, _suffix) = unsafe { slice.align_to::<u32>() };
+
+        // Ensure proper alignment - prefix should be empty for u32-aligned data
+        if !prefix.is_empty() {
+            log::warn!("Data at offset {} is not properly aligned for u32", offset);
+            return &[];
+        }
+
+        // _suffix can contain trailing bytes which is normal
         u32_slice
-        // u32::read_from_bytes(&self.data_base[offset..]).unwrap()
     }
 
     #[inline]

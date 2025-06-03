@@ -529,7 +529,16 @@ pub(crate) struct MemoryMap {
     size: usize,
 }
 
+// SAFETY: MemoryMap is safe to send between threads because:
+// - The underlying memory mapping is thread-safe at the OS level
+// - All access to the mapped memory goes through atomic operations or proper synchronization
+// - The File handle doesn't need to be accessed after mapping
 unsafe impl Send for MemoryMap {}
+
+// SAFETY: MemoryMap is safe to share between threads because:
+// - Memory-mapped regions can be safely accessed from multiple threads
+// - All property operations use atomic reads/writes or are properly synchronized
+// - The data pointer is immutable after initialization
 unsafe impl Sync for MemoryMap {}
 
 impl MemoryMap {

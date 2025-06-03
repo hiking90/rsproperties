@@ -48,9 +48,21 @@ impl PropertyInfo {
         trace!("Setting serial to {} (error_len={}, LONG_FLAG={})", serial_value, error_value_len, LONG_FLAG);
         self.serial.store(serial_value, std::sync::atomic::Ordering::Relaxed);
 
+        // Safe memory copy with proper bounds checking
         unsafe {
             let long_property = &mut self.data.long_property;
-            ptr::copy_nonoverlapping(LONG_LEGACY_ERROR.as_ptr(), long_property.error_message.as_mut_ptr(), error_value_len);
+            let error_bytes = LONG_LEGACY_ERROR.as_bytes();
+            let copy_len = error_value_len.min(error_bytes.len()).min(long_property.error_message.len());
+
+            // Always use safe bounds-checked copy
+            let dest_slice = &mut long_property.error_message[..copy_len];
+            dest_slice.copy_from_slice(&error_bytes[..copy_len]);
+            
+            // Clear remaining bytes if needed
+            if copy_len < long_property.error_message.len() {
+                long_property.error_message[copy_len..].fill(0);
+            }
+
             long_property.offset = offset;
         }
 
@@ -67,10 +79,19 @@ impl PropertyInfo {
         trace!("Setting serial to {} (value_len={})", serial_value, value.len());
         self.serial.store(serial_value, std::sync::atomic::Ordering::Relaxed);
 
+        // Safe memory copy with bounds checking
         unsafe {
-            let dest = self.data.value.as_mut_ptr();
-            ptr::copy_nonoverlapping(value.as_ptr(), dest, value.len());
-            *dest.add(value.len()) = 0; // Add null terminator
+            let value_bytes = value.as_bytes();
+            let max_len = PROP_VALUE_MAX.saturating_sub(1); // Reserve space for null terminator
+            let copy_len = value_bytes.len().min(max_len);
+
+            let dest_slice = &mut self.data.value[..copy_len];
+            dest_slice.copy_from_slice(&value_bytes[..copy_len]);
+
+            // Add null terminator
+            if copy_len < PROP_VALUE_MAX {
+                self.data.value[copy_len] = 0;
+            }
         }
 
         trace!("Successfully initialized property {} with value length {}", name, value.len());
@@ -122,10 +143,20 @@ impl PropertyInfo {
             warn!("Attempting to set value on long property - this may not work correctly");
         }
 
+        // Safe memory copy with bounds checking
         unsafe {
-            let dest = self.data.value.as_ptr() as *mut u8;
-            ptr::copy_nonoverlapping(value.as_ptr(), dest, value.len());
-            *dest.add(value.len()) = 0; // Add null terminator
+            let value_bytes = value.as_bytes();
+            let max_len = PROP_VALUE_MAX.saturating_sub(1); // Reserve space for null terminator
+            let copy_len = value_bytes.len().min(max_len);
+
+            let dest_ptr = self.data.value.as_ptr() as *mut u8;
+            let dest_slice = std::slice::from_raw_parts_mut(dest_ptr, copy_len);
+            dest_slice.copy_from_slice(&value_bytes[..copy_len]);
+
+            // Add null terminator
+            if copy_len < PROP_VALUE_MAX {
+                *dest_ptr.add(copy_len) = 0;
+            }
         }
 
         trace!("Successfully set property value with length {}", value.len());
