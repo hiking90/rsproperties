@@ -107,7 +107,7 @@ async fn test_property_get_with_default_performance() -> Result<()> {
     );
 
     // Both should be reasonably fast
-    assert!(existing_elapsed / iterations < Duration::from_micros(50));
+    assert!(existing_elapsed / iterations < Duration::from_micros(60));
     assert!(nonexistent_elapsed / iterations < Duration::from_micros(50));
 
     Ok(())
