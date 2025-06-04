@@ -293,12 +293,9 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
                     value,
                     res
                 );
-                return Err(Error::new_io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "Unable to set property \"{name}\" to \"{value}\": error code: 0x{res:X}"
-                    ),
-                )));
+                return Err(Error::new_io(std::io::Error::other(format!(
+                    "Unable to set property \"{name}\" to \"{value}\": error code: 0x{res:X}"
+                ))));
             }
         }
     }
