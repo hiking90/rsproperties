@@ -202,7 +202,7 @@ fn test_android_property_contexts_parsing() {
 
     for file in context_files {
         let (property_infos, errors) = PropertyInfoEntry::parse_from_file(Path::new(file), false)
-            .expect(&format!("Failed to parse {}", file));
+            .unwrap_or_else(|_| panic!("Failed to parse {}", file));
 
         assert!(
             !property_infos.is_empty(),

@@ -42,10 +42,7 @@ static SOCKET_DIR: OnceLock<PathBuf> = OnceLock::new();
 pub(crate) fn set_socket_dir<P: AsRef<Path>>(dir: P) -> bool {
     let dir_path = dir.as_ref().to_path_buf();
 
-    match SOCKET_DIR.set(dir_path.clone()) {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    SOCKET_DIR.set(dir_path.clone()).is_ok()
 }
 
 /// Get the current socket directory.
@@ -98,16 +95,14 @@ impl ServiceConnection {
             property_service_socket
         };
 
-        let stream: UnixStream = UnixStream::connect(&socket_name).map_err(|e| Error::new_io(e))?;
+        let stream: UnixStream = UnixStream::connect(&socket_name).map_err(Error::new_io)?;
 
         Ok(Self { stream })
     }
 
     fn recv_i32(&mut self) -> Result<i32> {
         let mut buf = [0u8; 4];
-        self.stream
-            .read_exact(&mut buf)
-            .map_err(|e| Error::new_io(e))?;
+        self.stream.read_exact(&mut buf).map_err(Error::new_io)?;
         let value = i32::from_ne_bytes(buf);
         Ok(value)
     }
@@ -143,8 +138,8 @@ impl<'a> ServiceWriter<'a> {
     fn send(self, conn: &mut ServiceConnection) -> Result<()> {
         conn.stream
             .write_vectored(&self.buffers)
-            .map_err(|e| Error::new_io(e))?;
-        conn.stream.flush().map_err(|e| Error::new_io(e))?;
+            .map_err(Error::new_io)?;
+        conn.stream.flush().map_err(Error::new_io)?;
         Ok(())
     }
 }
@@ -206,15 +201,13 @@ fn protocol_version() -> &'static ProtocolVersion {
         let version = env::var("PROPERTY_SERVICE_VERSION")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| 2);
+            .unwrap_or(2);
 
-        let protocol_version = if version >= 2 {
+        if version >= 2 {
             ProtocolVersion::V2
         } else {
             ProtocolVersion::V1
-        };
-
-        protocol_version
+        }
     })
 }
 
@@ -243,8 +236,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
                 return Err(Error::new_file_validation(format!(
                     "Property name is too long: {}",
                     name.len()
-                ))
-                .into());
+                )));
             }
 
             if value.len() >= PROP_VALUE_MAX {
@@ -256,8 +248,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
                 return Err(Error::new_file_validation(format!(
                     "Property value is too long: {}",
                     value.len()
-                ))
-                .into());
+                )));
             }
 
             let mut conn = ServiceConnection::new(PROP_SERVICE_NAME)?;
@@ -282,8 +273,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
                 return Err(Error::new_file_validation(format!(
                     "Property value is too long: {}",
                     value.len()
-                ))
-                .into());
+                )));
             }
 
             let mut conn = ServiceConnection::new(name)?;
@@ -308,8 +298,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
                     format!(
                         "Unable to set property \"{name}\" to \"{value}\": error code: 0x{res:X}"
                     ),
-                ))
-                .into());
+                )));
             }
         }
     }

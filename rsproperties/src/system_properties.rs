@@ -257,7 +257,7 @@ impl SystemProperties {
         if value.len() >= PROP_VALUE_MAX {
             let error_msg = format!("Value too long: {} (max: {})", value.len(), PROP_VALUE_MAX);
             log::error!("{}", error_msg);
-            return Err(Error::new_file_validation(error_msg).into());
+            return Err(Error::new_file_validation(error_msg));
         }
 
         let mut res = match self.contexts.prop_area_mut_with_index(index.context_index) {
@@ -288,7 +288,7 @@ impl SystemProperties {
         if !name.is_empty() && &name[0..3] == b"ro." {
             let error_msg = format!("Try to update the read-only property: {name:?}");
             log::error!("{}", error_msg);
-            return Err(Error::new_permission_denied(error_msg).into());
+            return Err(Error::new_permission_denied(error_msg));
         }
 
         let mut serial = pi.serial.load(Ordering::Relaxed);
@@ -336,7 +336,7 @@ impl SystemProperties {
         let old_serial = serial_pa.serial().load(Ordering::Relaxed);
         serial_pa.serial().store(old_serial + 1, Ordering::Release);
 
-        match futex_wake(&serial_pa.serial()) {
+        match futex_wake(serial_pa.serial()) {
             Ok(_) => {}
             Err(e) => {
                 log::error!("Failed to wake global serial futex: {}", e);
@@ -357,7 +357,7 @@ impl SystemProperties {
                 name
             );
             log::error!("{}", error_msg);
-            return Err(Error::new_file_validation(error_msg).into());
+            return Err(Error::new_file_validation(error_msg));
         }
 
         let mut res = match self.contexts.prop_area_mut_for_name(name) {
@@ -381,7 +381,7 @@ impl SystemProperties {
         let old_serial = serial_pa.serial().load(Ordering::Relaxed);
         serial_pa.serial().store(old_serial + 1, Ordering::Release);
 
-        match futex_wake(&serial_pa.serial()) {
+        match futex_wake(serial_pa.serial()) {
             Ok(_) => {}
             Err(e) => {
                 log::error!(
@@ -457,7 +457,7 @@ impl SystemProperties {
             },
             None => {
                 let serial_pa = self.contexts.serial_prop_area().serial();
-                futex_wait(&serial_pa, serial_pa.load(Ordering::Acquire), timeout)
+                futex_wait(serial_pa, serial_pa.load(Ordering::Acquire), timeout)
             }
         }
     }

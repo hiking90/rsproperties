@@ -16,13 +16,7 @@ use crate::property_info_parser::PropertyInfoAreaFile;
 
 // Pre-defined CStr constants to avoid unsafe code at runtime
 // Using const_str macro or safer compile-time construction
-const PROPERTIES_SERIAL_CONTEXT: &CStr = {
-    // Safe compile-time CStr construction
-    match CStr::from_bytes_with_nul(b"u:object_r:properties_serial:s0\0") {
-        Ok(cstr) => cstr,
-        Err(_) => panic!("Invalid CStr constant"),
-    }
-};
+const PROPERTIES_SERIAL_CONTEXT: &CStr = c"u:object_r:properties_serial:s0";
 
 pub(crate) struct ContextsSerialized {
     property_info_area_file: PropertyInfoAreaFile,
@@ -125,7 +119,7 @@ impl ContextsSerialized {
                 index,
                 self.context_nodes.len()
             );
-            return Err(Error::new_not_found(name.to_owned()).into());
+            return Err(Error::new_not_found(name.to_owned()));
         }
 
         let context_node = &self.context_nodes[index as usize];
@@ -158,8 +152,7 @@ impl ContextsSerialized {
             );
             return Err(Error::new_not_found(format!(
                 "Could not find context for property {name}"
-            ))
-            .into());
+            )));
         }
 
         let context_node = &self.context_nodes[index as usize];
@@ -188,9 +181,10 @@ impl ContextsSerialized {
                 context_index,
                 self.context_nodes.len()
             );
-            return Err(
-                Error::new_parse(format!("Invalid context index: {}", context_index)).into(),
-            );
+            return Err(Error::new_parse(format!(
+                "Invalid context index: {}",
+                context_index
+            )));
         }
 
         let context_node = &self.context_nodes[context_index as usize];
@@ -217,9 +211,10 @@ impl ContextsSerialized {
                 context_index,
                 self.context_nodes.len()
             );
-            return Err(
-                Error::new_parse(format!("Invalid context index: {}", context_index)).into(),
-            );
+            return Err(Error::new_parse(format!(
+                "Invalid context index: {}",
+                context_index
+            )));
         }
 
         let context_node = &self.context_nodes[context_index as usize];

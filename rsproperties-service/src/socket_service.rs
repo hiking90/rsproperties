@@ -54,8 +54,7 @@ impl Actor for SocketService {
         // Create parent directory if it doesn't exist
         if !args.socket_dir.exists() {
             debug!("Creating parent directory: {:?}", args.socket_dir);
-            fs::create_dir_all(&args.socket_dir)
-                .map_err(|e| rsproperties::errors::Error::new_io(e))?;
+            fs::create_dir_all(&args.socket_dir).map_err(rsproperties::errors::Error::new_io)?;
         }
 
         let property_socket_path = args
@@ -70,16 +69,14 @@ impl Actor for SocketService {
                 "Removing existing property socket file: {}",
                 property_socket_path.display()
             );
-            fs::remove_file(&property_socket_path)
-                .map_err(|e| rsproperties::errors::Error::new_io(e))?;
+            fs::remove_file(&property_socket_path).map_err(rsproperties::errors::Error::new_io)?;
         }
         if system_socket_path.exists() {
             debug!(
                 "Removing existing system socket file: {}",
                 system_socket_path.display()
             );
-            fs::remove_file(&system_socket_path)
-                .map_err(|e| rsproperties::errors::Error::new_io(e))?;
+            fs::remove_file(&system_socket_path).map_err(rsproperties::errors::Error::new_io)?;
         }
         info!(
             "Property socket services successfully created at: {} and {}",
@@ -92,13 +89,13 @@ impl Actor for SocketService {
             property_socket_path.display()
         );
         let property_listener = UnixListener::bind(&property_socket_path)
-            .map_err(|e| rsproperties::errors::Error::new_io(e))?;
+            .map_err(rsproperties::errors::Error::new_io)?;
         trace!(
             "Binding system property service Unix domain socket: {}",
             system_socket_path.display()
         );
-        let system_listener = UnixListener::bind(&system_socket_path)
-            .map_err(|e| rsproperties::errors::Error::new_io(e))?;
+        let system_listener =
+            UnixListener::bind(&system_socket_path).map_err(rsproperties::errors::Error::new_io)?;
         info!("AsyncPropertySocketService started successfully");
 
         Ok(Self {
@@ -202,7 +199,7 @@ impl SocketService {
         stream
             .read_exact(&mut cmd_buf)
             .await
-            .map_err(|e| rsproperties::errors::Error::new_io(e))?;
+            .map_err(rsproperties::errors::Error::new_io)?;
         let cmd = u32::from_ne_bytes(cmd_buf);
 
         debug!("Received command: 0x{:08X}", cmd);
@@ -218,8 +215,7 @@ impl SocketService {
                 return Err(rsproperties::errors::Error::new_parse(format!(
                     "Unknown command: 0x{:08X}",
                     cmd
-                ))
-                .into());
+                )));
             }
         }
 
@@ -245,8 +241,7 @@ impl SocketService {
             return Err(rsproperties::errors::Error::new_file_validation(format!(
                 "Name length too large: {}",
                 name_len
-            ))
-            .into());
+            )));
         }
 
         let name = Self::read_string(stream, name_len as usize).await?;
@@ -263,8 +258,7 @@ impl SocketService {
             return Err(rsproperties::errors::Error::new_file_validation(format!(
                 "Value length too large: {}",
                 value_len
-            ))
-            .into());
+            )));
         }
 
         let value = Self::read_string(stream, value_len as usize).await?;
@@ -311,7 +305,7 @@ impl SocketService {
         stream
             .read_exact(&mut buf)
             .await
-            .map_err(|e| rsproperties::errors::Error::new_io(e))?;
+            .map_err(rsproperties::errors::Error::new_io)?;
         Ok(u32::from_ne_bytes(buf))
     }
 
@@ -325,7 +319,7 @@ impl SocketService {
         stream
             .read_exact(&mut buf)
             .await
-            .map_err(|e| rsproperties::errors::Error::new_io(e))?;
+            .map_err(rsproperties::errors::Error::new_io)?;
 
         // Remove null terminator if present
         if let Some(null_pos) = buf.iter().position(|&x| x == 0) {
@@ -341,11 +335,11 @@ impl SocketService {
         stream
             .write_all(&response.to_ne_bytes())
             .await
-            .map_err(|e| rsproperties::errors::Error::new_io(e))?;
+            .map_err(rsproperties::errors::Error::new_io)?;
         stream
             .flush()
             .await
-            .map_err(|e| rsproperties::errors::Error::new_io(e))?;
+            .map_err(rsproperties::errors::Error::new_io)?;
         trace!("Response sent successfully");
         Ok(())
     }

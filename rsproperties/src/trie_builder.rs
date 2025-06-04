@@ -74,10 +74,9 @@ impl TrieBuilderNode {
             Ok(())
         } else {
             error!("Exact match already exists for '{}'", name);
-            Err(
-                Error::new_file_validation(format!("Exact match already exists for '{name}'"))
-                    .into(),
-            )
+            Err(Error::new_file_validation(format!(
+                "Exact match already exists for '{name}'"
+            )))
         }
     }
 
@@ -97,7 +96,9 @@ impl TrieBuilderNode {
             Ok(())
         } else {
             error!("Prefix already exists for '{}'", name);
-            Err(Error::new_file_validation(format!("Prefix already exists for '{name}'")).into())
+            Err(Error::new_file_validation(format!(
+                "Prefix already exists for '{name}'"
+            )))
         }
     }
 
@@ -193,8 +194,7 @@ impl TrieBuilder {
                 error!("Duplicate prefix match detected for '{}'", name);
                 return Err(Error::new_file_validation(format!(
                     "Duplicate prefix match detected for '{name}'"
-                ))
-                .into());
+                )));
             }
 
             child.set_context(context);

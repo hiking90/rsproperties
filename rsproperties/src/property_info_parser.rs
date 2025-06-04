@@ -177,9 +177,7 @@ impl<'a> PropertyInfoArea<'a> {
                 let end = end + offset + 1;
                 CStr::from_bytes_with_nul(&self.data_base[offset..end]).unwrap()
             }
-            None => {
-                return CStr::from_bytes_with_nul(b"\0").unwrap();
-            }
+            None => c"",
         }
     }
 

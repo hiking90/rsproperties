@@ -119,7 +119,7 @@ impl PropertyAreaMap {
             .custom_flags((fs::OFlags::NOFOLLOW.bits() | fs::OFlags::EXCL.bits()) as _) // additional flags
             .mode(0o444) // permission: 0444
             .open(filename)
-            .map_err(|e| Error::new_io(e))?;
+            .map_err(Error::new_io)?;
 
         if let Some(context) = context {
             if fs::fsetxattr(
@@ -195,7 +195,9 @@ impl PropertyAreaMap {
                 "Invalid magic ({:#x} != {:#x}) or version ({:#x} != {:#x}) for {:?}",
                 pa.magic, PROP_AREA_MAGIC, pa.version, PROP_AREA_VERSION, filename
             );
-            Err(Error::new_file_validation("Invalid magic or version".to_string()).into())
+            Err(Error::new_file_validation(
+                "Invalid magic or version".to_string(),
+            ))
         } else {
             info!(
                 "Successfully opened read-only property area map: {:?}",
@@ -241,7 +243,7 @@ impl PropertyAreaMap {
             let root = if children_offset != 0 {
                 self.to_prop_obj_from_atomic::<PropertyTrieNode>(&current.children)?
             } else {
-                return Err(Error::new_not_found(name.to_owned()).into());
+                return Err(Error::new_not_found(name.to_owned()));
             };
 
             current = self.find_prop_trie_node(root, subname)?;
@@ -262,7 +264,7 @@ impl PropertyAreaMap {
                 *offset,
             ))
         } else {
-            Err(Error::new_not_found(name.to_owned()).into())
+            Err(Error::new_not_found(name.to_owned()))
         }
     }
 
@@ -282,7 +284,7 @@ impl PropertyAreaMap {
 
             if substr_size == 0 {
                 error!("Invalid property name (empty segment): '{}'", name);
-                return Err(Error::new_parse(format!("Invalid property name: {name}")).into());
+                return Err(Error::new_parse(format!("Invalid property name: {name}")));
             }
 
             let subname = &remaining_name[0..substr_size];
@@ -367,7 +369,7 @@ impl PropertyAreaMap {
                 offset,
                 self.pa_data_size
             );
-            return Err(Error::new_file_validation("Invalid offset".to_string()).into());
+            return Err(Error::new_file_validation("Invalid offset".to_string()));
         }
 
         self.mmap
@@ -453,7 +455,7 @@ impl PropertyAreaMap {
                         current =
                             self.to_prop_obj_from_atomic::<PropertyTrieNode>(&current.left)?;
                     } else {
-                        return Err(Error::new_not_found(name.to_owned()).into());
+                        return Err(Error::new_not_found(name.to_owned()));
                     }
                 }
                 std::cmp::Ordering::Greater => {
@@ -462,7 +464,7 @@ impl PropertyAreaMap {
                         current =
                             self.to_prop_obj_from_atomic::<PropertyTrieNode>(&current.right)?;
                     } else {
-                        return Err(Error::new_not_found(name.to_owned()).into());
+                        return Err(Error::new_not_found(name.to_owned()));
                     }
                 }
                 std::cmp::Ordering::Equal => {
@@ -483,7 +485,7 @@ impl PropertyAreaMap {
                 "Out of memory: {} + {} > {}",
                 offset, aligned, self.pa_data_size
             );
-            return Err(Error::new_file_size("Out of memory".to_string()).into());
+            return Err(Error::new_file_size("Out of memory".to_string()));
         }
 
         self.property_area_mut().bytes_used += aligned as u32;
@@ -620,8 +622,7 @@ impl MemoryMap {
                 "Invalid offset: {} > {}",
                 offset + size,
                 self.size
-            ))
-            .into());
+            )));
         }
         Ok(())
     }

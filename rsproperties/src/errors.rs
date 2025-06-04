@@ -177,7 +177,7 @@ pub fn validate_file_metadata(
     }
 
     // Check write permissions (applies to all modes)
-    if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 {
+    if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) != 0 {
         let error_msg = format!(
             "File has group or other write permissions: mode={:#o} for {:?}",
             metadata.st_mode(),
@@ -194,17 +194,15 @@ pub fn validate_file_metadata(
     // This is compile-time only and cannot be bypassed at runtime
     let skip_ownership_check = cfg!(debug_assertions) || cfg!(test);
 
-    if !skip_ownership_check {
-        if metadata.st_uid() != 0 || metadata.st_gid() != 0 {
-            let error_msg = format!(
-                "File not owned by root: uid={}, gid={} for {:?}",
-                metadata.st_uid(),
-                metadata.st_gid(),
-                path
-            );
-            log::error!("{}", error_msg);
-            return Err(Error::new_file_ownership(error_msg));
-        }
+    if !skip_ownership_check && (metadata.st_uid() != 0 || metadata.st_gid() != 0) {
+        let error_msg = format!(
+            "File not owned by root: uid={}, gid={} for {:?}",
+            metadata.st_uid(),
+            metadata.st_gid(),
+            path
+        );
+        log::error!("{}", error_msg);
+        return Err(Error::new_file_ownership(error_msg));
     }
 
     Ok(())

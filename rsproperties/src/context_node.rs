@@ -86,7 +86,7 @@ pub(crate) struct PropertyAreaGuard<'a> {
     guard: RwLockReadGuard<'a, Option<PropertyAreaMap>>,
 }
 
-impl<'a> PropertyAreaGuard<'a> {
+impl PropertyAreaGuard<'_> {
     pub(crate) fn property_area(&self) -> &PropertyAreaMap {
         self.guard
             .as_ref()
@@ -104,7 +104,7 @@ pub(crate) struct PropertyAreaMutGuard<'a> {
 }
 
 #[cfg(feature = "builder")]
-impl<'a> PropertyAreaMutGuard<'a> {
+impl PropertyAreaMutGuard<'_> {
     pub(crate) fn property_area_mut(&mut self) -> &mut PropertyAreaMap {
         self.guard
             .as_mut()

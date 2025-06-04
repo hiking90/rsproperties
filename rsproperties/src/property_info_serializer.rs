@@ -78,8 +78,7 @@ impl PropertyInfoEntry {
             );
             return Err(Error::new_parse(format!(
                 "Match operation '{match_operation:?}' is not valid. Must be 'prefix' or 'exact'"
-            ))
-            .into());
+            )));
         }
 
         if !type_strings.is_empty() && !Self::is_type_valid(&type_strings) {
@@ -87,8 +86,7 @@ impl PropertyInfoEntry {
             return Err(Error::new_parse(format!(
                 "Type '{}' is not valid.",
                 type_strings.join(" ")
-            ))
-            .into());
+            )));
         }
 
         let entry = Self {
@@ -110,7 +108,7 @@ impl PropertyInfoEntry {
             filename, require_prefix_or_exact
         );
 
-        let file = File::open(filename).map_err(|e| Error::new_io(e))?;
+        let file = File::open(filename).map_err(Error::new_io)?;
         let reader = BufReader::new(file);
 
         let mut errors = Vec::new();

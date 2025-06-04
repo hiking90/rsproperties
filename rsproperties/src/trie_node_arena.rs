@@ -22,7 +22,7 @@ impl TrieNodeArena {
     }
 
     #[inline(always)]
-    pub(crate) fn to_object<T>(&mut self, offset: usize) -> &mut T {
+    pub(crate) fn get_object<T>(&mut self, offset: usize) -> &mut T {
         // Bounds checking
         let size = mem::size_of::<T>();
         assert!(
@@ -50,15 +50,15 @@ impl TrieNodeArena {
     #[inline(always)]
     pub(crate) fn allocate_object<T>(&mut self) -> usize {
         let size = mem::size_of::<T>();
-        let offset = self.allocate_data(size);
-        offset
+
+        self.allocate_data(size)
     }
 
     #[inline(always)]
     pub(crate) fn allocate_uint32_array(&mut self, length: usize) -> usize {
         let size = mem::size_of::<u32>() * length;
-        let offset = self.allocate_data(size);
-        offset
+
+        self.allocate_data(size)
     }
 
     pub(crate) fn uint32_array(&mut self, offset: usize) -> &mut [u32] {

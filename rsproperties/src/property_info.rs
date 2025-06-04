@@ -40,7 +40,7 @@ impl PropertyInfo {
     pub(crate) fn init_with_long_offset(&mut self, name: &str, offset: u32) {
         init_name_with_trailing_data(self, name);
         let error_value_len = LONG_LEGACY_ERROR.len();
-        let serial_value = (error_value_len << 24 | LONG_FLAG) as u32;
+        let serial_value = ((error_value_len << 24) | LONG_FLAG) as u32;
 
         self.serial
             .store(serial_value, std::sync::atomic::Ordering::Relaxed);

@@ -2,7 +2,6 @@ use std::fs::{create_dir_all, remove_dir_all};
 use std::path::PathBuf;
 
 use clap::Parser;
-use tokio;
 
 #[derive(Parser, Debug)]
 #[command(name = "example_service")]

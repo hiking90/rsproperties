@@ -421,7 +421,7 @@ mod tests {
         static SYSTEM_PROPERTIES: Mutex<Option<SystemProperties>> = Mutex::new(None);
         let mut system_properties_guard = SYSTEM_PROPERTIES.lock().unwrap();
 
-        if let None = *system_properties_guard {
+        if system_properties_guard.is_none() {
             *system_properties_guard = Some(build_property_dir(TEST_PROPERTY_DIR));
         }
         system_properties_guard

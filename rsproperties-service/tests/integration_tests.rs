@@ -10,8 +10,6 @@
 //! - Setting properties (when builder feature is enabled)
 //! - Error handling
 
-use rsproperties;
-
 #[path = "common.rs"]
 mod common;
 use common::init_test;

@@ -74,8 +74,10 @@ pub fn load_properties_from_file(
             if has_filter {
                 let filter = filter.expect("filter must be valid.");
                 if filter.ends_with('*') {
-                    if !key.starts_with(&filter[..filter.len() - 1]) {
-                        continue;
+                    if let Some(prefix) = filter.strip_suffix('*') {
+                        if !key.starts_with(prefix) {
+                            continue;
+                        }
                     }
                 } else if line != filter {
                     continue;
