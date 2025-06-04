@@ -2,14 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::path::Path;
-use std::sync::atomic::{fence, Ordering, AtomicU32};
+use std::sync::atomic::{fence, AtomicU32, Ordering};
 
-use rustix::{
-    fs::Timespec,
-    path::Arg,
-};
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use rustix::thread::futex;
+use rustix::{fs::Timespec, path::Arg};
 
 use crate::errors::*;
 
@@ -35,7 +32,7 @@ fn futex_wake(_addr: &AtomicU32) -> Result<usize> {
     {
         futex::wake(_addr, futex::Flags::empty(), i32::MAX as u32)
             .context_with_location("Failed to wake futex")
-            // .map_err(Error::new_errno)
+        // .map_err(Error::new_errno)
     }
     #[cfg(target_os = "macos")]
     Ok(0)
@@ -84,9 +81,7 @@ impl SystemProperties {
             }
         };
 
-        Ok(Self {
-            contexts,
-        })
+        Ok(Self { contexts })
     }
 
     // Create a new area for system properties
@@ -101,9 +96,7 @@ impl SystemProperties {
             }
         };
 
-        Ok(Self {
-            contexts,
-        })
+        Ok(Self { contexts })
     }
 
     fn read_mutable_property_value(&self, prop_info: &PropertyInfo) -> Result<(u32, String)> {
@@ -116,7 +109,11 @@ impl SystemProperties {
                 let res = match self.contexts.prop_area_for_name(prop_info.name().to_str()?) {
                     Ok(res) => res,
                     Err(e) => {
-                        log::error!("Failed to get property area for name {:?}: {}", prop_info.name(), e);
+                        log::error!(
+                            "Failed to get property area for name {:?}: {}",
+                            prop_info.name(),
+                            e
+                        );
                         return Err(e);
                     }
                 };
@@ -182,9 +179,7 @@ impl SystemProperties {
                 };
                 Ok(value)
             }
-            Err(e) => {
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 
@@ -193,7 +188,7 @@ impl SystemProperties {
     pub fn get(&self, name: &str) -> String {
         match self.get_with_result(name) {
             Ok(value) => value,
-            Err(_) => "".to_owned()
+            Err(_) => "".to_owned(),
         }
     }
 
@@ -202,7 +197,7 @@ impl SystemProperties {
     pub fn get_with_default(&self, name: &str, default: &str) -> String {
         match self.get_with_result(name) {
             Ok(value) => value,
-            Err(_) => default.to_owned()
+            Err(_) => default.to_owned(),
         }
     }
 
@@ -226,9 +221,7 @@ impl SystemProperties {
                 };
                 Ok(Some(index))
             }
-            Err(_) => {
-                Ok(None)
-            }
+            Err(_) => Ok(None),
         }
     }
 
@@ -240,24 +233,20 @@ impl SystemProperties {
     #[cfg(feature = "builder")]
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         match self.find(key)? {
-            Some(prop_ref) => {
-                match self.update(&prop_ref, value) {
-                    Ok(_) => {},
-                    Err(e) => {
-                        log::error!("Failed to update property {}: {}", key, e);
-                        return Err(e);
-                    }
+            Some(prop_ref) => match self.update(&prop_ref, value) {
+                Ok(_) => {}
+                Err(e) => {
+                    log::error!("Failed to update property {}: {}", key, e);
+                    return Err(e);
                 }
             },
-            None => {
-                match self.add(key, value) {
-                    Ok(_) => {},
-                    Err(e) => {
-                        log::error!("Failed to create property {}: {}", key, e);
-                        return Err(e);
-                    }
+            None => match self.add(key, value) {
+                Ok(_) => {}
+                Err(e) => {
+                    log::error!("Failed to create property {}: {}", key, e);
+                    return Err(e);
                 }
-            }
+            },
         }
 
         Ok(())
@@ -274,7 +263,11 @@ impl SystemProperties {
         let mut res = match self.contexts.prop_area_mut_with_index(index.context_index) {
             Ok(res) => res,
             Err(e) => {
-                log::error!("Failed to get mutable property area for context {}: {}", index.context_index, e);
+                log::error!(
+                    "Failed to get mutable property area for context {}: {}",
+                    index.context_index,
+                    e
+                );
                 return Err(e);
             }
         };
@@ -282,7 +275,11 @@ impl SystemProperties {
         let pi = match pa.property_info(index.property_index) {
             Ok(pi) => pi,
             Err(e) => {
-                log::error!("Failed to get property info for index {}: {}", index.property_index, e);
+                log::error!(
+                    "Failed to get property info for index {}: {}",
+                    index.property_index,
+                    e
+                );
                 return Err(e);
             }
         };
@@ -299,7 +296,7 @@ impl SystemProperties {
 
         // Before updating, the property value must be backed up
         match pa.set_dirty_backup_area(&backup_value) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
                 log::error!("Failed to set backup area: {}", e);
                 return Err(e);
@@ -324,10 +321,11 @@ impl SystemProperties {
 
         // Set the new serial. It is cleared the dirty flag and set the new length of the value.
         let new_serial = (value.len() << 24) as u32 | ((serial + 1) & 0xffffff);
-        pi.serial.store(new_serial, std::sync::atomic::Ordering::Relaxed);
+        pi.serial
+            .store(new_serial, std::sync::atomic::Ordering::Relaxed);
 
         match futex_wake(&pi.serial) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
                 log::error!("Failed to wake property futex: {}", e);
                 return Err(e);
@@ -339,7 +337,7 @@ impl SystemProperties {
         serial_pa.serial().store(old_serial + 1, Ordering::Release);
 
         match futex_wake(&serial_pa.serial()) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
                 log::error!("Failed to wake global serial futex: {}", e);
                 return Err(e);
@@ -352,8 +350,12 @@ impl SystemProperties {
     #[cfg(feature = "builder")]
     pub fn add(&mut self, name: &str, value: &str) -> Result<()> {
         if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
-            let error_msg = format!("Value too long: {} (max: {}) for property: {}",
-                                   value.len(), PROP_VALUE_MAX, name);
+            let error_msg = format!(
+                "Value too long: {} (max: {}) for property: {}",
+                value.len(),
+                PROP_VALUE_MAX,
+                name
+            );
             log::error!("{}", error_msg);
             return Err(Error::new_file_validation(error_msg).into());
         }
@@ -368,7 +370,7 @@ impl SystemProperties {
         let pa = res.0.property_area_mut();
 
         match pa.add(name, value) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
                 log::error!("Failed to add property {} to area: {}", name, e);
                 return Err(e);
@@ -380,9 +382,12 @@ impl SystemProperties {
         serial_pa.serial().store(old_serial + 1, Ordering::Release);
 
         match futex_wake(&serial_pa.serial()) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
-                log::error!("Failed to wake global serial futex after adding property: {}", e);
+                log::error!(
+                    "Failed to wake global serial futex after adding property: {}",
+                    e
+                );
                 return Err(e);
             }
         }
@@ -400,17 +405,21 @@ impl SystemProperties {
             Some(guard) => {
                 let pa = guard.property_area();
                 match pa.property_info(idx.property_index).ok() {
-                    Some(pi) => {
-                        pi.serial.load(Ordering::Acquire)
-                    }
+                    Some(pi) => pi.serial.load(Ordering::Acquire),
                     None => {
-                        log::error!("Failed to get PropertyInfo for index: {}", idx.property_index);
+                        log::error!(
+                            "Failed to get PropertyInfo for index: {}",
+                            idx.property_index
+                        );
                         0
                     }
                 }
             }
             None => {
-                log::error!("Failed to get PropertyArea for index: {}", idx.context_index);
+                log::error!(
+                    "Failed to get PropertyArea for index: {}",
+                    idx.context_index
+                );
                 0
             }
         }
@@ -422,35 +431,33 @@ impl SystemProperties {
 
     pub fn wait(&self, index: Option<&PropertyIndex>, timeout: Option<&Timespec>) -> Option<u32> {
         match index {
-            Some(idx) => {
-                match self.contexts.prop_area_with_index(idx.context_index).ok() {
-                    Some(guard) => {
-                        let pa = guard.property_area();
-                        match pa.property_info(idx.property_index).ok() {
-                            Some(pi) => {
-                                futex_wait(
-                                    &pi.serial,
-                                    pi.serial.load(Ordering::Acquire),
-                                    timeout)
-                            }
-                            None => {
-                                log::error!("Failed to get PropertyInfo for index: {}", idx.property_index);
-                                None
-                            }
+            Some(idx) => match self.contexts.prop_area_with_index(idx.context_index).ok() {
+                Some(guard) => {
+                    let pa = guard.property_area();
+                    match pa.property_info(idx.property_index).ok() {
+                        Some(pi) => {
+                            futex_wait(&pi.serial, pi.serial.load(Ordering::Acquire), timeout)
+                        }
+                        None => {
+                            log::error!(
+                                "Failed to get PropertyInfo for index: {}",
+                                idx.property_index
+                            );
+                            None
                         }
                     }
-                    None => {
-                        log::error!("Failed to get PropertyArea for index: {}", idx.context_index);
-                        None
-                    }
                 }
-            }
+                None => {
+                    log::error!(
+                        "Failed to get PropertyArea for index: {}",
+                        idx.context_index
+                    );
+                    None
+                }
+            },
             None => {
                 let serial_pa = self.contexts.serial_prop_area().serial();
-                futex_wait(
-                    &serial_pa,
-                    serial_pa.load(Ordering::Acquire),
-                    timeout)
+                futex_wait(&serial_pa, serial_pa.load(Ordering::Acquire), timeout)
             }
         }
     }
@@ -474,7 +481,9 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             let version1 = system_properties.get(VERSION_PROPERTY);
-            let version2 = AndroidSystemProperties::new().get(VERSION_PROPERTY).unwrap();
+            let version2 = AndroidSystemProperties::new()
+                .get(VERSION_PROPERTY)
+                .unwrap();
             assert_eq!(version1, version2);
         });
 

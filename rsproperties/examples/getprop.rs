@@ -22,7 +22,9 @@ use rsproperties::PropertyConfig;
 #[derive(Parser, Debug)]
 #[command(name = "getprop")]
 #[command(about = "Android-compatible property getter")]
-#[command(long_about = "This tool mimics Android's getprop command functionality.\nIt can retrieve system properties with optional default values.")]
+#[command(
+    long_about = "This tool mimics Android's getprop command functionality.\nIt can retrieve system properties with optional default values."
+)]
 struct Args {
     /// Property name to retrieve
     #[arg(help = "Name of the property to retrieve")]

@@ -1,16 +1,16 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::path::Path;
 use std::ffi::CStr;
+use std::path::Path;
 
-use rustix::fs;
-use log::{info, warn, error};
 use crate::errors::*;
+use log::{error, info, warn};
+use rustix::fs;
 
-use crate::context_node::{ContextNode, PropertyAreaGuard};
 #[cfg(feature = "builder")]
 use crate::context_node::PropertyAreaMutGuard;
+use crate::context_node::{ContextNode, PropertyAreaGuard};
 use crate::property_area::{PropertyArea, PropertyAreaMap};
 use crate::property_info_parser::PropertyInfoAreaFile;
 
@@ -31,7 +31,12 @@ pub(crate) struct ContextsSerialized {
 }
 
 impl ContextsSerialized {
-    pub(crate) fn new(writable: bool, dirname: &Path, fsetxattr_failed: &mut bool, load_default_path: bool) -> Result<Self> {
+    pub(crate) fn new(
+        writable: bool,
+        dirname: &Path,
+        fsetxattr_failed: &mut bool,
+        load_default_path: bool,
+    ) -> Result<Self> {
         let dirname = dirname.to_path_buf();
         let tree_filename = dirname.join("property_info");
         let serial_filename = dirname.join("properties_serial");
@@ -56,8 +61,11 @@ impl ContextsSerialized {
         let serial_property_area_map = if writable {
             if !dirname.is_dir() {
                 info!("Creating directory: {:?}", dirname);
-                fs::mkdir(dirname.as_path(), fs::Mode::RWXU | fs::Mode::XGRP | fs::Mode::XOTH)
-                    .map_err(Error::from)?;
+                fs::mkdir(
+                    dirname.as_path(),
+                    fs::Mode::RWXU | fs::Mode::XGRP | fs::Mode::XOTH,
+                )
+                .map_err(Error::from)?;
             }
 
             *fsetxattr_failed = false;
@@ -78,28 +86,45 @@ impl ContextsSerialized {
         })
     }
 
-    fn map_serial_property_area(serial_filename: &Path, access_rw: bool, fsetxattr_failed: &mut bool) -> Result<PropertyAreaMap> {
+    fn map_serial_property_area(
+        serial_filename: &Path,
+        access_rw: bool,
+        fsetxattr_failed: &mut bool,
+    ) -> Result<PropertyAreaMap> {
         let result = if access_rw {
-            PropertyAreaMap::new_rw(serial_filename, Some(PROPERTIES_SERIAL_CONTEXT), fsetxattr_failed)
+            PropertyAreaMap::new_rw(
+                serial_filename,
+                Some(PROPERTIES_SERIAL_CONTEXT),
+                fsetxattr_failed,
+            )
         } else {
             PropertyAreaMap::new_ro(serial_filename)
         };
 
         match &result {
-            Ok(_) => {},
-            Err(e) => error!("Failed to map serial property area {:?}: {}", serial_filename, e),
+            Ok(_) => {}
+            Err(e) => error!(
+                "Failed to map serial property area {:?}: {}",
+                serial_filename, e
+            ),
         }
 
         result
     }
 
     pub(crate) fn prop_area_for_name(&self, name: &str) -> Result<(PropertyAreaGuard<'_>, u32)> {
-        let (index, _) = self.property_info_area_file
+        let (index, _) = self
+            .property_info_area_file
             .property_info_area()
             .get_property_info_indexes(name);
 
         if index == u32::MAX || index >= self.context_nodes.len() as u32 {
-            warn!("Property {} not found: index={}, max_contexts={}", name, index, self.context_nodes.len());
+            warn!(
+                "Property {} not found: index={}, max_contexts={}",
+                name,
+                index,
+                self.context_nodes.len()
+            );
             return Err(Error::new_not_found(name.to_owned()).into());
         }
 
@@ -115,14 +140,26 @@ impl ContextsSerialized {
     }
 
     #[cfg(feature = "builder")]
-    pub(crate) fn prop_area_mut_for_name(&self, name: &str) -> Result<(PropertyAreaMutGuard<'_>, u32)> {
-        let (index, _) = self.property_info_area_file
+    pub(crate) fn prop_area_mut_for_name(
+        &self,
+        name: &str,
+    ) -> Result<(PropertyAreaMutGuard<'_>, u32)> {
+        let (index, _) = self
+            .property_info_area_file
             .property_info_area()
             .get_property_info_indexes(name);
 
         if index == u32::MAX || index >= self.context_nodes.len() as u32 {
-            error!("Could not find context for property {}: index={}, max_contexts={}", name, index, self.context_nodes.len());
-            return Err(Error::new_not_found(format!("Could not find context for property {name}")).into());
+            error!(
+                "Could not find context for property {}: index={}, max_contexts={}",
+                name,
+                index,
+                self.context_nodes.len()
+            );
+            return Err(Error::new_not_found(format!(
+                "Could not find context for property {name}"
+            ))
+            .into());
         }
 
         let context_node = &self.context_nodes[index as usize];
@@ -146,32 +183,53 @@ impl ContextsSerialized {
 
     pub(crate) fn prop_area_with_index(&self, context_index: u32) -> Result<PropertyAreaGuard<'_>> {
         if context_index >= self.context_nodes.len() as u32 {
-            error!("Invalid context index {}: max={}", context_index, self.context_nodes.len());
-            return Err(Error::new_parse(format!("Invalid context index: {}", context_index)).into());
+            error!(
+                "Invalid context index {}: max={}",
+                context_index,
+                self.context_nodes.len()
+            );
+            return Err(
+                Error::new_parse(format!("Invalid context index: {}", context_index)).into(),
+            );
         }
 
         let context_node = &self.context_nodes[context_index as usize];
         match context_node.property_area() {
             Ok(area) => Ok(area),
             Err(e) => {
-                error!("Failed to get property area for context index {}: {}", context_index, e);
+                error!(
+                    "Failed to get property area for context index {}: {}",
+                    context_index, e
+                );
                 Err(e)
             }
         }
     }
 
     #[cfg(feature = "builder")]
-    pub(crate) fn prop_area_mut_with_index(&self, context_index: u32) -> Result<PropertyAreaMutGuard<'_>> {
+    pub(crate) fn prop_area_mut_with_index(
+        &self,
+        context_index: u32,
+    ) -> Result<PropertyAreaMutGuard<'_>> {
         if context_index >= self.context_nodes.len() as u32 {
-            error!("Invalid context index {}: max={}", context_index, self.context_nodes.len());
-            return Err(Error::new_parse(format!("Invalid context index: {}", context_index)).into());
+            error!(
+                "Invalid context index {}: max={}",
+                context_index,
+                self.context_nodes.len()
+            );
+            return Err(
+                Error::new_parse(format!("Invalid context index: {}", context_index)).into(),
+            );
         }
 
         let context_node = &self.context_nodes[context_index as usize];
         match context_node.property_area_mut() {
             Ok(area) => Ok(area),
             Err(e) => {
-                error!("Failed to get mutable property area for context index {}: {}", context_index, e);
+                error!(
+                    "Failed to get mutable property area for context index {}: {}",
+                    context_index, e
+                );
                 Err(e)
             }
         }

@@ -6,10 +6,10 @@
 //! These tests verify performance characteristics and robustness
 //! under various stress conditions.
 
-use std::time::{Duration, Instant};
-use std::thread;
-use std::sync::{Arc, Barrier};
 use rsproperties::{self, Result};
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[path = "common.rs"]
 mod common;
@@ -49,13 +49,22 @@ async fn test_property_get_performance() -> Result<()> {
     let elapsed = start.elapsed();
     let avg_time = elapsed / iterations as u32;
 
-    println!("Get performance: {} iterations in {:?}", iterations, elapsed);
+    println!(
+        "Get performance: {} iterations in {:?}",
+        iterations, elapsed
+    );
     println!("Average time per get: {:?}", avg_time);
-    println!("Gets per second: {:.0}", iterations as f64 / elapsed.as_secs_f64());
+    println!(
+        "Gets per second: {:.0}",
+        iterations as f64 / elapsed.as_secs_f64()
+    );
 
     // Verify performance is reasonable (less than 100μs per get on average)
-    assert!(avg_time < Duration::from_micros(100),
-            "Get operation too slow: {:?} per operation", avg_time);
+    assert!(
+        avg_time < Duration::from_micros(100),
+        "Get operation too slow: {:?} per operation",
+        avg_time
+    );
 
     Ok(())
 }
@@ -84,10 +93,18 @@ async fn test_property_get_with_default_performance() -> Result<()> {
     let nonexistent_elapsed = start.elapsed();
 
     println!("get_with_default performance:");
-    println!("  Existing property: {} ops in {:?} ({:?} avg)",
-             iterations, existing_elapsed, existing_elapsed / iterations);
-    println!("  Non-existing property: {} ops in {:?} ({:?} avg)",
-             iterations, nonexistent_elapsed, nonexistent_elapsed / iterations);
+    println!(
+        "  Existing property: {} ops in {:?} ({:?} avg)",
+        iterations,
+        existing_elapsed,
+        existing_elapsed / iterations
+    );
+    println!(
+        "  Non-existing property: {} ops in {:?} ({:?} avg)",
+        iterations,
+        nonexistent_elapsed,
+        nonexistent_elapsed / iterations
+    );
 
     // Both should be reasonably fast
     assert!(existing_elapsed / iterations < Duration::from_micros(50));
@@ -112,13 +129,22 @@ async fn test_property_set_performance() -> Result<()> {
     let elapsed = start.elapsed();
     let avg_time = elapsed / iterations;
 
-    println!("Set performance: {} iterations in {:?}", iterations, elapsed);
+    println!(
+        "Set performance: {} iterations in {:?}",
+        iterations, elapsed
+    );
     println!("Average time per set: {:?}", avg_time);
-    println!("Sets per second: {:.0}", iterations as f64 / elapsed.as_secs_f64());
+    println!(
+        "Sets per second: {:.0}",
+        iterations as f64 / elapsed.as_secs_f64()
+    );
 
     // Verify set performance (should be under 1ms per operation)
-    assert!(avg_time < Duration::from_millis(1),
-            "Set operation too slow: {:?} per operation", avg_time);
+    assert!(
+        avg_time < Duration::from_millis(1),
+        "Set operation too slow: {:?} per operation",
+        avg_time
+    );
 
     Ok(())
 }
@@ -170,26 +196,30 @@ async fn test_concurrent_reads() -> Result<()> {
     let reads_per_thread = 1000;
     let barrier = Arc::new(Barrier::new(num_threads));
 
-    let handles: Vec<_> = (0..num_threads).map(|thread_id| {
-        let barrier = Arc::clone(&barrier);
+    let handles: Vec<_> = (0..num_threads)
+        .map(|thread_id| {
+            let barrier = Arc::clone(&barrier);
 
-        thread::spawn(move || {
-            barrier.wait(); // Synchronize start
+            thread::spawn(move || {
+                barrier.wait(); // Synchronize start
 
-            let start = Instant::now();
-            for i in 0..reads_per_thread {
-                let prop_name = format!("concurrent.read.prop.{}", i % num_props);
-                let expected = format!("value_{}", i % num_props);
-                let value = rsproperties::get(&prop_name);
-                assert_eq!(value, expected, "Failed to get property {}", prop_name);
-            }
-            let elapsed = start.elapsed();
+                let start = Instant::now();
+                for i in 0..reads_per_thread {
+                    let prop_name = format!("concurrent.read.prop.{}", i % num_props);
+                    let expected = format!("value_{}", i % num_props);
+                    let value = rsproperties::get(&prop_name);
+                    assert_eq!(value, expected, "Failed to get property {}", prop_name);
+                }
+                let elapsed = start.elapsed();
 
-            println!("Thread {} completed {} reads in {:?}",
-                     thread_id, reads_per_thread, elapsed);
-            elapsed
+                println!(
+                    "Thread {} completed {} reads in {:?}",
+                    thread_id, reads_per_thread, elapsed
+                );
+                elapsed
+            })
         })
-    }).collect();
+        .collect();
 
     let mut total_time = Duration::new(0, 0);
     for handle in handles {
@@ -198,8 +228,11 @@ async fn test_concurrent_reads() -> Result<()> {
     }
 
     let total_reads = num_threads * reads_per_thread;
-    println!("Concurrent reads: {} total reads, avg thread time: {:?}",
-             total_reads, total_time / num_threads as u32);
+    println!(
+        "Concurrent reads: {} total reads, avg thread time: {:?}",
+        total_reads,
+        total_time / num_threads as u32
+    );
 
     Ok(())
 }
@@ -212,25 +245,29 @@ async fn test_concurrent_writes() -> Result<()> {
     let writes_per_thread = 20;
     let barrier = Arc::new(Barrier::new(num_threads));
 
-    let handles: Vec<_> = (0..num_threads).map(|thread_id| {
-        let barrier = Arc::clone(&barrier);
+    let handles: Vec<_> = (0..num_threads)
+        .map(|thread_id| {
+            let barrier = Arc::clone(&barrier);
 
-        thread::spawn(move || -> Result<Duration> {
-            barrier.wait(); // Synchronize start
+            thread::spawn(move || -> Result<Duration> {
+                barrier.wait(); // Synchronize start
 
-            let start = Instant::now();
-            for i in 0..writes_per_thread {
-                let prop_name = format!("concurrent.write.{}.prop.{}", thread_id, i);
-                let prop_value = format!("thread_{}_value_{}", thread_id, i);
-                rsproperties::set(&prop_name, &prop_value)?;
-            }
-            let elapsed = start.elapsed();
+                let start = Instant::now();
+                for i in 0..writes_per_thread {
+                    let prop_name = format!("concurrent.write.{}.prop.{}", thread_id, i);
+                    let prop_value = format!("thread_{}_value_{}", thread_id, i);
+                    rsproperties::set(&prop_name, &prop_value)?;
+                }
+                let elapsed = start.elapsed();
 
-            println!("Thread {} completed {} writes in {:?}",
-                     thread_id, writes_per_thread, elapsed);
-            Ok(elapsed)
+                println!(
+                    "Thread {} completed {} writes in {:?}",
+                    thread_id, writes_per_thread, elapsed
+                );
+                Ok(elapsed)
+            })
         })
-    }).collect();
+        .collect();
 
     let mut total_time = Duration::new(0, 0);
     for handle in handles {
@@ -249,8 +286,11 @@ async fn test_concurrent_writes() -> Result<()> {
     }
 
     let total_writes = num_threads * writes_per_thread;
-    println!("Concurrent writes: {} total writes, avg thread time: {:?}",
-             total_writes, total_time / num_threads as u32);
+    println!(
+        "Concurrent writes: {} total writes, avg thread time: {:?}",
+        total_writes,
+        total_time / num_threads as u32
+    );
 
     Ok(())
 }
@@ -270,31 +310,36 @@ async fn test_mixed_read_write_workload() -> Result<()> {
     let operations_per_thread = 50;
     let barrier = Arc::new(Barrier::new(num_threads));
 
-    let handles: Vec<_> = (0..num_threads).map(|thread_id| {
-        let barrier = Arc::clone(&barrier);
+    let handles: Vec<_> = (0..num_threads)
+        .map(|thread_id| {
+            let barrier = Arc::clone(&barrier);
 
-        thread::spawn(move || -> Result<()> {
-            barrier.wait();
+            thread::spawn(move || -> Result<()> {
+                barrier.wait();
 
-            let start = Instant::now();
-            for i in 0..operations_per_thread {
-                if i % 3 == 0 {
-                    // Write operation
-                    let prop_name = format!("mixed.thread.{}.prop.{}", thread_id, i);
-                    let prop_value = format!("value_{}_{}", thread_id, i);
-                    rsproperties::set(&prop_name, &prop_value)?;
-                } else {
-                    // Read operation
-                    let prop_name = format!("mixed.initial.prop.{}", i % 50);
-                    let _value = rsproperties::get(&prop_name);
+                let start = Instant::now();
+                for i in 0..operations_per_thread {
+                    if i % 3 == 0 {
+                        // Write operation
+                        let prop_name = format!("mixed.thread.{}.prop.{}", thread_id, i);
+                        let prop_value = format!("value_{}_{}", thread_id, i);
+                        rsproperties::set(&prop_name, &prop_value)?;
+                    } else {
+                        // Read operation
+                        let prop_name = format!("mixed.initial.prop.{}", i % 50);
+                        let _value = rsproperties::get(&prop_name);
+                    }
                 }
-            }
-            let elapsed = start.elapsed();
+                let elapsed = start.elapsed();
 
-            println!("Mixed workload thread {} completed in {:?}", thread_id, elapsed);
-            Ok(())
+                println!(
+                    "Mixed workload thread {} completed in {:?}",
+                    thread_id, elapsed
+                );
+                Ok(())
+            })
         })
-    }).collect();
+        .collect();
 
     for handle in handles {
         handle.join().unwrap()?;
@@ -313,10 +358,13 @@ async fn test_property_name_patterns() -> Result<()> {
     let patterns = vec![
         ("short", "value"),
         ("medium.length.property", "value"),
-        ("very.long.property.name.with.many.segments.and.dots", "value"),
+        (
+            "very.long.property.name.with.many.segments.and.dots",
+            "value",
+        ),
         ("property_with_underscores", "value"),
         ("property.with.123.numbers", "value"),
-        ("ro.build.version.sdk", "33"), // Android-style
+        ("ro.build.version.sdk", "33"),  // Android-style
         ("persist.sys.locale", "en-US"), // Android-style
     ];
 
@@ -333,8 +381,13 @@ async fn test_property_name_patterns() -> Result<()> {
         }
         let elapsed = start.elapsed();
 
-        println!("Pattern '{}': {} gets in {:?} ({:?} avg)",
-                 prop_name, iterations, elapsed, elapsed / iterations);
+        println!(
+            "Pattern '{}': {} gets in {:?} ({:?} avg)",
+            prop_name,
+            iterations,
+            elapsed,
+            elapsed / iterations
+        );
 
         // Verify correctness
         let retrieved = rsproperties::get(prop_name);
@@ -343,4 +396,3 @@ async fn test_property_name_patterns() -> Result<()> {
 
     Ok(())
 }
-

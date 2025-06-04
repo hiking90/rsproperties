@@ -41,8 +41,8 @@
 //! ```
 
 use std::{
+    path::{Path, PathBuf},
     sync::OnceLock,
-    path::{PathBuf, Path},
 };
 
 /// Configuration for initializing the property system
@@ -110,7 +110,7 @@ impl PropertyConfig {
     /// Create config with both directories
     pub fn with_both_dirs<P1: Into<PathBuf>, P2: Into<PathBuf>>(
         properties_dir: P1,
-        socket_dir: P2
+        socket_dir: P2,
     ) -> Self {
         Self {
             properties_dir: Some(properties_dir.into()),
@@ -154,36 +154,35 @@ impl PropertyConfigBuilder {
 }
 
 pub mod errors;
-pub use errors::{Error, Result, ContextWithLocation};
+pub use errors::{ContextWithLocation, Error, Result};
 
-mod property_info_parser;
-mod system_properties;
+#[cfg(feature = "builder")]
+mod build_property_parser;
+mod context_node;
 mod contexts_serialized;
 mod property_area;
-mod context_node;
 mod property_info;
-mod system_property_set;
+mod property_info_parser;
 #[cfg(feature = "builder")]
 mod property_info_serializer;
+mod system_properties;
+mod system_property_set;
 #[cfg(feature = "builder")]
 mod trie_builder;
 #[cfg(feature = "builder")]
-mod trie_serializer;
-#[cfg(feature = "builder")]
 mod trie_node_arena;
 #[cfg(feature = "builder")]
-mod build_property_parser;
+mod trie_serializer;
 
-pub use system_properties::SystemProperties;
-#[cfg(feature = "builder")]
-pub use property_info_serializer::*;
 #[cfg(feature = "builder")]
 pub use build_property_parser::*;
+#[cfg(feature = "builder")]
+pub use property_info_serializer::*;
+pub use system_properties::SystemProperties;
 pub use system_property_set::socket_dir;
 
 pub use system_property_set::{
-    PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME,
-    PROPERTY_SERVICE_SOCKET_NAME,
+    PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME, PROPERTY_SERVICE_SOCKET_NAME,
 };
 
 pub const PROP_VALUE_MAX: usize = 92;
@@ -226,8 +225,11 @@ pub fn init(config: PropertyConfig) {
 
     match SYSTEM_PROPERTIES_DIR.set(props_dir.clone()) {
         Ok(_) => {
-            log::info!("Successfully set system properties directory to: {:?}", props_dir);
-        },
+            log::info!(
+                "Successfully set system properties directory to: {:?}",
+                props_dir
+            );
+        }
         Err(_) => {
             log::warn!("System properties directory already set, ignoring new value");
         }
@@ -248,10 +250,12 @@ pub fn init(config: PropertyConfig) {
 /// Returns the configured directory if init() was called,
 /// otherwise returns the default PROP_DIRNAME (/dev/__properties__).
 pub fn properties_dir() -> &'static Path {
-    let path = SYSTEM_PROPERTIES_DIR.get_or_init(|| {
-        log::info!("Using default properties directory: {}", PROP_DIRNAME);
-        PathBuf::from(PROP_DIRNAME)
-    }).as_path();
+    let path = SYSTEM_PROPERTIES_DIR
+        .get_or_init(|| {
+            log::info!("Using default properties directory: {}", PROP_DIRNAME);
+            PathBuf::from(PROP_DIRNAME)
+        })
+        .as_path();
     path
 }
 
@@ -261,16 +265,26 @@ pub fn properties_dir() -> &'static Path {
 pub fn system_properties() -> &'static system_properties::SystemProperties {
     SYSTEM_PROPERTIES.get_or_init(|| {
         let dir = properties_dir();
-        log::debug!("Initializing global SystemProperties instance from: {:?}", dir);
+        log::debug!(
+            "Initializing global SystemProperties instance from: {:?}",
+            dir
+        );
 
         match system_properties::SystemProperties::new(dir) {
             Ok(props) => {
                 log::debug!("Successfully initialized global SystemProperties instance");
                 props
-            },
+            }
             Err(e) => {
-                log::error!("Failed to initialize SystemProperties from {:?}: {}", dir, e);
-                panic!("Failed to initialize SystemProperties from {:?}: {}", dir, e);
+                log::error!(
+                    "Failed to initialize SystemProperties from {:?}: {}",
+                    dir,
+                    e
+                );
+                panic!(
+                    "Failed to initialize SystemProperties from {:?}: {}",
+                    dir, e
+                );
             }
         }
     })
@@ -310,13 +324,13 @@ pub fn set(name: &str, value: &str) -> Result<()> {
 mod tests {
     #![allow(unused_imports)]
     use super::*;
-    use std::fs::{File, remove_dir_all, create_dir};
-    use std::io::Write;
-    use std::collections::HashMap;
-    use std::path::Path;
-    use std::sync::{Mutex, MutexGuard};
     #[cfg(target_os = "android")]
     use android_system_properties::AndroidSystemProperties;
+    use std::collections::HashMap;
+    use std::fs::{create_dir, remove_dir_all, File};
+    use std::io::Write;
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
 
     const TEST_PROPERTY_DIR: &str = "__properties__";
 
@@ -367,7 +381,7 @@ mod tests {
             "sys.usb.state",
             "vold.post_fs_data_done",
             "wifi.interface",
-            "wifi.supplicant_scan_interval"
+            "wifi.supplicant_scan_interval",
         ];
 
         enable_logger();
@@ -395,7 +409,8 @@ mod tests {
 
         let mut properties = HashMap::new();
         for file in build_prop_files {
-            load_properties_from_file(Path::new(file), None, "u:r:init:s0", &mut properties).unwrap();
+            load_properties_from_file(Path::new(file), None, "u:r:init:s0", &mut properties)
+                .unwrap();
         }
 
         properties
@@ -424,30 +439,39 @@ mod tests {
 
         let mut property_infos = Vec::new();
         for file in property_contexts_files {
-            let (mut property_info, errors) = PropertyInfoEntry::parse_from_file(Path::new(file), false).unwrap();
+            let (mut property_info, errors) =
+                PropertyInfoEntry::parse_from_file(Path::new(file), false).unwrap();
             if !errors.is_empty() {
                 log::error!("{:?}", errors);
             }
             property_infos.append(&mut property_info);
         }
 
-        let data: Vec<u8> = build_trie(&property_infos, "u:object_r:build_prop:s0", "string").unwrap();
+        let data: Vec<u8> =
+            build_trie(&property_infos, "u:object_r:build_prop:s0", "string").unwrap();
 
         let dir = properties_dir();
         remove_dir_all(dir).unwrap_or_default();
         create_dir(dir).unwrap_or_default();
-        File::create(dir.join("property_info")).unwrap().write_all(&data).unwrap();
+        File::create(dir.join("property_info"))
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
 
         let properties = load_properties();
 
         let dir = properties_dir();
-        let mut system_properties = SystemProperties::new_area(dir)
-            .unwrap_or_else(|e| panic!("Cannot create system properties: {}. Please check if {dir:?} exists.", e));
+        let mut system_properties = SystemProperties::new_area(dir).unwrap_or_else(|e| {
+            panic!(
+                "Cannot create system properties: {}. Please check if {dir:?} exists.",
+                e
+            )
+        });
         for (key, value) in properties.iter() {
             match system_properties.find(key.as_str()).unwrap() {
                 Some(prop_ref) => {
                     system_properties.update(&prop_ref, value.as_str()).unwrap();
-                },
+                }
                 None => {
                     system_properties.add(key.as_str(), value.as_str()).unwrap();
                 }
@@ -509,7 +533,9 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let index = system_properties_area.find(test_prop).unwrap();
-        system_properties_area.update(&index.unwrap(), "false").unwrap();
+        system_properties_area
+            .update(&index.unwrap(), "false")
+            .unwrap();
 
         handle.join().unwrap();
         handle_any.join().unwrap();

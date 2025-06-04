@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::path::PathBuf;
-use std::sync::{RwLock, RwLockReadGuard};
 #[cfg(feature = "builder")]
 use std::sync::RwLockWriteGuard;
+use std::sync::{RwLock, RwLockReadGuard};
 
 use log::error;
 
-use crate::property_area::PropertyAreaMap;
 use crate::errors::*;
+use crate::property_area::PropertyAreaMap;
 
 pub(crate) struct ContextNode {
     access_rw: bool,
@@ -32,7 +32,10 @@ impl ContextNode {
 
     pub(crate) fn open(&self, fsetxattr_failed: &mut bool) -> Result<()> {
         if !self.access_rw {
-            error!("Attempted to open context node without write access: {:?}", self.filename);
+            error!(
+                "Attempted to open context node without write access: {:?}",
+                self.filename
+            );
             panic!("open() must be called with access_rw == true");
         }
 
@@ -41,7 +44,11 @@ impl ContextNode {
             return Ok(());
         }
 
-        *prop_area = Some(PropertyAreaMap::new_rw(self.filename.as_path(), None, fsetxattr_failed)?);
+        *prop_area = Some(PropertyAreaMap::new_rw(
+            self.filename.as_path(),
+            None,
+            fsetxattr_failed,
+        )?);
 
         Ok(())
     }
@@ -68,18 +75,22 @@ impl ContextNode {
     #[cfg(feature = "builder")]
     pub(crate) fn property_area_mut(&self) -> Result<PropertyAreaMutGuard<'_>> {
         self.property_area()?;
-        Ok(PropertyAreaMutGuard { guard: self.property_area.write().unwrap() })
+        Ok(PropertyAreaMutGuard {
+            guard: self.property_area.write().unwrap(),
+        })
     }
 }
 
 // PropertyAreaGuard is used to get a reference to the PropertyAreaMap.
 pub(crate) struct PropertyAreaGuard<'a> {
-    guard: RwLockReadGuard<'a, Option<PropertyAreaMap>>
+    guard: RwLockReadGuard<'a, Option<PropertyAreaMap>>,
 }
 
 impl<'a> PropertyAreaGuard<'a> {
     pub(crate) fn property_area(&self) -> &PropertyAreaMap {
-        self.guard.as_ref().expect("PropertyAreaMap is not initialized")
+        self.guard
+            .as_ref()
+            .expect("PropertyAreaMap is not initialized")
     }
 }
 
@@ -89,12 +100,14 @@ impl<'a> PropertyAreaGuard<'a> {
 // This is to ensure that the PropertyAreaMap is not replaced by another PropertyAreaMap.
 #[cfg(feature = "builder")]
 pub(crate) struct PropertyAreaMutGuard<'a> {
-    guard: RwLockWriteGuard<'a, Option<PropertyAreaMap>>
+    guard: RwLockWriteGuard<'a, Option<PropertyAreaMap>>,
 }
 
 #[cfg(feature = "builder")]
 impl<'a> PropertyAreaMutGuard<'a> {
     pub(crate) fn property_area_mut(&mut self) -> &mut PropertyAreaMap {
-        self.guard.as_mut().expect("PropertyAreaMap is not initialized")
+        self.guard
+            .as_mut()
+            .expect("PropertyAreaMap is not initialized")
     }
 }

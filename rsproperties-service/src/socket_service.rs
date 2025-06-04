@@ -5,9 +5,9 @@ use std::{fs, path::PathBuf};
 
 use log::{debug, error, info, trace, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixStream, UnixListener};
+use tokio::net::{UnixListener, UnixStream};
 
-use rsactor::{Actor, ActorRef, impl_message_handler};
+use rsactor::{impl_message_handler, Actor, ActorRef};
 
 use rsproperties::errors::*;
 
@@ -47,7 +47,10 @@ impl Actor for SocketService {
     type Args = SocketServiceArgs;
     type Error = rsproperties::errors::Error;
 
-    async fn on_start(args: Self::Args, _actor_ref: &ActorRef<Self>) -> std::result::Result<Self, Self::Error> {
+    async fn on_start(
+        args: Self::Args,
+        _actor_ref: &ActorRef<Self>,
+    ) -> std::result::Result<Self, Self::Error> {
         // Create parent directory if it doesn't exist
         if !args.socket_dir.exists() {
             debug!("Creating parent directory: {:?}", args.socket_dir);
@@ -55,26 +58,45 @@ impl Actor for SocketService {
                 .map_err(|e| rsproperties::errors::Error::new_io(e))?;
         }
 
-        let property_socket_path = args.socket_dir.join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
-        let system_socket_path = args.socket_dir.join(rsproperties::PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
+        let property_socket_path = args
+            .socket_dir
+            .join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
+        let system_socket_path = args
+            .socket_dir
+            .join(rsproperties::PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
         // Remove existing socket files if they exist
         if property_socket_path.exists() {
-            debug!("Removing existing property socket file: {}", property_socket_path.display());
+            debug!(
+                "Removing existing property socket file: {}",
+                property_socket_path.display()
+            );
             fs::remove_file(&property_socket_path)
                 .map_err(|e| rsproperties::errors::Error::new_io(e))?;
         }
         if system_socket_path.exists() {
-            debug!("Removing existing system socket file: {}", system_socket_path.display());
+            debug!(
+                "Removing existing system socket file: {}",
+                system_socket_path.display()
+            );
             fs::remove_file(&system_socket_path)
                 .map_err(|e| rsproperties::errors::Error::new_io(e))?;
         }
-        info!("Property socket services successfully created at: {} and {}",
-              property_socket_path.display(), system_socket_path.display());
+        info!(
+            "Property socket services successfully created at: {} and {}",
+            property_socket_path.display(),
+            system_socket_path.display()
+        );
         // Bind both sockets
-        trace!("Binding property service Unix domain socket: {}", property_socket_path.display());
+        trace!(
+            "Binding property service Unix domain socket: {}",
+            property_socket_path.display()
+        );
         let property_listener = UnixListener::bind(&property_socket_path)
             .map_err(|e| rsproperties::errors::Error::new_io(e))?;
-        trace!("Binding system property service Unix domain socket: {}", system_socket_path.display());
+        trace!(
+            "Binding system property service Unix domain socket: {}",
+            system_socket_path.display()
+        );
         let system_listener = UnixListener::bind(&system_socket_path)
             .map_err(|e| rsproperties::errors::Error::new_io(e))?;
         info!("AsyncPropertySocketService started successfully");
@@ -87,7 +109,10 @@ impl Actor for SocketService {
         })
     }
 
-    async fn on_run(&mut self, _actor_ref: &ActorRef<Self>) -> std::result::Result<(), Self::Error> {
+    async fn on_run(
+        &mut self,
+        _actor_ref: &ActorRef<Self>,
+    ) -> std::result::Result<(), Self::Error> {
         tokio::select! {
             _ = Self::handle_socket_connections(&self.property_listener, self.properties_service.clone()) => {
                 trace!("Property socket service task completed");
@@ -99,13 +124,19 @@ impl Actor for SocketService {
         Ok(())
     }
 
-    async fn on_stop(&mut self, _actor_ref: &ActorRef<Self>, killed: bool) -> std::result::Result<(), Self::Error> {
+    async fn on_stop(
+        &mut self,
+        _actor_ref: &ActorRef<Self>,
+        killed: bool,
+    ) -> std::result::Result<(), Self::Error> {
         warn!("=====================================");
         warn!("      SOCKET SERVICE SHUTDOWN       ");
         warn!("=====================================");
 
         if killed {
-            error!("*** FORCED TERMINATION *** SocketService is being killed, cleaning up resources.");
+            error!(
+                "*** FORCED TERMINATION *** SocketService is being killed, cleaning up resources."
+            );
         } else {
             warn!("*** GRACEFUL SHUTDOWN *** SocketService is stopping gracefully.");
         }
@@ -122,11 +153,14 @@ impl_message_handler!(SocketService, [crate::ReadyMessage]);
 impl rsactor::Message<crate::ReadyMessage> for SocketService {
     type Reply = bool;
 
-    async fn handle(&mut self, _message: crate::ReadyMessage, _actor_ref: &ActorRef<Self>) -> Self::Reply {
+    async fn handle(
+        &mut self,
+        _message: crate::ReadyMessage,
+        _actor_ref: &ActorRef<Self>,
+    ) -> Self::Reply {
         true
     }
 }
-
 
 impl SocketService {
     /// Handles socket connections for a specific socket type
@@ -165,7 +199,9 @@ impl SocketService {
 
         // Read the command (u32)
         let mut cmd_buf = [0u8; 4];
-        stream.read_exact(&mut cmd_buf).await
+        stream
+            .read_exact(&mut cmd_buf)
+            .await
             .map_err(|e| rsproperties::errors::Error::new_io(e))?;
         let cmd = u32::from_ne_bytes(cmd_buf);
 
@@ -179,9 +215,11 @@ impl SocketService {
             _ => {
                 warn!("Unknown command received: 0x{:08X}", cmd);
                 Self::send_response(&mut stream, PROP_ERROR).await?;
-                return Err(rsproperties::errors::Error::new_parse(
-                    format!("Unknown command: 0x{:08X}", cmd)
-                ).into());
+                return Err(rsproperties::errors::Error::new_parse(format!(
+                    "Unknown command: 0x{:08X}",
+                    cmd
+                ))
+                .into());
             }
         }
 
@@ -204,9 +242,11 @@ impl SocketService {
             // Reasonable limit
             error!("Name length too large: {}", name_len);
             Self::send_response(stream, PROP_ERROR).await?;
-            return Err(rsproperties::errors::Error::new_file_validation(
-                format!("Name length too large: {}", name_len)
-            ).into());
+            return Err(rsproperties::errors::Error::new_file_validation(format!(
+                "Name length too large: {}",
+                name_len
+            ))
+            .into());
         }
 
         let name = Self::read_string(stream, name_len as usize).await?;
@@ -220,9 +260,11 @@ impl SocketService {
             // Reasonable limit for property values
             error!("Value length too large: {}", value_len);
             Self::send_response(stream, PROP_ERROR).await?;
-            return Err(rsproperties::errors::Error::new_file_validation(
-                format!("Value length too large: {}", value_len)
-            ).into());
+            return Err(rsproperties::errors::Error::new_file_validation(format!(
+                "Value length too large: {}",
+                value_len
+            ))
+            .into());
         }
 
         let value = Self::read_string(stream, value_len as usize).await?;
@@ -239,11 +281,17 @@ impl SocketService {
 
         match service.ask(property_msg).await {
             Ok(true) => {
-                debug!("Property message sent successfully: '{}' = '{}'", name, value);
+                debug!(
+                    "Property message sent successfully: '{}' = '{}'",
+                    name, value
+                );
                 Self::send_response(stream, PROP_SUCCESS).await?;
             }
             Ok(false) => {
-                warn!("Property message was not processed by service: '{}' = '{}'", name, value);
+                warn!(
+                    "Property message was not processed by service: '{}' = '{}'",
+                    name, value
+                );
                 // Don't fail the operation if service doesn't process it
                 Self::send_response(stream, PROP_ERROR).await?;
             }
@@ -260,7 +308,9 @@ impl SocketService {
     /// Reads a u32 value from the stream
     async fn read_u32(stream: &mut UnixStream) -> Result<u32> {
         let mut buf = [0u8; 4];
-        stream.read_exact(&mut buf).await
+        stream
+            .read_exact(&mut buf)
+            .await
             .map_err(|e| rsproperties::errors::Error::new_io(e))?;
         Ok(u32::from_ne_bytes(buf))
     }
@@ -272,7 +322,9 @@ impl SocketService {
         }
 
         let mut buf = vec![0u8; len];
-        stream.read_exact(&mut buf).await
+        stream
+            .read_exact(&mut buf)
+            .await
             .map_err(|e| rsproperties::errors::Error::new_io(e))?;
 
         // Remove null terminator if present
@@ -280,16 +332,19 @@ impl SocketService {
             buf.truncate(null_pos);
         }
 
-        String::from_utf8(buf)
-            .map_err(|e| rsproperties::errors::Error::new_encoding(e.to_string()))
+        String::from_utf8(buf).map_err(|e| rsproperties::errors::Error::new_encoding(e.to_string()))
     }
 
     /// Sends a response to the client
     async fn send_response(stream: &mut UnixStream, response: i32) -> Result<()> {
         trace!("Sending response: {}", response);
-        stream.write_all(&response.to_ne_bytes()).await
+        stream
+            .write_all(&response.to_ne_bytes())
+            .await
             .map_err(|e| rsproperties::errors::Error::new_io(e))?;
-        stream.flush().await
+        stream
+            .flush()
+            .await
             .map_err(|e| rsproperties::errors::Error::new_io(e))?;
         trace!("Response sent successfully");
         Ok(())
@@ -301,21 +356,39 @@ impl Drop for SocketService {
         debug!("Cleaning up async socket service");
 
         // Remove socket files
-        let property_socket_path = self.socket_dir.join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
+        let property_socket_path = self
+            .socket_dir
+            .join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
         if property_socket_path.exists() {
             if let Err(e) = fs::remove_file(&property_socket_path) {
-                warn!("Failed to remove property socket file {}: {}", property_socket_path.display(), e);
+                warn!(
+                    "Failed to remove property socket file {}: {}",
+                    property_socket_path.display(),
+                    e
+                );
             } else {
-                debug!("Property socket file removed: {}", property_socket_path.display());
+                debug!(
+                    "Property socket file removed: {}",
+                    property_socket_path.display()
+                );
             }
         }
 
-        let system_socket_path = self.socket_dir.join(rsproperties::PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
+        let system_socket_path = self
+            .socket_dir
+            .join(rsproperties::PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
         if system_socket_path.exists() {
             if let Err(e) = fs::remove_file(&system_socket_path) {
-                warn!("Failed to remove system socket file {}: {}", system_socket_path.display(), e);
+                warn!(
+                    "Failed to remove system socket file {}: {}",
+                    system_socket_path.display(),
+                    e
+                );
             } else {
-                debug!("System socket file removed: {}", system_socket_path.display());
+                debug!(
+                    "System socket file removed: {}",
+                    system_socket_path.display()
+                );
             }
         }
     }

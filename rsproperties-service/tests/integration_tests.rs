@@ -54,7 +54,6 @@ async fn test_get_nonexistent_property() {
     assert!(result.is_empty());
 }
 
-
 mod builder_tests {
     use super::*;
 
@@ -245,19 +244,21 @@ mod concurrency_tests {
         // Set initial property
         rsproperties::set(prop_name, prop_value)?;
 
-        let handles: Vec<_> = (0..5).map(|i| {
-            let name = prop_name.to_string();
-            let expected = prop_value.to_string();
+        let handles: Vec<_> = (0..5)
+            .map(|i| {
+                let name = prop_name.to_string();
+                let expected = prop_value.to_string();
 
-            thread::spawn(move || {
-                for _ in 0..10 {
-                    let value = rsproperties::get(&name);
-                    assert_eq!(value, expected);
-                    thread::sleep(Duration::from_millis(1));
-                }
-                println!("Thread {} completed", i);
+                thread::spawn(move || {
+                    for _ in 0..10 {
+                        let value = rsproperties::get(&name);
+                        assert_eq!(value, expected);
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    println!("Thread {} completed", i);
+                })
             })
-        }).collect();
+            .collect();
 
         for handle in handles {
             handle.join().unwrap();
@@ -275,21 +276,23 @@ mod concurrency_tests {
         // Set initial property
         rsproperties::set(prop_name, "initial")?;
 
-        let handles: Vec<_> = (0..3).map(|i| {
-            let name = prop_name.to_string();
+        let handles: Vec<_> = (0..3)
+            .map(|i| {
+                let name = prop_name.to_string();
 
-            thread::spawn(move || {
-                let value = format!("thread_{}_value", i);
-                rsproperties::set(&name, &value).unwrap();
-                // thread::sleep(Duration::from_millis(10));
+                thread::spawn(move || {
+                    let value = format!("thread_{}_value", i);
+                    rsproperties::set(&name, &value).unwrap();
+                    // thread::sleep(Duration::from_millis(10));
 
-                // Verify we can read some value back
-                let retrieved = rsproperties::get(&name);
-                assert!(!retrieved.is_empty());
+                    // Verify we can read some value back
+                    let retrieved = rsproperties::get(&name);
+                    assert!(!retrieved.is_empty());
 
-                println!("Thread {} set value: {}, got: {}", i, value, retrieved);
+                    println!("Thread {} set value: {}, got: {}", i, value, retrieved);
+                })
             })
-        }).collect();
+            .collect();
 
         for handle in handles {
             handle.join().unwrap();

@@ -1,5 +1,5 @@
+use std::fs::{create_dir_all, remove_dir_all};
 use std::path::PathBuf;
-use std::fs::{remove_dir_all, create_dir_all};
 
 use clap::Parser;
 use tokio;
@@ -26,8 +26,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Setup directories
-    let properties_dir = args.properties_dir.unwrap_or_else(|| PathBuf::from("__properties__"));
-    let socket_dir = args.socket_dir.unwrap_or_else(|| properties_dir.join("sockets"));
+    let properties_dir = args
+        .properties_dir
+        .unwrap_or_else(|| PathBuf::from("__properties__"));
+    let socket_dir = args
+        .socket_dir
+        .unwrap_or_else(|| properties_dir.join("sockets"));
 
     // Clean and create directories
     let _ = remove_dir_all(&properties_dir);
@@ -49,7 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config,
         vec![], // property_contexts_files
         vec![], // build_prop_files
-    ).await?;
+    )
+    .await?;
 
     println!("✅ Services started successfully!");
     println!("🔄 Services are running. Press Ctrl+C to stop.");

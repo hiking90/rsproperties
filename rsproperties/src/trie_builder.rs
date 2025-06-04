@@ -1,10 +1,10 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, BTreeSet, HashSet};
+use log::error;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use log::error;
 
 use crate::errors::*;
 
@@ -58,7 +58,12 @@ impl TrieBuilderNode {
         self.property_entry.rtype = Some(rtype);
     }
 
-    fn add_exact_match_context(&mut self, name: Rc<String>, context: Rc<String>, rtype: Rc<String>) -> Result<()> {
+    fn add_exact_match_context(
+        &mut self,
+        name: Rc<String>,
+        context: Rc<String>,
+        rtype: Rc<String>,
+    ) -> Result<()> {
         let entry = PropertyEntryBuilder {
             name: Rc::clone(&name),
             context: Some(context),
@@ -69,11 +74,19 @@ impl TrieBuilderNode {
             Ok(())
         } else {
             error!("Exact match already exists for '{}'", name);
-            Err(Error::new_file_validation(format!("Exact match already exists for '{name}'")).into())
+            Err(
+                Error::new_file_validation(format!("Exact match already exists for '{name}'"))
+                    .into(),
+            )
         }
     }
 
-    fn add_prefix_context(&mut self, name: Rc<String>, context: Rc<String>, rtype: Rc<String>) -> Result<()> {
+    fn add_prefix_context(
+        &mut self,
+        name: Rc<String>,
+        context: Rc<String>,
+        rtype: Rc<String>,
+    ) -> Result<()> {
         let entry = PropertyEntryBuilder {
             name: Rc::clone(&name),
             context: Some(context),
@@ -125,7 +138,13 @@ impl TrieBuilder {
         }
     }
 
-    pub(crate) fn add_to_trie(&mut self, name: &str, context: &str, rtype: &str, exact: bool) -> Result<()> {
+    pub(crate) fn add_to_trie(
+        &mut self,
+        name: &str,
+        context: &str,
+        rtype: &str,
+        exact: bool,
+    ) -> Result<()> {
         let context = Rc::new(context.to_owned());
         let rtype = Rc::new(rtype.to_owned());
 
@@ -142,28 +161,40 @@ impl TrieBuilder {
             false
         };
 
-        let last_name: &str = name_parts.pop()
+        let last_name: &str = name_parts
+            .pop()
             .ok_or(Error::new_parse(format!("No name parts for '{name}'")))?;
 
         for part in name_parts {
             let part = Rc::new(part.to_owned());
-            current_node = current_node.children.entry(Rc::clone(&part))
+            current_node = current_node
+                .children
+                .entry(Rc::clone(&part))
                 .or_insert_with(|| TrieBuilderNode::new(part));
         }
 
         let last_name = Rc::new(last_name.to_owned());
 
         if exact {
-            current_node.add_exact_match_context(last_name, Rc::clone(&context), Rc::clone(&rtype))?;
+            current_node.add_exact_match_context(
+                last_name,
+                Rc::clone(&context),
+                Rc::clone(&rtype),
+            )?;
         } else if !ends_with_dot {
             current_node.add_prefix_context(last_name, Rc::clone(&context), Rc::clone(&rtype))?;
         } else {
-            let child = current_node.children.entry(Rc::clone(&last_name))
+            let child = current_node
+                .children
+                .entry(Rc::clone(&last_name))
                 .or_insert_with(|| TrieBuilderNode::new(last_name));
 
             if child.context().is_some() || child.rtype().is_some() {
                 error!("Duplicate prefix match detected for '{}'", name);
-                return Err(Error::new_file_validation(format!("Duplicate prefix match detected for '{name}'")).into());
+                return Err(Error::new_file_validation(format!(
+                    "Duplicate prefix match detected for '{name}'"
+                ))
+                .into());
             }
 
             child.set_context(context);

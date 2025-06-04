@@ -1,13 +1,13 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::atomic::AtomicU32;
+#[cfg(feature = "builder")]
+use log::warn;
+use std::ffi::CStr;
 use std::mem;
 #[cfg(feature = "builder")]
 use std::ptr;
-use std::ffi::CStr;
-#[cfg(feature = "builder")]
-use log::warn;
+use std::sync::atomic::AtomicU32;
 
 use crate::system_properties::PROP_VALUE_MAX;
 
@@ -42,13 +42,16 @@ impl PropertyInfo {
         let error_value_len = LONG_LEGACY_ERROR.len();
         let serial_value = (error_value_len << 24 | LONG_FLAG) as u32;
 
-        self.serial.store(serial_value, std::sync::atomic::Ordering::Relaxed);
+        self.serial
+            .store(serial_value, std::sync::atomic::Ordering::Relaxed);
 
         // Safe memory copy with proper bounds checking
         unsafe {
             let long_property = &mut self.data.long_property;
             let error_bytes = LONG_LEGACY_ERROR.as_bytes();
-            let copy_len = error_value_len.min(error_bytes.len()).min(long_property.error_message.len());
+            let copy_len = error_value_len
+                .min(error_bytes.len())
+                .min(long_property.error_message.len());
 
             // Always use safe bounds-checked copy
             let dest_slice = &mut long_property.error_message[..copy_len];
@@ -68,7 +71,8 @@ impl PropertyInfo {
         init_name_with_trailing_data(self, name);
         let serial_value = (value.len() << 24) as u32;
 
-        self.serial.store(serial_value, std::sync::atomic::Ordering::Relaxed);
+        self.serial
+            .store(serial_value, std::sync::atomic::Ordering::Relaxed);
 
         // Safe memory copy with bounds checking
         unsafe {
@@ -85,16 +89,16 @@ impl PropertyInfo {
             }
         }
     }
-/*
-    pub(crate) fn set_name(&mut self, name: &str) {
-        unsafe {
-            let self_ptr = self as *mut _ as *mut u8;
-            let name_ptr = self_ptr.add(mem::size_of::<Self>()) as *mut u8;
-            ptr::copy_nonoverlapping(name.as_ptr(), name_ptr, name.len());
-            *name_ptr.add(name.len()) = 0; // Add null terminator
+    /*
+        pub(crate) fn set_name(&mut self, name: &str) {
+            unsafe {
+                let self_ptr = self as *mut _ as *mut u8;
+                let name_ptr = self_ptr.add(mem::size_of::<Self>()) as *mut u8;
+                ptr::copy_nonoverlapping(name.as_ptr(), name_ptr, name.len());
+                *name_ptr.add(name.len()) = 0; // Add null terminator
+            }
         }
-    }
-*/
+    */
     pub(crate) fn name(&self) -> &CStr {
         name_from_trailing_data(self, None)
     }
@@ -155,13 +159,9 @@ pub(crate) fn name_from_trailing_data<I: Sized>(thiz: &I, len: Option<usize>) ->
         let thiz_ptr = thiz as *const _ as *const u8;
         let name_ptr = thiz_ptr.add(mem::size_of::<I>()) as _;
         match len {
-            Some(len) => {
-                CStr::from_bytes_until_nul(std::slice::from_raw_parts(name_ptr, len + 1))
-                    .expect("Failed to convert name to CStr")
-            }
-            None => {
-                CStr::from_ptr(name_ptr as *const i8)
-            }
+            Some(len) => CStr::from_bytes_until_nul(std::slice::from_raw_parts(name_ptr, len + 1))
+                .expect("Failed to convert name to CStr"),
+            None => CStr::from_ptr(name_ptr as *const i8),
         }
     }
 }

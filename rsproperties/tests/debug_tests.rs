@@ -5,7 +5,7 @@
 
 extern crate rsproperties;
 
-use rsproperties::{PROP_VALUE_MAX, PROP_DIRNAME};
+use rsproperties::{PROP_DIRNAME, PROP_VALUE_MAX};
 
 mod common;
 use common::init_test;

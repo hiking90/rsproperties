@@ -4,9 +4,9 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use crate::trie_node_arena::TrieNodeArena;
-use crate::trie_builder::*;
 use crate::property_info_parser::*;
+use crate::trie_builder::*;
+use crate::trie_node_arena::TrieNodeArena;
 
 pub(crate) struct TrieSerializer {
     arena: TrieNodeArena,
@@ -20,24 +20,36 @@ impl TrieSerializer {
 
         let header_offset = this.arena.allocate_object::<PropertyInfoAreaHeader>();
         {
-            let header = this.arena.to_object::<PropertyInfoAreaHeader>(header_offset);
+            let header = this
+                .arena
+                .to_object::<PropertyInfoAreaHeader>(header_offset);
             header.current_version = 1;
             header.minimum_supported_version = 1;
         }
 
-        this.arena.to_object::<PropertyInfoAreaHeader>(header_offset).contexts_offset = this.arena.size() as _;
+        this.arena
+            .to_object::<PropertyInfoAreaHeader>(header_offset)
+            .contexts_offset = this.arena.size() as _;
         this.serialize_strings(&trie_builder.contexts);
 
-        this.arena.to_object::<PropertyInfoAreaHeader>(header_offset).types_offset = this.arena.size() as _;
+        this.arena
+            .to_object::<PropertyInfoAreaHeader>(header_offset)
+            .types_offset = this.arena.size() as _;
         this.serialize_strings(&trie_builder.types);
 
-        this.arena.to_object::<PropertyInfoAreaHeader>(header_offset).size = this.arena.size() as _;
+        this.arena
+            .to_object::<PropertyInfoAreaHeader>(header_offset)
+            .size = this.arena.size() as _;
 
         let root_trie_offset = this.write_trie_node(&trie_builder.root);
-        this.arena.to_object::<PropertyInfoAreaHeader>(header_offset).root_offset = root_trie_offset as _;
+        this.arena
+            .to_object::<PropertyInfoAreaHeader>(header_offset)
+            .root_offset = root_trie_offset as _;
 
         let final_size = this.arena.size();
-        this.arena.to_object::<PropertyInfoAreaHeader>(header_offset).size = final_size as _;
+        this.arena
+            .to_object::<PropertyInfoAreaHeader>(header_offset)
+            .size = final_size as _;
 
         this
     }
@@ -52,9 +64,7 @@ impl TrieSerializer {
                     index
                 }
             }
-            None => {
-                !0
-            }
+            None => !0,
         };
 
         let type_index = match property_entry.rtype {
@@ -66,9 +76,7 @@ impl TrieSerializer {
                     index
                 }
             }
-            None => {
-                !0
-            }
+            None => !0,
         };
 
         let entry_offset = self.arena.allocate_object::<PropertyEntry>();
@@ -87,16 +95,24 @@ impl TrieSerializer {
         let trie_offset = self.arena.allocate_object::<TrieNodeData>();
 
         let property_entry = self.write_property_entry(&builder_node.property_entry);
-        self.arena.to_object::<TrieNodeData>(trie_offset).property_entry = property_entry as _;
+        self.arena
+            .to_object::<TrieNodeData>(trie_offset)
+            .property_entry = property_entry as _;
 
         // Sort prefixes by length (longest first)
         let mut sorted_prefix_matches: Vec<_> = builder_node.prefixes.iter().collect();
         sorted_prefix_matches.sort_by(|a, b| b.name.len().cmp(&a.name.len()));
 
-        self.arena.to_object::<TrieNodeData>(trie_offset).num_prefixes = sorted_prefix_matches.len() as _;
+        self.arena
+            .to_object::<TrieNodeData>(trie_offset)
+            .num_prefixes = sorted_prefix_matches.len() as _;
 
-        let prefix_entries_array_offset = self.arena.allocate_uint32_array(sorted_prefix_matches.len());
-        self.arena.to_object::<TrieNodeData>(trie_offset).prefix_entries = prefix_entries_array_offset as _;
+        let prefix_entries_array_offset = self
+            .arena
+            .allocate_uint32_array(sorted_prefix_matches.len());
+        self.arena
+            .to_object::<TrieNodeData>(trie_offset)
+            .prefix_entries = prefix_entries_array_offset as _;
 
         for (i, prefix_entry) in sorted_prefix_matches.iter().enumerate() {
             let offset = self.write_property_entry(prefix_entry);
@@ -107,9 +123,14 @@ impl TrieSerializer {
         let mut sorted_exact_matches: Vec<_> = builder_node.exact_matches.iter().collect();
         sorted_exact_matches.sort_by(|a, b| a.name.cmp(&b.name));
 
-        self.arena.to_object::<TrieNodeData>(trie_offset).num_exact_matches = sorted_exact_matches.len() as _;
-        let exact_match_entries_array_offset = self.arena.allocate_uint32_array(sorted_exact_matches.len());
-        self.arena.to_object::<TrieNodeData>(trie_offset).exact_match_entries = exact_match_entries_array_offset as _;
+        self.arena
+            .to_object::<TrieNodeData>(trie_offset)
+            .num_exact_matches = sorted_exact_matches.len() as _;
+        let exact_match_entries_array_offset =
+            self.arena.allocate_uint32_array(sorted_exact_matches.len());
+        self.arena
+            .to_object::<TrieNodeData>(trie_offset)
+            .exact_match_entries = exact_match_entries_array_offset as _;
 
         for (i, exact_entry) in sorted_exact_matches.iter().enumerate() {
             let offset = self.write_property_entry(exact_entry);
@@ -120,9 +141,13 @@ impl TrieSerializer {
         let mut sorted_children: Vec<_> = builder_node.children.values().collect();
         sorted_children.sort_by(|a, b| a.property_entry.name.cmp(&b.property_entry.name));
 
-        self.arena.to_object::<TrieNodeData>(trie_offset).num_child_nodes = sorted_children.len() as _;
+        self.arena
+            .to_object::<TrieNodeData>(trie_offset)
+            .num_child_nodes = sorted_children.len() as _;
         let children_offset_array_offset = self.arena.allocate_uint32_array(sorted_children.len());
-        self.arena.to_object::<TrieNodeData>(trie_offset).child_nodes = children_offset_array_offset as _;
+        self.arena
+            .to_object::<TrieNodeData>(trie_offset)
+            .child_nodes = children_offset_array_offset as _;
 
         for (i, child_node) in sorted_children.iter().enumerate() {
             let child_offset = self.write_trie_node(child_node);

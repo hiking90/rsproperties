@@ -6,7 +6,7 @@
 //! These tests use the existing __properties__ directory which contains
 //! real Android property system files.
 
-use rsproperties::{PROP_VALUE_MAX, PROP_DIRNAME};
+use rsproperties::{PROP_DIRNAME, PROP_VALUE_MAX};
 use std::sync::Once;
 
 static INIT_ONCE: Once = Once::new();
@@ -23,8 +23,14 @@ fn ensure_init() {
 #[test]
 fn test_constants_are_correct() {
     // Test Android system property constants
-    assert_eq!(PROP_VALUE_MAX, 92, "PROP_VALUE_MAX should match Android standard");
-    assert_eq!(PROP_DIRNAME, "/dev/__properties__", "PROP_DIRNAME should match Android default");
+    assert_eq!(
+        PROP_VALUE_MAX, 92,
+        "PROP_VALUE_MAX should match Android standard"
+    );
+    assert_eq!(
+        PROP_DIRNAME, "/dev/__properties__",
+        "PROP_DIRNAME should match Android default"
+    );
     println!("✓ API constants are correct");
 }
 
@@ -34,7 +40,10 @@ fn test_get_with_default_functionality() {
 
     // Test getting a property that definitely doesn't exist
     let result = rsproperties::get_with_default("test.nonexistent.property.12345", "default_value");
-    assert_eq!(result, "default_value", "Should return default value for non-existent properties");
+    assert_eq!(
+        result, "default_value",
+        "Should return default value for non-existent properties"
+    );
 
     // Test with empty default
     let result = rsproperties::get_with_default("test.another.nonexistent", "");
@@ -70,7 +79,11 @@ fn test_get_nonexistent_properties() {
 
     for prop in &nonexistent_props {
         let result = rsproperties::get_with_result(prop);
-        assert!(result.is_err(), "Getting non-existent property '{}' should return error", prop);
+        assert!(
+            result.is_err(),
+            "Getting non-existent property '{}' should return error",
+            prop
+        );
     }
 
     println!("✓ get returns errors for non-existent properties");
@@ -87,8 +100,11 @@ fn test_dirname_function() {
     assert!(!dirname_str.is_empty(), "dirname should not be empty");
 
     // Should be a valid path
-    assert!(dirname_str.contains("properties") || dirname_str.starts_with("/"),
-            "dirname should be a valid path, got: {}", dirname_str);
+    assert!(
+        dirname_str.contains("properties") || dirname_str.starts_with("/"),
+        "dirname should be a valid path, got: {}",
+        dirname_str
+    );
 
     println!("✓ dirname function returns: {}", dirname_str);
 }
@@ -116,9 +132,9 @@ fn test_property_name_validation() {
 
     // Test invalid property names
     let invalid_names = [
-        "", // empty
-        ".", // just dot
-        "..", // double dot
+        "",      // empty
+        ".",     // just dot
+        "..",    // double dot
         "name.", // ending with dot
         ".name", // starting with dot
     ];
@@ -135,9 +151,9 @@ fn test_property_name_validation() {
 
 #[test]
 fn test_thread_safety() {
-    use std::thread;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
 
     ensure_init();
 
@@ -174,9 +190,16 @@ fn test_thread_safety() {
     }
 
     let final_count = counter.load(Ordering::SeqCst);
-    assert_eq!(final_count, 10 * 5 * 3, "All thread operations should complete");
+    assert_eq!(
+        final_count,
+        10 * 5 * 3,
+        "All thread operations should complete"
+    );
 
-    println!("✓ Thread safety test completed with {} operations", final_count);
+    println!(
+        "✓ Thread safety test completed with {} operations",
+        final_count
+    );
 }
 
 #[test]
@@ -221,7 +244,10 @@ mod builder_tests {
                 println!("✓ Property read back successfully: {}", value);
             }
             Err(e) => {
-                println!("⚠ Property set failed (expected without property service): {}", e);
+                println!(
+                    "⚠ Property set failed (expected without property service): {}",
+                    e
+                );
                 // This is expected behavior when property service is not running
             }
         }
@@ -270,7 +296,10 @@ mod builder_tests {
         let result = rsproperties::set("test.too.long", &too_long_value);
 
         // This should fail
-        assert!(result.is_err(), "Setting property with value too long should fail");
+        assert!(
+            result.is_err(),
+            "Setting property with value too long should fail"
+        );
         println!("✓ Correctly rejected property value that is too long");
     }
 

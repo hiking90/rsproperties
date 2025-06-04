@@ -9,8 +9,16 @@ use common::init_test;
 #[test]
 fn test_library_constants() {
     // Test that library constants are properly exposed and have correct values
-    assert_eq!(rsproperties::PROP_VALUE_MAX, 92, "PROP_VALUE_MAX should be 92 bytes");
-    assert_eq!(rsproperties::PROP_DIRNAME, "/dev/__properties__", "PROP_DIRNAME should match Android default");
+    assert_eq!(
+        rsproperties::PROP_VALUE_MAX,
+        92,
+        "PROP_VALUE_MAX should be 92 bytes"
+    );
+    assert_eq!(
+        rsproperties::PROP_DIRNAME,
+        "/dev/__properties__",
+        "PROP_DIRNAME should match Android default"
+    );
 
     println!("✓ Library constants are correct");
     println!("  PROP_VALUE_MAX = {}", rsproperties::PROP_VALUE_MAX);
@@ -23,7 +31,10 @@ fn init_test_and_dirname() {
 
     // Test that dirname function works after initialization
     let dirname = rsproperties::properties_dir();
-    assert!(!dirname.to_string_lossy().is_empty(), "dirname should not be empty after init");
+    assert!(
+        !dirname.to_string_lossy().is_empty(),
+        "dirname should not be empty after init"
+    );
 
     println!("✓ init() and dirname() work correctly");
     println!("  Property directory: {:?}", dirname);
@@ -35,16 +46,25 @@ fn test_get_with_default_functionality() {
 
     // Test with non-existent property
     let result = rsproperties::get_with_default("test.nonexistent.property.12345", "default_value");
-    assert_eq!(result, "default_value", "Should return default for non-existent property");
+    assert_eq!(
+        result, "default_value",
+        "Should return default for non-existent property"
+    );
 
     // Test with empty property name
     let result = rsproperties::get_with_default("", "empty_default");
-    assert_eq!(result, "empty_default", "Should return default for empty property name");
+    assert_eq!(
+        result, "empty_default",
+        "Should return default for empty property name"
+    );
 
     // Test with very long property name
     let long_name = "a".repeat(500);
     let result = rsproperties::get_with_default(&long_name, "long_default");
-    assert_eq!(result, "long_default", "Should return default for very long property name");
+    assert_eq!(
+        result, "long_default",
+        "Should return default for very long property name"
+    );
 
     println!("✓ get_with_default() works correctly for non-existent properties");
 }
@@ -55,7 +75,10 @@ fn test_get_functionality() {
 
     // Test with non-existent property
     let result = rsproperties::get("test.nonexistent.property.67890");
-    assert!(result.is_empty(), "Should return empty string for non-existent property");
+    assert!(
+        result.is_empty(),
+        "Should return empty string for non-existent property"
+    );
 
     println!("✓ get() returns empty string for non-existent properties");
 }
@@ -127,12 +150,19 @@ fn test_property_name_validation() {
         ("CAPS_PROPERTY", "Capital letters"),
         ("property123", "Numbers"),
         ("property_with_underscores", "Underscores"),
-        ("very.long.property.name.with.many.segments.to.test.limits", "Long segmented name"),
+        (
+            "very.long.property.name.with.many.segments.to.test.limits",
+            "Long segmented name",
+        ),
     ];
 
     for (name, description) in edge_cases {
         let result = rsproperties::get_with_default(name, "default");
-        assert_eq!(result, "default", "Should handle edge case: {}", description);
+        assert_eq!(
+            result, "default",
+            "Should handle edge case: {}",
+            description
+        );
     }
 
     println!("✓ Property name edge cases handled correctly");
@@ -177,8 +207,12 @@ fn test_thread_safety() {
     }
 
     println!("✓ Thread safety test completed successfully");
-    println!("  {} threads × {} iterations = {} total operations",
-             num_threads, iterations, num_threads * iterations);
+    println!(
+        "  {} threads × {} iterations = {} total operations",
+        num_threads,
+        iterations,
+        num_threads * iterations
+    );
 }
 
 #[test]
@@ -227,7 +261,10 @@ fn test_error_handling_robustness() {
     // Property names with null bytes
     let null_name = "test\0property";
     let result = rsproperties::get_with_default(null_name, "default");
-    assert_eq!(result, "default", "Should handle property names with null bytes");
+    assert_eq!(
+        result, "default",
+        "Should handle property names with null bytes"
+    );
 
     // Property names with various Unicode characters
     let unicode_name = "test.🚀.property.世界";
@@ -260,7 +297,10 @@ fn test_performance_characteristics() {
     println!("  Average time per operation: {} ns", avg_time_ns);
 
     // Reasonable performance expectation (less than 100 microseconds per operation)
-    assert!(avg_time_ns < 100_000, "Operations should be reasonably fast");
+    assert!(
+        avg_time_ns < 100_000,
+        "Operations should be reasonably fast"
+    );
 }
 
 #[test]
@@ -292,7 +332,10 @@ fn test_real_android_properties() {
             Err(_) => {
                 // Property doesn't exist, which is fine
                 let default_val = rsproperties::get_with_default(prop, "not_found");
-                assert_eq!(default_val, "not_found", "get_with_default should work even if get fails");
+                assert_eq!(
+                    default_val, "not_found",
+                    "get_with_default should work even if get fails"
+                );
             }
         }
     }

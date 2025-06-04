@@ -1,9 +1,7 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    cmp::Ordering, ffi::CStr, fs::File, mem::size_of, path::Path
-};
+use std::{cmp::Ordering, ffi::CStr, fs::File, mem::size_of, path::Path};
 
 use log::info;
 
@@ -24,18 +22,17 @@ where
         match f(search) {
             Ordering::Equal => {
                 return search;
-            },
+            }
             Ordering::Less => {
                 bottom = search + 1;
-            },
+            }
             Ordering::Greater => {
                 top = search - 1;
-            },
+            }
         };
     }
     -1
 }
-
 
 #[derive(FromBytes, KnownLayout, Immutable, Debug)]
 #[repr(C, align(4))]
@@ -99,7 +96,8 @@ impl<'a> TrieNode<'a> {
     }
 
     fn property_entry(&self) -> &PropertyEntry {
-        self.property_info_area.ref_from(self.data().property_entry as usize)
+        self.property_info_area
+            .ref_from(self.data().property_entry as usize)
     }
 
     pub(crate) fn context_index(&self) -> u32 {
@@ -115,7 +113,9 @@ impl<'a> TrieNode<'a> {
     }
 
     fn child_node(&self, n: usize) -> TrieNode {
-        let child_node_offset = self.property_info_area.u32_slice_from(self.data().child_nodes as usize)[n];
+        let child_node_offset = self
+            .property_info_area
+            .u32_slice_from(self.data().child_nodes as usize)[n];
         TrieNode::new(&self.property_info_area, child_node_offset as usize)
     }
 
@@ -138,7 +138,9 @@ impl<'a> TrieNode<'a> {
     }
 
     pub(crate) fn prefix(&self, n: usize) -> &PropertyEntry {
-        let offset = self.property_info_area.u32_slice_from(self.data().prefix_entries as usize)[n] as usize;
+        let offset = self
+            .property_info_area
+            .u32_slice_from(self.data().prefix_entries as usize)[n] as usize;
         self.property_info_area.ref_from(offset)
     }
 
@@ -147,7 +149,9 @@ impl<'a> TrieNode<'a> {
     }
 
     pub(crate) fn exact_match(&self, n: usize) -> &PropertyEntry {
-        let offset = self.property_info_area.u32_slice_from(self.data().exact_match_entries as usize)[n] as usize;
+        let offset =
+            self.property_info_area
+                .u32_slice_from(self.data().exact_match_entries as usize)[n] as usize;
         self.property_info_area.ref_from(offset)
     }
 }
@@ -159,9 +163,7 @@ pub struct PropertyInfoArea<'a> {
 
 impl<'a> PropertyInfoArea<'a> {
     pub(crate) fn new(data_base: &'a [u8]) -> Self {
-        Self {
-            data_base,
-        }
+        Self { data_base }
     }
 
     // To resolve lifetime issues, we need to clone the TrieNode.
@@ -173,7 +175,7 @@ impl<'a> PropertyInfoArea<'a> {
         match self.data_base[offset..].iter().position(|&x| x == 0) {
             Some(end) => {
                 let end = end + offset + 1;
-                CStr::from_bytes_with_nul(&self.data_base[offset .. end]).unwrap()
+                CStr::from_bytes_with_nul(&self.data_base[offset..end]).unwrap()
             }
             None => {
                 return CStr::from_bytes_with_nul(b"\0").unwrap();
@@ -189,7 +191,7 @@ impl<'a> PropertyInfoArea<'a> {
         let size_of = size_of::<T>();
         zerocopy::Ref::into_ref(
             zerocopy::Ref::<&[u8], T>::from_bytes(&self.data_base[offset..offset + size_of])
-            .expect("Failed to create reference")
+                .expect("Failed to create reference"),
         )
     }
 
@@ -259,8 +261,13 @@ impl<'a> PropertyInfoArea<'a> {
         self.u32_slice_from(type_array_offset)[index] as _
     }
 
-    fn check_prefix_match(&self, remaining_name: &str, trie_node: &TrieNode,
-        context_index: &mut u32, type_index: &mut u32) {
+    fn check_prefix_match(
+        &self,
+        remaining_name: &str,
+        trie_node: &TrieNode,
+        context_index: &mut u32,
+        type_index: &mut u32,
+    ) {
         let remaining_name_size = remaining_name.len();
         for i in 0..trie_node.num_prefixes() {
             let prefix = trie_node.prefix(i as _);
@@ -297,7 +304,12 @@ impl<'a> PropertyInfoArea<'a> {
                 return_type_index = trie_node.type_index();
             }
 
-            self.check_prefix_match(remaining_name, &trie_node, &mut return_context_index, &mut return_type_index);
+            self.check_prefix_match(
+                remaining_name,
+                &trie_node,
+                &mut return_context_index,
+                &mut return_type_index,
+            );
 
             match remaining_name.find('.') {
                 Some(index) => {
@@ -310,12 +322,12 @@ impl<'a> PropertyInfoArea<'a> {
                         }
                         None => {
                             break;
-                        },
+                        }
                     };
                 }
                 None => {
                     break;
-                },
+                }
             }
         }
 
@@ -335,12 +347,20 @@ impl<'a> PropertyInfoArea<'a> {
                     return_type_index
                 };
 
-                info!("Property '{}' resolved: context_index={}, type_index={}", name, context_index, type_index);
+                info!(
+                    "Property '{}' resolved: context_index={}, type_index={}",
+                    name, context_index, type_index
+                );
                 return (context_index, type_index);
             }
         }
 
-        self.check_prefix_match(remaining_name, &trie_node, &mut return_context_index, &mut return_type_index);
+        self.check_prefix_match(
+            remaining_name,
+            &trie_node,
+            &mut return_context_index,
+            &mut return_type_index,
+        );
         (return_context_index, return_type_index)
     }
 
@@ -363,14 +383,20 @@ impl<'a> PropertyInfoArea<'a> {
     #[cfg(feature = "builder")]
     pub(crate) fn find_context_index(&self, context: &str) -> i32 {
         find(self.num_contexts() as _, |i| {
-            self.cstr(self.context_offset(i as _)).to_str().unwrap().cmp(context)
+            self.cstr(self.context_offset(i as _))
+                .to_str()
+                .unwrap()
+                .cmp(context)
         })
     }
 
     #[cfg(feature = "builder")]
     pub(crate) fn find_type_index(&self, rtype: &str) -> i32 {
         find(self.num_types() as _, |i| {
-            self.cstr(self.type_offset(i as _)).to_str().unwrap().cmp(rtype)
+            self.cstr(self.type_offset(i as _))
+                .to_str()
+                .unwrap()
+                .cmp(rtype)
         })
     }
 }
@@ -385,14 +411,19 @@ impl PropertyInfoAreaFile {
     }
 
     pub(crate) fn load_path(path: &Path) -> Result<Self> {
-        let file: File = File::open(path)
-            .context_with_location(format!("File open is failed in: {path:?}"))?;
+        let file: File =
+            File::open(path).context_with_location(format!("File open is failed in: {path:?}"))?;
 
-        let metadata = file.metadata()
+        let metadata = file
+            .metadata()
             .context_with_location(format!("File metadata is failed in: {path:?}"))?;
 
         // Validate file metadata using common utility function
-        crate::errors::validate_file_metadata(&metadata, path, size_of::<PropertyInfoAreaHeader>() as u64)?;
+        crate::errors::validate_file_metadata(
+            &metadata,
+            path,
+            size_of::<PropertyInfoAreaHeader>() as u64,
+        )?;
 
         Ok(Self {
             mmap: MemoryMap::new(file, metadata.len() as usize, false)?,
@@ -400,7 +431,11 @@ impl PropertyInfoAreaFile {
     }
 
     pub(crate) fn property_info_area(&self) -> PropertyInfoArea {
-        PropertyInfoArea::new(self.mmap.data(0, 0, self.mmap.size()).expect("offset is 0. So, it must be valid."))
+        PropertyInfoArea::new(
+            self.mmap
+                .data(0, 0, self.mmap.size())
+                .expect("offset is 0. So, it must be valid."),
+        )
     }
 }
 

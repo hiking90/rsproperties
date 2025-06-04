@@ -98,7 +98,9 @@ async fn example_error_handling() {
     fn get_required_config() -> Result<String> {
         let config = rsproperties::get("app.required.config");
         if config.is_empty() {
-            return Err(rsproperties::Error::new_not_found("app.required.config".to_string()).into());
+            return Err(
+                rsproperties::Error::new_not_found("app.required.config".to_string()).into(),
+            );
         }
         Ok(config)
     }
@@ -123,21 +125,16 @@ async fn example_android_property_patterns() {
         ("ro.product.model", "Device model"),
         ("ro.product.name", "Product name"),
         ("ro.hardware", "Hardware platform"),
-
         // System properties
         ("sys.boot_completed", "Boot completion status"),
         ("sys.usb.state", "USB connection state"),
-
         // Persistent properties (survive reboots)
         ("persist.sys.timezone", "System timezone"),
         ("persist.sys.locale", "System locale"),
-
         // Service properties
         ("service.adb.tcp.port", "ADB TCP port"),
-
         // Dalvik VM properties
         ("dalvik.vm.heapsize", "VM heap size"),
-
         // Network properties
         ("net.hostname", "Network hostname"),
     ];
@@ -194,19 +191,22 @@ async fn example_configuration_management() -> Result<()> {
     println!("Log level: {}", log_level);
 
     let max_connections: i32 = rsproperties::get("app.max.connections")
-        .parse().unwrap_or(50);
+        .parse()
+        .unwrap_or(50);
     println!("Max connections: {}", max_connections);
 
     let timeout: u64 = rsproperties::get("app.timeout.seconds")
-        .parse().unwrap_or(10);
+        .parse()
+        .unwrap_or(10);
     println!("Timeout: {} seconds", timeout);
 
-    let experimental_enabled = rsproperties::get("app.feature.experimental")
-        .to_lowercase() == "true";
+    let experimental_enabled =
+        rsproperties::get("app.feature.experimental").to_lowercase() == "true";
     println!("Experimental features: {}", experimental_enabled);
 
     let cache_size: u32 = rsproperties::get("app.cache.size.mb")
-        .parse().unwrap_or(128);
+        .parse()
+        .unwrap_or(128);
     println!("Cache size: {} MB", cache_size);
 
     // Demonstrate conditional logic based on properties
@@ -270,7 +270,8 @@ async fn example_best_practices() {
     // ✅ Good: Always provide sensible defaults
     let cache_enabled = rsproperties::get_with_default("com.myapp.feature.cache.enabled", "false");
     let retry_count: u32 = rsproperties::get_with_default("com.myapp.network.retry.count", "1")
-        .parse().unwrap_or(1);
+        .parse()
+        .unwrap_or(1);
 
     println!("Cache enabled: {}", cache_enabled);
     println!("Retry count: {}", retry_count);
@@ -300,8 +301,13 @@ async fn example_best_practices() {
     const FEATURE_FLAG_ANALYTICS: &str = "com.myapp.feature.analytics.enabled";
     const FEATURE_FLAG_TELEMETRY: &str = "com.myapp.feature.telemetry.enabled";
 
-    let analytics_enabled = rsproperties::get_with_default(FEATURE_FLAG_ANALYTICS, "false") == "true";
-    let telemetry_enabled = rsproperties::get_with_default(FEATURE_FLAG_TELEMETRY, "false") == "true";
+    let analytics_enabled =
+        rsproperties::get_with_default(FEATURE_FLAG_ANALYTICS, "false") == "true";
+    let telemetry_enabled =
+        rsproperties::get_with_default(FEATURE_FLAG_TELEMETRY, "false") == "true";
 
-    println!("Analytics: {}, Telemetry: {}", analytics_enabled, telemetry_enabled);
+    println!(
+        "Analytics: {}, Telemetry: {}",
+        analytics_enabled, telemetry_enabled
+    );
 }

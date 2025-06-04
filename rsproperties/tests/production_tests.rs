@@ -9,7 +9,7 @@
 
 extern crate rsproperties;
 
-use rsproperties::{PROP_VALUE_MAX, PROP_DIRNAME};
+use rsproperties::{PROP_DIRNAME, PROP_VALUE_MAX};
 
 mod common;
 use common::init_test;
@@ -22,8 +22,14 @@ fn init_properties() {
 #[test]
 fn test_constants_validation() {
     // Validate that Android system property constants are correct
-    assert_eq!(PROP_VALUE_MAX, 92, "PROP_VALUE_MAX must match Android specification");
-    assert_eq!(PROP_DIRNAME, "/dev/__properties__", "PROP_DIRNAME must match Android default");
+    assert_eq!(
+        PROP_VALUE_MAX, 92,
+        "PROP_VALUE_MAX must match Android specification"
+    );
+    assert_eq!(
+        PROP_DIRNAME, "/dev/__properties__",
+        "PROP_DIRNAME must match Android default"
+    );
 
     println!("✓ Constants validation passed");
     println!("  PROP_VALUE_MAX = {}", PROP_VALUE_MAX);
@@ -51,7 +57,11 @@ fn test_get_with_default_edge_cases() {
         ("test.spaces", "value with spaces", "default with spaces"),
         ("test.special", "!@#$%^&*()", "special characters"),
         ("test.unicode", "üñíçødé", "unicode characters"),
-        ("test.long.name.with.many.segments", "default", "long property name"),
+        (
+            "test.long.name.with.many.segments",
+            "default",
+            "long property name",
+        ),
     ];
 
     for (prop, default, description) in &test_cases {
@@ -59,7 +69,10 @@ fn test_get_with_default_edge_cases() {
         assert_eq!(result, *default, "Failed for {}", description);
     }
 
-    println!("✓ get_with_default edge cases passed ({} test cases)", test_cases.len());
+    println!(
+        "✓ get_with_default edge cases passed ({} test cases)",
+        test_cases.len()
+    );
 }
 
 #[test]
@@ -75,7 +88,11 @@ fn test_get_nonexistent_returns_error() {
 
     for prop in &nonexistent_props {
         let result = rsproperties::get_with_result(prop);
-        assert!(result.is_err(), "Property '{}' should not exist and should return error", prop);
+        assert!(
+            result.is_err(),
+            "Property '{}' should not exist and should return error",
+            prop
+        );
     }
 
     println!("✓ get nonexistent properties test passed");
@@ -118,9 +135,9 @@ fn test_value_length_limits() {
 
 #[test]
 fn test_thread_safety_basic() {
-    use std::thread;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
 
     init_properties();
 
@@ -182,10 +199,17 @@ fn test_performance_baseline() {
     let ops_per_sec = iterations as f64 / elapsed.as_secs_f64();
 
     println!("✓ Performance baseline test completed");
-    println!("  {} iterations in {:?} ({:.0} ops/sec)", iterations, elapsed, ops_per_sec);
+    println!(
+        "  {} iterations in {:?} ({:.0} ops/sec)",
+        iterations, elapsed, ops_per_sec
+    );
 
     // Should be reasonably fast
-    assert!(ops_per_sec > 500.0, "Performance should be reasonable, got {:.0} ops/sec", ops_per_sec);
+    assert!(
+        ops_per_sec > 500.0,
+        "Performance should be reasonable, got {:.0} ops/sec",
+        ops_per_sec
+    );
 }
 
 #[test]
@@ -194,12 +218,12 @@ fn test_error_conditions() {
 
     // Test various potentially problematic inputs
     let edge_cases = [
-        "",          // empty
-        ".",         // just dot
-        "..",        // double dot
-        "...",       // triple dot
-        ".test",     // starts with dot
-        "test.",     // ends with dot
+        "",      // empty
+        ".",     // just dot
+        "..",    // double dot
+        "...",   // triple dot
+        ".test", // starts with dot
+        "test.", // ends with dot
     ];
 
     for case in &edge_cases {

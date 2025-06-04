@@ -6,11 +6,10 @@
 //! These tests verify edge cases, error conditions, and API stability
 //! to ensure robust behavior under unusual conditions.
 
-use rsproperties::{self, PROP_VALUE_MAX, PROP_DIRNAME};
+use rsproperties::{self, PROP_DIRNAME, PROP_VALUE_MAX};
 
 mod common;
 use common::init_test;
-
 
 fn setup_edge_test_env() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -21,8 +20,14 @@ fn setup_edge_test_env() {
 #[test]
 fn test_api_constants() {
     // Verify constants match Android system property limits
-    assert_eq!(PROP_VALUE_MAX, 92, "PROP_VALUE_MAX should be 92 bytes as per Android");
-    assert_eq!(PROP_DIRNAME, "/dev/__properties__", "PROP_DIRNAME should match Android default");
+    assert_eq!(
+        PROP_VALUE_MAX, 92,
+        "PROP_VALUE_MAX should be 92 bytes as per Android"
+    );
+    assert_eq!(
+        PROP_DIRNAME, "/dev/__properties__",
+        "PROP_DIRNAME should match Android default"
+    );
 }
 
 /// Test empty and whitespace property names
@@ -35,13 +40,21 @@ fn test_empty_property_names() {
     assert!(result.is_err(), "Getting empty property name should fail");
 
     let default_result = rsproperties::get_with_default("", "default");
-    assert_eq!(default_result, "default", "Empty property should return default");
+    assert_eq!(
+        default_result, "default",
+        "Empty property should return default"
+    );
 
     // Test whitespace-only property names
     let whitespace_names = vec![" ", "\t", "\n", "  ", "\t\n  "];
     for name in whitespace_names {
         let result = rsproperties::get_with_default(name, "default");
-        assert_eq!(result, "default", "Whitespace property '{}' should return default", name.escape_debug());
+        assert_eq!(
+            result,
+            "default",
+            "Whitespace property '{}' should return default",
+            name.escape_debug()
+        );
     }
 }
 
@@ -62,7 +75,11 @@ fn test_special_character_property_names() {
     for name in special_names {
         let result = rsproperties::get_with_default(name, "not_found");
         // These should not crash and should return the default
-        assert_eq!(result, "not_found", "Special property name '{}' should return default", name);
+        assert_eq!(
+            result, "not_found",
+            "Special property name '{}' should return default",
+            name
+        );
     }
 }
 
@@ -118,7 +135,11 @@ fn test_long_property_names() {
     for length in lengths {
         let long_name = "a".repeat(length);
         let result = rsproperties::get_with_default(&long_name, "default");
-        assert_eq!(result, "default", "Long property name ({} chars) should return default", length);
+        assert_eq!(
+            result, "default",
+            "Long property name ({} chars) should return default",
+            length
+        );
 
         // Test that we don't crash on extremely long names
         println!("Tested property name of length {}", length);
@@ -162,11 +183,22 @@ fn test_property_value_edge_cases() {
         match rsproperties::set(&prop_name, value) {
             Ok(_) => {
                 let retrieved = rsproperties::get(&prop_name);
-                assert_eq!(retrieved, *value, "Failed for {}: {}", description, value.escape_debug());
+                assert_eq!(
+                    retrieved,
+                    *value,
+                    "Failed for {}: {}",
+                    description,
+                    value.escape_debug()
+                );
                 println!("✓ {}: '{}'", description, value.escape_debug());
             }
             Err(e) => {
-                println!("✗ Failed to set {}: {} - Error: {}", description, value.escape_debug(), e);
+                println!(
+                    "✗ Failed to set {}: {} - Error: {}",
+                    description,
+                    value.escape_debug(),
+                    e
+                );
             }
         }
     }
@@ -210,10 +242,15 @@ fn test_maximum_length_values() {
         Ok(_) => {
             // If it succeeds, check if value was truncated
             let retrieved = rsproperties::get("edge.oversized");
-            println!("Oversized value handling: set {} bytes, retrieved {} bytes",
-                        oversized_value.len(), retrieved.len());
-            assert!(retrieved.len() <= PROP_VALUE_MAX,
-                    "Retrieved value should not exceed PROP_VALUE_MAX");
+            println!(
+                "Oversized value handling: set {} bytes, retrieved {} bytes",
+                oversized_value.len(),
+                retrieved.len()
+            );
+            assert!(
+                retrieved.len() <= PROP_VALUE_MAX,
+                "Retrieved value should not exceed PROP_VALUE_MAX"
+            );
         }
         Err(e) => {
             println!("Oversized value correctly rejected: {}", e);
@@ -282,7 +319,10 @@ fn test_error_handling() {
 
     // Test get on non-existent property
     let result = rsproperties::get_with_result("definitely.does.not.exist.anywhere");
-    assert!(result.is_err(), "Should return error for non-existent property");
+    assert!(
+        result.is_err(),
+        "Should return error for non-existent property"
+    );
 
     // Test that error contains useful information
     if let Err(e) = result {
@@ -294,16 +334,18 @@ fn test_error_handling() {
     #[cfg(feature = "builder")]
     {
         // Test set with invalid inputs
-        let invalid_cases = vec![
-            ("", "some_value", "empty property name"),
-        ];
+        let invalid_cases = vec![("", "some_value", "empty property name")];
 
         for (name, value, description) in invalid_cases {
             let result = rsproperties::set(name, value);
             println!("Testing {}: {:?}", description, result);
             // Should either succeed or fail gracefully with a proper error
             if let Err(e) = result {
-                assert!(!format!("{}", e).is_empty(), "Error message should not be empty for {}", description);
+                assert!(
+                    !format!("{}", e).is_empty(),
+                    "Error message should not be empty for {}",
+                    description
+                );
             }
         }
     }
@@ -317,8 +359,14 @@ fn test_null_bytes_and_special_chars() {
 
     let test_cases = vec![
         ("prop.with.null", "value\0with\0nulls"),
-        ("prop.with.high.unicode", "value with high unicode: \u{1F600}\u{1F601}"),
-        ("prop.with.control.chars", "value\x01with\x02control\x03chars"),
+        (
+            "prop.with.high.unicode",
+            "value with high unicode: \u{1F600}\u{1F601}",
+        ),
+        (
+            "prop.with.control.chars",
+            "value\x01with\x02control\x03chars",
+        ),
         ("prop.with.del", "value\x7Fwith\x7Fdel"),
         ("prop.with.escape", "value\x1Bwith\x1Bescape"),
     ];
@@ -328,8 +376,12 @@ fn test_null_bytes_and_special_chars() {
         match result {
             Ok(_) => {
                 let retrieved = rsproperties::get(prop_name);
-                println!("✓ Special chars in '{}': {} bytes -> {} bytes",
-                        prop_name, prop_value.len(), retrieved.len());
+                println!(
+                    "✓ Special chars in '{}': {} bytes -> {} bytes",
+                    prop_name,
+                    prop_value.len(),
+                    retrieved.len()
+                );
                 // Value might be modified/filtered by the implementation
             }
             Err(e) => {

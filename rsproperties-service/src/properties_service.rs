@@ -1,15 +1,10 @@
-use std::path::PathBuf;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
-use std::collections::HashMap;
+use std::path::PathBuf;
 
-use rsproperties::{
-    PropertyInfoEntry,
-    SystemProperties,
-    build_trie,
-    load_properties_from_file,
-};
-use rsactor::{Actor, ActorRef, impl_message_handler};
+use rsactor::{impl_message_handler, Actor, ActorRef};
+use rsproperties::{build_trie, load_properties_from_file, PropertyInfoEntry, SystemProperties};
 
 pub struct PropertiesServiceArgs {
     property_contexts_files: Vec<PathBuf>,
@@ -20,40 +15,51 @@ pub struct PropertiesService {
     system_properties: SystemProperties,
 }
 
-impl PropertiesService {
-}
+impl PropertiesService {}
 
 impl Actor for PropertiesService {
     type Args = PropertiesServiceArgs;
     type Error = std::io::Error;
 
-    async fn on_start(args: Self::Args, _actor_ref: &rsactor::ActorRef<Self>) -> std::result::Result<Self, Self::Error> {
+    async fn on_start(
+        args: Self::Args,
+        _actor_ref: &rsactor::ActorRef<Self>,
+    ) -> std::result::Result<Self, Self::Error> {
         let mut property_infos = Vec::new();
         for file in args.property_contexts_files {
-            let (mut property_info, errors) = PropertyInfoEntry::parse_from_file(&file, false).unwrap();
+            let (mut property_info, errors) =
+                PropertyInfoEntry::parse_from_file(&file, false).unwrap();
             if !errors.is_empty() {
                 log::error!("{:?}", errors);
             }
             property_infos.append(&mut property_info);
         }
 
-        let data: Vec<u8> = build_trie(&property_infos, "u:object_r:build_prop:s0", "string").unwrap();
+        let data: Vec<u8> =
+            build_trie(&property_infos, "u:object_r:build_prop:s0", "string").unwrap();
 
         let dir = rsproperties::properties_dir();
-        File::create(dir.join("property_info")).unwrap().write_all(&data).unwrap();
+        File::create(dir.join("property_info"))
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
 
         let mut properties = HashMap::new();
         for file in args.build_prop_files {
             load_properties_from_file(&file, None, "u:r:init:s0", &mut properties).unwrap();
         }
 
-        let mut system_properties = SystemProperties::new_area(dir)
-            .unwrap_or_else(|e| panic!("Cannot create system properties: {}. Please check if {dir:?} exists.", e));
+        let mut system_properties = SystemProperties::new_area(dir).unwrap_or_else(|e| {
+            panic!(
+                "Cannot create system properties: {}. Please check if {dir:?} exists.",
+                e
+            )
+        });
         for (key, value) in properties.iter() {
             match system_properties.find(key.as_str()).unwrap() {
                 Some(prop_ref) => {
                     system_properties.update(&prop_ref, value.as_str()).unwrap();
-                },
+                }
                 None => {
                     system_properties.add(key.as_str(), value.as_str()).unwrap();
                 }
@@ -66,7 +72,11 @@ impl Actor for PropertiesService {
         })
     }
 
-    async fn on_stop(&mut self, _actor_ref: &ActorRef<Self>, killed: bool) -> std::result::Result<(), Self::Error> {
+    async fn on_stop(
+        &mut self,
+        _actor_ref: &ActorRef<Self>,
+        killed: bool,
+    ) -> std::result::Result<(), Self::Error> {
         log::warn!("=====================================");
         log::warn!("    PROPERTIES SERVICE SHUTDOWN     ");
         log::warn!("=====================================");
@@ -85,15 +95,21 @@ impl Actor for PropertiesService {
 
         Ok(())
     }
-
 }
 
-impl_message_handler!(PropertiesService, [crate::ReadyMessage, crate::PropertyMessage]);
+impl_message_handler!(
+    PropertiesService,
+    [crate::ReadyMessage, crate::PropertyMessage]
+);
 
 impl rsactor::Message<crate::ReadyMessage> for PropertiesService {
     type Reply = bool;
 
-    async fn handle(&mut self, _message: crate::ReadyMessage, _actor_ref: &ActorRef<Self>) -> Self::Reply {
+    async fn handle(
+        &mut self,
+        _message: crate::ReadyMessage,
+        _actor_ref: &ActorRef<Self>,
+    ) -> Self::Reply {
         true
     }
 }
@@ -101,7 +117,11 @@ impl rsactor::Message<crate::ReadyMessage> for PropertiesService {
 impl rsactor::Message<crate::PropertyMessage> for PropertiesService {
     type Reply = bool;
 
-    async fn handle(&mut self, message: crate::PropertyMessage, _actor_ref: &ActorRef<Self>) -> Self::Reply {
+    async fn handle(
+        &mut self,
+        message: crate::PropertyMessage,
+        _actor_ref: &ActorRef<Self>,
+    ) -> Self::Reply {
         log::debug!("Handling property message: {:?}", message);
         // Process the property message
         let key = message.key;
@@ -118,7 +138,7 @@ impl rsactor::Message<crate::PropertyMessage> for PropertiesService {
                     log::info!("Updated property: {} = {}", key, value);
                     true // Indicate success
                 }
-            },
+            }
             Ok(None) => {
                 // Property does not exist, add it
                 if let Err(e) = self.system_properties.add(&key, &value) {
@@ -128,15 +148,14 @@ impl rsactor::Message<crate::PropertyMessage> for PropertiesService {
                     log::info!("Added property: {} = {}", key, value);
                     true // Indicate success
                 }
-            },
+            }
             Err(e) => {
                 log::error!("Failed to find property '{}': {}", key, e);
                 false // Indicate failure
-            },
+            }
         }
     }
 }
-
 
 pub fn run(
     property_contexts_files: Vec<PathBuf>,

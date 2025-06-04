@@ -1,13 +1,16 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::os::unix::net::UnixStream;
 use std::io::{prelude::*, IoSlice};
-use std::{fs, env, path::{Path, PathBuf}};
+use std::os::unix::net::UnixStream;
 use std::sync::OnceLock;
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
-use zerocopy_derive::*;
 use zerocopy::IntoBytes;
+use zerocopy_derive::*;
 
 use crate::errors::*;
 
@@ -41,7 +44,7 @@ pub(crate) fn set_socket_dir<P: AsRef<Path>>(dir: P) -> bool {
 
     match SOCKET_DIR.set(dir_path.clone()) {
         Ok(_) => true,
-        Err(_) => false
+        Err(_) => false,
     }
 }
 
@@ -84,7 +87,8 @@ impl ServiceConnection {
             let system_socket = get_property_service_for_system_socket();
             if fs::metadata(&system_socket)
                 .map(|metadata| !metadata.permissions().readonly())
-                .is_ok() {
+                .is_ok()
+            {
                 system_socket
             } else {
                 log::warn!("System property service socket is not writable or does not exist, falling back to default: {}", property_service_socket);
@@ -94,15 +98,15 @@ impl ServiceConnection {
             property_service_socket
         };
 
-        let stream: UnixStream = UnixStream::connect(&socket_name)
-            .map_err(|e| Error::new_io(e))?;
+        let stream: UnixStream = UnixStream::connect(&socket_name).map_err(|e| Error::new_io(e))?;
 
         Ok(Self { stream })
     }
 
     fn recv_i32(&mut self) -> Result<i32> {
         let mut buf = [0u8; 4];
-        self.stream.read_exact(&mut buf)
+        self.stream
+            .read_exact(&mut buf)
             .map_err(|e| Error::new_io(e))?;
         let value = i32::from_ne_bytes(buf);
         Ok(value)
@@ -137,10 +141,10 @@ impl<'a> ServiceWriter<'a> {
     }
 
     fn send(self, conn: &mut ServiceConnection) -> Result<()> {
-        conn.stream.write_vectored(&self.buffers)
+        conn.stream
+            .write_vectored(&self.buffers)
             .map_err(|e| Error::new_io(e))?;
-        conn.stream.flush()
-            .map_err(|e| Error::new_io(e))?;
+        conn.stream.flush().map_err(|e| Error::new_io(e))?;
         Ok(())
     }
 }
@@ -167,14 +171,24 @@ impl PropertyMessage {
         let value_bytes = value.as_bytes();
 
         if name_bytes.len() > PROP_NAME_MAX {
-            log::warn!("Property name truncated from {} to {} bytes", name_bytes.len(), PROP_NAME_MAX);
+            log::warn!(
+                "Property name truncated from {} to {} bytes",
+                name_bytes.len(),
+                PROP_NAME_MAX
+            );
         }
         if value_bytes.len() > PROP_VALUE_MAX {
-            log::warn!("Property value truncated from {} to {} bytes", value_bytes.len(), PROP_VALUE_MAX);
+            log::warn!(
+                "Property value truncated from {} to {} bytes",
+                value_bytes.len(),
+                PROP_VALUE_MAX
+            );
         }
 
-        name_buf[..name_bytes.len().min(PROP_NAME_MAX)].copy_from_slice(&name_bytes[..name_bytes.len().min(PROP_NAME_MAX)]);
-        value_buf[..value_bytes.len().min(PROP_VALUE_MAX)].copy_from_slice(&value_bytes[..value_bytes.len().min(PROP_VALUE_MAX)]);
+        name_buf[..name_bytes.len().min(PROP_NAME_MAX)]
+            .copy_from_slice(&name_bytes[..name_bytes.len().min(PROP_NAME_MAX)]);
+        value_buf[..value_bytes.len().min(PROP_VALUE_MAX)]
+            .copy_from_slice(&value_bytes[..value_bytes.len().min(PROP_VALUE_MAX)]);
 
         Self {
             cmd,
@@ -207,8 +221,8 @@ fn protocol_version() -> &'static ProtocolVersion {
 use rustix::fd::{AsFd, BorrowedFd};
 
 fn wait_for_socket_close(_socket_fd: BorrowedFd<'_>) -> Result<()> {
-    use std::time::Duration;
     use std::thread;
+    use std::time::Duration;
 
     // Simple timeout approach - sleep for 250ms
     thread::sleep(Duration::from_millis(250));
@@ -216,19 +230,34 @@ fn wait_for_socket_close(_socket_fd: BorrowedFd<'_>) -> Result<()> {
     Ok(())
 }
 
-
 // Set a system property via local domain socket.
 pub(crate) fn set(name: &str, value: &str) -> Result<()> {
     match protocol_version() {
         ProtocolVersion::V1 => {
             if name.len() >= PROP_NAME_MAX {
-                log::error!("Property name too long for V1 protocol: {} >= {}", name.len(), PROP_NAME_MAX);
-                return Err(Error::new_file_validation(format!("Property name is too long: {}", name.len())).into());
+                log::error!(
+                    "Property name too long for V1 protocol: {} >= {}",
+                    name.len(),
+                    PROP_NAME_MAX
+                );
+                return Err(Error::new_file_validation(format!(
+                    "Property name is too long: {}",
+                    name.len()
+                ))
+                .into());
             }
 
             if value.len() >= PROP_VALUE_MAX {
-                log::error!("Property value too long for V1 protocol: {} >= {}", value.len(), PROP_VALUE_MAX);
-                return Err(Error::new_file_validation(format!("Property value is too long: {}", value.len())).into());
+                log::error!(
+                    "Property value too long for V1 protocol: {} >= {}",
+                    value.len(),
+                    PROP_VALUE_MAX
+                );
+                return Err(Error::new_file_validation(format!(
+                    "Property value is too long: {}",
+                    value.len()
+                ))
+                .into());
             }
 
             let mut conn = ServiceConnection::new(PROP_SERVICE_NAME)?;
@@ -245,8 +274,16 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
             let name_len = name.len() as u32;
 
             if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
-                log::error!("Property value too long for V2 protocol (non-ro property): {} >= {}", value.len(), PROP_VALUE_MAX);
-                return Err(Error::new_file_validation(format!("Property value is too long: {}", value.len())).into());
+                log::error!(
+                    "Property value too long for V2 protocol (non-ro property): {} >= {}",
+                    value.len(),
+                    PROP_VALUE_MAX
+                );
+                return Err(Error::new_file_validation(format!(
+                    "Property value is too long: {}",
+                    value.len()
+                ))
+                .into());
             }
 
             let mut conn = ServiceConnection::new(name)?;
@@ -260,8 +297,19 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
             let res = conn.recv_i32()?;
 
             if res != PROP_SUCCESS {
-                log::error!("Property service returned error for '{}' = '{}': 0x{:X}", name, value, res);
-                return Err(Error::new_io(std::io::Error::new(std::io::ErrorKind::Other, format!("Unable to set property \"{name}\" to \"{value}\": error code: 0x{res:X}"))).into());
+                log::error!(
+                    "Property service returned error for '{}' = '{}': 0x{:X}",
+                    name,
+                    value,
+                    res
+                );
+                return Err(Error::new_io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "Unable to set property \"{name}\" to \"{value}\": error code: 0x{res:X}"
+                    ),
+                ))
+                .into());
             }
         }
     }

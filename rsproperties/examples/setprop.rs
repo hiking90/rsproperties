@@ -21,7 +21,9 @@ use rsproperties::PropertyConfig;
 #[derive(Parser, Debug)]
 #[command(name = "setprop")]
 #[command(about = "Android-compatible property setter")]
-#[command(long_about = "This tool mimics Android's setprop command functionality.\nIt sets system properties via the property service socket connection.")]
+#[command(
+    long_about = "This tool mimics Android's setprop command functionality.\nIt sets system properties via the property service socket connection."
+)]
 struct Args {
     /// Property name to set
     #[arg(help = "Name of the property to set")]
@@ -67,7 +69,10 @@ fn main() {
     // Set the property
     match rsproperties::set(&args.property_name, &args.property_value) {
         Ok(_) => {
-            println!("Property '{}' set to '{}'", args.property_name, args.property_value);
+            println!(
+                "Property '{}' set to '{}'",
+                args.property_name, args.property_value
+            );
         }
         Err(e) => {
             eprintln!("Failed to set property '{}': {}", args.property_name, e);
@@ -91,13 +96,21 @@ fn validate_property(name: &str, value: &str) -> Result<(), String> {
     }
 
     // Check for invalid characters in property name
-    if !name.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-') {
-        return Err("Invalid characters in property name (only alphanumeric, ., _, - allowed)".to_string());
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err(
+            "Invalid characters in property name (only alphanumeric, ., _, - allowed)".to_string(),
+        );
     }
 
     // Warn about read-only properties
     if name.starts_with("ro.") {
-        eprintln!("Warning: Property '{}' is read-only and may not be settable", name);
+        eprintln!(
+            "Warning: Property '{}' is read-only and may not be settable",
+            name
+        );
     }
 
     Ok(())

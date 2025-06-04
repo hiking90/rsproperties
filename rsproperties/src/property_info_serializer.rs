@@ -1,10 +1,10 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::path::Path;
+use log::{error, info, warn};
 use std::fs::File;
-use std::io::{BufReader, BufRead};
-use log::{info, warn, error};
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 
 use crate::errors::*;
 use crate::trie_builder::*;
@@ -52,11 +52,13 @@ impl PropertyInfoEntry {
     fn parse_from_line(line: &str, require_prefix_or_exact: bool) -> Result<PropertyInfoEntry> {
         let mut tokenizer = line.split_whitespace();
 
-        let property = tokenizer.next().ok_or_else(||
-            Error::new_parse(format!("Did not find a property entry in '{line}'")))?;
+        let property = tokenizer.next().ok_or_else(|| {
+            Error::new_parse(format!("Did not find a property entry in '{line}'"))
+        })?;
 
-        let context = tokenizer.next().ok_or_else(||
-            Error::new_parse(format!("Did not find a context entry in '{line}'")))?;
+        let context = tokenizer
+            .next()
+            .ok_or_else(|| Error::new_parse(format!("Did not find a context entry in '{line}'")))?;
 
         let match_operation = tokenizer.next();
 
@@ -70,13 +72,23 @@ impl PropertyInfoEntry {
         if match_operation == Some("exact") {
             exact_match = true;
         } else if match_operation != Some("prefix") && require_prefix_or_exact {
-            error!("Invalid match operation '{:?}' - must be 'prefix' or 'exact'", match_operation);
-            return Err(Error::new_parse(format!("Match operation '{match_operation:?}' is not valid. Must be 'prefix' or 'exact'")).into());
+            error!(
+                "Invalid match operation '{:?}' - must be 'prefix' or 'exact'",
+                match_operation
+            );
+            return Err(Error::new_parse(format!(
+                "Match operation '{match_operation:?}' is not valid. Must be 'prefix' or 'exact'"
+            ))
+            .into());
         }
 
         if !type_strings.is_empty() && !Self::is_type_valid(&type_strings) {
             error!("Invalid type specification: '{}'", type_strings.join(" "));
-            return Err(Error::new_parse(format!("Type '{}' is not valid.", type_strings.join(" "))).into());
+            return Err(Error::new_parse(format!(
+                "Type '{}' is not valid.",
+                type_strings.join(" ")
+            ))
+            .into());
         }
 
         let entry = Self {
@@ -89,11 +101,16 @@ impl PropertyInfoEntry {
         Ok(entry)
     }
 
-    pub fn parse_from_file(filename: &Path, require_prefix_or_exact: bool) -> Result<(Vec<PropertyInfoEntry>, Vec<Error>)> {
-        info!("Parsing property info file: {:?} (require_prefix_or_exact={})", filename, require_prefix_or_exact);
+    pub fn parse_from_file(
+        filename: &Path,
+        require_prefix_or_exact: bool,
+    ) -> Result<(Vec<PropertyInfoEntry>, Vec<Error>)> {
+        info!(
+            "Parsing property info file: {:?} (require_prefix_or_exact={})",
+            filename, require_prefix_or_exact
+        );
 
-        let file = File::open(filename)
-            .map_err(|e| Error::new_io(e))?;
+        let file = File::open(filename).map_err(|e| Error::new_io(e))?;
         let reader = BufReader::new(file);
 
         let mut errors = Vec::new();
@@ -116,7 +133,10 @@ impl PropertyInfoEntry {
                     entries.push(entry);
                 }
                 Err(err) => {
-                    warn!("Line {}: Failed to parse line '{}': {}", line_count, line, err);
+                    warn!(
+                        "Line {}: Failed to parse line '{}': {}",
+                        line_count, line, err
+                    );
                     errors.push(err);
                 }
             }
@@ -129,9 +149,17 @@ impl PropertyInfoEntry {
     }
 }
 
-pub fn build_trie(property_info: &Vec<PropertyInfoEntry>, default_context: &str, default_type: &str) -> Result<Vec<u8>> {
-    info!("Building trie from {} property info entries (default_context='{}', default_type='{}')",
-          property_info.len(), default_context, default_type);
+pub fn build_trie(
+    property_info: &Vec<PropertyInfoEntry>,
+    default_context: &str,
+    default_type: &str,
+) -> Result<Vec<u8>> {
+    info!(
+        "Building trie from {} property info entries (default_context='{}', default_type='{}')",
+        property_info.len(),
+        default_context,
+        default_type
+    );
 
     let mut trie = TrieBuilder::new(default_context, default_type);
 
@@ -140,13 +168,17 @@ pub fn build_trie(property_info: &Vec<PropertyInfoEntry>, default_context: &str,
             entry.name.as_str(),
             entry.context.as_str(),
             entry.type_str.as_str(),
-            entry.exact_match)?;
+            entry.exact_match,
+        )?;
     }
 
     let mut serializer = TrieSerializer::new(&trie);
     let data = serializer.take_data();
 
-    info!("Trie built and serialized successfully: {} bytes", data.len());
+    info!(
+        "Trie built and serialized successfully: {} bytes",
+        data.len()
+    );
     Ok(data)
 }
 
@@ -158,25 +190,39 @@ mod tests {
 
     #[test]
     fn test_parse_from_line() {
-        let entry = PropertyInfoEntry::parse_from_line("ro.build.host u:object_r:build_prop:s0 exact string", true).unwrap();
+        let entry = PropertyInfoEntry::parse_from_line(
+            "ro.build.host u:object_r:build_prop:s0 exact string",
+            true,
+        )
+        .unwrap();
         assert_eq!(entry.name, "ro.build.host");
         assert_eq!(entry.context, "u:object_r:build_prop:s0");
         assert_eq!(entry.type_str, "string");
         assert!(entry.exact_match);
 
-        let entry = PropertyInfoEntry::parse_from_line("ro.build.host u:object_r:build_prop:s0 prefix string", true).unwrap();
+        let entry = PropertyInfoEntry::parse_from_line(
+            "ro.build.host u:object_r:build_prop:s0 prefix string",
+            true,
+        )
+        .unwrap();
         assert_eq!(entry.name, "ro.build.host");
         assert_eq!(entry.context, "u:object_r:build_prop:s0");
         assert_eq!(entry.type_str, "string");
         assert!(!entry.exact_match);
 
-        let entry = PropertyInfoEntry::parse_from_line("ro.build.host u:object_r:build_prop:s0", false).unwrap();
+        let entry =
+            PropertyInfoEntry::parse_from_line("ro.build.host u:object_r:build_prop:s0", false)
+                .unwrap();
         assert_eq!(entry.name, "ro.build.host");
         assert_eq!(entry.context, "u:object_r:build_prop:s0");
         assert_eq!(entry.type_str, "");
         assert!(!entry.exact_match);
 
-        let entry = PropertyInfoEntry::parse_from_line("ro.build.host u:object_r:build_prop:s0 exact enum string int", true).unwrap();
+        let entry = PropertyInfoEntry::parse_from_line(
+            "ro.build.host u:object_r:build_prop:s0 exact enum string int",
+            true,
+        )
+        .unwrap();
         assert_eq!(entry.name, "ro.build.host");
         assert_eq!(entry.context, "u:object_r:build_prop:s0");
         assert_eq!(entry.type_str, "enum string int");

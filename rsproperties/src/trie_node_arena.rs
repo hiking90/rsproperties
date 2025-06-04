@@ -16,7 +16,7 @@ pub(crate) struct TrieNodeArena {
 impl TrieNodeArena {
     pub(crate) fn new() -> Self {
         Self {
-            data: Vec::with_capacity(16*1024),
+            data: Vec::with_capacity(16 * 1024),
             current_data_pointer: 0,
         }
     }
@@ -25,15 +25,23 @@ impl TrieNodeArena {
     pub(crate) fn to_object<T>(&mut self, offset: usize) -> &mut T {
         // Bounds checking
         let size = mem::size_of::<T>();
-        assert!(offset.checked_add(size).unwrap_or(usize::MAX) <= self.data.len(),
-                "Object access out of bounds: offset={}, size={}, data_len={}",
-                offset, size, self.data.len());
+        assert!(
+            offset.checked_add(size).unwrap_or(usize::MAX) <= self.data.len(),
+            "Object access out of bounds: offset={}, size={}, data_len={}",
+            offset,
+            size,
+            self.data.len()
+        );
 
         // Alignment checking
         let align = mem::align_of::<T>();
-        assert!(offset % align == 0,
-                "Object at offset {} is not properly aligned for type {} (alignment={})",
-                offset, std::any::type_name::<T>(), align);
+        assert!(
+            offset % align == 0,
+            "Object at offset {} is not properly aligned for type {} (alignment={})",
+            offset,
+            std::any::type_name::<T>(),
+            align
+        );
 
         // SAFETY: We've verified bounds and alignment above
         unsafe { &mut *(self.data.as_mut_ptr().add(offset) as *mut T) }
@@ -55,14 +63,20 @@ impl TrieNodeArena {
 
     pub(crate) fn uint32_array(&mut self, offset: usize) -> &mut [u32] {
         // Bounds checking
-        assert!(offset <= self.data.len(),
-                "Array access out of bounds: offset={}, data_len={}",
-                offset, self.data.len());
+        assert!(
+            offset <= self.data.len(),
+            "Array access out of bounds: offset={}, data_len={}",
+            offset,
+            self.data.len()
+        );
 
         // Alignment checking
-        assert!(offset % mem::align_of::<u32>() == 0,
-                "Array at offset {} is not properly aligned for u32 (alignment={})",
-                offset, mem::align_of::<u32>());
+        assert!(
+            offset % mem::align_of::<u32>() == 0,
+            "Array at offset {} is not properly aligned for u32 (alignment={})",
+            offset,
+            mem::align_of::<u32>()
+        );
 
         let remaining_bytes = self.data.len() - offset;
         let array_len = remaining_bytes / mem::size_of::<u32>();

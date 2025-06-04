@@ -3,24 +3,21 @@
 
 use std::{
     ffi::CStr,
-    fs::{OpenOptions, File},
+    fmt::Debug,
+    fs::{File, OpenOptions},
     mem,
+    os::unix::fs::OpenOptionsExt,
     path::Path,
     sync::atomic::AtomicU32,
-    os::unix::fs::OpenOptionsExt,
-    fmt::Debug,
 };
 
-use rustix::{fs, mm};
-use log::{debug, info, warn, error};
 use crate::errors::*;
+use log::{debug, error, info, warn};
+use rustix::{fs, mm};
 
-use crate::property_info::{
-    PropertyInfo,
-    name_from_trailing_data,
-};
 #[cfg(feature = "builder")]
 use crate::property_info::init_name_with_trailing_data;
+use crate::property_info::{name_from_trailing_data, PropertyInfo};
 
 const PA_SIZE: u64 = 128 * 1024;
 const PROP_AREA_MAGIC: u32 = 0x504f5250;
@@ -108,21 +105,31 @@ pub(crate) struct PropertyAreaMap {
 
 impl PropertyAreaMap {
     // Initialize the property area map with the given file to create a new property area map.
-    pub(crate) fn new_rw(filename: &Path, context: Option<&CStr>, fsetxattr_failed: &mut bool) -> Result<Self> {
+    pub(crate) fn new_rw(
+        filename: &Path,
+        context: Option<&CStr>,
+        fsetxattr_failed: &mut bool,
+    ) -> Result<Self> {
         debug!("Creating new read-write property area map: {:?}", filename);
 
         let file = OpenOptions::new()
-            .read(true)               // O_RDWR
-            .write(true)              // O_RDWR
-            .create(true)             // O_CREAT
+            .read(true) // O_RDWR
+            .write(true) // O_RDWR
+            .create(true) // O_CREAT
             .custom_flags((fs::OFlags::NOFOLLOW.bits() | fs::OFlags::EXCL.bits()) as _) // additional flags
-            .mode(0o444)              // permission: 0444
+            .mode(0o444) // permission: 0444
             .open(filename)
             .map_err(|e| Error::new_io(e))?;
 
         if let Some(context) = context {
-            if fs::fsetxattr(&file, "selinux", context.to_bytes_with_nul(),
-                fs::XattrFlags::empty()).is_err() {
+            if fs::fsetxattr(
+                &file,
+                "selinux",
+                context.to_bytes_with_nul(),
+                fs::XattrFlags::empty(),
+            )
+            .is_err()
+            {
                 warn!("Failed to set SELinux context for {:?}", filename);
                 *fsetxattr_failed = true;
             }
@@ -139,9 +146,13 @@ impl PropertyAreaMap {
             pa_data_size,
         };
 
-        thiz.property_area_mut().init(PROP_AREA_MAGIC, PROP_AREA_VERSION);
+        thiz.property_area_mut()
+            .init(PROP_AREA_MAGIC, PROP_AREA_VERSION);
 
-        info!("Successfully created read-write property area map: {:?}", filename);
+        info!(
+            "Successfully created read-write property area map: {:?}",
+            filename
+        );
         Ok(thiz)
     }
 
@@ -150,16 +161,21 @@ impl PropertyAreaMap {
         debug!("Opening read-only property area map: {:?}", filename);
 
         let file = OpenOptions::new()
-            .read(true)               // read only
+            .read(true) // read only
             .custom_flags(fs::OFlags::NOFOLLOW.bits() as _) // additional flags
             .open(filename)
             .context_with_location("Failed to open to {filename:?}")?;
 
-        let metadata = file.metadata()
+        let metadata = file
+            .metadata()
             .context_with_location("Failed to get metadata")?;
 
         // Validate file metadata using common utility function
-        crate::errors::validate_file_metadata(&metadata, filename, mem::size_of::<PropertyArea>() as u64)?;
+        crate::errors::validate_file_metadata(
+            &metadata,
+            filename,
+            mem::size_of::<PropertyArea>() as u64,
+        )?;
 
         let pa_size = metadata.len() as usize;
         let pa_data_size = pa_size - std::mem::size_of::<PropertyArea>();
@@ -172,31 +188,41 @@ impl PropertyAreaMap {
 
         let pa = thiz.property_area();
 
-        if thiz.property_area().magic != PROP_AREA_MAGIC ||
-           thiz.property_area().version != PROP_AREA_VERSION {
-            error!("Invalid magic ({:#x} != {:#x}) or version ({:#x} != {:#x}) for {:?}",
-                   pa.magic, PROP_AREA_MAGIC, pa.version, PROP_AREA_VERSION, filename);
+        if thiz.property_area().magic != PROP_AREA_MAGIC
+            || thiz.property_area().version != PROP_AREA_VERSION
+        {
+            error!(
+                "Invalid magic ({:#x} != {:#x}) or version ({:#x} != {:#x}) for {:?}",
+                pa.magic, PROP_AREA_MAGIC, pa.version, PROP_AREA_VERSION, filename
+            );
             Err(Error::new_file_validation("Invalid magic or version".to_string()).into())
         } else {
-            info!("Successfully opened read-only property area map: {:?}", filename);
+            info!(
+                "Successfully opened read-only property area map: {:?}",
+                filename
+            );
             Ok(thiz)
         }
     }
 
     pub(crate) fn property_area(&self) -> &PropertyArea {
-        self.mmap.to_object::<PropertyArea>(0, 0)
+        self.mmap
+            .to_object::<PropertyArea>(0, 0)
             .expect("PropertyArea's offset is zero. So, it must be valid.")
     }
 
     fn property_area_mut(&mut self) -> &mut PropertyArea {
-        self.mmap.to_object_mut::<PropertyArea>(0, 0)
+        self.mmap
+            .to_object_mut::<PropertyArea>(0, 0)
             .expect("PropertyArea's offset is zero. So, it must be valid.")
     }
 
     // Find the property information with the given name.
     pub(crate) fn find(&self, name: &str) -> Result<(&PropertyInfo, u32)> {
         let mut remaining_name = name;
-        let mut current = self.mmap.to_object::<PropertyTrieNode>(0, self.data_offset)?;
+        let mut current = self
+            .mmap
+            .to_object::<PropertyTrieNode>(0, self.data_offset)?;
         loop {
             let sep = remaining_name.find('.');
             let substr_size = match sep {
@@ -231,7 +257,10 @@ impl PropertyAreaMap {
 
         if prop_offset != 0 {
             let offset = &current.prop.load(std::sync::atomic::Ordering::Acquire);
-            Ok((self.mmap.to_object(*offset as usize, self.data_offset)?, *offset))
+            Ok((
+                self.mmap.to_object(*offset as usize, self.data_offset)?,
+                *offset,
+            ))
         } else {
             Err(Error::new_not_found(name.to_owned()).into())
         }
@@ -259,16 +288,28 @@ impl PropertyAreaMap {
             let subname = &remaining_name[0..substr_size];
 
             let children_offset = {
-                let current_node = self.mmap.to_object::<PropertyTrieNode>(current, self.data_offset)?;
-                current_node.children.load(std::sync::atomic::Ordering::Relaxed)
+                let current_node = self
+                    .mmap
+                    .to_object::<PropertyTrieNode>(current, self.data_offset)?;
+                current_node
+                    .children
+                    .load(std::sync::atomic::Ordering::Relaxed)
             };
             let root_offset = if children_offset != 0 {
-                let current_node = self.mmap.to_object::<PropertyTrieNode>(current, self.data_offset)?;
-                current_node.children.load(std::sync::atomic::Ordering::Acquire)
+                let current_node = self
+                    .mmap
+                    .to_object::<PropertyTrieNode>(current, self.data_offset)?;
+                current_node
+                    .children
+                    .load(std::sync::atomic::Ordering::Acquire)
             } else {
                 let offset = self.new_prop_trie_node(subname)?;
-                let current_node = self.mmap.to_object::<PropertyTrieNode>(current, self.data_offset)?;
-                current_node.children.store(offset, std::sync::atomic::Ordering::Release);
+                let current_node = self
+                    .mmap
+                    .to_object::<PropertyTrieNode>(current, self.data_offset)?;
+                current_node
+                    .children
+                    .store(offset, std::sync::atomic::Ordering::Release);
                 offset
             };
 
@@ -282,14 +323,20 @@ impl PropertyAreaMap {
         }
 
         let prop_offset = {
-            let current_node = self.mmap.to_object_mut::<PropertyTrieNode>(current, self.data_offset)?;
+            let current_node = self
+                .mmap
+                .to_object_mut::<PropertyTrieNode>(current, self.data_offset)?;
             current_node.prop.load(std::sync::atomic::Ordering::Relaxed)
         };
 
         if prop_offset == 0 {
             let offset = self.new_prop_info(name, value)?;
-            let current_node = self.mmap.to_object_mut::<PropertyTrieNode>(current, self.data_offset)?;
-            current_node.prop.store(offset, std::sync::atomic::Ordering::Release);
+            let current_node = self
+                .mmap
+                .to_object_mut::<PropertyTrieNode>(current, self.data_offset)?;
+            current_node
+                .prop
+                .store(offset, std::sync::atomic::Ordering::Release);
         }
 
         Ok(())
@@ -297,7 +344,9 @@ impl PropertyAreaMap {
 
     // Read the dirty backup area.
     pub(crate) fn dirty_backup_area(&self) -> Result<&CStr> {
-        let result = self.mmap.to_cstr(mem::size_of::<PropertyTrieNode>(), self.data_offset);
+        let result = self
+            .mmap
+            .to_cstr(mem::size_of::<PropertyTrieNode>(), self.data_offset);
         if result.is_err() {
             error!("Failed to read dirty backup area");
         }
@@ -312,11 +361,18 @@ impl PropertyAreaMap {
         let bytes = value.to_bytes_with_nul();
 
         if bytes.len() + offset > self.pa_data_size {
-            error!("Backup area overflow: {} + {} > {}", bytes.len(), offset, self.pa_data_size);
+            error!(
+                "Backup area overflow: {} + {} > {}",
+                bytes.len(),
+                offset,
+                self.pa_data_size
+            );
             return Err(Error::new_file_validation("Invalid offset".to_string()).into());
         }
 
-        self.mmap.data_mut(offset, self.data_offset, bytes.len())?.copy_from_slice(bytes);
+        self.mmap
+            .data_mut(offset, self.data_offset, bytes.len())?
+            .copy_from_slice(bytes);
         Ok(())
     }
 
@@ -327,32 +383,49 @@ impl PropertyAreaMap {
         let name_bytes = name.as_bytes();
         let mut current_offset = trie_offset;
         loop {
-            let current_node = self.mmap.to_object::<PropertyTrieNode>(current_offset as usize, self.data_offset)?;
+            let current_node = self
+                .mmap
+                .to_object::<PropertyTrieNode>(current_offset as usize, self.data_offset)?;
 
             match cmp_prop_name(name_bytes, current_node.name().to_bytes()) {
                 std::cmp::Ordering::Less => {
                     let left_offset = current_node.left.load(std::sync::atomic::Ordering::Relaxed);
                     if left_offset != 0 {
-                        current_offset = current_node.left.load(std::sync::atomic::Ordering::Acquire);
+                        current_offset =
+                            current_node.left.load(std::sync::atomic::Ordering::Acquire);
                     } else {
                         let offset = self.new_prop_trie_node(name)?;
 
                         // To avoid the life time issue of current trie node.
-                        let current_node = self.mmap.to_object::<PropertyTrieNode>(current_offset as usize, self.data_offset)?;
-                        current_node.left.store(offset, std::sync::atomic::Ordering::Release);
+                        let current_node = self.mmap.to_object::<PropertyTrieNode>(
+                            current_offset as usize,
+                            self.data_offset,
+                        )?;
+                        current_node
+                            .left
+                            .store(offset, std::sync::atomic::Ordering::Release);
                         current_offset = offset;
                         break;
                     }
                 }
                 std::cmp::Ordering::Greater => {
-                    let right_offset = current_node.right.load(std::sync::atomic::Ordering::Relaxed);
+                    let right_offset = current_node
+                        .right
+                        .load(std::sync::atomic::Ordering::Relaxed);
                     if right_offset != 0 {
-                        current_offset = current_node.right.load(std::sync::atomic::Ordering::Acquire);
+                        current_offset = current_node
+                            .right
+                            .load(std::sync::atomic::Ordering::Acquire);
                     } else {
                         let offset = self.new_prop_trie_node(name)?;
                         // To avoid the life time issue of current trie node.
-                        let current_node = self.mmap.to_object::<PropertyTrieNode>(current_offset as usize, self.data_offset)?;
-                        current_node.right.store(offset, std::sync::atomic::Ordering::Release);
+                        let current_node = self.mmap.to_object::<PropertyTrieNode>(
+                            current_offset as usize,
+                            self.data_offset,
+                        )?;
+                        current_node
+                            .right
+                            .store(offset, std::sync::atomic::Ordering::Release);
                         current_offset = offset;
                         break;
                     }
@@ -365,7 +438,11 @@ impl PropertyAreaMap {
         Ok(current_offset)
     }
 
-    fn find_prop_trie_node<'a>(&'a self, trie: &'a PropertyTrieNode, name: &str) -> Result<&'a PropertyTrieNode> {
+    fn find_prop_trie_node<'a>(
+        &'a self,
+        trie: &'a PropertyTrieNode,
+        name: &str,
+    ) -> Result<&'a PropertyTrieNode> {
         let name_bytes = name.as_bytes();
         let mut current = trie;
         loop {
@@ -373,7 +450,8 @@ impl PropertyAreaMap {
                 std::cmp::Ordering::Less => {
                     let left_offset = current.left.load(std::sync::atomic::Ordering::Relaxed);
                     if left_offset != 0 {
-                        current = self.to_prop_obj_from_atomic::<PropertyTrieNode>(&current.left)?;
+                        current =
+                            self.to_prop_obj_from_atomic::<PropertyTrieNode>(&current.left)?;
                     } else {
                         return Err(Error::new_not_found(name.to_owned()).into());
                     }
@@ -381,7 +459,8 @@ impl PropertyAreaMap {
                 std::cmp::Ordering::Greater => {
                     let right_offset = current.right.load(std::sync::atomic::Ordering::Relaxed);
                     if right_offset != 0 {
-                        current = self.to_prop_obj_from_atomic::<PropertyTrieNode>(&current.right)?;
+                        current =
+                            self.to_prop_obj_from_atomic::<PropertyTrieNode>(&current.right)?;
                     } else {
                         return Err(Error::new_not_found(name.to_owned()).into());
                     }
@@ -400,7 +479,10 @@ impl PropertyAreaMap {
         let offset = self.property_area().bytes_used;
 
         if offset + (aligned as u32) > self.pa_data_size as u32 {
-            error!("Out of memory: {} + {} > {}", offset, aligned, self.pa_data_size);
+            error!(
+                "Out of memory: {} + {} > {}",
+                offset, aligned, self.pa_data_size
+            );
             return Err(Error::new_file_size("Out of memory".to_string()).into());
         }
 
@@ -411,7 +493,9 @@ impl PropertyAreaMap {
     #[cfg(feature = "builder")]
     pub(crate) fn new_prop_trie_node(&mut self, name: &str) -> Result<u32> {
         let new_offset = self.allocate_obj(mem::size_of::<PropertyTrieNode>() + name.len() + 1)?;
-        let node = self.mmap.to_object_mut::<PropertyTrieNode>(new_offset as usize, self.data_offset)?;
+        let node = self
+            .mmap
+            .to_object_mut::<PropertyTrieNode>(new_offset as usize, self.data_offset)?;
         node.init(name);
         Ok(new_offset)
     }
@@ -423,16 +507,22 @@ impl PropertyAreaMap {
         if value.len() > crate::PROP_VALUE_MAX {
             let long_offset = self.allocate_obj(value.len() + 1)?;
 
-            let target = self.mmap.data_mut(long_offset as usize, self.data_offset, value.len() + 1)?;
+            let target =
+                self.mmap
+                    .data_mut(long_offset as usize, self.data_offset, value.len() + 1)?;
             target[0..value.len()].copy_from_slice(value.as_bytes());
             target[value.len()] = 0; // Add null terminator
 
             let relative_offset = long_offset - new_offset;
 
-            let info = self.mmap.to_object_mut::<PropertyInfo>(new_offset as usize, self.data_offset)?;
+            let info = self
+                .mmap
+                .to_object_mut::<PropertyInfo>(new_offset as usize, self.data_offset)?;
             info.init_with_long_offset(name, relative_offset as _);
         } else {
-            let info = self.mmap.to_object_mut::<PropertyInfo>(new_offset as usize, self.data_offset)?;
+            let info = self
+                .mmap
+                .to_object_mut::<PropertyInfo>(new_offset as usize, self.data_offset)?;
             info.init_with_value(name, value);
         };
 
@@ -480,10 +570,16 @@ impl MemoryMap {
         };
 
         let memory_area = unsafe {
-            mm::mmap(std::ptr::null_mut(),
-                size, flags, mm::MapFlags::SHARED,
-                file, 0)
-        }.map_err(Error::from)? as *mut u8;
+            mm::mmap(
+                std::ptr::null_mut(),
+                size,
+                flags,
+                mm::MapFlags::SHARED,
+                file,
+                0,
+            )
+        }
+        .map_err(Error::from)? as *mut u8;
 
         Ok(Self {
             data: memory_area,
@@ -498,25 +594,34 @@ impl MemoryMap {
     pub(crate) fn data(&self, offset: usize, base: usize, size: usize) -> Result<&[u8]> {
         let offset = offset + base;
         self.check_size(offset, size)?;
-        Ok(unsafe {
-            std::slice::from_raw_parts(self.data.add(offset) as *const u8, size)
-        })
+        Ok(unsafe { std::slice::from_raw_parts(self.data.add(offset) as *const u8, size) })
     }
 
     #[cfg(feature = "builder")]
-    pub(crate) fn data_mut(&mut self, offset: usize, base: usize, size: usize) -> Result<&mut [u8]> {
+    pub(crate) fn data_mut(
+        &mut self,
+        offset: usize,
+        base: usize,
+        size: usize,
+    ) -> Result<&mut [u8]> {
         let offset = offset + base;
         self.check_size(offset, size)?;
 
-        Ok(unsafe {
-            std::slice::from_raw_parts_mut(self.data.add(offset), size)
-        })
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.data.add(offset), size) })
     }
 
     fn check_size(&self, offset: usize, size: usize) -> Result<()> {
         if offset + size > self.size {
-            error!("Memory access out of bounds: {} + {} > {} (ptr={:p})", offset, size, self.size, self.data);
-            return Err(Error::new_file_validation(format!("Invalid offset: {} > {}", offset + size, self.size)).into());
+            error!(
+                "Memory access out of bounds: {} + {} > {} (ptr={:p})",
+                offset, size, self.size, self.data
+            );
+            return Err(Error::new_file_validation(format!(
+                "Invalid offset: {} > {}",
+                offset + size,
+                self.size
+            ))
+            .into());
         }
         Ok(())
     }

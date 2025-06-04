@@ -8,12 +8,14 @@
 
 #![cfg(feature = "builder")]
 
-use std::path::{Path, PathBuf};
-use std::fs::{remove_dir_all, File, create_dir};
-use std::io::Write;
+use rsproperties::{
+    self, build_trie, load_properties_from_file, PropertyInfoEntry, SystemProperties,
+};
 use std::collections::HashMap;
+use std::fs::{create_dir, remove_dir_all, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
-use rsproperties::{self, PropertyInfoEntry, build_trie, load_properties_from_file, SystemProperties};
 
 mod common;
 use common::TEST_PROPERTIES_DIR;
@@ -34,7 +36,9 @@ fn load_properties() -> HashMap<String, String> {
 
     let mut properties = HashMap::new();
     for file in build_prop_files {
-        if let Err(e) = load_properties_from_file(Path::new(file), None, "u:r:init:s0", &mut properties) {
+        if let Err(e) =
+            load_properties_from_file(Path::new(file), None, "u:r:init:s0", &mut properties)
+        {
             eprintln!("Warning: Failed to load {}: {}", file, e);
         }
     }
@@ -63,8 +67,9 @@ fn build_property_dir(dir: &str) -> SystemProperties {
 
     let mut property_infos = Vec::new();
     for file in property_contexts_files {
-        let (mut property_info, errors) = PropertyInfoEntry::parse_from_file(Path::new(file), false)
-            .expect("Failed to parse property contexts");
+        let (mut property_info, errors) =
+            PropertyInfoEntry::parse_from_file(Path::new(file), false)
+                .expect("Failed to parse property contexts");
         if !errors.is_empty() {
             eprintln!("Errors parsing {}: {:?}", file, errors);
         }
@@ -85,14 +90,18 @@ fn build_property_dir(dir: &str) -> SystemProperties {
 
     let properties = load_properties();
 
-    let mut system_properties = SystemProperties::new_area(dir_path)
-        .unwrap_or_else(|e| panic!("Cannot create system properties: {}. Please check if {dir_path:?} exists.", e));
+    let mut system_properties = SystemProperties::new_area(dir_path).unwrap_or_else(|e| {
+        panic!(
+            "Cannot create system properties: {}. Please check if {dir_path:?} exists.",
+            e
+        )
+    });
 
     for (key, value) in properties.iter() {
         match system_properties.find(key.as_str()).unwrap() {
             Some(prop_ref) => {
                 system_properties.update(&prop_ref, value.as_str()).unwrap();
-            },
+            }
             None => {
                 system_properties.add(key.as_str(), value.as_str()).unwrap();
             }
@@ -117,9 +126,15 @@ fn test_android_build_properties_loading() {
     let properties = setup_android_test_env();
 
     // Verify that we loaded some properties
-    assert!(!properties.is_empty(), "Should have loaded some properties from Android build files");
+    assert!(
+        !properties.is_empty(),
+        "Should have loaded some properties from Android build files"
+    );
 
-    println!("Loaded {} properties from Android build files", properties.len());
+    println!(
+        "Loaded {} properties from Android build files",
+        properties.len()
+    );
 
     // Test some common Android properties that should exist
     let expected_props = vec![
@@ -141,13 +156,18 @@ fn test_get_android_properties() {
     let properties = setup_android_test_env();
 
     // Test getting properties through the public API
-    for (key, expected_value) in properties.iter().take(10) { // Test first 10 properties
+    for (key, expected_value) in properties.iter().take(10) {
+        // Test first 10 properties
         let retrieved_value = rsproperties::get(key);
         // Since get() now returns String directly, we check if it matches expected value or is empty
         if retrieved_value.is_empty() {
             eprintln!("✗ Property {} not found (empty string returned)", key);
         } else {
-            assert_eq!(retrieved_value, *expected_value, "Property {} has incorrect value", key);
+            assert_eq!(
+                retrieved_value, *expected_value,
+                "Property {} has incorrect value",
+                key
+            );
             println!("✓ {}: {}", key, retrieved_value);
         }
     }
@@ -184,13 +204,21 @@ fn test_android_property_contexts_parsing() {
         let (property_infos, errors) = PropertyInfoEntry::parse_from_file(Path::new(file), false)
             .expect(&format!("Failed to parse {}", file));
 
-        assert!(!property_infos.is_empty(), "Should have parsed some property info from {}", file);
+        assert!(
+            !property_infos.is_empty(),
+            "Should have parsed some property info from {}",
+            file
+        );
 
         if !errors.is_empty() {
             println!("Parsing errors in {}: {:?}", file, errors);
         }
 
-        println!("Parsed {} property entries from {}", property_infos.len(), file);
+        println!(
+            "Parsed {} property entries from {}",
+            property_infos.len(),
+            file
+        );
 
         // Verify some basic structure
         for (i, _info) in property_infos.iter().take(3).enumerate() {
@@ -211,11 +239,16 @@ fn test_android_build_prop_parsing() {
 
     for file in build_files {
         let mut properties = HashMap::new();
-        let result = load_properties_from_file(Path::new(file), None, "u:r:init:s0", &mut properties);
+        let result =
+            load_properties_from_file(Path::new(file), None, "u:r:init:s0", &mut properties);
 
         match result {
             Ok(_) => {
-                assert!(!properties.is_empty(), "Should have loaded properties from {}", file);
+                assert!(
+                    !properties.is_empty(),
+                    "Should have loaded properties from {}",
+                    file
+                );
                 println!("Loaded {} properties from {}", properties.len(), file);
 
                 // Print a few properties as examples
@@ -237,10 +270,14 @@ fn test_property_trie_building() {
     // Parse property contexts to get property info entries
     let (property_infos, _) = PropertyInfoEntry::parse_from_file(
         Path::new("tests/android/plat_property_contexts"),
-        false
-    ).expect("Failed to parse property contexts");
+        false,
+    )
+    .expect("Failed to parse property contexts");
 
-    assert!(!property_infos.is_empty(), "Should have property info entries");
+    assert!(
+        !property_infos.is_empty(),
+        "Should have property info entries"
+    );
 
     // Build trie
     let trie_data = build_trie(&property_infos, "u:object_r:default_prop:s0", "string")
@@ -248,8 +285,11 @@ fn test_property_trie_building() {
 
     assert!(!trie_data.is_empty(), "Trie data should not be empty");
 
-    println!("Built trie with {} bytes of data from {} property info entries",
-             trie_data.len(), property_infos.len());
+    println!(
+        "Built trie with {} bytes of data from {} property info entries",
+        trie_data.len(),
+        property_infos.len()
+    );
 }
 
 #[test]

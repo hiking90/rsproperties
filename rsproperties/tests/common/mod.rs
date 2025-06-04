@@ -1,6 +1,6 @@
-use std::{path::PathBuf, str::FromStr};
-use std::fs::{remove_dir_all, create_dir_all};
+use std::fs::{create_dir_all, remove_dir_all};
 use std::sync::Once;
+use std::{path::PathBuf, str::FromStr};
 
 use rsproperties::PropertyConfig;
 
@@ -19,8 +19,6 @@ pub fn init_test() {
         remove_dir_all(&socket_dir).unwrap_or_default();
         create_dir_all(&socket_dir).expect("Failed to create socket directory");
 
-        rsproperties::init(
-            PropertyConfig::with_both_dirs(properties_dir, socket_dir)
-        );
+        rsproperties::init(PropertyConfig::with_both_dirs(properties_dir, socket_dir));
     });
 }

@@ -140,7 +140,8 @@ where
     E: Into<Error>,
 {
     fn context_with_location(self, msg: impl Into<String>) -> Result<T> {
-        self.map_err(|e| e.into()).map_err(|_| Error::new_file_validation(msg.into()))
+        self.map_err(|e| e.into())
+            .map_err(|_| Error::new_file_validation(msg.into()))
     }
 }
 
@@ -151,30 +152,37 @@ where
 pub fn validate_file_metadata(
     metadata: &std::fs::Metadata,
     path: &std::path::Path,
-    min_size: u64
+    min_size: u64,
 ) -> Result<()> {
     // Platform-specific MetadataExt imports
-    #[cfg(target_os = "macos")]
-    use std::os::macos::fs::MetadataExt;
     #[cfg(target_os = "android")]
     use std::os::android::fs::MetadataExt;
     #[cfg(target_os = "linux")]
     use std::os::linux::fs::MetadataExt;
+    #[cfg(target_os = "macos")]
+    use std::os::macos::fs::MetadataExt;
 
     use rustix::fs;
 
     // Check file size first (applies to all modes)
     if metadata.st_size() < min_size {
-        let error_msg = format!("File too small: size={}, min_size={} for {:?}",
-                               metadata.st_size(), min_size, path);
+        let error_msg = format!(
+            "File too small: size={}, min_size={} for {:?}",
+            metadata.st_size(),
+            min_size,
+            path
+        );
         log::error!("{}", error_msg);
         return Err(Error::new_file_size(error_msg));
     }
 
     // Check write permissions (applies to all modes)
     if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 {
-        let error_msg = format!("File has group or other write permissions: mode={:#o} for {:?}",
-                               metadata.st_mode(), path);
+        let error_msg = format!(
+            "File has group or other write permissions: mode={:#o} for {:?}",
+            metadata.st_mode(),
+            path
+        );
         log::error!("{}", error_msg);
         return Err(Error::new_permission_denied(error_msg));
     }
@@ -182,8 +190,12 @@ pub fn validate_file_metadata(
     // In production mode, also check ownership
     if !cfg!(test) && !cfg!(debug_assertions) {
         if metadata.st_uid() != 0 || metadata.st_gid() != 0 {
-            let error_msg = format!("File not owned by root: uid={}, gid={} for {:?}",
-                                   metadata.st_uid(), metadata.st_gid(), path);
+            let error_msg = format!(
+                "File not owned by root: uid={}, gid={} for {:?}",
+                metadata.st_uid(),
+                metadata.st_gid(),
+                path
+            );
             log::error!("{}", error_msg);
             return Err(Error::new_file_ownership(error_msg));
         }
@@ -208,7 +220,8 @@ mod tests {
             .map_err(|e| {
                 println!("Error: {}", e);
                 e
-            }).unwrap_err();
+            })
+            .unwrap_err();
         std::fs::File::open("non-existent-file")
             .context("Failed to open file")
             .unwrap_err();

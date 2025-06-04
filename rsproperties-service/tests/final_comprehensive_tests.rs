@@ -9,7 +9,7 @@
 
 extern crate rsproperties;
 
-use rsproperties::{PROP_VALUE_MAX, PROP_DIRNAME};
+use rsproperties::{PROP_DIRNAME, PROP_VALUE_MAX};
 
 #[path = "common.rs"]
 mod common;
@@ -18,8 +18,14 @@ use common::init_test;
 #[test]
 fn test_api_constants() {
     // Verify Android system property constants are correct
-    assert_eq!(PROP_VALUE_MAX, 92, "PROP_VALUE_MAX should match Android spec");
-    assert_eq!(PROP_DIRNAME, "/dev/__properties__", "PROP_DIRNAME should match Android default");
+    assert_eq!(
+        PROP_VALUE_MAX, 92,
+        "PROP_VALUE_MAX should match Android spec"
+    );
+    assert_eq!(
+        PROP_DIRNAME, "/dev/__properties__",
+        "PROP_DIRNAME should match Android default"
+    );
 
     println!("✓ API constants validation passed");
     println!("  PROP_VALUE_MAX = {}", PROP_VALUE_MAX);
@@ -34,11 +40,31 @@ async fn test_get_with_default_comprehensive() {
     let test_cases = [
         ("test.simple", "default", "should handle simple case"),
         ("test.empty.default", "", "should handle empty default"),
-        ("test.spaces", "default with spaces", "should handle defaults with spaces"),
-        ("test.special.chars", "!@#$%^&*()", "should handle special characters"),
-        ("test.unicode", "üñíçødé", "should handle unicode characters"),
-        ("test.long.property.name.with.many.dots", "default", "should handle long property names"),
-        ("test.numbers.123", "456", "should handle numbers in names and values"),
+        (
+            "test.spaces",
+            "default with spaces",
+            "should handle defaults with spaces",
+        ),
+        (
+            "test.special.chars",
+            "!@#$%^&*()",
+            "should handle special characters",
+        ),
+        (
+            "test.unicode",
+            "üñíçødé",
+            "should handle unicode characters",
+        ),
+        (
+            "test.long.property.name.with.many.dots",
+            "default",
+            "should handle long property names",
+        ),
+        (
+            "test.numbers.123",
+            "456",
+            "should handle numbers in names and values",
+        ),
     ];
 
     for (property, default, description) in &test_cases {
@@ -46,7 +72,10 @@ async fn test_get_with_default_comprehensive() {
         assert_eq!(result, *default, "{}", description);
     }
 
-    println!("✓ get_with_default comprehensive tests passed ({} cases)", test_cases.len());
+    println!(
+        "✓ get_with_default comprehensive tests passed ({} cases)",
+        test_cases.len()
+    );
 }
 
 #[tokio::test]
@@ -68,8 +97,10 @@ async fn test_get_nonexistent_properties() {
         assert!(result.is_err(), "Property '{}' should not exist", property);
     }
 
-    println!("✓ get non-existent properties test passed ({} properties tested)",
-             nonexistent_properties.len());
+    println!(
+        "✓ get non-existent properties test passed ({} properties tested)",
+        nonexistent_properties.len()
+    );
 }
 
 #[tokio::test]
@@ -81,8 +112,11 @@ async fn test_dirname_functionality() {
 
     // Verify dirname is not empty and looks like a path
     assert!(!dirname_str.is_empty(), "dirname should not be empty");
-    assert!(dirname_str.contains("properties") || dirname_str.starts_with("/"),
-            "dirname should be a valid path, got: '{}'", dirname_str);
+    assert!(
+        dirname_str.contains("properties") || dirname_str.starts_with("/"),
+        "dirname should be a valid path, got: '{}'",
+        dirname_str
+    );
 
     println!("✓ dirname functionality test passed");
     println!("  Current dirname: '{}'", dirname_str);
@@ -114,9 +148,9 @@ async fn test_property_name_validation() {
 
     // Test potentially problematic property names
     let edge_case_names = [
-        "", // empty name
-        ".", // just dot
-        "..", // double dot
+        "",      // empty name
+        ".",     // just dot
+        "..",    // double dot
         "name.", // ending with dot
         ".name", // starting with dot
     ];
@@ -151,14 +185,18 @@ async fn test_property_value_length_limits() {
 
     println!("✓ Property value length limits test passed");
     println!("  PROP_VALUE_MAX = {}", PROP_VALUE_MAX);
-    println!("  Tested values of length {} and {}", max_length_value.len(), too_long_value.len());
+    println!(
+        "  Tested values of length {} and {}",
+        max_length_value.len(),
+        too_long_value.len()
+    );
 }
 
 #[tokio::test]
 async fn test_thread_safety() {
-    use std::thread;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
 
     init_test().await;
 
@@ -200,10 +238,16 @@ async fn test_thread_safety() {
 
     let final_count = success_count.load(Ordering::SeqCst);
     let expected_count = 10 * 5 * 3; // 10 threads × 5 operations × 3 calls per operation
-    assert_eq!(final_count, expected_count, "All thread operations should complete");
+    assert_eq!(
+        final_count, expected_count,
+        "All thread operations should complete"
+    );
 
     println!("✓ Thread safety test passed");
-    println!("  {} threads × 5 operations × 3 calls = {} total operations", 10, expected_count);
+    println!(
+        "  {} threads × 5 operations × 3 calls = {} total operations",
+        10, expected_count
+    );
 }
 
 #[tokio::test]
@@ -252,7 +296,11 @@ async fn test_performance_basic() {
     println!("  {:.0} operations per second", ops_per_sec);
 
     // Performance should be reasonable (at least 1000 ops/sec)
-    assert!(ops_per_sec > 1000.0, "Performance should be at least 1000 ops/sec, got {:.0}", ops_per_sec);
+    assert!(
+        ops_per_sec > 1000.0,
+        "Performance should be at least 1000 ops/sec, got {:.0}",
+        ops_per_sec
+    );
 }
 
 // Tests that require the builder feature
@@ -275,14 +323,17 @@ mod builder_tests {
                 println!("✓ Property read back successfully: '{}'", value);
             }
             Err(e) => {
-                println!("⚠ Property set failed (expected without property service): {}", e);
+                println!(
+                    "⚠ Property set failed (expected without property service): {}",
+                    e
+                );
                 // This is expected when property service is not running
             }
         }
     }
 
     #[tokio::test]
-    async  fn test_set_property_various_values() {
+    async fn test_set_property_various_values() {
         init_test().await;
 
         let test_cases = [
@@ -313,7 +364,10 @@ mod builder_tests {
         let result = rsproperties::set("test.max.length.set", &max_value);
 
         match result {
-            Ok(_) => println!("✓ Successfully set property with max length ({})", PROP_VALUE_MAX),
+            Ok(_) => println!(
+                "✓ Successfully set property with max length ({})",
+                PROP_VALUE_MAX
+            ),
             Err(e) => println!("⚠ Failed to set max length property: {}", e),
         }
 
@@ -324,7 +378,10 @@ mod builder_tests {
         // This should typically fail, but behavior may vary
         match result {
             Ok(_) => println!("⚠ Unexpectedly succeeded setting overlong property"),
-            Err(_) => println!("✓ Correctly rejected property value that is too long ({})", too_long_value.len()),
+            Err(_) => println!(
+                "✓ Correctly rejected property value that is too long ({})",
+                too_long_value.len()
+            ),
         }
 
         println!("✓ Set property length limits test completed");
@@ -376,7 +433,10 @@ mod builder_tests {
 
                 match rsproperties::set(&property_name, &property_value) {
                     Ok(_) => {
-                        println!("Thread {}: Set property '{}' = '{}'", thread_id, property_name, property_value);
+                        println!(
+                            "Thread {}: Set property '{}' = '{}'",
+                            thread_id, property_name, property_value
+                        );
 
                         // Try to read it back
                         let value = rsproperties::get(&property_name);
