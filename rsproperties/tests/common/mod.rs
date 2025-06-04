@@ -6,8 +6,10 @@ use rsproperties::PropertyConfig;
 
 pub static TEST_PROPERTIES_DIR: &str = "__properties__";
 
+#[allow(dead_code)]
 static INIT: Once = Once::new();
 
+#[allow(dead_code)]
 pub fn init_test() {
     INIT.call_once(|| {
         let properties_dir = PathBuf::from_str(TEST_PROPERTIES_DIR)

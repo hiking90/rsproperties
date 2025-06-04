@@ -15,7 +15,7 @@
 //!
 //! ## Usage
 //!
-//! ```rust
+//! ```rust,no_run
 //! #[cfg(target_os = "android")]
 //! {
 //!     use rsproperties::{init, PropertyConfig};
@@ -203,7 +203,7 @@ static SYSTEM_PROPERTIES: OnceLock<system_properties::SystemProperties> = OnceLo
 ///   - `Some(PropertyConfig)` - Full configuration
 ///
 /// # Examples
-/// ```rust
+/// ```rust,no_run
 /// use rsproperties::{init, PropertyConfig};
 /// use std::path::PathBuf;
 ///

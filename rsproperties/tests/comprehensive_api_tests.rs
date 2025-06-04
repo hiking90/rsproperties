@@ -3,7 +3,6 @@
 //! This test suite provides complete coverage of the rsproperties library's public API,
 //! testing both read and write functionality with the real Android property system.
 
-#[path = "common.rs"]
 mod common;
 use common::init_test;
 

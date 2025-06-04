@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 use rsproperties::{self, PropertyInfoEntry, build_trie, load_properties_from_file, SystemProperties};
 
-#[path = "common.rs"]
 mod common;
 use common::TEST_PROPERTIES_DIR;
 

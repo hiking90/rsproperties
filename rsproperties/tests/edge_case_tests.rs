@@ -8,7 +8,6 @@
 
 use rsproperties::{self, PROP_VALUE_MAX, PROP_DIRNAME};
 
-#[path = "common.rs"]
 mod common;
 use common::init_test;
 
