@@ -10,6 +10,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Jeff Kim <hiking90@gmail.com>"]
 license = "Apache-2.0"
+rust-version = "1.75.0"
 repository = "https://github.com/yourusername/rsproperties"
 homepage = "https://github.com/yourusername/rsproperties"
 documentation = "https://docs.rs/rsproperties"
