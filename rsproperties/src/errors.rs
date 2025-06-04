@@ -188,7 +188,13 @@ pub fn validate_file_metadata(
     }
 
     // In production mode, also check ownership
-    if !cfg!(test) && !cfg!(debug_assertions) {
+    // Skip ownership checks only in test/development environments:
+    // 1. When compiled with debug assertions (development builds)
+    // 2. When compiled in test configuration
+    // This is compile-time only and cannot be bypassed at runtime
+    let skip_ownership_check = cfg!(debug_assertions) || cfg!(test);
+
+    if !skip_ownership_check {
         if metadata.st_uid() != 0 || metadata.st_gid() != 0 {
             let error_msg = format!(
                 "File not owned by root: uid={}, gid={} for {:?}",
