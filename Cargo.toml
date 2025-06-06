@@ -6,13 +6,13 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Jeff Kim <hiking90@gmail.com>"]
 license = "Apache-2.0"
 rust-version = "1.77"
-repository = "https://github.com/yourusername/rsproperties"
-homepage = "https://github.com/yourusername/rsproperties"
+repository = "https://github.com/hiking90/rsproperties"
+homepage = "https://github.com/hiking90/rsproperties"
 documentation = "https://docs.rs/rsproperties"
 keywords = ["android", "properties", "system"]
 categories = ["os", "api-bindings"]
