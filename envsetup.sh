@@ -111,3 +111,35 @@ function version_update() {
     find . -name "Cargo.toml" -exec sed -i '' "s/^version = \".*\"/version = \"$NEW_VERSION\"/" {} \;
     find . -name "Cargo.toml" -exec sed -i '' "/version = \"[^\"]*\", path =/ s/version = \"[^\"]*\"/version = \"$NEW_VERSION\"/" {} \;
 }
+
+function update_cargo_lock() {
+    echo "Updating Cargo.lock for Rust 1.77 environment..."
+
+    # Check if rustup is available
+    if ! command -v rustup &> /dev/null; then
+        echo "Error: rustup is not installed. Please install rustup first."
+        return 1
+    fi
+
+    # Install or update to Rust 1.77 if not already installed
+    echo "Ensuring Rust 1.77 toolchain is available..."
+    rustup toolchain install 1.77
+
+    # Remove existing Cargo.lock files to force regeneration
+    echo "Removing existing Cargo.lock files..."
+    find . -name "Cargo.lock" -type f -delete
+
+    # Update dependencies and regenerate Cargo.lock using Rust 1.77
+    echo "Updating dependencies and regenerating Cargo.lock with Rust 1.77..."
+    rustup run 1.77 cargo update
+
+    # Verify the update was successful
+    if [ $? -eq 0 ]; then
+        echo "Successfully updated Cargo.lock for Rust 1.77!"
+        echo "Used Rust version:"
+        rustup run 1.77 rustc --version
+    else
+        echo "Error: Failed to update Cargo.lock"
+        return 1
+    fi
+}
