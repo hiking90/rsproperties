@@ -45,11 +45,11 @@ function ndk_sync() {
     read_remote_android
 
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        # macOS - use modern BSD find syntax
-        find_command="find \"$source_directory\" -maxdepth 1 -type f -perm /111"
+        # macOS - use BSD find syntax with +111 for executable files
+        find_command="find \"$source_directory\" -maxdepth 2 -type f -perm +111"
     else
         # Linux - use GNU find syntax
-        find_command="find \"$source_directory\" -maxdepth 1 -type f -executable"
+        find_command="find \"$source_directory\" -maxdepth 2 -type f -executable"
     fi
 
     echo "Syncing files from: $source_directory"
