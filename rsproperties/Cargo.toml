@@ -9,7 +9,7 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Android system properties library for Rust"
+description = "Pure Rust implementation of Android's property system with cross-platform support, real-time monitoring, and Linux emulation"
 
 [features]
 default = []
