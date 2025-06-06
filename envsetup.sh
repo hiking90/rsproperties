@@ -45,14 +45,24 @@ function ndk_sync() {
     read_remote_android
 
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        # macOS
-        find_command="find \"$source_directory\" -maxdepth 1 -type f -perm +111"
+        # macOS - use modern BSD find syntax
+        find_command="find \"$source_directory\" -maxdepth 1 -type f -perm /111"
     else
-        # Linux
+        # Linux - use GNU find syntax
         find_command="find \"$source_directory\" -maxdepth 1 -type f -executable"
     fi
 
+    echo "Syncing files from: $source_directory"
+    echo "To remote directory: $remote_directory"
+
+    if [ ! -d "$source_directory" ]; then
+        echo "Error: Source directory does not exist: $source_directory"
+        echo "Please run 'ndk_build' first to build the project."
+        return 1
+    fi
+
     eval $find_command | while read file; do
+        echo "Pushing: $(basename "$file")"
         adb push "$file" "$remote_directory/"
     done
 }
