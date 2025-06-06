@@ -21,7 +21,24 @@ fi
 
 function ndk_build() {
     read_remote_android
-    cargo ndk --no-strip -t $cargo_ndk_target build && cargo ndk --no-strip -t $cargo_ndk_target -- test --no-run
+
+    # Build the main project first
+    if cargo ndk --no-strip -t $cargo_ndk_target build && cargo ndk --no-strip -t $cargo_ndk_target -- test --no-run; then
+        echo "Main build successful, building examples..."
+
+        # Build examples from rsproperties package
+        echo "Building rsproperties examples..."
+        cargo ndk --no-strip -t $cargo_ndk_target build --examples -p rsproperties
+
+        # Build examples from rsproperties-service package
+        echo "Building rsproperties-service examples..."
+        cargo ndk --no-strip -t $cargo_ndk_target build --examples -p rsproperties-service
+
+        echo "All builds completed successfully!"
+    else
+        echo "Main build failed, skipping examples build."
+        return 1
+    fi
 }
 
 function ndk_sync() {
