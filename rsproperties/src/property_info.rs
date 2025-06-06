@@ -111,7 +111,7 @@ impl PropertyInfo {
                 let value_ptr = self_ptr.add(long_property.offset as usize) as *const i8;
 
                 // Don't know the length of the long property value, so it depends on the null terminator.
-                CStr::from_ptr(value_ptr)
+                CStr::from_ptr(value_ptr as _)
             }
         } else {
             unsafe {
@@ -161,7 +161,7 @@ pub(crate) fn name_from_trailing_data<I: Sized>(thiz: &I, len: Option<usize>) ->
         match len {
             Some(len) => CStr::from_bytes_until_nul(std::slice::from_raw_parts(name_ptr, len + 1))
                 .expect("Failed to convert name to CStr"),
-            None => CStr::from_ptr(name_ptr as *const i8),
+            None => CStr::from_ptr(name_ptr as *const _),
         }
     }
 }

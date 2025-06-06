@@ -648,7 +648,7 @@ impl MemoryMap {
         let offset = offset + base;
         self.check_size(offset, 1)?;
         unsafe {
-            let ptr = self.data.add(offset) as *const i8;
+            let ptr = self.data.add(offset) as *const _;
             Ok(CStr::from_ptr(ptr))
         }
     }

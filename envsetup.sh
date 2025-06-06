@@ -53,7 +53,7 @@ function read_remote_android() {
         echo "Example:"
         echo "arm64-v8a"
         echo "aarch64"
-        echo "/data/rsbinder"
+        echo "/data/rsproperties"
         exit 1
     fi
 
