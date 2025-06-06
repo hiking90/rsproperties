@@ -30,9 +30,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rsproperties = "0.1.0"
+rsproperties = "0.1"
 # For Linux property service daemon
-rsproperties-service = "0.1.0"
+rsproperties-service = "0.1"
 
 # Optional features
 [features]
