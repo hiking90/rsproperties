@@ -214,21 +214,6 @@ fn set_app_config() -> Result<()> {
 - **Memory Mapping**: Efficient memory-mapped property storage
 - **Property Service**: Use with `rsproperties-service` for full daemon functionality
 
-## Property Naming Conventions
-
-The library follows Android property naming conventions:
-
-- **Read-only properties**: `ro.*` (e.g., `ro.build.version.sdk`)
-- **System properties**: `sys.*` (e.g., `sys.boot_completed`)
-- **Persist properties**: `persist.*` (e.g., `persist.sys.timezone`)
-- **Debug properties**: `debug.*` (e.g., `debug.my_app.log_level`)
-- **Vendor properties**: `vendor.*` (e.g., `vendor.audio.config`)
-
-### Property Constraints
-- **Name length**: Maximum 32 characters
-- **Value length**: Maximum 92 characters (except ro.* properties)
-- **Character set**: Alphanumeric, dots, underscores, and hyphens
-
 ## API Reference
 
 ### Configuration
