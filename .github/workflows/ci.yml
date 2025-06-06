@@ -5,6 +5,9 @@ on:
     branches: [ main, develop ]
   pull_request:
     branches: [ main, develop ]
+  schedule:
+    # Run dependency checks weekly on Sundays at 02:00 UTC
+    - cron: '0 2 * * 0'
 
 env:
   CARGO_TERM_COLOR: always
@@ -173,7 +176,7 @@ jobs:
     - name: Check for outdated dependencies
       run: |
         cargo install cargo-outdated || echo "cargo-outdated already installed"
-        cargo outdated --exit-code 1 || echo "Some dependencies may be outdated"
+        cargo outdated --exit-code 1
 
   android:
     name: Android Build
