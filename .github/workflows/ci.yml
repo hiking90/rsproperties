@@ -175,6 +175,62 @@ jobs:
         cargo install cargo-outdated || echo "cargo-outdated already installed"
         cargo outdated --exit-code 1 || echo "Some dependencies may be outdated"
 
+  android:
+    name: Android Build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - aarch64-linux-android
+          - armv7-linux-androideabi
+          - x86_64-linux-android
+          - i686-linux-android
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+      with:
+        api-level: 34
+        ndk-version: '26.1.10909125'
+
+    - name: Install cargo-ndk
+      run: cargo install cargo-ndk
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-android-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-android-${{ matrix.target }}-
+          ${{ runner.os }}-cargo-android-
+
+    - name: Build for Android (${{ matrix.target }})
+      run: |
+        export ANDROID_NDK_HOME=$ANDROID_NDK_ROOT
+        cargo ndk --target ${{ matrix.target }} --platform 21 build --all-features
+
+    - name: Build examples for Android (${{ matrix.target }})
+      run: |
+        export ANDROID_NDK_HOME=$ANDROID_NDK_ROOT
+        cargo ndk --target ${{ matrix.target }} --platform 21 build --examples --all-features
+
+    - name: Check workspace for Android (${{ matrix.target }})
+      run: |
+        export ANDROID_NDK_HOME=$ANDROID_NDK_ROOT
+        cd rsproperties
+        cargo ndk --target ${{ matrix.target }} --platform 21 check --all-features
+
   docs:
     name: Documentation
     runs-on: ubuntu-latest
