@@ -197,8 +197,10 @@ jobs:
     - name: Setup Android SDK
       uses: android-actions/setup-android@v3
       with:
-        api-level: 34
-        ndk-version: '26.1.10909125'
+        packages: |
+          platform-tools
+          platforms;android-34
+          ndk;26.1.10909125
 
     - name: Install cargo-ndk
       run: cargo install cargo-ndk
