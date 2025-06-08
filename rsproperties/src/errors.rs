@@ -180,7 +180,8 @@ pub fn validate_file_metadata(
     let check_permissions = metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits());
 
     #[cfg(target_os = "macos")]
-    let check_permissions = metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32;
+    let check_permissions =
+        metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32;
 
     // Check write permissions (applies to all modes)
     if check_permissions != 0 {
