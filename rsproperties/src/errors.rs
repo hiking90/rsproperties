@@ -176,8 +176,14 @@ pub fn validate_file_metadata(
         return Err(Error::new_file_size(error_msg));
     }
 
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    let check_permissions = metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits());
+
+    #[cfg(target_os = "macos")]
+    let check_permissions = metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32;
+
     // Check write permissions (applies to all modes)
-    if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 {
+    if check_permissions != 0 {
         let error_msg = format!(
             "File has group or other write permissions: mode={:#o} for {:?}",
             metadata.st_mode(),
