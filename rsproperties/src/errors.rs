@@ -177,7 +177,7 @@ pub fn validate_file_metadata(
     }
 
     // Check write permissions (applies to all modes)
-    if metadata.st_mode() as u16 & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) != 0 {
+    if metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32 != 0 {
         let error_msg = format!(
             "File has group or other write permissions: mode={:#o} for {:?}",
             metadata.st_mode(),
