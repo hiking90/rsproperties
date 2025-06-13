@@ -295,29 +295,96 @@ pub(crate) fn bionic_align(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & !(alignment - 1)
 }
 
-/// Get a value of the property.
+/// Get a value of the property as string.
 /// If the property is not found, it returns the default value.
 /// If an error occurs, it returns the default value.
 pub fn get_with_default(name: &str, default: &str) -> String {
     system_properties().get_with_default(name, default)
 }
 
-/// Get a value of the property.
+/// Get a value of the property as string.
 /// If the property is not found, it returns an empty string.
 /// If an error occurs, it returns Err.
 pub fn get(name: &str) -> String {
     system_properties().get(name)
 }
 
+/// Get a value of the property as string with Result.
+/// If the property is not found, it returns an empty string.
+/// If an error occurs, it returns Err.
 pub fn get_with_result(name: &str) -> Result<String> {
     system_properties().get_with_result(name)
 }
 
-/// Set a value of the property.
+/// Get a value of the property parsed to the specified type.
+/// If the property is not found, it returns the default value.
+/// If an error occurs or parsing fails, it returns the default value.
+///
+/// # Examples
+/// ```rust,no_run
+/// use rsproperties::get_parsed_with_default;
+///
+/// let sdk_version: i32 = get_parsed_with_default("ro.build.version.sdk", 0);
+/// let is_debuggable: bool = get_parsed_with_default("ro.debuggable", false);
+/// let heap_size: f64 = get_parsed_with_default("dalvik.vm.heapsize", 64.0);
+/// ```
+pub fn get_parsed_with_default<T: std::str::FromStr>(name: &str, default: T) -> T {
+    let value = system_properties().get(name);
+    if value.is_empty() {
+        return default;
+    }
+    value.parse().unwrap_or(default)
+}
+
+/// Get a value of the property parsed to the specified type.
+/// If the property is not found, parsing fails, or an error occurs, it returns Err.
+///
+/// # Examples
+/// ```rust,no_run
+/// use rsproperties::get_parsed;
+///
+/// let sdk_version: Result<i32, _> = get_parsed("ro.build.version.sdk");
+/// let is_debuggable: Result<bool, _> = get_parsed("ro.debuggable");
+/// let heap_size: Result<f64, _> = get_parsed("dalvik.vm.heapsize");
+/// ```
+pub fn get_parsed<T: std::str::FromStr>(name: &str) -> Result<T>
+where
+    T::Err: std::fmt::Display,
+{
+    let value = system_properties().get_with_result(name)?;
+    if value.is_empty() {
+        return Err(Error::NotFound(name.to_string()));
+    }
+    value.parse().map_err(|e| {
+        Error::Parse(format!(
+            "Failed to parse '{}' for property '{}': {}",
+            value, name, e
+        ))
+    })
+}
+
+/// Set a value of the property with string value.
 /// If an error occurs, it returns Err.
 /// It uses socket communication to set the property. Because it is designed for client applications,
-pub fn set(name: &str, value: &str) -> Result<()> {
+pub fn set_str(name: &str, value: &str) -> Result<()> {
     system_property_set::set(name, value)
+}
+
+/// Set a value of the property with any Display type.
+/// If an error occurs, it returns Err.
+/// It uses socket communication to set the property. Because it is designed for client applications,
+///
+/// # Examples
+/// ```rust,no_run
+/// use rsproperties::set;
+///
+/// set("test.int.property", &42).unwrap();
+/// set("test.bool.property", &true).unwrap();
+/// set("test.float.property", &3.14).unwrap();
+/// set("test.string.property", &"hello".to_string()).unwrap();
+/// ```
+pub fn set<T: std::fmt::Display + ?Sized>(name: &str, value: &T) -> Result<()> {
+    system_property_set::set(name, &value.to_string())
 }
 
 #[cfg(test)]
