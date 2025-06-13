@@ -355,7 +355,12 @@ where
     if value.is_empty() {
         return Err(Error::NotFound(name.to_string()));
     }
-    value.parse().map_err(|e| Error::Parse(format!("Failed to parse '{}' for property '{}': {}", value, name, e)))
+    value.parse().map_err(|e| {
+        Error::Parse(format!(
+            "Failed to parse '{}' for property '{}': {}",
+            value, name, e
+        ))
+    })
 }
 
 /// Set a value of the property with string value.
