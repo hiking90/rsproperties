@@ -59,29 +59,6 @@ if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
 }
 ```
 
-### Custom Configuration
-
-```rust
-use rsproperties::PropertyConfig;
-
-// Configure custom directories
-let config = PropertyConfig {
-    properties_dir: Some("/custom/properties".into()),
-    socket_dir: Some("/custom/socket".into()),
-};
-rsproperties::init(config);
-
-// Using the builder pattern
-let config = PropertyConfig::builder()
-    .properties_dir("/my/properties")
-    .socket_dir("/my/socket")
-    .build();
-rsproperties::init(config);
-
-// Convenience methods
-rsproperties::init(PropertyConfig::with_properties_dir("/my/props"));
-```
-
 ### Property Monitoring
 
 ```rust
@@ -211,6 +188,31 @@ fn set_app_config() -> Result<()> {
     }
     Ok(())
 }
+```
+
+### Custom Configuration
+
+> **Warning**: Do not use custom configuration on Android devices. Custom configuration is only intended for Linux environments or development/testing purposes.
+
+```rust
+use rsproperties::PropertyConfig;
+
+// Configure custom directories
+let config = PropertyConfig {
+    properties_dir: Some("/custom/properties".into()),
+    socket_dir: Some("/custom/socket".into()),
+};
+rsproperties::init(config);
+
+// Using the builder pattern
+let config = PropertyConfig::builder()
+    .properties_dir("/my/properties")
+    .socket_dir("/my/socket")
+    .build();
+rsproperties::init(config);
+
+// Convenience methods
+rsproperties::init(PropertyConfig::with_properties_dir("/my/props"));
 ```
 
 ## Platform Support

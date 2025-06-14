@@ -398,7 +398,7 @@ mod tests {
     use std::path::Path;
     use std::sync::{Mutex, MutexGuard};
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(feature = "builder", not(target_os = "android")))]
     const TEST_PROPERTY_DIR: &str = "__properties__";
 
     #[cfg(any(feature = "builder", target_os = "android"))]
