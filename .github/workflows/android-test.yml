@@ -212,6 +212,7 @@ jobs:
     - name: Build for Android (ndk_build and ndk_sync)
       run: |
         source envsetup.sh
+        cargo Clean
         ndk_build && ndk_sync
 
     - name: Copy test files and executables to Android device
