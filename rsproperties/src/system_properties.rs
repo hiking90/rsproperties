@@ -462,7 +462,9 @@ mod tests {
         let system_properties = SystemProperties::new(&Path::new(crate::PROP_DIRNAME)).unwrap();
 
         let handle = std::thread::spawn(move || {
-            let version1 = system_properties.get_with_result(VERSION_PROPERTY).unwrap_or_default();
+            let version1 = system_properties
+                .get_with_result(VERSION_PROPERTY)
+                .unwrap_or_default();
             let version2 = AndroidSystemProperties::new()
                 .get(VERSION_PROPERTY)
                 .unwrap_or_default();

@@ -45,7 +45,10 @@ fn test_get_with_default_functionality() {
     init_test();
 
     // Test with non-existent property
-    let result = rsproperties::get_or("test.nonexistent.property.12345", "default_value".to_string());
+    let result = rsproperties::get_or(
+        "test.nonexistent.property.12345",
+        "default_value".to_string(),
+    );
     assert_eq!(
         result, "default_value",
         "Should return default for non-existent property"
@@ -100,7 +103,11 @@ mod write_tests {
 
                 // Try to read the property back
                 let value: Result<String, _> = rsproperties::get("test.property.name");
-                assert_eq!(value.unwrap(), "test_value", "Read value should match written value");
+                assert_eq!(
+                    value.unwrap(),
+                    "test_value",
+                    "Read value should match written value"
+                );
                 println!("✓ Property read/write cycle successful");
             }
             Err(e) => {

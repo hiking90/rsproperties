@@ -8,9 +8,7 @@
 
 #![cfg(feature = "builder")]
 
-use rsproperties::{
-    self, build_trie, load_properties_from_file, PropertyInfoEntry,
-};
+use rsproperties::{self, build_trie, load_properties_from_file, PropertyInfoEntry};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -115,4 +113,3 @@ fn test_property_trie_building() {
         property_infos.len()
     );
 }
-

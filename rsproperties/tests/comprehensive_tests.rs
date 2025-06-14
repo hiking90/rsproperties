@@ -39,7 +39,10 @@ fn test_get_with_default_functionality() {
     ensure_init();
 
     // Test getting a property that definitely doesn't exist
-    let result = rsproperties::get_or("test.nonexistent.property.12345", "default_value".to_string());
+    let result = rsproperties::get_or(
+        "test.nonexistent.property.12345",
+        "default_value".to_string(),
+    );
     assert_eq!(
         result, "default_value",
         "Should return default value for non-existent properties"

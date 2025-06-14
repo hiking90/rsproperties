@@ -353,7 +353,7 @@ async fn test_api_contract_validation() -> anyhow::Result<()> {
     // Contract 2: get() never panics, always returns a string
     let problematic_names = [
         "non.existent.property",
-        "", // empty name
+        "",                     // empty name
         "test.non.empty.value", // Changed from test.empty.value since empty strings might not be supported
     ];
 

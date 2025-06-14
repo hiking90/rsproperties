@@ -74,8 +74,7 @@ async fn test_new_api_showcase() -> anyhow::Result<()> {
     // =================================
 
     // Get with defaults for existing properties
-    let existing_timeout: u32 =
-        rsproperties::get_or("app.config.api_timeout", 5000);
+    let existing_timeout: u32 = rsproperties::get_or("app.config.api_timeout", 5000);
     assert_eq!(existing_timeout, 30000); // Should return actual value, not default
 
     // Get with defaults for non-existent properties
@@ -84,8 +83,7 @@ async fn test_new_api_showcase() -> anyhow::Result<()> {
 
     // Get with defaults for properties with invalid format
     rsproperties::set("app.config.invalid_number", "not_a_number")?;
-    let invalid_parsed: i32 =
-        rsproperties::get_or("app.config.invalid_number", 999);
+    let invalid_parsed: i32 = rsproperties::get_or("app.config.invalid_number", 999);
     assert_eq!(invalid_parsed, 999); // Should return default when parsing fails
 
     // =================================
@@ -374,8 +372,7 @@ async fn test_complete_feature_summary() -> anyhow::Result<()> {
     // Feature 3: Safe Defaults
     println!("🛡️ Feature 3: Safe Defaults");
     let safe_int: i32 = rsproperties::get_or("demo.missing_prop", 999);
-    let safe_str: String =
-        rsproperties::get_or("demo.missing_string", "default".to_string());
+    let safe_str: String = rsproperties::get_or("demo.missing_string", "default".to_string());
 
     assert_eq!(safe_int, 999);
     assert_eq!(safe_str, "default");

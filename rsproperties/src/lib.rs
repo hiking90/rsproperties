@@ -343,9 +343,7 @@ where
     T: std::str::FromStr + Clone,
 {
     match system_properties().get_with_result(name) {
-        Ok(value) if !value.is_empty() => {
-            value.parse().unwrap_or(default)
-        }
+        Ok(value) if !value.is_empty() => value.parse().unwrap_or(default),
         _ => default,
     }
 }
@@ -561,7 +559,9 @@ mod tests {
         let properties = load_properties();
 
         for (key, value) in properties.iter() {
-            let prop_value = system_properties.get_with_result(key.as_str()).unwrap_or_default();
+            let prop_value = system_properties
+                .get_with_result(key.as_str())
+                .unwrap_or_default();
             assert_eq!(prop_value, value.as_str());
         }
     }

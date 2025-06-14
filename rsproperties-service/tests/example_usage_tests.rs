@@ -190,20 +190,17 @@ async fn example_configuration_management() -> Result<()> {
     let log_level: String = rsproperties::get("app.log.level")?;
     println!("Log level: {}", log_level);
 
-    let max_connections: i32 = rsproperties::get("app.max.connections")
-        .unwrap_or(50);
+    let max_connections: i32 = rsproperties::get("app.max.connections").unwrap_or(50);
     println!("Max connections: {}", max_connections);
 
-    let timeout: u64 = rsproperties::get("app.timeout.seconds")
-        .unwrap_or(10);
+    let timeout: u64 = rsproperties::get("app.timeout.seconds").unwrap_or(10);
     println!("Timeout: {} seconds", timeout);
 
     let experimental_enabled =
         rsproperties::get_or("app.feature.experimental", "".to_owned()).to_lowercase() == "true";
     println!("Experimental features: {}", experimental_enabled);
 
-    let cache_size: u32 = rsproperties::get("app.cache.size.mb")
-        .unwrap_or(128);
+    let cache_size: u32 = rsproperties::get("app.cache.size.mb").unwrap_or(128);
     println!("Cache size: {} MB", cache_size);
 
     // Demonstrate conditional logic based on properties
@@ -265,7 +262,8 @@ async fn example_best_practices() {
     }
 
     // ✅ Good: Always provide sensible defaults
-    let cache_enabled = rsproperties::get_or("com.myapp.feature.cache.enabled", "false".to_string());
+    let cache_enabled =
+        rsproperties::get_or("com.myapp.feature.cache.enabled", "false".to_string());
     let retry_count: u32 = rsproperties::get_or("com.myapp.network.retry.count", "1".to_string())
         .parse()
         .unwrap_or(1);
