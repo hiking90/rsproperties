@@ -34,3 +34,15 @@ android_system_properties = "0.1"
 env_logger = "0.11"
 ctrlc = "3.4"
 clap = { version = "4.0", features = ["derive"] }
+
+[profile.android-release]
+inherits = "release"
+opt-level = 3
+debug = false
+strip = "symbols"
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = 'abort'
+codegen-units = 1
+rpath = false

@@ -22,13 +22,14 @@ fi
 function ndk_build() {
     read_remote_android
 
-    # Build the main project first
-    if cargo ndk --no-strip -t $cargo_ndk_target build && cargo ndk --no-strip -t $cargo_ndk_target -- test --no-run; then
+    # Build the main project first with --release and without tests
+    # Explicitly specify no features to ensure builder is not enabled
+    if cargo ndk --no-strip -t $cargo_ndk_target build --release --no-default-features && cargo ndk --no-strip -t $cargo_ndk_target -- test --no-run; then
         echo "Main build successful, building examples..."
 
-        # Build examples from rsproperties package
+        # Build examples from rsproperties package without builder feature
         echo "Building rsproperties examples..."
-        cargo ndk --no-strip -t $cargo_ndk_target build --examples -p rsproperties
+        cargo ndk --no-strip -t $cargo_ndk_target build --examples --no-default-features -p rsproperties
 
         # Build examples from rsproperties-service package
         echo "Building rsproperties-service examples..."

@@ -460,7 +460,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "builder")]
+    #[cfg(all(feature = "builder", test))]
     fn load_properties() -> HashMap<String, String> {
         let build_prop_files = vec![
             "tests/android/product_build.prop",
@@ -482,7 +482,7 @@ mod tests {
         properties
     }
 
-    #[cfg(feature = "builder")]
+    #[cfg(all(feature = "builder", test))]
     fn system_properties_area() -> MutexGuard<'static, Option<SystemProperties>> {
         static SYSTEM_PROPERTIES: Mutex<Option<SystemProperties>> = Mutex::new(None);
         let mut system_properties_guard = SYSTEM_PROPERTIES.lock().unwrap();
@@ -493,7 +493,7 @@ mod tests {
         system_properties_guard
     }
 
-    #[cfg(feature = "builder")]
+    #[cfg(all(feature = "builder", test))]
     fn build_property_dir(dir: &str) -> SystemProperties {
         crate::init(PropertyConfig::from(PathBuf::from(dir)));
 
@@ -547,7 +547,7 @@ mod tests {
         system_properties
     }
 
-    #[cfg(feature = "builder")]
+    #[cfg(all(feature = "builder", test))]
     #[test]
     fn test_property_info() {
         enable_logger();
@@ -566,7 +566,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "builder")]
+    #[cfg(all(feature = "builder", test))]
     #[test]
     fn test_wait() {
         enable_logger();

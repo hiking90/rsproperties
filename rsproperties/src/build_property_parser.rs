@@ -124,6 +124,7 @@ pub fn load_properties_from_file(
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn test_load_properties_from_file() {
         let mut properties = HashMap::new();
