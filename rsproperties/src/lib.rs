@@ -452,7 +452,7 @@ mod tests {
 
         enable_logger();
         for prop in PROPERTIES.iter() {
-            let value1: String = get_or(prop, "".to_owned);
+            let value1: String = get_or(prop, "".to_owned());
             let value2 = AndroidSystemProperties::new().get(prop).unwrap_or_default();
 
             println!("{}: [{}], [{}]", prop, value1, value2);
