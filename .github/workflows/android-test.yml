@@ -3,15 +3,6 @@ name: Android Device Test
 on:
   workflow_dispatch:
     inputs:
-      target_device:
-        description: 'Target Android architecture'
-        required: false
-        default: 'aarch64'
-        type: choice
-        options:
-          - aarch64
-          - x86_64
-          - i686
       test_type:
         description: 'Type of tests to run'
         required: false
@@ -27,11 +18,11 @@ env:
 
 jobs:
   android-device-test:
-    name: Android Device Test (API ${{ matrix.android_api }}, ${{ github.event.inputs.target_device || 'aarch64' }})
+    name: Android Device Test (API ${{ matrix.android_api }}, aarch64)
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        android_api: ['30', '36']
+        android_api: ['30', '34']
       fail-fast: false
 
     steps:
@@ -41,12 +32,12 @@ jobs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
-        targets: ${{ github.event.inputs.target_device || 'aarch64' }}-linux-android
+        targets: aarch64-linux-android
 
     - name: Setup Android SDK
       uses: android-actions/setup-android@v3
       with:
-        packages: platform-tools platforms;android-30 platforms;android-36 ndk;26.1.10909125 system-images;android-30;google_apis;x86_64 system-images;android-36;google_apis;x86_64 emulator
+        packages: platform-tools platforms;android-30 platforms;android-34 ndk;26.1.10909125 system-images;android-30;google_apis;arm64-v8a system-images;android-34;google_apis;arm64-v8a emulator
 
     - name: Install cargo-ndk
       run: cargo install cargo-ndk
@@ -58,10 +49,10 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ runner.os }}-cargo-android-test-${{ github.event.inputs.target_device || 'aarch64' }}-api${{ matrix.android_api }}-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-android-test-aarch64-api${{ matrix.android_api }}-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-cargo-android-test-${{ github.event.inputs.target_device || 'aarch64' }}-api${{ matrix.android_api }}-
-          ${{ runner.os }}-cargo-android-test-${{ github.event.inputs.target_device || 'aarch64' }}-
+          ${{ runner.os }}-cargo-android-test-aarch64-api${{ matrix.android_api }}-
+          ${{ runner.os }}-cargo-android-test-aarch64-
           ${{ runner.os }}-cargo-android-test-
           ${{ runner.os }}-cargo-
 
@@ -72,57 +63,61 @@ jobs:
         echo "ANDROID_NDK_HOME=$ANDROID_NDK_ROOT" >> $GITHUB_ENV
         echo "TOP_DIR=$(pwd)" >> $GITHUB_ENV
         echo "PATH=$PATH:$ANDROID_HOME/tools:$ANDROID_HOME/tools/bin:$ANDROID_HOME/platform-tools" >> $GITHUB_ENV
-        echo "TARGET_ARCH=${{ github.event.inputs.target_device || 'aarch64' }}" >> $GITHUB_ENV
+        echo "TARGET_ARCH=aarch64" >> $GITHUB_ENV
         echo "TEST_TYPE=${{ github.event.inputs.test_type || 'all' }}" >> $GITHUB_ENV
         echo "ANDROID_API=${{ matrix.android_api }}" >> $GITHUB_ENV
 
     - name: Create and start Android emulator
       run: |
-        # Determine emulator system image based on target architecture
-        target_arch="${{ github.event.inputs.target_device || 'aarch64' }}"
+        # Use ARM64 emulator for aarch64 target
+        target_arch="aarch64"
         android_api="${{ matrix.android_api }}"
+        emulator_arch="arm64-v8a"
+        avd_arch="arm64-v8a"
 
-        case "$target_arch" in
-          "aarch64")
-            # For ARM64, we'll use x86_64 emulator as it's more reliable in CI
-            emulator_arch="x86_64"
-            avd_arch="x86_64"
-            ;;
-          "x86_64")
-            emulator_arch="x86_64"
-            avd_arch="x86_64"
-            ;;
-          "i686")
-            emulator_arch="x86"
-            avd_arch="x86"
-            ;;
-          *)
-            echo "Unknown target architecture: $target_arch"
-            exit 1
-            ;;
-        esac
+        avd_name="test_avd_api${android_api}_arm64"
 
-        avd_name="test_avd_api${android_api}_${avd_arch}"
+        echo "Creating ARM64 AVD: $avd_name with API $android_api"
 
-        echo "Creating AVD: $avd_name with API $android_api and arch $avd_arch"
+        # Check if the system image exists
+        if ! $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list | grep -q "system-images;android-${android_api};google_apis;arm64-v8a"; then
+          echo "❌ ERROR: ARM64 system image for API $android_api not available"
+          echo "Available system images:"
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --list | grep "system-images" | head -10
+          exit 1
+        fi
 
-        # Create AVD
-        echo "no" | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd \
+        # Create AVD with error handling
+        if ! echo "no" | $ANDROID_HOME/cmdline-tools/latest/bin/avdmanager create avd \
           -n "$avd_name" \
-          -k "system-images;android-${android_api};google_apis;${avd_arch}" \
-          --force
+          -k "system-images;android-${android_api};google_apis;arm64-v8a" \
+          --force; then
+          echo "❌ ERROR: Failed to create AVD"
+          exit 1
+        fi
 
-        # Configure AVD for better CI performance
-        echo "hw.ramSize=2048" >> ~/.android/avd/${avd_name}.avd/config.ini
-        echo "hw.heapSize=512" >> ~/.android/avd/${avd_name}.avd/config.ini
-        echo "hw.camera.back=none" >> ~/.android/avd/${avd_name}.avd/config.ini
-        echo "hw.camera.front=none" >> ~/.android/avd/${avd_name}.avd/config.ini
-        echo "hw.gps=no" >> ~/.android/avd/${avd_name}.avd/config.ini
-        echo "hw.audioInput=no" >> ~/.android/avd/${avd_name}.avd/config.ini
-        echo "hw.audioOutput=no" >> ~/.android/avd/${avd_name}.avd/config.ini
+        # Wait a moment for AVD creation to complete
+        sleep 2
+
+        # Check if config.ini exists before modifying
+        if [ -f ~/.android/avd/${avd_name}.avd/config.ini ]; then
+          echo "Configuring AVD for better CI performance..."
+          echo "hw.ramSize=2048" >> ~/.android/avd/${avd_name}.avd/config.ini
+          echo "hw.heapSize=512" >> ~/.android/avd/${avd_name}.avd/config.ini
+          echo "hw.camera.back=none" >> ~/.android/avd/${avd_name}.avd/config.ini
+          echo "hw.camera.front=none" >> ~/.android/avd/${avd_name}.avd/config.ini
+          echo "hw.gps=no" >> ~/.android/avd/${avd_name}.avd/config.ini
+          echo "hw.audioInput=no" >> ~/.android/avd/${avd_name}.avd/config.ini
+          echo "hw.audioOutput=no" >> ~/.android/avd/${avd_name}.avd/config.ini
+          echo "hw.keyboard=yes" >> ~/.android/avd/${avd_name}.avd/config.ini
+          echo "hw.gpu.enabled=yes" >> ~/.android/avd/${avd_name}.avd/config.ini
+          echo "hw.gpu.mode=swiftshader_indirect" >> ~/.android/avd/${avd_name}.avd/config.ini
+        else
+          echo "⚠️  WARNING: config.ini not found, using default settings"
+        fi
 
         # Start emulator in background
-        echo "Starting emulator: $avd_name"
+        echo "Starting ARM64 emulator: $avd_name"
         $ANDROID_HOME/emulator/emulator -avd "$avd_name" \
           -no-snapshot \
           -no-window \
@@ -132,11 +127,12 @@ jobs:
           -camera-front none \
           -gpu swiftshader_indirect \
           -memory 2048 \
-          -partition-size 4096 &
+          -partition-size 4096 \
+          -verbose &
 
         # Store emulator info for later steps
         echo "AVD_NAME=$avd_name" >> $GITHUB_ENV
-        echo "EMULATOR_ARCH=$emulator_arch" >> $GITHUB_ENV
+        echo "EMULATOR_ARCH=arm64-v8a" >> $GITHUB_ENV
 
     - name: Wait for emulator to be ready
       run: |
@@ -193,7 +189,7 @@ jobs:
     - name: Verify emulator configuration
       run: |
         device_arch=$(adb shell getprop ro.product.cpu.abi)
-        target_arch="${{ github.event.inputs.target_device || 'aarch64' }}"
+        target_arch="aarch64"
         android_api="${{ matrix.android_api }}"
         device_sdk=$(adb shell getprop ro.build.version.sdk)
 
@@ -206,8 +202,13 @@ jobs:
         echo "AVD Name: $AVD_NAME"
         echo "========================================"
 
-        # Note: For CI, we use x86_64 emulator even for ARM targets for better performance
-        # The tests will still validate the cross-compilation to the target architecture
+        # Verify we're using ARM64 emulator for ARM64 target
+        if [[ "$device_arch" == "arm64-v8a" ]]; then
+          echo "✅ Emulator architecture matches target (ARM64)"
+        else
+          echo "⚠️  WARNING: Emulator architecture ($device_arch) doesn't match target (arm64-v8a)"
+          echo "This may affect test accuracy"
+        fi
 
         # Check API level compatibility
         if [[ "$device_sdk" -ge "$android_api" ]]; then
