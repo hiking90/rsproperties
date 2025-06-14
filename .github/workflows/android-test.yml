@@ -274,9 +274,9 @@ jobs:
     - name: Run tests on Android device
       if: env.TEST_TYPE == 'all' || env.TEST_TYPE == 'unit'
       run: |
-        echo "Looking for rsproperties test executables on API level ${{ matrix.api-level }}..."
-        timeout 10 adb shell "ls -la /data/rsproperties/*rsproperties*" || echo "No rsproperties test executables found"
-        echo "Finding and running rsproperties test executables..."
+        echo "Looking for executables on API level ${{ matrix.api-level }}..."
+        timeout 10 adb shell "ls -la /data/rsproperties/" || echo "No executables found"
+        echo "Finding and running all executables in /data/rsproperties/..."
 
         # Set up test environment variables and run tests
         test_exit_code=0
@@ -290,15 +290,52 @@ jobs:
           echo 'Available files:'
           ls -la
 
-          echo 'Available test data:'
-          if [ -d 'rsproperties/tests/android' ]; then
-            echo 'Test data directory found:'
-            ls -la rsproperties/tests/android/ | head -10
+          # Test getprop command
+          if [ -f \"getprop\" ] && [ -x \"getprop\" ]; then
+            echo \"✅ Testing getprop command...\"
+            chmod +x getprop
+            echo \"Running: ./getprop ro.build.version.sdk\"
+            ./getprop ro.build.version.sdk
+            echo \"---\"
           else
-            echo 'Warning: Test data directory not found'
+            echo \"❌ getprop executable not found\"
           fi
 
+          # Test setprop command
+          if [ -f \"setprop\" ] && [ -x \"setprop\" ]; then
+            echo \"✅ Testing setprop command...\"
+            chmod +x setprop
+            echo \"Running: ./setprop debug.test.prop test_value\"
+            ./setprop debug.test.prop test_value
+            # Verify the property was set correctly
+            if [ \"\$(./getprop debug.test.prop)\" = \"test_value\" ]; then
+              echo \"✅ Property set successfully!\"
+            else
+              echo \"❌ Failed to set property or verify its value\"
+            fi
+            echo \"---\"
+          else
+            echo \"❌ setprop executable not found\"
+          fi
+
+          # Run all test executables
           test_failed=0
+          for test_file in *; do
+            if [ -f \"\$test_file\" ] && [ -x \"\$test_file\" ]; then
+              echo \"Running executable: \$test_file\"
+              chmod +x \"\$test_file\"
+              if ./\"\$test_file\"; then
+                echo \"✅ \$test_file executed successfully\"
+              else
+                echo \"❌ \$test_file failed with error code \$?\"
+                test_failed=1
+              fi
+              echo \"Finished running: \$test_file\"
+              echo \"---\"
+            fi
+          done
+
+          # Run specific tests for rsproperties executables
           for test_file in *rsproperties*; do
             if [ -f \"\$test_file\" ] && [ -x \"\$test_file\" ]; then
               echo \"Running rsproperties test: \$test_file\"
@@ -327,7 +364,7 @@ jobs:
           echo "This will be reported as a workflow failure."
           exit 1
         else
-          echo "✅ All rsproperties tests passed on Android API level ${{ matrix.api-level }}"
+          echo "✅ All tests passed on Android API level ${{ matrix.api-level }}"
         fi
 
     - name: Run integration tests

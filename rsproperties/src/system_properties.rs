@@ -475,10 +475,4 @@ mod tests {
 
         Ok(())
     }
-
-    #[cfg(feature = "builder")]
-    #[test]
-    fn test_property_update() -> Result<()> {
-        Ok(())
-    }
 }

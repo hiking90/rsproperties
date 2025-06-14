@@ -398,6 +398,7 @@ mod tests {
     use std::path::Path;
     use std::sync::{Mutex, MutexGuard};
 
+    #[cfg(not(target_os = "android"))]
     const TEST_PROPERTY_DIR: &str = "__properties__";
 
     fn enable_logger() {

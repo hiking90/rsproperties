@@ -24,16 +24,12 @@ function ndk_build() {
 
     # Build the main project first with --release and without tests
     # Explicitly specify no features to ensure builder is not enabled
-    if cargo ndk --no-strip -t $cargo_ndk_target build --release --no-default-features && cargo ndk --no-strip -t $cargo_ndk_target -- test --no-run; then
+    if cargo ndk -t $cargo_ndk_target build --no-default-features -p rsproperties && cargo ndk -t $cargo_ndk_target -- test --no-run -p rsproperties; then
         echo "Main build successful, building examples..."
 
         # Build examples from rsproperties package without builder feature
         echo "Building rsproperties examples..."
-        cargo ndk --no-strip -t $cargo_ndk_target build --examples --no-default-features -p rsproperties
-
-        # Build examples from rsproperties-service package
-        echo "Building rsproperties-service examples..."
-        cargo ndk --no-strip -t $cargo_ndk_target build --examples -p rsproperties-service
+        cargo ndk -t $cargo_ndk_target build --examples -p rsproperties
 
         echo "All builds completed successfully!"
     else

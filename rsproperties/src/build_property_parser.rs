@@ -122,6 +122,7 @@ pub fn load_properties_from_file(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "android"))]
     use super::*;
 
     #[cfg(not(target_os = "android"))]
