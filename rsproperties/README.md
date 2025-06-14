@@ -23,7 +23,7 @@ Add `rsproperties` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rsproperties = "0.1"
+rsproperties = "0.2"
 
 # Optional features
 [features]
@@ -36,14 +36,15 @@ builder = ["rsproperties/builder"]  # Enable property database building
 use rsproperties;
 
 // Get property with default value (no initialization needed for default configuration)
-let sdk_version = rsproperties::get_with_default("ro.build.version.sdk", "0");
+let sdk_version: String = rsproperties::get_or("ro.build.version.sdk", "0".to_string());
 println!("SDK Version: {}", sdk_version);
 
-// Get property (returns empty string if not found)
-let device_name = rsproperties::get("ro.product.device");
+// Get property with type parsing and default fallback
+let sdk_version: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
+let is_debuggable: bool = rsproperties::get_or("ro.debuggable", false);
 
 // Get property with error handling
-match rsproperties::get_with_result("ro.build.version.release") {
+match rsproperties::get::<String>("ro.build.version.release") {
     Ok(version) => println!("Android Version: {}", version),
     Err(e) => eprintln!("Failed to get version: {}", e),
 }
@@ -101,6 +102,20 @@ std::thread::spawn(|| {
         }
     }
 });
+
+// Monitor multiple properties
+let monitored_props = vec![
+    "sys.boot_completed",
+    "dev.bootcomplete",
+    "service.bootanim.exit"
+];
+
+for prop_name in monitored_props {
+    match system_properties.get_with_result(prop_name) {
+        Ok(value) => println!("{}: {}", prop_name, value),
+        Err(_) => println!("{}: <not set>", prop_name),
+    }
+}
 ```
 
 ### Setting Properties
@@ -168,12 +183,7 @@ fn handle_property_operation() -> Result<()> {
         Ok(_) => println!("Property set successfully"),
         Err(e) => {
             eprintln!("Failed to set property: {}", e);
-            // Handle specific error conditions
-            if e.to_string().contains("Permission denied") {
-                eprintln!("Insufficient permissions to set this property");
-            } else if e.to_string().contains("Read-only") {
-                eprintln!("Cannot modify read-only property");
-            }
+            // Error provides context and location information
         }
     }
     Ok(())
@@ -220,27 +230,37 @@ fn set_app_config() -> Result<()> {
 
 - `PropertyConfig` - Configuration for property system initialization
 - `PropertyConfig::builder()` - Builder pattern for configuration
+- `PropertyConfig::with_properties_dir()` - Create config with only properties directory
+- `PropertyConfig::with_socket_dir()` - Create config with only socket directory
+- `PropertyConfig::with_both_dirs()` - Create config with both directories
 - `init(config)` - Initialize the property system
 
 ### Property Operations
 
-- `get(name)` - Get property value (returns empty string if not found)
-- `get_with_default(name, default)` - Get property with default value
-- `get_with_result(name)` - Get property with error handling
-- `set(name, value)` - Set property value (requires property service)
+- `get<T>(name)` - Get property value parsed to specified type (returns Err if not found)
+- `get_or<T>(name, default)` - Get property with default fallback (never fails)
+- `set<T>(name, value)` - Set property value (requires property service)
 
 ### System Properties
 
 - `system_properties()` - Get global SystemProperties instance
+- `properties_dir()` - Get the configured properties directory
+- `SystemProperties::get_with_result(name)` - Get property with error handling
 - `SystemProperties::find(name)` - Find property index by name
 - `SystemProperties::wait_any()` - Wait for any property change
 - `SystemProperties::wait(index, timeout)` - Wait for specific property change
+
+### Socket Configuration
+
+- `socket_dir()` - Get the configured socket directory for property service
+- Socket directory priority: `set_socket_dir()` > `PROPERTY_SERVICE_SOCKET_DIR` env var > `/dev/socket`
 
 ### Advanced Features (with `builder` feature)
 
 - `SystemProperties::new_area(dir)` - Create new property area
 - `SystemProperties::add(name, value)` - Add new property
 - `SystemProperties::update(index, value)` - Update existing property
+- `SystemProperties::set(name, value)` - Set property (create or update)
 - `load_properties_from_file()` - Load properties from build.prop files
 
 ## Thread Safety
@@ -254,7 +274,7 @@ use std::thread;
 let handles: Vec<_> = (0..10).map(|i| {
     thread::spawn(move || {
         let prop_name = format!("debug.thread.{}", i);
-        let value = rsproperties::get_with_default(&prop_name, "default");
+        let value: String = rsproperties::get_or(&prop_name, "default".to_string());
         println!("Thread {}: {} = {}", i, prop_name, value);
     })
 }).collect();
@@ -262,6 +282,49 @@ let handles: Vec<_> = (0..10).map(|i| {
 for handle in handles {
     handle.join().unwrap();
 }
+```
+
+### Building Property Databases (with `builder` feature)
+
+```rust
+#[cfg(feature = "builder")]
+use rsproperties::{load_properties_from_file, SystemProperties};
+use std::collections::HashMap;
+use std::path::Path;
+
+// Load properties from Android build.prop files
+let mut properties = HashMap::new();
+load_properties_from_file(
+    Path::new("system_build.prop"),
+    None,
+    "u:r:init:s0",
+    &mut properties
+)?;
+
+// Create a system properties area for testing or service
+let mut system_properties = SystemProperties::new_area(Path::new("./test_props"))?;
+
+// Add loaded properties to the area
+for (key, value) in properties {
+    system_properties.add(&key, &value)?;
+}
+
+// Now properties can be read normally
+let sdk_version: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
+```
+
+## Constants
+
+The library exposes Android-compatible constants:
+
+```rust
+use rsproperties::{PROP_VALUE_MAX, PROP_DIRNAME};
+
+// Maximum property value length (92 bytes for most properties)
+assert_eq!(PROP_VALUE_MAX, 92);
+
+// Default Android properties directory
+assert_eq!(PROP_DIRNAME, "/dev/__properties__");
 ```
 
 ## Performance
@@ -273,10 +336,19 @@ for handle in handles {
 
 ## Examples
 
-The crate includes command-line tools demonstrating usage:
+The crate includes Android-compatible command-line tools:
 
-- `getprop.rs` - Android-compatible property getter
-- `setprop.rs` - Android-compatible property setter
+- **`getprop.rs`** - Android-compatible property getter with support for custom directories
+- **`setprop.rs`** - Android-compatible property setter with validation and error handling
+
+Run examples with:
+```bash
+# Get a property with default value
+cargo run --example getprop ro.build.version.sdk 0
+
+# Set a property
+cargo run --example setprop debug.my_app.test true
+```
 
 ## Related Crates
 
