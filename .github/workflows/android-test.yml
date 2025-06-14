@@ -3,15 +3,6 @@ name: Android Test (Multiple API Levels)
 on:
   workflow_dispatch:
     inputs:
-      test_type:
-        description: 'Type of tests to run'
-        required: false
-        default: 'all'
-        type: choice
-        options:
-          - all
-          - integration
-          - unit
       run_tests:
         description: 'Run Android tests'
         required: true
@@ -106,7 +97,6 @@ jobs:
         echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
         echo "TARGET_ARCH=aarch64" >> $GITHUB_ENV
         echo "EMULATOR_ARCH=x86_64" >> $GITHUB_ENV
-        echo "TEST_TYPE=${{ github.event.inputs.test_type || 'all' }}" >> $GITHUB_ENV
         echo "ANDROID_API=${{ matrix.api-level }}" >> $GITHUB_ENV
 
     - name: Create AVD
@@ -272,7 +262,6 @@ jobs:
         fi
 
     - name: Run tests on Android device
-      if: env.TEST_TYPE == 'all' || env.TEST_TYPE == 'unit'
       run: |
         echo "Looking for executables on API level ${{ matrix.api-level }}..."
         timeout 10 adb shell "ls -la /data/rsproperties/" || echo "No executables found"
@@ -368,7 +357,6 @@ jobs:
         fi
 
     - name: Run integration tests
-      if: env.TEST_TYPE == 'all' || env.TEST_TYPE == 'integration'
       run: |
         echo "Running rsproperties integration tests on Android emulator (API ${{ matrix.api-level }})..."
 
@@ -404,7 +392,6 @@ jobs:
         echo "rsproperties Test Configuration Summary:"
         echo "Target API level: $ANDROID_API"
         echo "Target build architecture: $TARGET_ARCH"
-        echo "Test type: $TEST_TYPE"
         echo "Test scope: rsproperties package only"
         echo "Test environment: Android Emulator"
         echo "========================================"
