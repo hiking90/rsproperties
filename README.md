@@ -47,14 +47,15 @@ builder = ["rsproperties/builder"]  # Enable property database building
 use rsproperties;
 
 // Get property with default value (no initialization needed for default configuration)
-let sdk_version = rsproperties::get_with_default("ro.build.version.sdk", "0");
+let sdk_version: String = rsproperties::get_or("ro.build.version.sdk", "0".to_string());
 println!("SDK Version: {}", sdk_version);
 
-// Get property (returns empty string if not found)
-let device_name = rsproperties::get("ro.product.device");
+// Get property with type parsing and default fallback
+let sdk_version: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
+let is_debuggable: bool = rsproperties::get_or("ro.debuggable", false);
 
 // Get property with error handling
-match rsproperties::get_with_result("ro.build.version.release") {
+match rsproperties::get::<String>("ro.build.version.release") {
     Ok(version) => println!("Android Version: {}", version),
     Err(e) => eprintln!("Failed to get version: {}", e),
 }
@@ -120,8 +121,10 @@ let monitored_props = vec![
 ];
 
 for prop_name in monitored_props {
-    let current_value = system_properties.get(prop_name);
-    println!("{}: {}", prop_name, current_value);
+    match system_properties.get_with_result(prop_name) {
+        Ok(value) => println!("{}: {}", prop_name, value),
+        Err(_) => println!("{}: <not set>", prop_name),
+    }
 }
 ```
 
