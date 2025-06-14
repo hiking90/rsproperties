@@ -18,19 +18,6 @@
 //! ```rust,no_run
 //! #[cfg(target_os = "android")]
 //! {
-//!     use rsproperties::{init, PropertyConfig};
-//!     use std::path::PathBuf;
-//!
-//!     // Initialize with defaults
-//!     rsproperties::init(PropertyConfig::default());
-//!
-//!     // Initialize with custom directories
-//!     let config = PropertyConfig {
-//!         properties_dir: Some(PathBuf::from("/custom/properties")),
-//!         socket_dir: Some(PathBuf::from("/custom/socket")),
-//!     };
-//!     rsproperties::init(config);
-//!
 //!     // Get a value of the property.
 //!     let value: String = rsproperties::get_or("ro.build.version.sdk", "0".to_owned());
 //!     println!("ro.build.version.sdk: {}", value);
