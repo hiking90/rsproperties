@@ -100,6 +100,7 @@ function ndk_prepare() {
         echo "Directory does not exist, creating: $remote_directory"
         adb shell mkdir -p $remote_directory
     fi
+    adb shell "rm -rf $remote_directory/*"
 }
 
 function version_update() {
