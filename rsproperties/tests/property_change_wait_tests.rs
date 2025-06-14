@@ -47,7 +47,7 @@ fn test_wait_for_property_change() {
                 Ok(value) => {
                     assert_eq!(value, initial_value);
                     println!("✓ Initial property value verified: '{}'", value);
-                },
+                }
                 Err(e) => {
                     panic!("Failed to get property after setting: {}", e);
                 }
@@ -80,17 +80,21 @@ fn test_wait_for_property_change() {
                         match system_properties.wait(Some(&index), None) {
                             Some(_serial) => {
                                 // Wait completed successfully
-                                let new_value = rsproperties::get::<String>(&prop_name).unwrap_or_default();
-                                println!("Waiter thread: Property change detected! New value: '{}'", new_value);
+                                let new_value =
+                                    rsproperties::get::<String>(&prop_name).unwrap_or_default();
+                                println!(
+                                    "Waiter thread: Property change detected! New value: '{}'",
+                                    new_value
+                                );
                                 assert_eq!(new_value, changed_value);
                                 true
-                            },
+                            }
                             None => {
                                 println!("Waiter thread: Wait failed or timed out");
                                 false
                             }
                         }
-                    },
+                    }
                     None => {
                         println!("Waiter thread: Could not find property index");
                         barrier_clone.wait(); // Make sure we don't block the test
@@ -110,7 +114,7 @@ fn test_wait_for_property_change() {
             match rsproperties::set(test_prop, changed_value) {
                 Ok(_) => {
                     println!("Main thread: Changed property value to '{}'", changed_value);
-                },
+                }
                 Err(e) => {
                     println!("Main thread: Failed to change property: {}", e);
                 }
@@ -125,7 +129,7 @@ fn test_wait_for_property_change() {
 
             assert!(wait_succeeded, "Property change wait should have succeeded");
             println!("✓ Property change wait test passed");
-        },
+        }
         Err(e) => {
             println!("⚠ Initial property set failed: {}", e);
             println!("This is expected if not running on Android");
@@ -179,7 +183,7 @@ fn test_wait_for_any_property_change() {
     match rsproperties::set(test_prop, changed_value) {
         Ok(_) => {
             println!("Main thread: Set property to '{}'", changed_value);
-        },
+        }
         Err(e) => {
             println!("Main thread: Failed to change property: {}", e);
         }
@@ -194,7 +198,10 @@ fn test_wait_for_any_property_change() {
     if final_value == changed_value {
         println!("✓ Property value verified: '{}'", final_value);
     } else {
-        println!("⚠ Property value unexpected: '{}' (expected '{}')", final_value, changed_value);
+        println!(
+            "⚠ Property value unexpected: '{}' (expected '{}')",
+            final_value, changed_value
+        );
     }
 
     assert!(wait_succeeded, "Property change wait should have succeeded");
