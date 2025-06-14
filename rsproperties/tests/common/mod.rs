@@ -11,6 +11,7 @@ static INIT: Once = Once::new();
 
 #[allow(dead_code)]
 pub fn init_test() {
+    #[cfg(not(target_os = "android"))]
     INIT.call_once(|| {
         let properties_dir = PathBuf::from_str(TEST_PROPERTIES_DIR)
             .expect("Failed to parse properties directory path");

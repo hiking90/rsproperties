@@ -12,6 +12,7 @@ use std::sync::Once;
 static INIT_ONCE: Once = Once::new();
 
 fn ensure_init() {
+    #[cfg(not(target_os = "android"))]
     INIT_ONCE.call_once(|| {
         // Initialize with the existing __properties__ directory
         let props_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("__properties__");
@@ -172,7 +173,7 @@ fn test_thread_safety() {
                 let prop_name = format!("test.thread.{}.{}", i, j);
 
                 // Test get_or
-                let _result = rsproperties::get_or(&prop_name, "default".to_string());
+                let _result: String = rsproperties::get_or(&prop_name, "default".to_string());
                 counter_clone.fetch_add(1, Ordering::SeqCst);
 
                 // Test get (which will likely fail)

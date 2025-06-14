@@ -141,3 +141,136 @@ function update_cargo_lock() {
         return 1
     fi
 }
+
+function ndk_test() {
+    read_remote_android
+    echo "Copying test data files first..."
+
+    # Copy test data files (Android property files needed by tests)
+    if [ -d "$TOP_DIR/rsproperties/tests/android" ]; then
+        echo "Creating test data directory on device..."
+        adb shell "mkdir -p $remote_directory/rsproperties/tests"
+        echo "Copying Android test data files..."
+        adb push "$TOP_DIR/rsproperties/tests/android" "$remote_directory/rsproperties/tests/"
+        echo "Test data files copied successfully"
+    else
+        echo "Warning: rsproperties/tests/android directory not found"
+    fi
+
+    # Copy property info files from __properties__ directory
+    if [ -d "$TOP_DIR/rsproperties/__properties__" ]; then
+        echo "Creating properties directory on device..."
+        adb shell "mkdir -p $remote_directory/rsproperties"
+        echo "Copying property info files..."
+        adb push "$TOP_DIR/rsproperties/__properties__" "$remote_directory/rsproperties/"
+        echo "Property info files copied successfully"
+    fi
+
+    echo "Copying test executables from deps directory..."
+    deps_directory="$source_directory/deps"
+    if [ -d "$deps_directory" ]; then
+        echo "Found deps directory: $deps_directory"
+        echo "Looking for rsproperties test executables..."
+        find "$deps_directory" -name "*rsproperties*" -type f -executable | grep -E "(test|spec)" | while read test_file; do
+            echo "Copying test file: $test_file"
+            adb push "$test_file" "$remote_directory/"
+        done
+        echo "Test executable copy completed"
+    else
+        echo "deps directory not found: $deps_directory"
+        echo "Looking for test binaries in alternative locations..."
+        find "$TOP_DIR/target" -name "*rsproperties*" -type f -executable | grep -E "(test|spec)" | head -5 | while read test_file; do
+            echo "Found alternative test file: $test_file"
+            adb push "$test_file" "$remote_directory/"
+        done
+    fi
+
+    # Copy basic executables, made executable and copy getprop/setprop
+    find "$source_directory" -name "getprop" -o -name "setprop" | while read basic_file; do
+        echo "Copying basic executable: $basic_file"
+        adb push "$basic_file" "$remote_directory/"
+    done
+
+    echo "Test files and executables copied to Android device"
+    echo "Running tests on Android device..."
+    adb shell "
+            cd $remote_directory
+            export RUST_BACKTRACE=1
+            export RUST_LOG=debug
+
+            echo 'Test environment setup:'
+            echo 'Working directory: \$(pwd)'
+            echo 'Available files:'
+            ls -la
+
+            # Test getprop command
+            if [ -f \"getprop\" ] && [ -x \"getprop\" ]; then
+                echo \"✅ Testing getprop command...\"
+                chmod +x getprop
+                echo \"Running: ./getprop ro.build.version.sdk\"
+                ./getprop ro.build.version.sdk || { echo \"❌ getprop command failed\"; exit 1; }
+                echo \"---\"
+            else
+                echo \"❌ getprop executable not found\"
+                exit 1
+            fi
+
+            # Test setprop command
+            if [ -f \"setprop\" ] && [ -x \"setprop\" ]; then
+                echo \"✅ Testing setprop command...\"
+                chmod +x setprop
+                echo \"Running: ./setprop debug.test.prop test_value\"
+                ./setprop debug.test.prop test_value || { echo \"❌ setprop command failed\"; exit 1; }
+                # Verify the property was set correctly
+                if [ \"\$(./getprop debug.test.prop)\" = \"test_value\" ]; then
+                    echo \"✅ Property set successfully!\"
+                else
+                    echo \"❌ Failed to set property or verify its value\"
+                    exit 1
+                fi
+                echo \"---\"
+            else
+                echo \"❌ setprop executable not found\"
+                exit 1
+            fi
+
+            # Run all test executables except those starting with getprop or setprop
+            for test_file in *; do
+                if [ -f \"\$test_file\" ] && [ -x \"\$test_file\" ] && [[ \"\$test_file\" != getprop* ]] && [[ \"\$test_file\" != setprop* ]]; then
+                    echo \"Running executable: \$test_file\"
+                    chmod +x \"\$test_file\"
+                    if ./\"\$test_file\"; then
+                        echo \"✅ \$test_file executed successfully\"
+                    else
+                        echo \"❌ \$test_file failed with error code \$?\"
+                        exit 1
+                    fi
+                    echo \"Finished running: \$test_file\"
+                    echo \"---\"
+                fi
+            done            # Run specific tests for rsproperties executables (excluding getprop/setprop)
+            for test_file in *rsproperties*; do
+                if [ -f \"\$test_file\" ] && [ -x \"\$test_file\" ] && [[ \"\$test_file\" != getprop* ]] && [[ \"\$test_file\" != setprop* ]]; then
+                    echo \"Running rsproperties test: \$test_file\"
+                    chmod +x \"\$test_file\"
+                    if ./\"\$test_file\" --test-threads=1; then
+                        echo \"✅ Test \$test_file PASSED\"
+                    else
+                        echo \"❌ Test \$test_file FAILED\"
+                        exit 1
+                    fi
+                    echo \"Finished running: \$test_file\"
+                    echo \"---\"
+                fi
+            done
+
+            echo '✅ All tests passed!'
+        "
+        test_exit_code=$?
+        if [ $test_exit_code -ne 0 ]; then
+            echo "❌ Tests failed with exit code: $test_exit_code"
+        else
+            echo "✅ All tests passed on Android device"
+        fi
+    # No else block needed as tests always run
+}

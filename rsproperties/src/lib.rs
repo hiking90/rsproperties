@@ -401,6 +401,7 @@ mod tests {
     #[cfg(not(target_os = "android"))]
     const TEST_PROPERTY_DIR: &str = "__properties__";
 
+    #[cfg(any(feature = "builder", target_os = "android"))]
     fn enable_logger() {
         let _ = env_logger::builder().is_test(true).try_init();
     }
