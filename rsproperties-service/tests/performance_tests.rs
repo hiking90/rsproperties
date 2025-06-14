@@ -43,7 +43,7 @@ async fn test_property_get_performance() -> Result<()> {
 
     for i in 0..iterations {
         let prop_name = &test_props[i % test_props.len()].0;
-        let _value = rsproperties::get(prop_name);
+        let _value: String = rsproperties::get(prop_name).unwrap_or_default();
     }
 
     let elapsed = start.elapsed();
@@ -70,7 +70,7 @@ async fn test_property_get_performance() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_property_get_with_default_performance() -> Result<()> {
+async fn test_property_get_or_performance() -> Result<()> {
     setup_perf_test_env().await;
 
     // Test both existing and non-existing properties
@@ -81,18 +81,18 @@ async fn test_property_get_with_default_performance() -> Result<()> {
     // Test existing property performance
     let start = Instant::now();
     for _ in 0..iterations {
-        let _value = rsproperties::get_with_default("existing.perf.prop", "default");
+        let _value = rsproperties::get_or("existing.perf.prop", "default".to_string());
     }
     let existing_elapsed = start.elapsed();
 
     // Test non-existing property performance
     let start = Instant::now();
     for _ in 0..iterations {
-        let _value = rsproperties::get_with_default("nonexistent.perf.prop", "default");
+        let _value = rsproperties::get_or("nonexistent.perf.prop", "default".to_string());
     }
     let nonexistent_elapsed = start.elapsed();
 
-    println!("get_with_default performance:");
+    println!("get_or performance:");
     println!(
         "  Existing property: {} ops in {:?} ({:?} avg)",
         iterations,
@@ -165,7 +165,7 @@ async fn test_large_property_values() -> Result<()> {
         let set_time = start.elapsed();
 
         let start = Instant::now();
-        let retrieved = rsproperties::get(&prop_name);
+        let retrieved: String = rsproperties::get(&prop_name)?;
         let get_time = start.elapsed();
 
         assert_eq!(retrieved, large_value);
@@ -207,7 +207,7 @@ async fn test_concurrent_reads() -> Result<()> {
                 for i in 0..reads_per_thread {
                     let prop_name = format!("concurrent.read.prop.{}", i % num_props);
                     let expected = format!("value_{}", i % num_props);
-                    let value = rsproperties::get(&prop_name);
+                    let value: String = rsproperties::get(&prop_name).unwrap_or_default();
                     assert_eq!(value, expected, "Failed to get property {}", prop_name);
                 }
                 let elapsed = start.elapsed();
@@ -280,7 +280,7 @@ async fn test_concurrent_writes() -> Result<()> {
         for i in 0..writes_per_thread {
             let prop_name = format!("concurrent.write.{}.prop.{}", thread_id, i);
             let expected = format!("thread_{}_value_{}", thread_id, i);
-            let value = rsproperties::get(&prop_name);
+            let value: String = rsproperties::get(&prop_name).unwrap_or_default();
             assert_eq!(value, expected);
         }
     }
@@ -327,7 +327,7 @@ async fn test_mixed_read_write_workload() -> Result<()> {
                     } else {
                         // Read operation
                         let prop_name = format!("mixed.initial.prop.{}", i % 50);
-                        let _value = rsproperties::get(&prop_name);
+                        let _value: String = rsproperties::get(&prop_name).unwrap_or_default();
                     }
                 }
                 let elapsed = start.elapsed();
@@ -377,7 +377,7 @@ async fn test_property_name_patterns() -> Result<()> {
         // Measure get performance for this pattern
         let start = Instant::now();
         for _ in 0..iterations {
-            let _value = rsproperties::get(prop_name);
+            let _value: String = rsproperties::get(prop_name).unwrap_or_default();
         }
         let elapsed = start.elapsed();
 
@@ -390,7 +390,7 @@ async fn test_property_name_patterns() -> Result<()> {
         );
 
         // Verify correctness
-        let retrieved = rsproperties::get(prop_name);
+        let retrieved: String = rsproperties::get(prop_name)?;
         assert_eq!(retrieved, *prop_value);
     }
 

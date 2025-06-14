@@ -22,7 +22,7 @@
 //!     use std::path::PathBuf;
 //!
 //!     // Initialize with defaults
-//!     rsproperties::init(None);
+//!     rsproperties::init(PropertyConfig::default());
 //!
 //!     // Initialize with custom directories
 //!     let config = PropertyConfig {
@@ -32,11 +32,14 @@
 //!     rsproperties::init(config);
 //!
 //!     // Get a value of the property.
-//!     let value = rsproperties::get_with_default("ro.build.version.sdk", "0");
+//!     let value: String = rsproperties::get_or("ro.build.version.sdk", "0");
 //!     println!("ro.build.version.sdk: {}", value);
 //!
-//!     // Set a value of the property.
+//!     // Set a value of the property - use string literals for compatibility
 //!     rsproperties::set("test.property", "test.value").unwrap();
+//!
+//!     // For Android system properties, prefer string format used by the system
+//!     rsproperties::set("ro.debuggable", "1").unwrap();  // Not &true
 //! }
 //! ```
 
@@ -295,66 +298,27 @@ pub(crate) fn bionic_align(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & !(alignment - 1)
 }
 
-/// Get a value of the property as string.
-/// If the property is not found, it returns the default value.
-/// If an error occurs, it returns the default value.
-pub fn get_with_default(name: &str, default: &str) -> String {
-    system_properties().get_with_default(name, default)
-}
-
-/// Get a value of the property as string.
-/// If the property is not found, it returns an empty string.
-/// If an error occurs, it returns Err.
-pub fn get(name: &str) -> String {
-    system_properties().get(name)
-}
-
-/// Get a value of the property as string with Result.
-/// If the property is not found, it returns an empty string.
-/// If an error occurs, it returns Err.
-pub fn get_with_result(name: &str) -> Result<String> {
-    system_properties().get_with_result(name)
-}
-
-/// Get a value of the property parsed to the specified type.
-/// If the property is not found, it returns the default value.
-/// If an error occurs or parsing fails, it returns the default value.
+/// Get a property value parsed to specified type
+/// Returns Err if property not found, system error, or parse error occurs
 ///
 /// # Examples
 /// ```rust,no_run
-/// use rsproperties::get_parsed_with_default;
+/// use rsproperties::get;
 ///
-/// let sdk_version: i32 = get_parsed_with_default("ro.build.version.sdk", 0);
-/// let is_debuggable: bool = get_parsed_with_default("ro.debuggable", false);
-/// let heap_size: f64 = get_parsed_with_default("dalvik.vm.heapsize", 64.0);
+/// let sdk_version: i32 = get("ro.build.version.sdk").unwrap();
+/// let is_debuggable: bool = get("ro.debuggable").unwrap();
+/// let version: String = get("ro.build.version.release").unwrap();
+///
+/// // With fallback
+/// let sdk_version: i32 = get("ro.build.version.sdk").unwrap_or(0);
+/// let version: String = get("ro.build.version.release").unwrap_or_default();
 /// ```
-pub fn get_parsed_with_default<T: std::str::FromStr>(name: &str, default: T) -> T {
-    let value = system_properties().get(name);
-    if value.is_empty() {
-        return default;
-    }
-    value.parse().unwrap_or(default)
-}
-
-/// Get a value of the property parsed to the specified type.
-/// If the property is not found, parsing fails, or an error occurs, it returns Err.
-///
-/// # Examples
-/// ```rust,no_run
-/// use rsproperties::get_parsed;
-///
-/// let sdk_version: Result<i32, _> = get_parsed("ro.build.version.sdk");
-/// let is_debuggable: Result<bool, _> = get_parsed("ro.debuggable");
-/// let heap_size: Result<f64, _> = get_parsed("dalvik.vm.heapsize");
-/// ```
-pub fn get_parsed<T: std::str::FromStr>(name: &str) -> Result<T>
+pub fn get<T>(name: &str) -> Result<T>
 where
+    T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
     let value = system_properties().get_with_result(name)?;
-    if value.is_empty() {
-        return Err(Error::NotFound(name.to_string()));
-    }
     value.parse().map_err(|e| {
         Error::Parse(format!(
             "Failed to parse '{}' for property '{}': {}",
@@ -363,26 +327,61 @@ where
     })
 }
 
-/// Set a value of the property with string value.
-/// If an error occurs, it returns Err.
-/// It uses socket communication to set the property. Because it is designed for client applications,
-pub fn set_str(name: &str, value: &str) -> Result<()> {
-    system_property_set::set(name, value)
+/// Get a property value with default fallback
+/// Never fails - always returns a valid value
+///
+/// # Examples
+/// ```rust,no_run
+/// use rsproperties::get_or;
+///
+/// let sdk_version: i32 = get_or("ro.build.version.sdk", 0);
+/// let is_debuggable: bool = get_or("ro.debuggable", false);
+/// let version: String = get_or("ro.build.version.release", "unknown".to_owned());
+/// ```
+pub fn get_or<T>(name: &str, default: T) -> T
+where
+    T: std::str::FromStr + Clone,
+{
+    match system_properties().get_with_result(name) {
+        Ok(value) if !value.is_empty() => value.parse().unwrap_or(default),
+        _ => default,
+    }
 }
 
 /// Set a value of the property with any Display type.
+///
+/// **Important**: All values are converted to strings using the `Display` trait before being stored.
+/// This means that when reading properties set by other applications or systems, you should be aware
+/// of potential format differences. For example:
+/// - Boolean values are stored as "true"/"false" (Rust format)
+/// - Numbers may have different precision or formatting
+/// - Different applications may use different string representations for the same logical value
+///
+/// For maximum compatibility with existing Android properties, consider using string literals
+/// when setting well-known system properties that may be read by other applications.
+///
 /// If an error occurs, it returns Err.
-/// It uses socket communication to set the property. Because it is designed for client applications,
+/// It uses socket communication to set the property. Because it is designed for client applications.
 ///
 /// # Examples
 /// ```rust,no_run
 /// use rsproperties::set;
 ///
-/// set("test.int.property", &42).unwrap();
-/// set("test.bool.property", &true).unwrap();
-/// set("test.float.property", &3.14).unwrap();
-/// set("test.string.property", &"hello".to_string()).unwrap();
+/// // Setting various types (all converted to strings)
+/// set("test.int.property", &42).unwrap();           // Stored as "42"
+/// set("test.bool.property", &true).unwrap();        // Stored as "true"
+/// set("test.float.property", &3.14).unwrap();       // Stored as "3.14"
+/// set("test.string.property", &"hello").unwrap();   // Stored as "hello"
+///
+/// // For Android system properties, prefer string literals for compatibility
+/// set("ro.debuggable", "1").unwrap();               // Better than set("ro.debuggable", &1)
+/// set("persist.sys.timezone", "Asia/Seoul").unwrap();
 /// ```
+///
+/// # Compatibility Notes
+/// - Android system properties typically use "0"/"1" for boolean values, not "true"/"false"
+/// - Numeric properties may have specific formatting requirements
+/// - Always test compatibility when setting properties that will be read by other applications
 pub fn set<T: std::fmt::Display + ?Sized>(name: &str, value: &T) -> Result<()> {
     system_property_set::set(name, &value.to_string())
 }
@@ -453,7 +452,7 @@ mod tests {
 
         enable_logger();
         for prop in PROPERTIES.iter() {
-            let value1 = get_with_default(prop, "");
+            let value1: String = get_or(prop, "");
             let value2 = AndroidSystemProperties::new().get(prop).unwrap_or_default();
 
             println!("{}: [{}], [{}]", prop, value1, value2);
@@ -560,7 +559,9 @@ mod tests {
         let properties = load_properties();
 
         for (key, value) in properties.iter() {
-            let prop_value = system_properties.get(key.as_str());
+            let prop_value = system_properties
+                .get_with_result(key.as_str())
+                .unwrap_or_default();
             assert_eq!(prop_value, value.as_str());
         }
     }

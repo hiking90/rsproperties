@@ -22,8 +22,8 @@ fn test_basic_functionality() {
     // Initialize with the existing __properties__ directory
     init_test();
 
-    // Test get_with_default
-    let result = rsproperties::get_with_default("test.nonexistent", "default");
+    // Test get_or
+    let result = rsproperties::get_or("test.nonexistent", "default".to_string());
     assert_eq!(result, "default");
 
     println!("Basic functionality test passed");
