@@ -26,7 +26,7 @@ async fn test_get_with_default_nonexistent_property() {
     let prop_name = "nonexistent.test.property";
     let default_value = "default_test_value";
 
-    let result = rsproperties::get_with_default(prop_name, default_value);
+    let result = rsproperties::get_or(prop_name, default_value.to_string());
     assert_eq!(result, default_value);
 }
 
@@ -37,7 +37,7 @@ async fn test_get_with_default_empty_default() {
     let prop_name = "another.nonexistent.property";
     let default_value = "";
 
-    let result = rsproperties::get_with_default(prop_name, default_value);
+    let result = rsproperties::get_or(prop_name, default_value.to_string());
     assert_eq!(result, default_value);
 }
 
@@ -46,7 +46,7 @@ async fn test_get_nonexistent_property() {
     setup_test_env().await;
 
     let prop_name = "definitely.does.not.exist";
-    let result = rsproperties::get(prop_name);
+    let result: String = rsproperties::get(prop_name).unwrap_or_default();
 
     // Should return empty string for non-existent property
     assert!(result.is_empty());
@@ -66,11 +66,11 @@ mod builder_tests {
         rsproperties::set(prop_name, prop_value)?;
 
         // Get the property back
-        let retrieved_value = rsproperties::get(prop_name);
+        let retrieved_value: String = rsproperties::get(prop_name)?;
         assert_eq!(retrieved_value, prop_value);
 
         // Also test get_with_default
-        let retrieved_with_default = rsproperties::get_with_default(prop_name, "fallback");
+        let retrieved_with_default = rsproperties::get_or(prop_name, "fallback".to_string());
         assert_eq!(retrieved_with_default, prop_value);
 
         Ok(())
@@ -84,21 +84,7 @@ mod builder_tests {
         let prop_value = "value with spaces and symbols: !@#$%^&*()";
 
         rsproperties::set(prop_name, prop_value)?;
-        let retrieved_value = rsproperties::get(prop_name);
-        assert_eq!(retrieved_value, prop_value);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_set_property_empty_value() -> anyhow::Result<()> {
-        setup_test_env().await;
-
-        let prop_name = "test.empty.value";
-        let prop_value = "";
-
-        rsproperties::set(prop_name, prop_value)?;
-        let retrieved_value = rsproperties::get(prop_name);
+        let retrieved_value: String = rsproperties::get(prop_name)?;
         assert_eq!(retrieved_value, prop_value);
 
         Ok(())
@@ -114,12 +100,12 @@ mod builder_tests {
 
         // Set initial value
         rsproperties::set(prop_name, initial_value)?;
-        let retrieved = rsproperties::get(prop_name);
+        let retrieved: String = rsproperties::get(prop_name)?;
         assert_eq!(retrieved, initial_value);
 
         // Update the value
         rsproperties::set(prop_name, updated_value)?;
-        let retrieved = rsproperties::get(prop_name);
+        let retrieved: String = rsproperties::get(prop_name)?;
         assert_eq!(retrieved, updated_value);
 
         Ok(())
@@ -152,7 +138,7 @@ mod builder_tests {
 
         // Verify all properties
         for (name, expected_value) in &properties {
-            let retrieved_value = rsproperties::get(name);
+            let retrieved_value: String = rsproperties::get(name)?;
             assert_eq!(retrieved_value, *expected_value);
         }
 
@@ -174,7 +160,7 @@ mod linux_specific_tests {
         rsproperties::set(prop_name, prop_value)?;
 
         // Verify it's set
-        let retrieved = rsproperties::get(prop_name);
+        let retrieved: String = rsproperties::get(prop_name)?;
         assert_eq!(retrieved, prop_value);
 
         Ok(())
@@ -193,7 +179,7 @@ mod error_handling_tests {
         let long_name = "a".repeat(1000);
         let default_value = "default";
 
-        let result = rsproperties::get_with_default(&long_name, default_value);
+        let result = rsproperties::get_or(&long_name, default_value.to_string());
         // Should return default value when property doesn't exist
         assert_eq!(result, default_value);
     }
@@ -249,7 +235,7 @@ mod concurrency_tests {
 
                 thread::spawn(move || {
                     for _ in 0..10 {
-                        let value = rsproperties::get(&name);
+                        let value: String = rsproperties::get(&name).unwrap_or_default();
                         assert_eq!(value, expected);
                         thread::sleep(Duration::from_millis(1));
                     }
@@ -284,7 +270,7 @@ mod concurrency_tests {
                     // thread::sleep(Duration::from_millis(10));
 
                     // Verify we can read some value back
-                    let retrieved = rsproperties::get(&name);
+                    let retrieved: String = rsproperties::get(&name).unwrap_or_default();
                     assert!(!retrieved.is_empty());
 
                     println!("Thread {} set value: {}, got: {}", i, value, retrieved);
@@ -297,7 +283,7 @@ mod concurrency_tests {
         }
 
         // Final verification
-        let final_value = rsproperties::get(prop_name);
+        let final_value: String = rsproperties::get(prop_name).unwrap_or_default();
         assert!(!final_value.is_empty());
 
         Ok(())

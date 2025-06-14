@@ -26,14 +26,14 @@ async fn test_get_parsed_with_default_integers() -> anyhow::Result<()> {
     let test_value = 42;
     rsproperties::set(prop_name, &test_value)?;
 
-    let parsed_value: i32 = rsproperties::get_parsed_with_default(prop_name, 0);
+    let parsed_value: i32 = rsproperties::get_or(prop_name, 0);
     assert_eq!(parsed_value, test_value);
 
     // Test with different integer types
-    let parsed_i64: i64 = rsproperties::get_parsed_with_default(prop_name, 0i64);
+    let parsed_i64: i64 = rsproperties::get_or(prop_name, 0i64);
     assert_eq!(parsed_i64, test_value as i64);
 
-    let parsed_u32: u32 = rsproperties::get_parsed_with_default(prop_name, 0u32);
+    let parsed_u32: u32 = rsproperties::get_or(prop_name, 0u32);
     assert_eq!(parsed_u32, test_value as u32);
 
     Ok(())
@@ -46,7 +46,7 @@ async fn test_get_parsed_with_default_nonexistent_property() {
     let prop_name = "nonexistent.parsed.property";
     let default_value = 123;
 
-    let result: i32 = rsproperties::get_parsed_with_default(prop_name, default_value);
+    let result: i32 = rsproperties::get_or(prop_name, default_value);
     assert_eq!(result, default_value);
 }
 
@@ -60,7 +60,7 @@ async fn test_get_parsed_with_default_invalid_parsing() -> anyhow::Result<()> {
 
     // Should return default value when parsing fails
     let default_value = 999;
-    let result: i32 = rsproperties::get_parsed_with_default(prop_name, default_value);
+    let result: i32 = rsproperties::get_or(prop_name, default_value);
     assert_eq!(result, default_value);
 
     Ok(())
@@ -89,8 +89,8 @@ async fn test_get_parsed_with_default_booleans() -> anyhow::Result<()> {
 
     // Test valid boolean strings
     for (prop_name, prop_value, expected) in valid_cases.iter() {
-        rsproperties::set_str(prop_name, prop_value)?;
-        let result: bool = rsproperties::get_parsed_with_default(prop_name, false);
+        rsproperties::set(prop_name, prop_value)?;
+        let result: bool = rsproperties::get_or(prop_name, false);
         assert_eq!(
             result, *expected,
             "Failed for valid boolean property {} with value {}",
@@ -100,8 +100,8 @@ async fn test_get_parsed_with_default_booleans() -> anyhow::Result<()> {
 
     // Test invalid boolean strings (should return default)
     for (prop_name, prop_value) in invalid_cases.iter() {
-        rsproperties::set_str(prop_name, prop_value)?;
-        let result: bool = rsproperties::get_parsed_with_default(prop_name, true); // Use true as default to verify fallback
+        rsproperties::set(prop_name, prop_value)?;
+        let result: bool = rsproperties::get_or(prop_name, true); // Use true as default to verify fallback
         assert!(
             result,
             "Should return default for invalid boolean value: {}",
@@ -120,10 +120,10 @@ async fn test_get_parsed_with_default_floats() -> anyhow::Result<()> {
     let test_value = std::f64::consts::PI;
     rsproperties::set(prop_name, &test_value)?;
 
-    let parsed_f32: f32 = rsproperties::get_parsed_with_default(prop_name, 0.0f32);
+    let parsed_f32: f32 = rsproperties::get_or(prop_name, 0.0f32);
     assert!((parsed_f32 - test_value as f32).abs() < f32::EPSILON);
 
-    let parsed_f64: f64 = rsproperties::get_parsed_with_default(prop_name, 0.0f64);
+    let parsed_f64: f64 = rsproperties::get_or(prop_name, 0.0f64);
     assert!((parsed_f64 - test_value).abs() < f64::EPSILON);
 
     Ok(())
@@ -138,7 +138,7 @@ async fn test_get_parsed_success() -> anyhow::Result<()> {
     let test_int = 12345;
     rsproperties::set(prop_name_int, &test_int)?;
 
-    let result: i32 = rsproperties::get_parsed(prop_name_int)?;
+    let result: i32 = rsproperties::get(prop_name_int)?;
     assert_eq!(result, test_int);
 
     // Test with string parsing
@@ -146,7 +146,7 @@ async fn test_get_parsed_success() -> anyhow::Result<()> {
     let test_str = "hello_world";
     rsproperties::set(prop_name_str, test_str)?;
 
-    let result: String = rsproperties::get_parsed(prop_name_str)?;
+    let result: String = rsproperties::get(prop_name_str)?;
     assert_eq!(result, test_str);
 
     Ok(())
@@ -157,7 +157,7 @@ async fn test_get_parsed_nonexistent_property() {
     setup_test_env().await;
 
     let prop_name = "completely.nonexistent.property";
-    let result: Result<i32, _> = rsproperties::get_parsed(prop_name);
+    let result: Result<i32, _> = rsproperties::get(prop_name);
 
     assert!(result.is_err());
     let error_msg = result.unwrap_err().to_string();
@@ -172,7 +172,7 @@ async fn test_get_parsed_parsing_error() -> anyhow::Result<()> {
     let prop_name = "test.get_parsed.invalid";
     rsproperties::set(prop_name, "definitely_not_a_number")?;
 
-    let result: Result<i32, _> = rsproperties::get_parsed(prop_name);
+    let result: Result<i32, _> = rsproperties::get(prop_name);
 
     assert!(result.is_err());
     let error_msg = result.unwrap_err().to_string();
@@ -189,11 +189,11 @@ async fn test_get_parsed_empty_property() -> anyhow::Result<()> {
     let prop_name = "test.get_parsed.empty";
     rsproperties::set(prop_name, "")?;
 
-    let result: Result<i32, _> = rsproperties::get_parsed(prop_name);
+    let result: Result<i32, _> = rsproperties::get(prop_name);
 
     assert!(result.is_err());
     let error_msg = result.unwrap_err().to_string();
-    assert!(error_msg.contains("NotFound") || error_msg.contains("not found"));
+    assert!(error_msg.contains("cannot parse integer from empty string"));
 
     Ok(())
 }
@@ -208,13 +208,13 @@ async fn test_get_parsed_complex_types() -> anyhow::Result<()> {
     // Test u64
     let large_value = u64::MAX / 2;
     rsproperties::set(prop_name, &large_value)?;
-    let parsed_u64: u64 = rsproperties::get_parsed(prop_name)?;
+    let parsed_u64: u64 = rsproperties::get(prop_name)?;
     assert_eq!(parsed_u64, large_value);
 
     // Test i64 negative
     let negative_value = -12345678901234i64;
     rsproperties::set(prop_name, &negative_value)?;
-    let parsed_i64: i64 = rsproperties::get_parsed(prop_name)?;
+    let parsed_i64: i64 = rsproperties::get(prop_name)?;
     assert_eq!(parsed_i64, negative_value);
 
     Ok(())
@@ -234,7 +234,7 @@ async fn test_get_parsed_edge_cases() -> anyhow::Result<()> {
 
     for (prop_name, prop_value, expected) in test_cases.iter() {
         rsproperties::set(prop_name, prop_value)?;
-        let result: i32 = rsproperties::get_parsed(prop_name)?;
+        let result: i32 = rsproperties::get(prop_name)?;
         assert_eq!(
             result, *expected,
             "Failed for property {} with value {}",
@@ -255,7 +255,7 @@ async fn test_get_parsed_with_whitespace() -> anyhow::Result<()> {
     rsproperties::set(prop_name, test_value)?;
 
     // The property system should handle whitespace appropriately
-    let result: Result<i32, _> = rsproperties::get_parsed(prop_name);
+    let result: Result<i32, _> = rsproperties::get(prop_name);
 
     // Note: The behavior here depends on how the property system handles whitespace
     // We'll just verify that the function behaves consistently
@@ -279,10 +279,10 @@ async fn test_parsed_api_type_safety() -> anyhow::Result<()> {
     rsproperties::set(prop_name, test_value)?;
 
     // Verify that different numeric types parse correctly from the same string
-    let as_i32: i32 = rsproperties::get_parsed(prop_name)?;
-    let as_u32: u32 = rsproperties::get_parsed(prop_name)?;
-    let as_i64: i64 = rsproperties::get_parsed(prop_name)?;
-    let as_f64: f64 = rsproperties::get_parsed(prop_name)?;
+    let as_i32: i32 = rsproperties::get(prop_name)?;
+    let as_u32: u32 = rsproperties::get(prop_name)?;
+    let as_i64: i64 = rsproperties::get(prop_name)?;
+    let as_f64: f64 = rsproperties::get(prop_name)?;
 
     assert_eq!(as_i32, 42);
     assert_eq!(as_u32, 42);
@@ -308,14 +308,14 @@ async fn test_parsed_api_with_real_world_properties() -> anyhow::Result<()> {
     for (prop_name, prop_value, expected) in test_cases.iter() {
         rsproperties::set(prop_name, prop_value)?;
 
-        let parsed_result: i32 = rsproperties::get_parsed(prop_name)?;
+        let parsed_result: i32 = rsproperties::get(prop_name)?;
         assert_eq!(
             parsed_result, *expected,
             "Failed for property {}",
             prop_name
         );
 
-        let with_default: i32 = rsproperties::get_parsed_with_default(prop_name, 999);
+        let with_default: i32 = rsproperties::get_or(prop_name, 999);
         assert_eq!(
             with_default, *expected,
             "get_parsed_with_default failed for property {}",

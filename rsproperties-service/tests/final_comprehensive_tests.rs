@@ -68,7 +68,7 @@ async fn test_get_with_default_comprehensive() {
     ];
 
     for (property, default, description) in &test_cases {
-        let result = rsproperties::get_with_default(property, default);
+        let result = rsproperties::get_or(property, default.to_string());
         assert_eq!(result, *default, "{}", description);
     }
 
@@ -93,7 +93,7 @@ async fn test_get_nonexistent_properties() {
     ];
 
     for property in &nonexistent_properties {
-        let result = rsproperties::get_with_result(property);
+        let result = rsproperties::get::<String>(property);
         assert!(result.is_err(), "Property '{}' should not exist", property);
     }
 
@@ -141,8 +141,8 @@ async fn test_property_name_validation() {
 
     // These names are valid format-wise, they may or may not exist
     for name in &valid_format_names {
-        let _result = rsproperties::get(name);
-        let _default_result = rsproperties::get_with_default(name, "default");
+        let _result: String = rsproperties::get(name).unwrap_or_default();
+        let _default_result = rsproperties::get_or(name, "default".to_string());
         // We don't assert success/failure since properties may or may not exist
     }
 
@@ -156,7 +156,7 @@ async fn test_property_name_validation() {
     ];
 
     for name in &edge_case_names {
-        let _result = rsproperties::get(name);
+        let _result: String = rsproperties::get(name).unwrap_or_default();
         // Don't assert specific behavior as implementation may vary
     }
 
@@ -177,10 +177,10 @@ async fn test_property_value_length_limits() {
     init_test().await;
 
     // Test with get_with_default (should work regardless of length)
-    let result1 = rsproperties::get_with_default("test.max.length", &max_length_value);
+    let result1 = rsproperties::get_or("test.max.length", max_length_value.to_string());
     assert_eq!(result1, max_length_value);
 
-    let result2 = rsproperties::get_with_default("test.too.long", &too_long_value);
+    let result2 = rsproperties::get_or("test.too.long", too_long_value.to_string());
     assert_eq!(result2, too_long_value);
 
     println!("✓ Property value length limits test passed");
@@ -213,13 +213,13 @@ async fn test_thread_safety() {
                 let property_name = format!("test.thread.{}.{}", thread_id, op_id);
 
                 // Test get_with_default (should always succeed)
-                let result = rsproperties::get_with_default(&property_name, "default");
+                let result = rsproperties::get_or(&property_name, "default".to_string());
                 if result == "default" {
                     success_count_clone.fetch_add(1, Ordering::SeqCst);
                 }
 
                 // Test get (will likely fail but shouldn't crash)
-                let _result = rsproperties::get(&property_name);
+                let _result: String = rsproperties::get(&property_name).unwrap_or_default();
                 success_count_clone.fetch_add(1, Ordering::SeqCst);
 
                 // Test dirname (should always work)
@@ -258,15 +258,15 @@ async fn test_error_handling() {
 
     // Very long property name
     let long_name = "very.long.property.name.".repeat(50);
-    let _result = rsproperties::get(&long_name);
+    let _result: String = rsproperties::get(&long_name).unwrap_or_default();
     // May or may not fail depending on implementation limits
 
     // Empty property name
-    let _result = rsproperties::get("");
+    let _result: String = rsproperties::get("").unwrap_or_default();
     // Behavior may vary
 
     // Property name with only dots
-    let _result = rsproperties::get("...");
+    let _result: String = rsproperties::get("...").unwrap_or_default();
     // Behavior may vary
 
     println!("✓ Error handling test completed");
@@ -285,7 +285,7 @@ async fn test_performance_basic() {
 
     for i in 0..iterations {
         let property_name = format!("test.perf.{}", i);
-        let _result = rsproperties::get_with_default(&property_name, "default");
+        let _result = rsproperties::get_or(&property_name, "default".to_string());
     }
 
     let elapsed = start.elapsed();
@@ -318,7 +318,7 @@ mod builder_tests {
                 println!("✓ Property set successfully");
 
                 // Try to read it back
-                let value = rsproperties::get("test.basic.set");
+                let value: String = rsproperties::get("test.basic.set").unwrap_or_default();
                 assert_eq!(value, "test_value");
                 println!("✓ Property read back successfully: '{}'", value);
             }
@@ -404,7 +404,7 @@ mod builder_tests {
                         println!("✓ Updated property value");
 
                         // Verify the update
-                        let value = rsproperties::get(property_name);
+                        let value: String = rsproperties::get(property_name).unwrap_or_default();
                         assert_eq!(value, "updated_value");
                         println!("✓ Property update verified: '{}'", value);
                     }
@@ -439,7 +439,7 @@ mod builder_tests {
                         );
 
                         // Try to read it back
-                        let value = rsproperties::get(&property_name);
+                        let value: String = rsproperties::get(&property_name).unwrap_or_default();
                         println!("Thread {}: Read back value: '{}'", thread_id, value);
                         if value == property_value {
                             println!("Thread {}: ✓ Value matches", thread_id);
@@ -486,13 +486,13 @@ async fn test_integration_comprehensive() {
 
     for (i, property) in test_properties.iter().enumerate() {
         let default_value = format!("default_{}", i);
-        let result = rsproperties::get_with_default(property, &default_value);
+        let result = rsproperties::get_or(property, default_value.to_string());
         assert_eq!(result, default_value);
     }
 
     // Test error conditions
     for property in &test_properties {
-        let result = rsproperties::get_with_result(property);
+        let result = rsproperties::get::<String>(property);
         assert!(result.is_err());
     }
 

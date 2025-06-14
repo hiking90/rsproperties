@@ -45,14 +45,14 @@ fn test_get_with_default_functionality() {
     init_test();
 
     // Test with non-existent property
-    let result = rsproperties::get_with_default("test.nonexistent.property.12345", "default_value");
+    let result = rsproperties::get_or("test.nonexistent.property.12345", "default_value".to_string());
     assert_eq!(
         result, "default_value",
         "Should return default for non-existent property"
     );
 
     // Test with empty property name
-    let result = rsproperties::get_with_default("", "empty_default");
+    let result = rsproperties::get_or("", "empty_default".to_string());
     assert_eq!(
         result, "empty_default",
         "Should return default for empty property name"
@@ -60,13 +60,13 @@ fn test_get_with_default_functionality() {
 
     // Test with very long property name
     let long_name = "a".repeat(500);
-    let result = rsproperties::get_with_default(&long_name, "long_default");
+    let result = rsproperties::get_or(&long_name, "long_default".to_string());
     assert_eq!(
         result, "long_default",
         "Should return default for very long property name"
     );
 
-    println!("✓ get_with_default() works correctly for non-existent properties");
+    println!("✓ get_or() works correctly for non-existent properties");
 }
 
 #[test]
@@ -74,13 +74,13 @@ fn test_get_functionality() {
     init_test();
 
     // Test with non-existent property
-    let result = rsproperties::get("test.nonexistent.property.67890");
+    let result: Result<String, _> = rsproperties::get("test.nonexistent.property.67890");
     assert!(
-        result.is_empty(),
-        "Should return empty string for non-existent property"
+        result.is_err(),
+        "Should return error for non-existent property"
     );
 
-    println!("✓ get() returns empty string for non-existent properties");
+    println!("✓ get() returns error for non-existent properties");
 }
 
 #[cfg(feature = "builder")]
@@ -99,8 +99,8 @@ mod write_tests {
                 println!("✓ set() function succeeded");
 
                 // Try to read the property back
-                let value = rsproperties::get("test.property.name");
-                assert_eq!(value, "test_value", "Read value should match written value");
+                let value: Result<String, _> = rsproperties::get("test.property.name");
+                assert_eq!(value.unwrap(), "test_value", "Read value should match written value");
                 println!("✓ Property read/write cycle successful");
             }
             Err(e) => {
@@ -157,7 +157,7 @@ fn test_property_name_validation() {
     ];
 
     for (name, description) in edge_cases {
-        let result = rsproperties::get_with_default(name, "default");
+        let result = rsproperties::get_or(name, "default".to_string());
         assert_eq!(
             result, "default",
             "Should handle edge case: {}",
@@ -191,11 +191,11 @@ fn test_thread_safety() {
                 for i in 0..iterations {
                     let prop_name = format!("thread.{}.property.{}", thread_id, i);
 
-                    // Test get_with_default (should not crash)
-                    let _result = rsproperties::get_with_default(&prop_name, "default");
+                    // Test get_or (should not crash)
+                    let _result = rsproperties::get_or(&prop_name, "default".to_string());
 
                     // Test get (should return error for non-existent property)
-                    let _result = rsproperties::get(&prop_name);
+                    let _result: Result<String, _> = rsproperties::get(&prop_name);
                 }
             })
         })
@@ -222,8 +222,8 @@ fn test_api_completeness() {
     // Verify that all expected public API functions exist and are callable
 
     // Core read functions
-    let _: String = rsproperties::get_with_default("test", "default");
-    let _ = rsproperties::get("test");
+    let _: String = rsproperties::get_or("test", "default".to_string());
+    let _ = rsproperties::get::<String>("test");
 
     // Write functions (if builder feature enabled)
     #[cfg(feature = "builder")]
@@ -255,12 +255,12 @@ fn test_error_handling_robustness() {
 
     // Very long property names
     let very_long_name = "x".repeat(10000);
-    let result = rsproperties::get_with_default(&very_long_name, "default");
+    let result = rsproperties::get_or(&very_long_name, "default".to_string());
     assert_eq!(result, "default", "Should handle very long property names");
 
     // Property names with null bytes
     let null_name = "test\0property";
-    let result = rsproperties::get_with_default(null_name, "default");
+    let result = rsproperties::get_or(null_name, "default".to_string());
     assert_eq!(
         result, "default",
         "Should handle property names with null bytes"
@@ -268,7 +268,7 @@ fn test_error_handling_robustness() {
 
     // Property names with various Unicode characters
     let unicode_name = "test.🚀.property.世界";
-    let result = rsproperties::get_with_default(unicode_name, "default");
+    let result = rsproperties::get_or(unicode_name, "default".to_string());
     assert_eq!(result, "default", "Should handle Unicode property names");
 
     println!("✓ Error handling robustness tests passed");
@@ -280,13 +280,13 @@ fn test_performance_characteristics() {
 
     use std::time::Instant;
 
-    // Test performance of get_with_default for non-existent properties
+    // Test performance of get_or for non-existent properties
     let start = Instant::now();
     let iterations = 1000;
 
     for i in 0..iterations {
         let prop_name = format!("perf.test.property.{}", i);
-        let _result = rsproperties::get_with_default(&prop_name, "default");
+        let _result = rsproperties::get_or(&prop_name, "default".to_string());
     }
 
     let duration = start.elapsed();
@@ -324,17 +324,17 @@ fn test_real_android_properties() {
     let mut found_count = 0;
 
     for prop in common_properties {
-        match rsproperties::get_with_result(prop) {
+        match rsproperties::get::<String>(prop) {
             Ok(value) => {
                 found_count += 1;
                 println!("  {} = {}", prop, value);
             }
             Err(_) => {
                 // Property doesn't exist, which is fine
-                let default_val = rsproperties::get_with_default(prop, "not_found");
+                let default_val = rsproperties::get_or(prop, "not_found".to_string());
                 assert_eq!(
                     default_val, "not_found",
-                    "get_with_default should work even if get fails"
+                    "get_or should work even if get fails"
                 );
             }
         }

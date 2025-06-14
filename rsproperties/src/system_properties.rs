@@ -157,7 +157,7 @@ impl SystemProperties {
         Ok((name, value))
     }
 
-    /// Internal function to get property value that returns error for missing properties
+    /// Get property value that returns error for missing properties
     pub fn get_with_result(&self, name: &str) -> Result<String> {
         let res = match self.contexts.prop_area_for_name(name) {
             Ok(res) => res,
@@ -180,24 +180,6 @@ impl SystemProperties {
                 Ok(value)
             }
             Err(e) => Err(e),
-        }
-    }
-
-    /// Get the value of a system property
-    /// Returns empty string if property is not found (Android compatible behavior)
-    pub fn get(&self, name: &str) -> String {
-        match self.get_with_result(name) {
-            Ok(value) => value,
-            Err(_) => "".to_owned(),
-        }
-    }
-
-    /// Get the value of a system property with a default value
-    /// Returns the default value if property is not found or on error
-    pub fn get_with_default(&self, name: &str, default: &str) -> String {
-        match self.get_with_result(name) {
-            Ok(value) => value,
-            Err(_) => default.to_owned(),
         }
     }
 
@@ -480,10 +462,10 @@ mod tests {
         let system_properties = SystemProperties::new(&Path::new(crate::PROP_DIRNAME)).unwrap();
 
         let handle = std::thread::spawn(move || {
-            let version1 = system_properties.get(VERSION_PROPERTY);
+            let version1 = system_properties.get_with_result(VERSION_PROPERTY).unwrap_or_default();
             let version2 = AndroidSystemProperties::new()
                 .get(VERSION_PROPERTY)
-                .unwrap();
+                .unwrap_or_default();
             assert_eq!(version1, version2);
         });
 

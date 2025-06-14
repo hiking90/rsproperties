@@ -63,14 +63,16 @@ fn main() {
         Some(name) => {
             // Get specific property
             let value = if let Some(default) = args.default_value {
-                rsproperties::get_with_default(&name, &default)
+                rsproperties::get_or(&name, default)
             } else {
-                let result = rsproperties::get(&name);
-                if result.is_empty() {
-                    // Property not found, print nothing (Android getprop behavior)
-                    return;
+                let result: Result<String, _> = rsproperties::get(&name);
+                match result {
+                    Ok(val) if !val.is_empty() => val,
+                    _ => {
+                        // Property not found, print nothing (Android getprop behavior)
+                        return;
+                    }
                 }
-                result
             };
             println!("{}", value);
         }

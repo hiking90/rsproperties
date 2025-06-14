@@ -4,8 +4,7 @@
 //! Tests for property setting API functions
 //!
 //! These tests verify the functionality of the property setting APIs:
-//! - set_str() - Set property with string value
-//! - set() - Set property with any Display type
+//! - set() - Set property with any Display type (includes strings)
 //! - Type conversion and validation
 //! - Error handling and edge cases
 #![allow(clippy::approx_constant)]
@@ -20,80 +19,66 @@ async fn setup_test_env() {
 }
 
 #[tokio::test]
-async fn test_set_str_basic() -> anyhow::Result<()> {
+async fn test_set_basic() -> anyhow::Result<()> {
     setup_test_env().await;
 
-    let prop_name = "test.set_str.basic";
+    let prop_name = "test.set.basic";
     let prop_value = "test_string_value";
 
-    // Set property using set_str
-    rsproperties::set_str(prop_name, prop_value)?;
+    // Set property using set
+    rsproperties::set(prop_name, prop_value)?;
 
     // Verify the property was set correctly
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, prop_value);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_set_str_empty_value() -> anyhow::Result<()> {
+async fn test_set_special_characters() -> anyhow::Result<()> {
     setup_test_env().await;
 
-    let prop_name = "test.set_str.empty";
-    let prop_value = "";
-
-    rsproperties::set_str(prop_name, prop_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
-    assert_eq!(retrieved_value, prop_value);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_set_str_special_characters() -> anyhow::Result<()> {
-    setup_test_env().await;
-
-    let prop_name = "test.set_str.special";
+    let prop_name = "test.set.special";
     let prop_value = "special!@#$%^&*()_+-={}[]|\\:;\"'<>?,./";
 
-    rsproperties::set_str(prop_name, prop_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    rsproperties::set(prop_name, prop_value)?;
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, prop_value);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_set_str_unicode() -> anyhow::Result<()> {
+async fn test_set_unicode() -> anyhow::Result<()> {
     setup_test_env().await;
 
-    let prop_name = "test.set_str.unicode";
+    let prop_name = "test.set.unicode";
     let prop_value = "안녕하세요 🌍 こんにちは Здравствуй";
 
-    rsproperties::set_str(prop_name, prop_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    rsproperties::set(prop_name, prop_value)?;
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, prop_value);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_set_str_whitespace() -> anyhow::Result<()> {
+async fn test_set_whitespace() -> anyhow::Result<()> {
     setup_test_env().await;
 
     let test_cases = [
-        ("test.set_str.spaces", "value with spaces"),
-        ("test.set_str.tabs", "value\twith\ttabs"),
-        ("test.set_str.newlines", "value\nwith\nnewlines"),
-        ("test.set_str.leading_space", " leading_space"),
-        ("test.set_str.trailing_space", "trailing_space "),
-        ("test.set_str.multiple_spaces", "multiple   spaces   here"),
+        ("test.set.spaces", "value with spaces"),
+        ("test.set.tabs", "value\twith\ttabs"),
+        ("test.set.newlines", "value\nwith\nnewlines"),
+        ("test.set.leading_space", " leading_space"),
+        ("test.set.trailing_space", "trailing_space "),
+        ("test.set.multiple_spaces", "multiple   spaces   here"),
     ];
 
     for (prop_name, prop_value) in test_cases.iter() {
-        rsproperties::set_str(prop_name, prop_value)?;
-        let retrieved_value = rsproperties::get(prop_name);
+        rsproperties::set(prop_name, prop_value)?;
+        let retrieved_value: String = rsproperties::get(prop_name)?;
         assert_eq!(
             retrieved_value, *prop_value,
             "Failed for property {}",
@@ -112,56 +97,56 @@ async fn test_set_display_integers() -> anyhow::Result<()> {
     let prop_name = "test.set.i8";
     let test_value = i8::MAX;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test i16
     let prop_name = "test.set.i16";
     let test_value = i16::MAX;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test i32
     let prop_name = "test.set.i32";
     let test_value = i32::MAX;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test i64
     let prop_name = "test.set.i64";
     let test_value = i64::MAX;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test u8
     let prop_name = "test.set.u8";
     let test_value = u8::MAX;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test u16
     let prop_name = "test.set.u16";
     let test_value = u16::MAX;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test u32
     let prop_name = "test.set.u32";
     let test_value = u32::MAX;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test u64 (using a smaller value to avoid potential issues)
     let prop_name = "test.set.u64";
     let test_value = u64::MAX / 2;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     Ok(())
@@ -175,42 +160,42 @@ async fn test_set_display_negative_integers() -> anyhow::Result<()> {
     let prop_name = "test.set.neg_i8";
     let test_value = i8::MIN;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test i16 min
     let prop_name = "test.set.neg_i16";
     let test_value = i16::MIN;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test i32 min
     let prop_name = "test.set.neg_i32";
     let test_value = i32::MIN;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test i64 min
     let prop_name = "test.set.neg_i64";
     let test_value = i64::MIN;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test zero
     let prop_name = "test.set.neg_zero";
     let test_value = 0i32;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test small negative
     let prop_name = "test.set.neg_small";
     let test_value = -42i32;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     Ok(())
@@ -224,42 +209,42 @@ async fn test_set_display_floats() -> anyhow::Result<()> {
     let prop_name = "test.set.f32";
     let test_value = 3.14159f32;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test f64
     let prop_name = "test.set.f64";
     let test_value = 2.718281828459045f64;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test f32 zero
     let prop_name = "test.set.f32_zero";
     let test_value = 0.0f32;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test f64 negative
     let prop_name = "test.set.f64_negative";
     let test_value = -123.456f64;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test f32 small
     let prop_name = "test.set.f32_small";
     let test_value = f32::EPSILON;
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test f64 large (use smaller value to avoid length limits)
     let prop_name = "test.set.f64_large";
     let test_value = 1e10f64; // Smaller than 1e100 to fit in 92 chars
     rsproperties::set(prop_name, &test_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     Ok(())
@@ -276,7 +261,7 @@ async fn test_set_display_booleans() -> anyhow::Result<()> {
 
     for (prop_name, test_value, expected_str) in test_cases.iter() {
         rsproperties::set(prop_name, test_value)?;
-        let retrieved_value = rsproperties::get(prop_name);
+        let retrieved_value: String = rsproperties::get(prop_name)?;
         assert_eq!(
             retrieved_value, *expected_str,
             "Failed for property {} with value {}",
@@ -300,7 +285,7 @@ async fn test_set_display_strings() -> anyhow::Result<()> {
 
     for (prop_name, test_value) in test_cases.iter() {
         rsproperties::set(prop_name, test_value)?;
-        let retrieved_value = rsproperties::get(prop_name);
+        let retrieved_value: String = rsproperties::get(prop_name)?;
         assert_eq!(
             retrieved_value, *test_value,
             "Failed for property {} with value '{}'",
@@ -323,7 +308,7 @@ async fn test_set_display_string_slices() -> anyhow::Result<()> {
 
     for (prop_name, test_value) in test_cases.iter() {
         rsproperties::set(prop_name, test_value)?;
-        let retrieved_value = rsproperties::get(prop_name);
+        let retrieved_value: String = rsproperties::get(prop_name)?;
         assert_eq!(
             retrieved_value,
             test_value.to_string(),
@@ -343,20 +328,20 @@ async fn test_set_overwrite_existing() -> anyhow::Result<()> {
 
     // Set initial value
     let initial_value = "initial_value";
-    rsproperties::set_str(prop_name, initial_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    rsproperties::set(prop_name, initial_value)?;
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, initial_value);
 
     // Overwrite with different type
     let new_value = 12345i32;
     rsproperties::set(prop_name, &new_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, new_value.to_string());
 
     // Overwrite with another string
     let final_value = "final_value";
-    rsproperties::set_str(prop_name, final_value)?;
-    let retrieved_value = rsproperties::get(prop_name);
+    rsproperties::set(prop_name, final_value)?;
+    let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, final_value);
 
     Ok(())
@@ -376,12 +361,12 @@ async fn test_set_multiple_properties() -> anyhow::Result<()> {
 
     // Set all properties
     for (prop_name, prop_value) in properties.iter() {
-        rsproperties::set_str(prop_name, prop_value)?;
+        rsproperties::set(prop_name, prop_value)?;
     }
 
     // Verify all properties were set correctly
     for (prop_name, expected_value) in properties.iter() {
-        let retrieved_value = rsproperties::get(prop_name);
+        let retrieved_value: String = rsproperties::get(prop_name)?;
         assert_eq!(
             retrieved_value, *expected_value,
             "Failed for property {}",
@@ -410,7 +395,7 @@ async fn test_set_property_name_validation() {
     ];
 
     for prop_name in valid_names.iter() {
-        let result = rsproperties::set_str(prop_name, "test_value");
+        let result = rsproperties::set(prop_name, "test_value");
         assert!(
             result.is_ok(),
             "Valid property name should succeed: {}",
@@ -432,15 +417,15 @@ async fn test_set_and_get_integration() -> anyhow::Result<()> {
     rsproperties::set(prop_name, &original_value)?;
 
     // Get as string
-    let string_value = rsproperties::get(prop_name);
+    let string_value: String = rsproperties::get(prop_name)?;
     assert_eq!(string_value, original_value.to_string());
 
     // Parse back to integer
-    let parsed_value: i32 = rsproperties::get_parsed(prop_name)?;
+    let parsed_value: i32 = rsproperties::get(prop_name)?;
     assert_eq!(parsed_value, original_value);
 
     // Get with default (should return the actual value, not default)
-    let with_default: i32 = rsproperties::get_parsed_with_default(prop_name, 999);
+    let with_default: i32 = rsproperties::get_or(prop_name, 999);
     assert_eq!(with_default, original_value);
 
     Ok(())
@@ -457,9 +442,9 @@ async fn test_set_concurrent_properties() -> anyhow::Result<()> {
                 let prop_name = format!("test.concurrent.prop_{}", i);
                 let prop_value = format!("value_{}", i);
 
-                rsproperties::set_str(&prop_name, &prop_value).unwrap();
+                rsproperties::set(&prop_name, &prop_value).unwrap();
 
-                let retrieved = rsproperties::get(&prop_name);
+                let retrieved: String = rsproperties::get(&prop_name).unwrap();
                 assert_eq!(retrieved, prop_value);
 
                 (prop_name, prop_value)
@@ -470,7 +455,7 @@ async fn test_set_concurrent_properties() -> anyhow::Result<()> {
     // Wait for all tasks to complete
     for handle in handles {
         let (prop_name, expected_value) = handle.await?;
-        let final_value = rsproperties::get(&prop_name);
+        let final_value: String = rsproperties::get(&prop_name)?;
         assert_eq!(final_value, expected_value);
     }
 
@@ -496,8 +481,8 @@ async fn test_set_real_world_android_properties() -> anyhow::Result<()> {
     ];
 
     for (prop_name, prop_value) in properties.iter() {
-        rsproperties::set_str(prop_name, prop_value)?;
-        let retrieved = rsproperties::get(prop_name);
+        rsproperties::set(prop_name, prop_value)?;
+        let retrieved: String = rsproperties::get(prop_name)?;
         assert_eq!(
             retrieved, *prop_value,
             "Failed for Android-style property {}",
@@ -517,7 +502,7 @@ async fn test_set_error_handling() {
     let very_long_value = "b".repeat(10000);
 
     // Very long property name - should either succeed or fail gracefully
-    let result = rsproperties::set_str(&very_long_name, "test");
+    let result = rsproperties::set(&very_long_name, "test");
     // We don't assert success/failure as it depends on system limits
     // But we ensure it doesn't panic
     match result {
@@ -526,7 +511,7 @@ async fn test_set_error_handling() {
     }
 
     // Very long property value - should either succeed or fail gracefully
-    let result = rsproperties::set_str("test.long.value", &very_long_value);
+    let result = rsproperties::set("test.long.value", &very_long_value);
     match result {
         Ok(_) => println!("Long property value was accepted"),
         Err(e) => println!("Long property value was rejected: {}", e),
@@ -534,22 +519,22 @@ async fn test_set_error_handling() {
 }
 
 #[tokio::test]
-async fn test_set_consistency_between_set_and_set_str() -> anyhow::Result<()> {
+async fn test_set_consistency_between_set_and_set() -> anyhow::Result<()> {
     setup_test_env().await;
 
     let test_value = "consistent_test_value";
 
-    // Set using set_str
+    // Set using set with &str
     let prop_name1 = "test.consistency.set_str";
-    rsproperties::set_str(prop_name1, test_value)?;
+    rsproperties::set(prop_name1, test_value)?;
 
-    // Set using set with string
+    // Set using set with String
     let prop_name2 = "test.consistency.set";
-    rsproperties::set(prop_name2, test_value)?;
+    rsproperties::set(prop_name2, &test_value.to_string())?;
 
     // Both should produce the same result
-    let value1 = rsproperties::get(prop_name1);
-    let value2 = rsproperties::get(prop_name2);
+    let value1: String = rsproperties::get(prop_name1)?;
+    let value2: String = rsproperties::get(prop_name2)?;
 
     assert_eq!(value1, value2);
     assert_eq!(value1, test_value);

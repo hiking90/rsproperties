@@ -40,8 +40,8 @@ fn test_constants_validation() {
 fn test_get_with_default_basic() {
     init_properties();
 
-    // Test basic get_with_default functionality
-    let result = rsproperties::get_with_default("test.nonexistent.basic", "default_value");
+    // Test basic get_or functionality
+    let result = rsproperties::get_or("test.nonexistent.basic", "default_value".to_string());
     assert_eq!(result, "default_value");
 
     println!("✓ Basic get_with_default test passed");
@@ -65,7 +65,7 @@ fn test_get_with_default_edge_cases() {
     ];
 
     for (prop, default, description) in &test_cases {
-        let result = rsproperties::get_with_default(prop, default);
+        let result = rsproperties::get_or(prop, default.to_string());
         assert_eq!(result, *default, "Failed for {}", description);
     }
 
@@ -87,7 +87,7 @@ fn test_get_nonexistent_returns_error() {
     ];
 
     for prop in &nonexistent_props {
-        let result = rsproperties::get_with_result(prop);
+        let result: Result<String, _> = rsproperties::get(prop);
         assert!(
             result.is_err(),
             "Property '{}' should not exist and should return error",
@@ -123,11 +123,11 @@ fn test_value_length_limits() {
 
     init_properties();
 
-    // Test with get_with_default (should work with any length default)
-    let result1 = rsproperties::get_with_default("test.max.length", &max_value);
+    // Test with get_or (should work with any length default)
+    let result1 = rsproperties::get_or("test.max.length", max_value.clone());
     assert_eq!(result1, max_value);
 
-    let result2 = rsproperties::get_with_default("test.too.long", &too_long_value);
+    let result2 = rsproperties::get_or("test.too.long", too_long_value.clone());
     assert_eq!(result2, too_long_value);
 
     println!("✓ Value length limits test passed");
@@ -153,12 +153,12 @@ fn test_thread_safety_basic() {
             for j in 0..10 {
                 let prop_name = format!("test.thread.{}.{}", i, j);
 
-                // Test get_with_default
-                let _result = rsproperties::get_with_default(&prop_name, "default");
+                // Test get_or
+                let _result = rsproperties::get_or(&prop_name, "default".to_string());
                 counter_clone.fetch_add(1, Ordering::SeqCst);
 
                 // Test get
-                let _result = rsproperties::get(&prop_name);
+                let _result: Result<String, _> = rsproperties::get(&prop_name);
                 counter_clone.fetch_add(1, Ordering::SeqCst);
 
                 // Test dirname
@@ -192,7 +192,7 @@ fn test_performance_baseline() {
 
     for i in 0..iterations {
         let prop = format!("perf.test.{}", i);
-        let _result = rsproperties::get_with_default(&prop, "default");
+        let _result = rsproperties::get_or(&prop, "default".to_string());
     }
 
     let elapsed = start.elapsed();
@@ -228,8 +228,8 @@ fn test_error_conditions() {
 
     for case in &edge_cases {
         // These may succeed or fail depending on implementation
-        let _result1 = rsproperties::get(case);
-        let _result2 = rsproperties::get_with_default(case, "default");
+        let _result1: Result<String, _> = rsproperties::get(case);
+        let _result2 = rsproperties::get_or(case, "default".to_string());
     }
 
     println!("✓ Error conditions test completed");
@@ -296,8 +296,8 @@ mod builder_tests {
                 match rsproperties::set(prop, "updated") {
                     Ok(_) => {
                         // Verify
-                        let value = rsproperties::get(prop);
-                        assert_eq!(value, "updated");
+                        let value: Result<String, _> = rsproperties::get(prop);
+                        assert_eq!(value.unwrap(), "updated");
                         println!("✓ Property update verified");
                     }
                     Err(e) => println!("⚠ Update failed: {}", e),
@@ -322,17 +322,17 @@ fn test_comprehensive_integration() {
     let dirname = rsproperties::properties_dir();
     assert!(!dirname.to_string_lossy().is_empty());
 
-    // 3. Test get_with_default for multiple properties
+    // 3. Test get_or for multiple properties
     let props = ["int.test.1", "int.test.2", "int.test.3"];
     for (i, prop) in props.iter().enumerate() {
         let default = format!("default_{}", i);
-        let result = rsproperties::get_with_default(prop, &default);
+        let result = rsproperties::get_or(prop, default.clone());
         assert_eq!(result, default);
     }
 
     // 4. Test get for non-existent properties
     for prop in &props {
-        let result = rsproperties::get_with_result(prop);
+        let result: Result<String, _> = rsproperties::get(prop);
         assert!(result.is_err());
     }
 

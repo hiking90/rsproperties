@@ -36,10 +36,10 @@ fn test_empty_property_names() {
     setup_edge_test_env();
 
     // Test empty property name
-    let result = rsproperties::get_with_result("");
+    let result: Result<String, _> = rsproperties::get("");
     assert!(result.is_err(), "Getting empty property name should fail");
 
-    let default_result = rsproperties::get_with_default("", "default");
+    let default_result = rsproperties::get_or("", "default".to_string());
     assert_eq!(
         default_result, "default",
         "Empty property should return default"
@@ -48,7 +48,7 @@ fn test_empty_property_names() {
     // Test whitespace-only property names
     let whitespace_names = vec![" ", "\t", "\n", "  ", "\t\n  "];
     for name in whitespace_names {
-        let result = rsproperties::get_with_default(name, "default");
+        let result = rsproperties::get_or(name, "default".to_string());
         assert_eq!(
             result,
             "default",
@@ -73,7 +73,7 @@ fn test_special_character_property_names() {
     ];
 
     for name in special_names {
-        let result = rsproperties::get_with_default(name, "not_found");
+        let result = rsproperties::get_or(name, "not_found".to_string());
         // These should not crash and should return the default
         assert_eq!(
             result, "not_found",
@@ -118,7 +118,7 @@ fn test_invalid_property_names() {
 
     for name in potentially_invalid_names {
         // Test that these don't crash the system
-        let result = rsproperties::get_with_default(name, "default");
+        let result = rsproperties::get_or(name, "default".to_string());
         println!("Property name '{}' -> '{}'", name.escape_debug(), result);
         // Should at least return the default without crashing
         assert_eq!(result, "default");
@@ -134,7 +134,7 @@ fn test_long_property_names() {
 
     for length in lengths {
         let long_name = "a".repeat(length);
-        let result = rsproperties::get_with_default(&long_name, "default");
+        let result = rsproperties::get_or(&long_name, "default".to_string());
         assert_eq!(
             result, "default",
             "Long property name ({} chars) should return default",
@@ -182,9 +182,9 @@ fn test_property_value_edge_cases() {
 
         match rsproperties::set(&prop_name, value) {
             Ok(_) => {
-                let retrieved = rsproperties::get(&prop_name);
+                let retrieved: Result<String, _> = rsproperties::get(&prop_name);
                 assert_eq!(
-                    retrieved,
+                    retrieved.unwrap(),
                     *value,
                     "Failed for {}: {}",
                     description,
@@ -224,9 +224,10 @@ fn test_maximum_length_values() {
 
         match rsproperties::set(&prop_name, &value) {
             Ok(_) => {
-                let retrieved = rsproperties::get(&prop_name);
-                assert_eq!(retrieved.len(), length);
-                assert_eq!(retrieved, value);
+                let retrieved: Result<String, _> = rsproperties::get(&prop_name);
+                let retrieved_value = retrieved.unwrap();
+                assert_eq!(retrieved_value.len(), length);
+                assert_eq!(retrieved_value, value);
                 println!("✓ Successfully set/get property with {} byte value", length);
             }
             Err(e) => {
@@ -241,14 +242,15 @@ fn test_maximum_length_values() {
     match result {
         Ok(_) => {
             // If it succeeds, check if value was truncated
-            let retrieved = rsproperties::get("edge.oversized");
+            let retrieved: Result<String, _> = rsproperties::get("edge.oversized");
+            let retrieved_value = retrieved.unwrap();
             println!(
                 "Oversized value handling: set {} bytes, retrieved {} bytes",
                 oversized_value.len(),
-                retrieved.len()
+                retrieved_value.len()
             );
             assert!(
-                retrieved.len() <= PROP_VALUE_MAX,
+                retrieved_value.len() <= PROP_VALUE_MAX,
                 "Retrieved value should not exceed PROP_VALUE_MAX"
             );
         }
@@ -264,7 +266,7 @@ fn test_error_handling() {
     setup_edge_test_env();
 
     // Test get on non-existent property
-    let result = rsproperties::get_with_result("definitely.does.not.exist.anywhere");
+    let result: Result<String, _> = rsproperties::get("definitely.does.not.exist.anywhere");
     assert!(
         result.is_err(),
         "Should return error for non-existent property"
@@ -321,12 +323,13 @@ fn test_null_bytes_and_special_chars() {
         let result = rsproperties::set(prop_name, prop_value);
         match result {
             Ok(_) => {
-                let retrieved = rsproperties::get(prop_name);
+                let retrieved: Result<String, _> = rsproperties::get(prop_name);
+                let retrieved_value = retrieved.unwrap();
                 println!(
                     "✓ Special chars in '{}': {} bytes -> {} bytes",
                     prop_name,
                     prop_value.len(),
-                    retrieved.len()
+                    retrieved_value.len()
                 );
                 // Value might be modified/filtered by the implementation
             }
