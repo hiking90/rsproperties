@@ -32,7 +32,7 @@
 //!     rsproperties::init(config);
 //!
 //!     // Get a value of the property.
-//!     let value: String = rsproperties::get_or("ro.build.version.sdk", "0");
+//!     let value: String = rsproperties::get_or("ro.build.version.sdk", "0".to_owned());
 //!     println!("ro.build.version.sdk: {}", value);
 //!
 //!     // Set a value of the property - use string literals for compatibility
@@ -452,7 +452,7 @@ mod tests {
 
         enable_logger();
         for prop in PROPERTIES.iter() {
-            let value1: String = get_or(prop, "");
+            let value1: String = get_or(prop, "".to_owned);
             let value2 = AndroidSystemProperties::new().get(prop).unwrap_or_default();
 
             println!("{}: [{}], [{}]", prop, value1, value2);
