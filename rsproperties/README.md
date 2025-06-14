@@ -6,6 +6,10 @@
 
 A pure Rust implementation of Android's property system, providing cross-platform access to Android system properties on both Linux and Android platforms.
 
+## Supported Android Versions
+
+This library supports Android versions from Android 9 (API level 28) to Android 16 (API level 36).
+
 ## Features
 
 - **Complete Android Properties Implementation**: Full Rust implementation of Android's property system - read, write, and monitor properties exactly like Android native code
@@ -53,7 +57,6 @@ match rsproperties::get::<String>("ro.build.version.release") {
 if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
     eprintln!("Failed to set property: {}", e);
 }
-```
 ```
 
 ### Custom Configuration

@@ -13,6 +13,10 @@ The library implements Android's property system semantics, including property c
 
 **Note:** This project is actively evolving. While core APIs are stable, some features may be refined in future releases.
 
+## Supported Android Versions
+
+This library supports Android versions from Android 9 (API level 28) to Android 16 (API level 36).
+
 ## Features
 
 - **Complete Android Properties Implementation**: Full Rust implementation of Android's property system - read, write, and monitor properties exactly like Android native code
