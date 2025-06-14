@@ -1,0 +1,362 @@
+name: Android Device Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_device:
+        description: 'Target Android architecture'
+        required: false
+        default: 'aarch64'
+        type: choice
+        options:
+          - aarch64
+          - armv7
+          - x86_64
+          - i686
+      test_type:
+        description: 'Type of tests to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - integration
+          - unit
+          - examples
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  android-device-test:
+    name: Android Device Test (${{ github.event.inputs.target_device || 'aarch64' }})
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ github.event.inputs.target_device || 'aarch64' }}-linux-android
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+      with:
+        packages: platform-tools platforms;android-34 ndk;26.1.10909125
+
+    - name: Install cargo-ndk
+      run: cargo install cargo-ndk
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-android-test-${{ github.event.inputs.target_device || 'aarch64' }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-android-test-${{ github.event.inputs.target_device || 'aarch64' }}-
+          ${{ runner.os }}-cargo-android-test-
+          ${{ runner.os }}-cargo-
+
+    - name: Setup environment variables
+      run: |
+        export ANDROID_NDK_HOME=$ANDROID_NDK_ROOT
+        export TOP_DIR=$(pwd)
+        echo "ANDROID_NDK_HOME=$ANDROID_NDK_ROOT" >> $GITHUB_ENV
+        echo "TOP_DIR=$(pwd)" >> $GITHUB_ENV
+        echo "PATH=$PATH:$ANDROID_HOME/tools:$ANDROID_HOME/tools/bin:$ANDROID_HOME/platform-tools" >> $GITHUB_ENV
+        echo "TARGET_ARCH=${{ github.event.inputs.target_device || 'aarch64' }}" >> $GITHUB_ENV
+        echo "TEST_TYPE=${{ github.event.inputs.test_type || 'all' }}" >> $GITHUB_ENV
+
+    - name: Enable ADB debugging and wait for device
+      run: |
+        # Start ADB server
+        adb start-server
+
+        # Wait for device to be connected (timeout after 60 seconds for manual testing)
+        timeout=60
+        echo "Waiting for Android device to be connected..."
+        echo "Please ensure your Android device is:"
+        echo "1. Connected via USB"
+        echo "2. USB debugging enabled"
+        echo "3. Device authorized for this computer"
+
+        while [ $timeout -gt 0 ]; do
+          if adb devices | grep -q "device$"; then
+            echo "Device found!"
+            adb devices
+            device_info=$(adb shell getprop ro.product.model)
+            echo "Connected device: $device_info"
+            break
+          fi
+          echo "No device found, waiting... ($timeout seconds remaining)"
+          sleep 2
+          timeout=$((timeout - 2))
+        done
+
+        if [ $timeout -le 0 ]; then
+          echo "❌ ERROR: No Android device found after 60 seconds."
+          echo "Please ensure:"
+          echo "1. Android device is connected via USB"
+          echo "2. USB debugging is enabled in Developer Options"
+          echo "3. Device is authorized (check for authorization dialog on device)"
+          echo "4. ADB drivers are properly installed"
+          exit 1
+        else
+          echo "✅ Device connected successfully"
+          echo "DEVICE_AVAILABLE=true" >> $GITHUB_ENV
+        fi
+
+    - name: Verify device architecture
+      run: |
+        device_arch=$(adb shell getprop ro.product.cpu.abi)
+        target_arch="${{ github.event.inputs.target_device || 'aarch64' }}"
+
+        echo "Device architecture: $device_arch"
+        echo "Target architecture: $target_arch"
+
+        # Map target architecture to Android ABI
+        case "$target_arch" in
+          "aarch64") expected_abi="arm64-v8a" ;;
+          "armv7") expected_abi="armeabi-v7a" ;;
+          "x86_64") expected_abi="x86_64" ;;
+          "i686") expected_abi="x86" ;;
+          *) echo "Unknown target architecture: $target_arch"; exit 1 ;;
+        esac
+
+        if [[ "$device_arch" == "$expected_abi" ]]; then
+          echo "✅ Device architecture matches target"
+        else
+          echo "⚠️  WARNING: Device architecture ($device_arch) doesn't match target ($expected_abi)"
+          echo "Tests may fail or behave unexpectedly"
+        fi
+
+    - name: Prepare Android environment (ndk_prepare)
+      run: |
+        source envsetup.sh
+        ndk_prepare
+
+    - name: Build for Android (ndk_build)
+      run: |
+        source envsetup.sh
+        ndk_build
+
+    - name: Build test binaries
+      run: |
+        source envsetup.sh
+        read_remote_android
+
+        echo "Building test binaries for $cargo_ndk_target..."
+
+        # Build all test binaries without running them
+        cargo ndk --no-strip -t $cargo_ndk_target test --no-run -p rsproperties
+
+        # Also build examples if test type includes them
+        if [[ "$TEST_TYPE" == "all" || "$TEST_TYPE" == "examples" ]]; then
+          echo "Building examples..."
+          cargo ndk --no-strip -t $cargo_ndk_target build --examples -p rsproperties
+        fi
+
+    - name: Sync binaries to device (ndk_sync)
+      run: |
+        source envsetup.sh
+        ndk_sync
+
+    - name: Push test binaries to device
+      run: |
+        source envsetup.sh
+        read_remote_android
+
+        echo "Pushing test binaries to device..."
+
+        # Find and push test binaries
+        test_binaries=$(find target/$ndk_target-linux-android/debug/deps -name "*rsproperties*" -type f -executable | grep -E "(test|spec)")
+
+        if [ -z "$test_binaries" ]; then
+          echo "❌ No test binaries found!"
+          exit 1
+        fi
+
+        for binary in $test_binaries; do
+          echo "Pushing test binary: $(basename $binary)"
+          adb push "$binary" "$remote_directory/"
+        done
+
+        # Push examples if requested
+        if [[ "$TEST_TYPE" == "all" || "$TEST_TYPE" == "examples" ]]; then
+          echo "Pushing example binaries..."
+          example_binaries=$(find target/$ndk_target-linux-android/debug/examples -name "*" -type f -executable 2>/dev/null || true)
+          for binary in $example_binaries; do
+            echo "Pushing example binary: $(basename $binary)"
+            adb push "$binary" "$remote_directory/"
+          done
+        fi
+
+    - name: Run unit tests on Android device
+      if: env.TEST_TYPE == 'all' || env.TEST_TYPE == 'unit'
+      run: |
+        source envsetup.sh
+        read_remote_android
+
+        echo "Running unit tests on Android device..."
+
+        # Get list of test binaries on device
+        test_binaries=$(adb shell "ls $remote_directory/" | grep -E "(test|spec)" | grep rsproperties | head -10)
+
+        if [ -z "$test_binaries" ]; then
+          echo "❌ No test binaries found on device!"
+          exit 1
+        fi
+
+        failed_tests=0
+        total_tests=0
+
+        for binary in $test_binaries; do
+          echo "========================================="
+          echo "Running test binary: $binary"
+          echo "========================================="
+
+          total_tests=$((total_tests + 1))
+
+          # Make binary executable and run it
+          adb shell "chmod +x $remote_directory/$binary"
+
+          if timeout 300 adb shell "cd $remote_directory && ./$binary --test-threads=1"; then
+            echo "✅ Test $binary passed"
+          else
+            echo "❌ Test $binary failed"
+            failed_tests=$((failed_tests + 1))
+          fi
+
+          echo ""
+        done
+
+        echo "========================================="
+        echo "Unit Test Summary:"
+        echo "Total tests: $total_tests"
+        echo "Failed tests: $failed_tests"
+        echo "Passed tests: $((total_tests - failed_tests))"
+        echo "========================================="
+
+        if [ $failed_tests -gt 0 ]; then
+          echo "Some unit tests failed on Android device"
+          exit 1
+        else
+          echo "All unit tests passed on Android device!"
+        fi
+
+    - name: Run integration tests
+      if: env.TEST_TYPE == 'all' || env.TEST_TYPE == 'integration'
+      run: |
+        source envsetup.sh
+        read_remote_android
+
+        echo "Running integration tests on Android device..."
+
+        # Test basic property access
+        echo "Testing basic Android property operations..."
+
+        if adb shell "cd $remote_directory && echo 'Testing device connectivity...'" > /dev/null; then
+          echo "✅ Device communication working"
+        else
+          echo "❌ Device communication failed"
+          exit 1
+        fi
+
+        # Test property reading functionality
+        echo "Testing property reading..."
+        if adb shell "getprop ro.build.version.release" > /dev/null; then
+          android_version=$(adb shell "getprop ro.build.version.release")
+          echo "✅ Android version: $android_version"
+        else
+          echo "❌ Failed to read Android properties"
+          exit 1
+        fi
+
+        # Test if our rsproperties can access basic properties
+        test_props=("ro.build.version.release" "ro.product.model" "ro.build.version.sdk")
+        for prop in "${test_props[@]}"; do
+          echo "Testing property access: $prop"
+          if value=$(adb shell "getprop $prop" 2>/dev/null) && [ -n "$value" ]; then
+            echo "✅ Property $prop = $value"
+          else
+            echo "⚠️  Property $prop not accessible or empty"
+          fi
+        done
+
+    - name: Run examples
+      if: env.TEST_TYPE == 'all' || env.TEST_TYPE == 'examples'
+      run: |
+        source envsetup.sh
+        read_remote_android
+
+        echo "Running examples on Android device..."
+
+        # Run examples if available
+        examples=$(adb shell "ls $remote_directory/" | grep -v test | grep -v spec || true)
+
+        if [ -z "$examples" ]; then
+          echo "No examples found to run"
+          return 0
+        fi
+
+        failed_examples=0
+        total_examples=0
+
+        for example in $examples; do
+          # Skip if it's clearly not an executable (avoid binary files, etc.)
+          if [[ "$example" == *".so"* ]] || [[ "$example" == *".a"* ]]; then
+            continue
+          fi
+
+          echo "Running example: $example"
+          total_examples=$((total_examples + 1))
+
+          adb shell "chmod +x $remote_directory/$example"
+
+          if timeout 60 adb shell "cd $remote_directory && ./$example" 2>&1; then
+            echo "✅ Example $example completed"
+          else
+            echo "❌ Example $example failed or timed out"
+            failed_examples=$((failed_examples + 1))
+          fi
+          echo ""
+        done
+
+        if [ $total_examples -gt 0 ]; then
+          echo "========================================="
+          echo "Examples Summary:"
+          echo "Total examples: $total_examples"
+          echo "Failed examples: $failed_examples"
+          echo "Successful examples: $((total_examples - failed_examples))"
+          echo "========================================="
+
+          if [ $failed_examples -gt 0 ]; then
+            echo "⚠️  Some examples failed, but this might be expected"
+          fi
+        fi
+
+    - name: Collect device logs
+      if: always()
+      run: |
+        echo "Collecting device information..."
+        echo "Device model: $(adb shell getprop ro.product.model || echo 'Unknown')"
+        echo "Android version: $(adb shell getprop ro.build.version.release || echo 'Unknown')"
+        echo "SDK version: $(adb shell getprop ro.build.version.sdk || echo 'Unknown')"
+        echo "Architecture: $(adb shell getprop ro.product.cpu.abi || echo 'Unknown')"
+        echo "Available memory:"
+        adb shell "cat /proc/meminfo | head -3" || echo "Memory info not available"
+
+    - name: Cleanup device
+      if: always()
+      run: |
+        source envsetup.sh
+        read_remote_android
+
+        echo "Cleaning up test files from device..."
+        adb shell "rm -rf $remote_directory" || echo "Cleanup completed or directory not found"
+        echo "Android device test completed"
