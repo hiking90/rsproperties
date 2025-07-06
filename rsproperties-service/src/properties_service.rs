@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 
-use rsactor::{impl_message_handler, Actor, ActorRef};
+use rsactor::{Actor, ActorRef, ActorWeak};
 use rsproperties::{build_trie, load_properties_from_file, PropertyInfoEntry, SystemProperties};
 
 pub struct PropertiesServiceArgs {
@@ -74,7 +74,7 @@ impl Actor for PropertiesService {
 
     async fn on_stop(
         &mut self,
-        _actor_ref: &ActorRef<Self>,
+        _actor_weak: &ActorWeak<Self>,
         killed: bool,
     ) -> std::result::Result<(), Self::Error> {
         log::warn!("=====================================");
@@ -96,11 +96,6 @@ impl Actor for PropertiesService {
         Ok(())
     }
 }
-
-impl_message_handler!(
-    PropertiesService,
-    [crate::ReadyMessage, crate::PropertyMessage]
-);
 
 impl rsactor::Message<crate::ReadyMessage> for PropertiesService {
     type Reply = bool;

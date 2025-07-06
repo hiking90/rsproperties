@@ -7,7 +7,7 @@ use log::{debug, error, info, trace, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use rsactor::{impl_message_handler, Actor, ActorRef};
+use rsactor::{Actor, ActorRef, ActorWeak};
 
 use rsproperties::errors::*;
 
@@ -108,7 +108,7 @@ impl Actor for SocketService {
 
     async fn on_run(
         &mut self,
-        _actor_ref: &ActorRef<Self>,
+        _actor_weak: &ActorWeak<Self>,
     ) -> std::result::Result<(), Self::Error> {
         tokio::select! {
             _ = Self::handle_socket_connections(&self.property_listener, self.properties_service.clone()) => {
@@ -123,7 +123,7 @@ impl Actor for SocketService {
 
     async fn on_stop(
         &mut self,
-        _actor_ref: &ActorRef<Self>,
+        _actor_weak: &ActorWeak<Self>,
         killed: bool,
     ) -> std::result::Result<(), Self::Error> {
         warn!("=====================================");
@@ -144,8 +144,6 @@ impl Actor for SocketService {
         Ok(())
     }
 }
-
-impl_message_handler!(SocketService, [crate::ReadyMessage]);
 
 impl rsactor::Message<crate::ReadyMessage> for SocketService {
     type Reply = bool;
