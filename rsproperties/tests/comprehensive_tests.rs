@@ -198,9 +198,7 @@ fn test_thread_safety() {
         "All thread operations should complete"
     );
 
-    println!(
-        "✓ Thread safety test completed with {final_count} operations"
-    );
+    println!("✓ Thread safety test completed with {final_count} operations");
 }
 
 #[test]
@@ -245,9 +243,7 @@ mod builder_tests {
                 println!("✓ Property read back successfully");
             }
             Err(e) => {
-                println!(
-                    "⚠ Property set failed (expected without property service): {e}"
-                );
+                println!("⚠ Property set failed (expected without property service): {e}");
                 // This is expected behavior when property service is not running
             }
         }

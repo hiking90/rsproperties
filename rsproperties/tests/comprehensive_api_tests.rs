@@ -165,10 +165,7 @@ fn test_property_name_validation() {
 
     for (name, description) in edge_cases {
         let result = rsproperties::get_or(name, "default".to_string());
-        assert_eq!(
-            result, "default",
-            "Should handle edge case: {description}"
-        );
+        assert_eq!(result, "default", "Should handle edge case: {description}");
     }
 
     println!("✓ Property name edge cases handled correctly");

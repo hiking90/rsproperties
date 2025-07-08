@@ -72,9 +72,7 @@ impl PropertyInfoEntry {
         if match_operation == Some("exact") {
             exact_match = true;
         } else if match_operation != Some("prefix") && require_prefix_or_exact {
-            error!(
-                "Invalid match operation '{match_operation:?}' - must be 'prefix' or 'exact'"
-            );
+            error!("Invalid match operation '{match_operation:?}' - must be 'prefix' or 'exact'");
             return Err(Error::new_parse(format!(
                 "Match operation '{match_operation:?}' is not valid. Must be 'prefix' or 'exact'"
             )));
@@ -129,9 +127,7 @@ impl PropertyInfoEntry {
                     entries.push(entry);
                 }
                 Err(err) => {
-                    warn!(
-                        "Line {line_count}: Failed to parse line '{line}': {err}"
-                    );
+                    warn!("Line {line_count}: Failed to parse line '{line}': {err}");
                     errors.push(err);
                 }
             }

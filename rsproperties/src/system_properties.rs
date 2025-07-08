@@ -366,9 +366,7 @@ impl SystemProperties {
         match futex_wake(serial_pa.serial()) {
             Ok(_) => {}
             Err(e) => {
-                log::error!(
-                    "Failed to wake global serial futex after adding property: {e}"
-                );
+                log::error!("Failed to wake global serial futex after adding property: {e}");
                 return Err(e);
             }
         }

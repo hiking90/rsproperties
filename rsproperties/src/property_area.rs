@@ -149,9 +149,7 @@ impl PropertyAreaMap {
         thiz.property_area_mut()
             .init(PROP_AREA_MAGIC, PROP_AREA_VERSION);
 
-        info!(
-            "Successfully created read-write property area map: {filename:?}"
-        );
+        info!("Successfully created read-write property area map: {filename:?}");
         Ok(thiz)
     }
 
@@ -198,9 +196,7 @@ impl PropertyAreaMap {
                 "Invalid magic or version".to_string(),
             ))
         } else {
-            info!(
-                "Successfully opened read-only property area map: {filename:?}"
-            );
+            info!("Successfully opened read-only property area map: {filename:?}");
             Ok(thiz)
         }
     }

@@ -50,9 +50,7 @@ impl Actor for PropertiesService {
         }
 
         let mut system_properties = SystemProperties::new_area(dir).unwrap_or_else(|e| {
-            panic!(
-                "Cannot create system properties: {e}. Please check if {dir:?} exists."
-            )
+            panic!("Cannot create system properties: {e}. Please check if {dir:?} exists.")
         });
         for (key, value) in properties.iter() {
             match system_properties.find(key.as_str()).unwrap() {

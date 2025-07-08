@@ -270,15 +270,11 @@ impl SocketService {
 
         match service.ask(property_msg).await {
             Ok(true) => {
-                debug!(
-                    "Property message sent successfully: '{name}' = '{value}'"
-                );
+                debug!("Property message sent successfully: '{name}' = '{value}'");
                 Self::send_response(stream, PROP_SUCCESS).await?;
             }
             Ok(false) => {
-                warn!(
-                    "Property message was not processed by service: '{name}' = '{value}'"
-                );
+                warn!("Property message was not processed by service: '{name}' = '{value}'");
                 // Don't fail the operation if service doesn't process it
                 Self::send_response(stream, PROP_ERROR).await?;
             }

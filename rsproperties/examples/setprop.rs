@@ -107,9 +107,7 @@ fn validate_property(name: &str, value: &str) -> Result<(), String> {
 
     // Warn about read-only properties
     if name.starts_with("ro.") {
-        eprintln!(
-            "Warning: Property '{name}' is read-only and may not be settable"
-        );
+        eprintln!("Warning: Property '{name}' is read-only and may not be settable");
     }
 
     Ok(())

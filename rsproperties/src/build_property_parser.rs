@@ -56,9 +56,7 @@ pub fn load_properties_from_file(
         }
 
         if !has_filter && line.starts_with("import ") {
-            warn!(
-                "Line {line_count}: Import statements not implemented: {line}"
-            );
+            warn!("Line {line_count}: Import statements not implemented: {line}");
             // let line = line[7..].trim();
             unimplemented!("import")
         } else {
@@ -105,9 +103,7 @@ pub fn load_properties_from_file(
                     _processed_properties += 1;
                 }
                 Err(e) => {
-                    error!(
-                        "Line {line_count}: Failed to check permissions for '{key}': {e}"
-                    );
+                    error!("Line {line_count}: Failed to check permissions for '{key}': {e}");
                     continue;
                 }
             }

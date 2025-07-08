@@ -215,9 +215,7 @@ pub fn init(config: PropertyConfig) {
 
     match SYSTEM_PROPERTIES_DIR.set(props_dir.clone()) {
         Ok(_) => {
-            log::info!(
-                "Successfully set system properties directory to: {props_dir:?}"
-            );
+            log::info!("Successfully set system properties directory to: {props_dir:?}");
         }
         Err(_) => {
             log::warn!("System properties directory already set, ignoring new value");
@@ -254,9 +252,7 @@ pub fn properties_dir() -> &'static Path {
 pub fn system_properties() -> &'static system_properties::SystemProperties {
     SYSTEM_PROPERTIES.get_or_init(|| {
         let dir = properties_dir();
-        log::debug!(
-            "Initializing global SystemProperties instance from: {dir:?}"
-        );
+        log::debug!("Initializing global SystemProperties instance from: {dir:?}");
 
         match system_properties::SystemProperties::new(dir) {
             Ok(props) => {
@@ -264,12 +260,8 @@ pub fn system_properties() -> &'static system_properties::SystemProperties {
                 props
             }
             Err(e) => {
-                log::error!(
-                    "Failed to initialize SystemProperties from {dir:?}: {e}"
-                );
-                panic!(
-                    "Failed to initialize SystemProperties from {dir:?}: {e}"
-                );
+                log::error!("Failed to initialize SystemProperties from {dir:?}: {e}");
+                panic!("Failed to initialize SystemProperties from {dir:?}: {e}");
             }
         }
     })
@@ -511,9 +503,7 @@ mod tests {
 
         let dir = properties_dir();
         let mut system_properties = SystemProperties::new_area(dir).unwrap_or_else(|e| {
-            panic!(
-                "Cannot create system properties: {e}. Please check if {dir:?} exists."
-            )
+            panic!("Cannot create system properties: {e}. Please check if {dir:?} exists.")
         });
         for (key, value) in properties.iter() {
             match system_properties.find(key.as_str()).unwrap() {

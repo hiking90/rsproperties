@@ -198,9 +198,7 @@ fn test_performance_baseline() {
     let ops_per_sec = iterations as f64 / elapsed.as_secs_f64();
 
     println!("✓ Performance baseline test completed");
-    println!(
-        "  {iterations} iterations in {elapsed:?} ({ops_per_sec:.0} ops/sec)"
-    );
+    println!("  {iterations} iterations in {elapsed:?} ({ops_per_sec:.0} ops/sec)");
 
     // Should be reasonably fast
     assert!(

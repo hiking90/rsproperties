@@ -287,9 +287,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
             let res = conn.recv_i32()?;
 
             if res != PROP_SUCCESS {
-                log::error!(
-                    "Property service returned error for '{name}' = '{value}': 0x{res:X}"
-                );
+                log::error!("Property service returned error for '{name}' = '{value}': 0x{res:X}");
                 return Err(Error::new_io(std::io::Error::other(format!(
                     "Unable to set property \"{name}\" to \"{value}\": error code: 0x{res:X}"
                 ))));

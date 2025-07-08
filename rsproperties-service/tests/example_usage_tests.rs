@@ -301,7 +301,5 @@ async fn example_best_practices() {
     let telemetry_enabled =
         rsproperties::get_or(FEATURE_FLAG_TELEMETRY, "false".to_string()) == "true";
 
-    println!(
-        "Analytics: {analytics_enabled}, Telemetry: {telemetry_enabled}"
-    );
+    println!("Analytics: {analytics_enabled}, Telemetry: {telemetry_enabled}");
 }

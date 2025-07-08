@@ -97,9 +97,7 @@ impl ContextsSerialized {
 
         match &result {
             Ok(_) => {}
-            Err(e) => error!(
-                "Failed to map serial property area {serial_filename:?}: {e}"
-            ),
+            Err(e) => error!("Failed to map serial property area {serial_filename:?}: {e}"),
         }
 
         result
@@ -189,9 +187,7 @@ impl ContextsSerialized {
         match context_node.property_area() {
             Ok(area) => Ok(area),
             Err(e) => {
-                error!(
-                    "Failed to get property area for context index {context_index}: {e}"
-                );
+                error!("Failed to get property area for context index {context_index}: {e}");
                 Err(e)
             }
         }

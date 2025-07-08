@@ -422,10 +422,7 @@ async fn test_android_property_patterns() -> anyhow::Result<()> {
 
         // Parse as integer (typical app usage)
         let parsed_int: i32 = rsproperties::get(prop_name)?;
-        assert_eq!(
-            parsed_int, *expected_int,
-            "Failed for property {prop_name}"
-        );
+        assert_eq!(parsed_int, *expected_int, "Failed for property {prop_name}");
 
         // Get with default (safe app usage)
         let with_default: i32 = rsproperties::get_or(prop_name, -1);

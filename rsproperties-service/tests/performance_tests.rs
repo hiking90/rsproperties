@@ -49,9 +49,7 @@ async fn test_property_get_performance() -> Result<()> {
     let elapsed = start.elapsed();
     let avg_time = elapsed / iterations as u32;
 
-    println!(
-        "Get performance: {iterations} iterations in {elapsed:?}"
-    );
+    println!("Get performance: {iterations} iterations in {elapsed:?}");
     println!("Average time per get: {avg_time:?}");
     println!(
         "Gets per second: {:.0}",
@@ -127,9 +125,7 @@ async fn test_property_set_performance() -> Result<()> {
     let elapsed = start.elapsed();
     let avg_time = elapsed / iterations;
 
-    println!(
-        "Set performance: {iterations} iterations in {elapsed:?}"
-    );
+    println!("Set performance: {iterations} iterations in {elapsed:?}");
     println!("Average time per set: {avg_time:?}");
     println!(
         "Sets per second: {:.0}",
@@ -208,9 +204,7 @@ async fn test_concurrent_reads() -> Result<()> {
                 }
                 let elapsed = start.elapsed();
 
-                println!(
-                    "Thread {thread_id} completed {reads_per_thread} reads in {elapsed:?}"
-                );
+                println!("Thread {thread_id} completed {reads_per_thread} reads in {elapsed:?}");
                 elapsed
             })
         })
@@ -255,9 +249,7 @@ async fn test_concurrent_writes() -> Result<()> {
                 }
                 let elapsed = start.elapsed();
 
-                println!(
-                    "Thread {thread_id} completed {writes_per_thread} writes in {elapsed:?}"
-                );
+                println!("Thread {thread_id} completed {writes_per_thread} writes in {elapsed:?}");
                 Ok(elapsed)
             })
         })
@@ -326,9 +318,7 @@ async fn test_mixed_read_write_workload() -> Result<()> {
                 }
                 let elapsed = start.elapsed();
 
-                println!(
-                    "Mixed workload thread {thread_id} completed in {elapsed:?}"
-                );
+                println!("Mixed workload thread {thread_id} completed in {elapsed:?}");
                 Ok(())
             })
         })

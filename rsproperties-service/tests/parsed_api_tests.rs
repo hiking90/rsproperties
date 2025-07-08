@@ -306,10 +306,7 @@ async fn test_parsed_api_with_real_world_properties() -> anyhow::Result<()> {
         rsproperties::set(prop_name, prop_value)?;
 
         let parsed_result: i32 = rsproperties::get(prop_name)?;
-        assert_eq!(
-            parsed_result, *expected,
-            "Failed for property {prop_name}"
-        );
+        assert_eq!(parsed_result, *expected, "Failed for property {prop_name}");
 
         let with_default: i32 = rsproperties::get_or(prop_name, 999);
         assert_eq!(

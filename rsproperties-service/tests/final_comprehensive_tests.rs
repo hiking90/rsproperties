@@ -321,9 +321,7 @@ mod builder_tests {
                 println!("✓ Property read back successfully: '{value}'");
             }
             Err(e) => {
-                println!(
-                    "⚠ Property set failed (expected without property service): {e}"
-                );
+                println!("⚠ Property set failed (expected without property service): {e}");
                 // This is expected when property service is not running
             }
         }
@@ -361,9 +359,7 @@ mod builder_tests {
         let result = rsproperties::set("test.max.length.set", &max_value);
 
         match result {
-            Ok(_) => println!(
-                "✓ Successfully set property with max length ({PROP_VALUE_MAX})"
-            ),
+            Ok(_) => println!("✓ Successfully set property with max length ({PROP_VALUE_MAX})"),
             Err(e) => println!("⚠ Failed to set max length property: {e}"),
         }
 
