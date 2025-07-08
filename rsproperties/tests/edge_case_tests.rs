@@ -77,8 +77,7 @@ fn test_special_character_property_names() {
         // These should not crash and should return the default
         assert_eq!(
             result, "not_found",
-            "Special property name '{}' should return default",
-            name
+            "Special property name '{name}' should return default"
         );
     }
 }
@@ -137,12 +136,11 @@ fn test_long_property_names() {
         let result = rsproperties::get_or(&long_name, "default".to_string());
         assert_eq!(
             result, "default",
-            "Long property name ({} chars) should return default",
-            length
+            "Long property name ({length} chars) should return default"
         );
 
         // Test that we don't crash on extremely long names
-        println!("Tested property name of length {}", length);
+        println!("Tested property name of length {length}");
     }
 }
 
@@ -178,7 +176,7 @@ fn test_property_value_edge_cases() {
     ];
 
     for (i, (value, description)) in test_values.iter().enumerate() {
-        let prop_name = format!("edge.value.test.{}", i);
+        let prop_name = format!("edge.value.test.{i}");
 
         match rsproperties::set(&prop_name, value) {
             Ok(_) => {
@@ -219,7 +217,7 @@ fn test_maximum_length_values() {
     ];
 
     for length in test_lengths {
-        let prop_name = format!("edge.maxlen.{}", length);
+        let prop_name = format!("edge.maxlen.{length}");
         let value = "x".repeat(length);
 
         match rsproperties::set(&prop_name, &value) {
@@ -228,10 +226,10 @@ fn test_maximum_length_values() {
                 let retrieved_value = retrieved.unwrap();
                 assert_eq!(retrieved_value.len(), length);
                 assert_eq!(retrieved_value, value);
-                println!("✓ Successfully set/get property with {} byte value", length);
+                println!("✓ Successfully set/get property with {length} byte value");
             }
             Err(e) => {
-                println!("✗ Failed to set property with {} byte value: {}", length, e);
+                println!("✗ Failed to set property with {length} byte value: {e}");
             }
         }
     }
@@ -255,7 +253,7 @@ fn test_maximum_length_values() {
             );
         }
         Err(e) => {
-            println!("Oversized value correctly rejected: {}", e);
+            println!("Oversized value correctly rejected: {e}");
         }
     }
 }
@@ -274,9 +272,9 @@ fn test_error_handling() {
 
     // Test that error contains useful information
     if let Err(e) = result {
-        let error_msg = format!("{}", e);
+        let error_msg = format!("{e}");
         assert!(!error_msg.is_empty(), "Error message should not be empty");
-        println!("Error message for non-existent property: {}", error_msg);
+        println!("Error message for non-existent property: {error_msg}");
     }
 
     #[cfg(feature = "builder")]
@@ -286,13 +284,12 @@ fn test_error_handling() {
 
         for (name, value, description) in invalid_cases {
             let result = rsproperties::set(name, value);
-            println!("Testing {}: {:?}", description, result);
+            println!("Testing {description}: {result:?}");
             // Should either succeed or fail gracefully with a proper error
             if let Err(e) = result {
                 assert!(
-                    !format!("{}", e).is_empty(),
-                    "Error message should not be empty for {}",
-                    description
+                    !format!("{e}").is_empty(),
+                    "Error message should not be empty for {description}"
                 );
             }
         }
@@ -334,7 +331,7 @@ fn test_null_bytes_and_special_chars() {
                 // Value might be modified/filtered by the implementation
             }
             Err(e) => {
-                println!("✗ Failed to set '{}': {}", prop_name, e);
+                println!("✗ Failed to set '{prop_name}': {e}");
             }
         }
     }

@@ -174,12 +174,12 @@ impl SocketService {
                 // Handle each connection in a separate task
                 tokio::spawn(async move {
                     if let Err(e) = Self::handle_client(stream, connection_sender).await {
-                        error!("Error handling client: {}", e);
+                        error!("Error handling client: {e}");
                     }
                 });
             }
             Err(e) => {
-                error!("Error accepting connection: {}", e);
+                error!("Error accepting connection: {e}");
             }
         }
         Ok(())
@@ -200,7 +200,7 @@ impl SocketService {
             .map_err(rsproperties::errors::Error::new_io)?;
         let cmd = u32::from_ne_bytes(cmd_buf);
 
-        debug!("Received command: 0x{:08X}", cmd);
+        debug!("Received command: 0x{cmd:08X}");
 
         match cmd {
             PROP_MSG_SETPROP2 => {
@@ -208,11 +208,10 @@ impl SocketService {
                 Self::handle_setprop2(&mut stream, service).await?;
             }
             _ => {
-                warn!("Unknown command received: 0x{:08X}", cmd);
+                warn!("Unknown command received: 0x{cmd:08X}");
                 Self::send_response(&mut stream, PROP_ERROR).await?;
                 return Err(rsproperties::errors::Error::new_parse(format!(
-                    "Unknown command: 0x{:08X}",
-                    cmd
+                    "Unknown command: 0x{cmd:08X}"
                 )));
             }
         }
@@ -230,40 +229,38 @@ impl SocketService {
 
         // Read name length and name
         let name_len = Self::read_u32(stream).await?;
-        trace!("Name length: {}", name_len);
+        trace!("Name length: {name_len}");
 
         if name_len > 1024 {
             // Reasonable limit
-            error!("Name length too large: {}", name_len);
+            error!("Name length too large: {name_len}");
             Self::send_response(stream, PROP_ERROR).await?;
             return Err(rsproperties::errors::Error::new_file_validation(format!(
-                "Name length too large: {}",
-                name_len
+                "Name length too large: {name_len}"
             )));
         }
 
         let name = Self::read_string(stream, name_len as usize).await?;
-        debug!("Property name: '{}'", name);
+        debug!("Property name: '{name}'");
 
         // Read value length and value
         let value_len = Self::read_u32(stream).await?;
-        trace!("Value length: {}", value_len);
+        trace!("Value length: {value_len}");
 
         if value_len > 8192 {
             // Reasonable limit for property values
-            error!("Value length too large: {}", value_len);
+            error!("Value length too large: {value_len}");
             Self::send_response(stream, PROP_ERROR).await?;
             return Err(rsproperties::errors::Error::new_file_validation(format!(
-                "Value length too large: {}",
-                value_len
+                "Value length too large: {value_len}"
             )));
         }
 
         let value = Self::read_string(stream, value_len as usize).await?;
-        debug!("Property value: '{}'", value);
+        debug!("Property value: '{value}'");
 
         // Process the property setting
-        info!("Successfully set property: '{}' = '{}'", name, value);
+        info!("Successfully set property: '{name}' = '{value}'");
 
         // Send property data through channel if sender is available
         let property_msg = crate::PropertyMessage {
@@ -274,21 +271,19 @@ impl SocketService {
         match service.ask(property_msg).await {
             Ok(true) => {
                 debug!(
-                    "Property message sent successfully: '{}' = '{}'",
-                    name, value
+                    "Property message sent successfully: '{name}' = '{value}'"
                 );
                 Self::send_response(stream, PROP_SUCCESS).await?;
             }
             Ok(false) => {
                 warn!(
-                    "Property message was not processed by service: '{}' = '{}'",
-                    name, value
+                    "Property message was not processed by service: '{name}' = '{value}'"
                 );
                 // Don't fail the operation if service doesn't process it
                 Self::send_response(stream, PROP_ERROR).await?;
             }
             Err(e) => {
-                error!("Failed to send property message through channel: {}", e);
+                error!("Failed to send property message through channel: {e}");
                 // Don't fail the operation if channel send fails
                 Self::send_response(stream, PROP_ERROR).await?;
             }
@@ -329,7 +324,7 @@ impl SocketService {
 
     /// Sends a response to the client
     async fn send_response(stream: &mut UnixStream, response: i32) -> Result<()> {
-        trace!("Sending response: {}", response);
+        trace!("Sending response: {response}");
         stream
             .write_all(&response.to_ne_bytes())
             .await

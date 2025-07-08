@@ -30,8 +30,7 @@ async fn test_get_parsed_error_types() -> anyhow::Result<()> {
     assert!(
         error_str.to_lowercase().contains("not found")
             || error_str.to_lowercase().contains("notfound"),
-        "Expected NotFound error, got: {}",
-        error_str
+        "Expected NotFound error, got: {error_str}"
     );
 
     // Test Parse error
@@ -42,8 +41,7 @@ async fn test_get_parsed_error_types() -> anyhow::Result<()> {
     let error_str = result.unwrap_err().to_string();
     assert!(
         error_str.to_lowercase().contains("parse") || error_str.to_lowercase().contains("failed"),
-        "Expected Parse error, got: {}",
-        error_str
+        "Expected Parse error, got: {error_str}"
     );
 
     // Test empty string parsing
@@ -68,7 +66,7 @@ async fn test_numeric_overflow_edge_cases() -> anyhow::Result<()> {
     ];
 
     for (name, overflow_value) in overflow_cases.iter() {
-        let prop_name = format!("test.overflow.{}", name);
+        let prop_name = format!("test.overflow.{name}");
         rsproperties::set(&prop_name, overflow_value)?;
 
         // Should parse successfully as larger types
@@ -78,7 +76,7 @@ async fn test_numeric_overflow_edge_cases() -> anyhow::Result<()> {
         // But should fail for smaller types (depending on the specific case)
         if name.contains("i8") {
             let result: Result<i8, _> = rsproperties::get(&prop_name);
-            assert!(result.is_err(), "i8 should overflow for {}", overflow_value);
+            assert!(result.is_err(), "i8 should overflow for {overflow_value}");
         }
     }
 
@@ -98,7 +96,7 @@ async fn test_floating_point_special_values() -> anyhow::Result<()> {
     ];
 
     for (name, special_value) in special_values.iter() {
-        let prop_name = format!("test.float_special.{}", name);
+        let prop_name = format!("test.float_special.{name}");
         rsproperties::set(&prop_name, special_value)?;
 
         let result: Result<f64, _> = rsproperties::get(&prop_name);
@@ -153,7 +151,7 @@ async fn test_string_parsing_edge_cases() -> anyhow::Result<()> {
     ];
 
     for (name, test_value) in edge_cases.iter() {
-        let prop_name = format!("test.string_edge.{}", name);
+        let prop_name = format!("test.string_edge.{name}");
         rsproperties::set(&prop_name, test_value)?;
 
         // Try parsing as integer
@@ -172,11 +170,11 @@ async fn test_string_parsing_edge_cases() -> anyhow::Result<()> {
             }
             &"empty_string" | &"whitespace_only" | &"tab_and_newline" | &"multiple_signs"
             | &"decimal_only" | &"trailing_garbage" | &"embedded_space" => {
-                assert!(is_error, "Should fail to parse '{}' as integer", test_value);
+                assert!(is_error, "Should fail to parse '{test_value}' as integer");
             }
             &"decimal_no_digits" => {
                 // This should fail for integer parsing
-                assert!(is_error, "Should fail to parse '{}' as integer", test_value);
+                assert!(is_error, "Should fail to parse '{test_value}' as integer");
             }
             &"very_long_number" => {
                 // This might succeed or fail depending on the number size
@@ -192,8 +190,7 @@ async fn test_string_parsing_edge_cases() -> anyhow::Result<()> {
         if is_error {
             assert_eq!(
                 with_default, 999,
-                "get_parsed_with_default should return default for invalid input: '{}'",
-                test_value
+                "get_parsed_with_default should return default for invalid input: '{test_value}'"
             );
         }
     }
@@ -227,13 +224,12 @@ async fn test_property_name_edge_cases() -> anyhow::Result<()> {
                 let retrieved: String = rsproperties::get(prop_name)?;
                 assert_eq!(
                     retrieved, test_value,
-                    "Retrieved value doesn't match for property name case: {}",
-                    test_name
+                    "Retrieved value doesn't match for property name case: {test_name}"
                 );
             }
             Err(e) => {
                 // Some property names might be rejected by the system
-                println!("Property name '{}' was rejected: {}", prop_name, e);
+                println!("Property name '{prop_name}' was rejected: {e}");
                 // This is acceptable behavior for invalid names
             }
         }
@@ -255,7 +251,7 @@ async fn test_property_value_size_limits() -> anyhow::Result<()> {
     ];
 
     for (test_name, test_value) in size_cases.iter() {
-        let prop_name = format!("test.size_limits.{}", test_name);
+        let prop_name = format!("test.size_limits.{test_name}");
 
         let set_result = rsproperties::set(&prop_name, test_value);
 
@@ -274,12 +270,11 @@ async fn test_property_value_size_limits() -> anyhow::Result<()> {
                 // Should at least preserve some of the value
                 assert!(
                     !retrieved.is_empty() || test_value.is_empty(),
-                    "Value completely lost for {}",
-                    test_name
+                    "Value completely lost for {test_name}"
                 );
             }
             Err(e) => {
-                println!("Large value rejected for {}: {}", test_name, e);
+                println!("Large value rejected for {test_name}: {e}");
                 // This is acceptable for very large values
             }
         }
@@ -298,15 +293,15 @@ async fn test_concurrent_error_scenarios() -> anyhow::Result<()> {
         .map(|task_id| {
             tokio::spawn(async move {
                 // Each task tries various error scenarios
-                let base_name = format!("test.concurrent_errors.task_{}", task_id);
+                let base_name = format!("test.concurrent_errors.task_{task_id}");
 
                 // Try parsing non-existent property
-                let non_existent = format!("{}.non_existent", base_name);
+                let non_existent = format!("{base_name}.non_existent");
                 let result: Result<i32, _> = rsproperties::get(&non_existent);
                 assert!(result.is_err());
 
                 // Set invalid value and try parsing
-                let invalid_prop = format!("{}.invalid", base_name);
+                let invalid_prop = format!("{base_name}.invalid");
                 rsproperties::set(&invalid_prop, "not_a_number")?;
                 let result: Result<i32, _> = rsproperties::get(&invalid_prop);
                 assert!(result.is_err());
@@ -379,9 +374,7 @@ async fn test_api_contract_validation() -> anyhow::Result<()> {
         let result = rsproperties::set(prop_name, prop_value);
         assert!(
             result.is_ok(),
-            "Valid set operation should succeed: {}={}",
-            prop_name,
-            prop_value
+            "Valid set operation should succeed: {prop_name}={prop_value}"
         );
     }
 
@@ -396,7 +389,7 @@ async fn test_memory_usage_patterns() -> anyhow::Result<()> {
     let num_iterations = 100;
 
     for i in 0..num_iterations {
-        let prop_name = format!("test.memory.iteration_{}", i);
+        let prop_name = format!("test.memory.iteration_{i}");
 
         // Create and destroy many property values
         rsproperties::set(&prop_name, &i)?;
@@ -407,7 +400,7 @@ async fn test_memory_usage_patterns() -> anyhow::Result<()> {
         rsproperties::set(&prop_name, &(i as f64 * 1.5))?;
         let _as_float: f64 = rsproperties::get(&prop_name)?;
 
-        rsproperties::set(&prop_name, &format!("string_{}", i))?;
+        rsproperties::set(&prop_name, &format!("string_{i}"))?;
         let _as_string: String = rsproperties::get(&prop_name)?;
     }
 
@@ -430,8 +423,7 @@ async fn test_error_message_quality() -> anyhow::Result<()> {
         error_msg.contains("non.existent.test.property")
             || error_msg.to_lowercase().contains("not found")
             || error_msg.to_lowercase().contains("notfound"),
-        "Error message should be informative: '{}'",
-        error_msg
+        "Error message should be informative: '{error_msg}'"
     );
 
     // Test 2: Parse error
@@ -444,8 +436,7 @@ async fn test_error_message_quality() -> anyhow::Result<()> {
         error_msg.to_lowercase().contains("parse")
             || error_msg.to_lowercase().contains("invalid")
             || error_msg.contains("invalid_for_integer"),
-        "Parse error message should be informative: '{}'",
-        error_msg
+        "Parse error message should be informative: '{error_msg}'"
     );
 
     Ok(())
@@ -467,7 +458,7 @@ async fn test_type_conversion_boundaries() -> anyhow::Result<()> {
     for (test_name, value_str, should_succeed_signed, should_succeed_unsigned) in
         boundary_tests.iter()
     {
-        let prop_name = format!("test.boundaries.{}", test_name);
+        let prop_name = format!("test.boundaries.{test_name}");
         rsproperties::set(&prop_name, value_str)?;
 
         // Try parsing as signed
@@ -479,32 +470,24 @@ async fn test_type_conversion_boundaries() -> anyhow::Result<()> {
         if *should_succeed_signed {
             assert!(
                 signed_result.is_ok(),
-                "Should parse successfully as i32 for {}: {}",
-                test_name,
-                value_str
+                "Should parse successfully as i32 for {test_name}: {value_str}"
             );
         } else {
             assert!(
                 signed_result.is_err(),
-                "Should fail to parse as i32 for {}: {}",
-                test_name,
-                value_str
+                "Should fail to parse as i32 for {test_name}: {value_str}"
             );
         }
 
         if *should_succeed_unsigned {
             assert!(
                 unsigned_result.is_ok(),
-                "Should parse successfully as u32 for {}: {}",
-                test_name,
-                value_str
+                "Should parse successfully as u32 for {test_name}: {value_str}"
             );
         } else {
             assert!(
                 unsigned_result.is_err(),
-                "Should fail to parse as u32 for {}: {}",
-                test_name,
-                value_str
+                "Should fail to parse as u32 for {test_name}: {value_str}"
             );
         }
 

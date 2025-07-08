@@ -93,8 +93,7 @@ async fn test_get_parsed_with_default_booleans() -> anyhow::Result<()> {
         let result: bool = rsproperties::get_or(prop_name, false);
         assert_eq!(
             result, *expected,
-            "Failed for valid boolean property {} with value {}",
-            prop_name, prop_value
+            "Failed for valid boolean property {prop_name} with value {prop_value}"
         );
     }
 
@@ -104,8 +103,7 @@ async fn test_get_parsed_with_default_booleans() -> anyhow::Result<()> {
         let result: bool = rsproperties::get_or(prop_name, true); // Use true as default to verify fallback
         assert!(
             result,
-            "Should return default for invalid boolean value: {}",
-            prop_value
+            "Should return default for invalid boolean value: {prop_value}"
         );
     }
 
@@ -237,8 +235,7 @@ async fn test_get_parsed_edge_cases() -> anyhow::Result<()> {
         let result: i32 = rsproperties::get(prop_name)?;
         assert_eq!(
             result, *expected,
-            "Failed for property {} with value {}",
-            prop_name, prop_value
+            "Failed for property {prop_name} with value {prop_value}"
         );
     }
 
@@ -311,15 +308,13 @@ async fn test_parsed_api_with_real_world_properties() -> anyhow::Result<()> {
         let parsed_result: i32 = rsproperties::get(prop_name)?;
         assert_eq!(
             parsed_result, *expected,
-            "Failed for property {}",
-            prop_name
+            "Failed for property {prop_name}"
         );
 
         let with_default: i32 = rsproperties::get_or(prop_name, 999);
         assert_eq!(
             with_default, *expected,
-            "get_parsed_with_default failed for property {}",
-            prop_name
+            "get_parsed_with_default failed for property {prop_name}"
         );
     }
 

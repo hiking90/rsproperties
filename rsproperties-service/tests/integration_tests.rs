@@ -208,7 +208,7 @@ mod error_handling_tests {
         let result = rsproperties::set(prop_name, &too_long_value);
         // This should fail or truncate the value
         // The exact behavior depends on implementation
-        println!("Result for too long value: {:?}", result);
+        println!("Result for too long value: {result:?}");
     }
 }
 
@@ -239,7 +239,7 @@ mod concurrency_tests {
                         assert_eq!(value, expected);
                         thread::sleep(Duration::from_millis(1));
                     }
-                    println!("Thread {} completed", i);
+                    println!("Thread {i} completed");
                 })
             })
             .collect();
@@ -265,7 +265,7 @@ mod concurrency_tests {
                 let name = prop_name.to_string();
 
                 thread::spawn(move || {
-                    let value = format!("thread_{}_value", i);
+                    let value = format!("thread_{i}_value");
                     rsproperties::set(&name, &value).unwrap();
                     // thread::sleep(Duration::from_millis(10));
 
@@ -273,7 +273,7 @@ mod concurrency_tests {
                     let retrieved: String = rsproperties::get(&name).unwrap_or_default();
                     assert!(!retrieved.is_empty());
 
-                    println!("Thread {} set value: {}, got: {}", i, value, retrieved);
+                    println!("Thread {i} set value: {value}, got: {retrieved}");
                 })
             })
             .collect();

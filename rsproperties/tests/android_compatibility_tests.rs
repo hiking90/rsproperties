@@ -24,16 +24,15 @@ fn test_android_property_contexts_parsing() {
 
     for file in context_files {
         let (property_infos, errors) = PropertyInfoEntry::parse_from_file(Path::new(file), false)
-            .unwrap_or_else(|_| panic!("Failed to parse {}", file));
+            .unwrap_or_else(|_| panic!("Failed to parse {file}"));
 
         assert!(
             !property_infos.is_empty(),
-            "Should have parsed some property info from {}",
-            file
+            "Should have parsed some property info from {file}"
         );
 
         if !errors.is_empty() {
-            println!("Parsing errors in {}: {:?}", file, errors);
+            println!("Parsing errors in {file}: {errors:?}");
         }
 
         println!(
@@ -44,7 +43,7 @@ fn test_android_property_contexts_parsing() {
 
         // Verify some basic structure
         for (i, _info) in property_infos.iter().take(3).enumerate() {
-            println!("Property info entry {} parsed successfully", i);
+            println!("Property info entry {i} parsed successfully");
         }
     }
 }
@@ -68,18 +67,17 @@ fn test_android_build_prop_parsing() {
             Ok(_) => {
                 assert!(
                     !properties.is_empty(),
-                    "Should have loaded properties from {}",
-                    file
+                    "Should have loaded properties from {file}"
                 );
                 println!("Loaded {} properties from {}", properties.len(), file);
 
                 // Print a few properties as examples
                 for (key, value) in properties.iter().take(3) {
-                    println!("  {}={}", key, value);
+                    println!("  {key}={value}");
                 }
             }
             Err(e) => {
-                eprintln!("Failed to load {}: {}", file, e);
+                eprintln!("Failed to load {file}: {e}");
             }
         }
     }

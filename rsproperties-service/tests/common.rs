@@ -59,10 +59,10 @@ pub async fn init_test() -> (ActorRef<SocketService>, ActorRef<PropertiesService
                         tokio::join!(services.0.join_handle, services.1.join_handle,);
                     // Handle potential errors from join handles
                     if let Err(e) = res1 {
-                        eprintln!("Socket service error: {}", e);
+                        eprintln!("Socket service error: {e}");
                     }
                     if let Err(e) = res2 {
-                        eprintln!("Properties service error: {}", e);
+                        eprintln!("Properties service error: {e}");
                     }
                 });
             });

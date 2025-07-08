@@ -32,8 +32,8 @@ fn test_constants_validation() {
     );
 
     println!("✓ Constants validation passed");
-    println!("  PROP_VALUE_MAX = {}", PROP_VALUE_MAX);
-    println!("  PROP_DIRNAME = '{}'", PROP_DIRNAME);
+    println!("  PROP_VALUE_MAX = {PROP_VALUE_MAX}");
+    println!("  PROP_DIRNAME = '{PROP_DIRNAME}'");
 }
 
 #[test]
@@ -66,7 +66,7 @@ fn test_get_with_default_edge_cases() {
 
     for (prop, default, description) in &test_cases {
         let result = rsproperties::get_or(prop, default.to_string());
-        assert_eq!(result, *default, "Failed for {}", description);
+        assert_eq!(result, *default, "Failed for {description}");
     }
 
     println!(
@@ -90,8 +90,7 @@ fn test_get_nonexistent_returns_error() {
         let result: Result<String, _> = rsproperties::get(prop);
         assert!(
             result.is_err(),
-            "Property '{}' should not exist and should return error",
-            prop
+            "Property '{prop}' should not exist and should return error"
         );
     }
 
@@ -109,7 +108,7 @@ fn test_dirname_function() {
     assert!(!dirname_str.is_empty(), "dirname should not be empty");
 
     println!("✓ dirname function test passed");
-    println!("  dirname = '{}'", dirname_str);
+    println!("  dirname = '{dirname_str}'");
 }
 
 #[test]
@@ -151,7 +150,7 @@ fn test_thread_safety_basic() {
         let handle = thread::spawn(move || {
             // Each thread performs property operations
             for j in 0..10 {
-                let prop_name = format!("test.thread.{}.{}", i, j);
+                let prop_name = format!("test.thread.{i}.{j}");
 
                 // Test get_or
                 let _result = rsproperties::get_or(&prop_name, "default".to_string());
@@ -178,7 +177,7 @@ fn test_thread_safety_basic() {
     let final_count = counter.load(Ordering::SeqCst);
     assert_eq!(final_count, 5 * 10 * 3, "All operations should complete");
 
-    println!("✓ Thread safety test passed ({} operations)", final_count);
+    println!("✓ Thread safety test passed ({final_count} operations)");
 }
 
 #[test]
@@ -191,7 +190,7 @@ fn test_performance_baseline() {
     let iterations = 1000;
 
     for i in 0..iterations {
-        let prop = format!("perf.test.{}", i);
+        let prop = format!("perf.test.{i}");
         let _result = rsproperties::get_or(&prop, "default".to_string());
     }
 
@@ -200,15 +199,13 @@ fn test_performance_baseline() {
 
     println!("✓ Performance baseline test completed");
     println!(
-        "  {} iterations in {:?} ({:.0} ops/sec)",
-        iterations, elapsed, ops_per_sec
+        "  {iterations} iterations in {elapsed:?} ({ops_per_sec:.0} ops/sec)"
     );
 
     // Should be reasonably fast
     assert!(
         ops_per_sec > 500.0,
-        "Performance should be reasonable, got {:.0} ops/sec",
-        ops_per_sec
+        "Performance should be reasonable, got {ops_per_sec:.0} ops/sec"
     );
 }
 
@@ -254,8 +251,8 @@ mod builder_tests {
 
         for (prop, value) in &values {
             match rsproperties::set(prop, value) {
-                Ok(_) => println!("✓ Set '{}' = '{}'", prop, value),
-                Err(e) => println!("⚠ Failed to set '{}': {}", prop, e),
+                Ok(_) => println!("✓ Set '{prop}' = '{value}'"),
+                Err(e) => println!("⚠ Failed to set '{prop}': {e}"),
             }
         }
     }
@@ -274,7 +271,7 @@ mod builder_tests {
 
         match result1 {
             Ok(_) => println!("✓ Max length property set successfully"),
-            Err(e) => println!("⚠ Max length set failed: {}", e),
+            Err(e) => println!("⚠ Max length set failed: {e}"),
         }
 
         match result2 {
@@ -300,10 +297,10 @@ mod builder_tests {
                         assert_eq!(value.unwrap(), "updated");
                         println!("✓ Property update verified");
                     }
-                    Err(e) => println!("⚠ Update failed: {}", e),
+                    Err(e) => println!("⚠ Update failed: {e}"),
                 }
             }
-            Err(e) => println!("⚠ Initial set failed: {}", e),
+            Err(e) => println!("⚠ Initial set failed: {e}"),
         }
     }
 }
@@ -325,7 +322,7 @@ fn test_comprehensive_integration() {
     // 3. Test get_or for multiple properties
     let props = ["int.test.1", "int.test.2", "int.test.3"];
     for (i, prop) in props.iter().enumerate() {
-        let default = format!("default_{}", i);
+        let default = format!("default_{i}");
         let result = rsproperties::get_or(prop, default.clone());
         assert_eq!(result, default);
     }

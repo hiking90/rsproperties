@@ -73,7 +73,7 @@ impl TrieBuilderNode {
         if self.exact_matches.insert(entry) {
             Ok(())
         } else {
-            error!("Exact match already exists for '{}'", name);
+            error!("Exact match already exists for '{name}'");
             Err(Error::new_file_validation(format!(
                 "Exact match already exists for '{name}'"
             )))
@@ -95,7 +95,7 @@ impl TrieBuilderNode {
         if self.prefixes.insert(entry) {
             Ok(())
         } else {
-            error!("Prefix already exists for '{}'", name);
+            error!("Prefix already exists for '{name}'");
             Err(Error::new_file_validation(format!(
                 "Prefix already exists for '{name}'"
             )))
@@ -191,7 +191,7 @@ impl TrieBuilder {
                 .or_insert_with(|| TrieBuilderNode::new(last_name));
 
             if child.context().is_some() || child.rtype().is_some() {
-                error!("Duplicate prefix match detected for '{}'", name);
+                error!("Duplicate prefix match detected for '{name}'");
                 return Err(Error::new_file_validation(format!(
                     "Duplicate prefix match detected for '{name}'"
                 )));

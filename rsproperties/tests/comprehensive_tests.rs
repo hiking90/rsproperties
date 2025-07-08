@@ -63,7 +63,7 @@ fn test_get_with_default_functionality() {
 
     for (prop, default) in &test_cases {
         let result = rsproperties::get_or(prop, default.to_string());
-        assert_eq!(result, *default, "Should return default for {}", prop);
+        assert_eq!(result, *default, "Should return default for {prop}");
     }
 
     println!("✓ get_or functionality works correctly");
@@ -85,8 +85,7 @@ fn test_get_nonexistent_properties() {
         let result: Result<String, _> = rsproperties::get(prop);
         assert!(
             result.is_err(),
-            "Getting non-existent property '{}' should return error",
-            prop
+            "Getting non-existent property '{prop}' should return error"
         );
     }
 
@@ -106,11 +105,10 @@ fn test_dirname_function() {
     // Should be a valid path
     assert!(
         dirname_str.contains("properties") || dirname_str.starts_with("/"),
-        "dirname should be a valid path, got: {}",
-        dirname_str
+        "dirname should be a valid path, got: {dirname_str}"
     );
 
-    println!("✓ dirname function returns: {}", dirname_str);
+    println!("✓ dirname function returns: {dirname_str}");
 }
 
 #[test]
@@ -131,7 +129,7 @@ fn test_property_name_validation() {
         // These may or may not exist, but the names should be valid
         let _result: Result<String, _> = rsproperties::get(name);
         // We don't assert success/failure here since properties may or may not exist
-        println!("Tested property name: {}", name);
+        println!("Tested property name: {name}");
     }
 
     // Test invalid property names
@@ -170,7 +168,7 @@ fn test_thread_safety() {
         let handle = thread::spawn(move || {
             // Each thread performs multiple property operations
             for j in 0..5 {
-                let prop_name = format!("test.thread.{}.{}", i, j);
+                let prop_name = format!("test.thread.{i}.{j}");
 
                 // Test get_or
                 let _result: String = rsproperties::get_or(&prop_name, "default".to_string());
@@ -201,8 +199,7 @@ fn test_thread_safety() {
     );
 
     println!(
-        "✓ Thread safety test completed with {} operations",
-        final_count
+        "✓ Thread safety test completed with {final_count} operations"
     );
 }
 
@@ -249,8 +246,7 @@ mod builder_tests {
             }
             Err(e) => {
                 println!(
-                    "⚠ Property set failed (expected without property service): {}",
-                    e
+                    "⚠ Property set failed (expected without property service): {e}"
                 );
                 // This is expected behavior when property service is not running
             }
@@ -271,8 +267,8 @@ mod builder_tests {
 
         for (prop, value) in &test_cases {
             match rsproperties::set(prop, value) {
-                Ok(_) => println!("✓ Set property {} = {}", prop, value),
-                Err(e) => println!("⚠ Failed to set property {}: {}", prop, e),
+                Ok(_) => println!("✓ Set property {prop} = {value}"),
+                Err(e) => println!("⚠ Failed to set property {prop}: {e}"),
             }
         }
     }
@@ -287,7 +283,7 @@ mod builder_tests {
 
         match result {
             Ok(_) => println!("✓ Successfully set property with max length"),
-            Err(e) => println!("⚠ Failed to set max length property: {}", e),
+            Err(e) => println!("⚠ Failed to set max length property: {e}"),
         }
     }
 
@@ -328,10 +324,10 @@ mod builder_tests {
                         assert_eq!(value.unwrap(), "updated");
                         println!("✓ Property update verified");
                     }
-                    Err(e) => println!("⚠ Property update failed: {}", e),
+                    Err(e) => println!("⚠ Property update failed: {e}"),
                 }
             }
-            Err(e) => println!("⚠ Initial property set failed: {}", e),
+            Err(e) => println!("⚠ Initial property set failed: {e}"),
         }
     }
 
@@ -346,18 +342,18 @@ mod builder_tests {
         // Spawn multiple threads that try to set properties
         for i in 0..5 {
             let handle = thread::spawn(move || {
-                let prop_name = format!("test.concurrent.{}", i);
-                let prop_value = format!("value_{}", i);
+                let prop_name = format!("test.concurrent.{i}");
+                let prop_value = format!("value_{i}");
 
                 match rsproperties::set(&prop_name, &prop_value) {
                     Ok(_) => {
-                        println!("Thread {}: Set property {} = {}", i, prop_name, prop_value);
+                        println!("Thread {i}: Set property {prop_name} = {prop_value}");
 
                         // Try to read it back
                         let value: Result<String, _> = rsproperties::get(&prop_name);
-                        println!("Thread {}: Read back: {:?}", i, value);
+                        println!("Thread {i}: Read back: {value:?}");
                     }
-                    Err(e) => println!("Thread {}: Set failed: {}", i, e),
+                    Err(e) => println!("Thread {i}: Set failed: {e}"),
                 }
             });
             handles.push(handle);
@@ -410,11 +406,11 @@ fn test_real_android_properties() {
 
     for prop in &common_props {
         match rsproperties::get::<String>(prop) {
-            Ok(value) => println!("Found property {} = {}", prop, value),
+            Ok(value) => println!("Found property {prop} = {value}"),
             Err(_) => {
                 // Use get_or to test the functionality
                 let default_value = rsproperties::get_or(prop, "not_found".to_string());
-                println!("Property {} not found, default: {}", prop, default_value);
+                println!("Property {prop} not found, default: {default_value}");
             }
         }
     }

@@ -73,8 +73,7 @@ impl PropertyInfoEntry {
             exact_match = true;
         } else if match_operation != Some("prefix") && require_prefix_or_exact {
             error!(
-                "Invalid match operation '{:?}' - must be 'prefix' or 'exact'",
-                match_operation
+                "Invalid match operation '{match_operation:?}' - must be 'prefix' or 'exact'"
             );
             return Err(Error::new_parse(format!(
                 "Match operation '{match_operation:?}' is not valid. Must be 'prefix' or 'exact'"
@@ -104,8 +103,7 @@ impl PropertyInfoEntry {
         require_prefix_or_exact: bool,
     ) -> Result<(Vec<PropertyInfoEntry>, Vec<Error>)> {
         info!(
-            "Parsing property info file: {:?} (require_prefix_or_exact={})",
-            filename, require_prefix_or_exact
+            "Parsing property info file: {filename:?} (require_prefix_or_exact={require_prefix_or_exact})"
         );
 
         let file = File::open(filename).map_err(Error::new_io)?;
@@ -132,8 +130,7 @@ impl PropertyInfoEntry {
                 }
                 Err(err) => {
                     warn!(
-                        "Line {}: Failed to parse line '{}': {}",
-                        line_count, line, err
+                        "Line {line_count}: Failed to parse line '{line}': {err}"
                     );
                     errors.push(err);
                 }

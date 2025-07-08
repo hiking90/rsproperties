@@ -209,15 +209,14 @@ static SYSTEM_PROPERTIES: OnceLock<system_properties::SystemProperties> = OnceLo
 pub fn init(config: PropertyConfig) {
     // Initialize properties directory
     let props_dir = config.properties_dir.unwrap_or_else(|| {
-        log::info!("Using default properties directory: {}", PROP_DIRNAME);
+        log::info!("Using default properties directory: {PROP_DIRNAME}");
         PathBuf::from(PROP_DIRNAME)
     });
 
     match SYSTEM_PROPERTIES_DIR.set(props_dir.clone()) {
         Ok(_) => {
             log::info!(
-                "Successfully set system properties directory to: {:?}",
-                props_dir
+                "Successfully set system properties directory to: {props_dir:?}"
             );
         }
         Err(_) => {
@@ -229,7 +228,7 @@ pub fn init(config: PropertyConfig) {
     if let Some(socket_dir) = config.socket_dir {
         let success = system_property_set::set_socket_dir(&socket_dir);
         if success {
-            log::info!("Successfully set socket directory to: {:?}", socket_dir);
+            log::info!("Successfully set socket directory to: {socket_dir:?}");
         } else {
             log::warn!("Socket directory already set, ignoring new value");
         }
@@ -242,7 +241,7 @@ pub fn init(config: PropertyConfig) {
 pub fn properties_dir() -> &'static Path {
     let path = SYSTEM_PROPERTIES_DIR
         .get_or_init(|| {
-            log::info!("Using default properties directory: {}", PROP_DIRNAME);
+            log::info!("Using default properties directory: {PROP_DIRNAME}");
             PathBuf::from(PROP_DIRNAME)
         })
         .as_path();
@@ -256,8 +255,7 @@ pub fn system_properties() -> &'static system_properties::SystemProperties {
     SYSTEM_PROPERTIES.get_or_init(|| {
         let dir = properties_dir();
         log::debug!(
-            "Initializing global SystemProperties instance from: {:?}",
-            dir
+            "Initializing global SystemProperties instance from: {dir:?}"
         );
 
         match system_properties::SystemProperties::new(dir) {
@@ -267,13 +265,10 @@ pub fn system_properties() -> &'static system_properties::SystemProperties {
             }
             Err(e) => {
                 log::error!(
-                    "Failed to initialize SystemProperties from {:?}: {}",
-                    dir,
-                    e
+                    "Failed to initialize SystemProperties from {dir:?}: {e}"
                 );
                 panic!(
-                    "Failed to initialize SystemProperties from {:?}: {}",
-                    dir, e
+                    "Failed to initialize SystemProperties from {dir:?}: {e}"
                 );
             }
         }
@@ -308,8 +303,7 @@ where
     let value = system_properties().get_with_result(name)?;
     value.parse().map_err(|e| {
         Error::Parse(format!(
-            "Failed to parse '{}' for property '{}': {}",
-            value, name, e
+            "Failed to parse '{value}' for property '{name}': {e}"
         ))
     })
 }
@@ -497,7 +491,7 @@ mod tests {
             let (mut property_info, errors) =
                 PropertyInfoEntry::parse_from_file(Path::new(file), false).unwrap();
             if !errors.is_empty() {
-                log::error!("{:?}", errors);
+                log::error!("{errors:?}");
             }
             property_infos.append(&mut property_info);
         }
@@ -518,8 +512,7 @@ mod tests {
         let dir = properties_dir();
         let mut system_properties = SystemProperties::new_area(dir).unwrap_or_else(|e| {
             panic!(
-                "Cannot create system properties: {}. Please check if {dir:?} exists.",
-                e
+                "Cannot create system properties: {e}. Please check if {dir:?} exists."
             )
         });
         for (key, value) in properties.iter() {

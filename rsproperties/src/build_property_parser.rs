@@ -57,8 +57,7 @@ pub fn load_properties_from_file(
 
         if !has_filter && line.starts_with("import ") {
             warn!(
-                "Line {}: Import statements not implemented: {}",
-                line_count, line
+                "Line {line_count}: Import statements not implemented: {line}"
             );
             // let line = line[7..].trim();
             unimplemented!("import")
@@ -85,7 +84,7 @@ pub fn load_properties_from_file(
             }
 
             if key.starts_with("ctl.") || key == "sys.powerctl" || key == RESTORECON_PROPERTY {
-                error!("Line {}: Ignoring disallowed property '{}' with special meaning in prop file '{:?}'", line_count, key, filename);
+                error!("Line {line_count}: Ignoring disallowed property '{key}' with special meaning in prop file '{filename:?}'");
                 continue;
             }
 
@@ -100,16 +99,14 @@ pub fn load_properties_from_file(
                 Ok(_) => {
                     if let Some(old_value) = properties.insert(key.to_string(), value.to_string()) {
                         warn!(
-                            "Line {}: Overriding previous property '{}':'{}' with new value '{}'",
-                            line_count, key, old_value, value
+                            "Line {line_count}: Overriding previous property '{key}':'{old_value}' with new value '{value}'"
                         );
                     }
                     _processed_properties += 1;
                 }
                 Err(e) => {
                     error!(
-                        "Line {}: Failed to check permissions for '{}': {}",
-                        line_count, key, e
+                        "Line {line_count}: Failed to check permissions for '{key}': {e}"
                     );
                     continue;
                 }

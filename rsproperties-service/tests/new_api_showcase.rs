@@ -219,9 +219,9 @@ async fn test_safe_programming_patterns() -> anyhow::Result<()> {
     match validated {
         Ok(val) => {
             assert_eq!(val, 123);
-            println!("✅ Property validation passed: {}", val);
+            println!("✅ Property validation passed: {val}");
         }
-        Err(e) => panic!("Validation should have succeeded: {}", e),
+        Err(e) => panic!("Validation should have succeeded: {e}"),
     }
 
     // Pattern 4: Fallback chain
@@ -272,7 +272,7 @@ async fn test_performance_and_concurrency() -> anyhow::Result<()> {
     let handles: Vec<_> = (0..10)
         .map(|i| {
             tokio::spawn(async move {
-                let prop_name = format!("perf.test.prop_{}", i);
+                let prop_name = format!("perf.test.prop_{i}");
 
                 // Set different types concurrently
                 match i % 3 {
@@ -287,9 +287,9 @@ async fn test_performance_and_concurrency() -> anyhow::Result<()> {
                         assert!((value - (i as f64 * 1.5)).abs() < f64::EPSILON);
                     }
                     2 => {
-                        rsproperties::set(&prop_name, &format!("string_{}", i))?;
+                        rsproperties::set(&prop_name, &format!("string_{i}"))?;
                         let value: String = rsproperties::get(&prop_name)?;
-                        assert_eq!(value, format!("string_{}", i));
+                        assert_eq!(value, format!("string_{i}"));
                     }
                     _ => unreachable!(),
                 }
@@ -318,7 +318,7 @@ async fn test_performance_and_concurrency() -> anyhow::Result<()> {
     let num_ops = 50; // Reduced for reliability
 
     for i in 0..num_ops {
-        let prop_name = format!("perf.measurement.{}", i);
+        let prop_name = format!("perf.measurement.{i}");
 
         // Combined set/get/parse operation
         rsproperties::set(&prop_name, &i)?;
@@ -329,13 +329,12 @@ async fn test_performance_and_concurrency() -> anyhow::Result<()> {
     let elapsed = start_time.elapsed();
     let ops_per_second = (num_ops as f64 * 3.0) / elapsed.as_secs_f64(); // 3 operations per iteration
 
-    println!("✅ Performance: {:.0} operations/second", ops_per_second);
+    println!("✅ Performance: {ops_per_second:.0} operations/second");
 
     // Should be reasonably fast
     assert!(
         elapsed.as_millis() < 1000,
-        "Operations took too long: {:?}",
-        elapsed
+        "Operations took too long: {elapsed:?}"
     );
 
     Ok(())

@@ -60,12 +60,12 @@ pub async fn run(
         .actor_ref
         .ask(ReadyMessage {})
         .await
-        .map_err(|e| format!("Failed to start socket service: {}", e))?;
+        .map_err(|e| format!("Failed to start socket service: {e}"))?;
     let _ = properties_service
         .actor_ref
         .ask(ReadyMessage {})
         .await
-        .map_err(|e| format!("Failed to start properties service: {}", e))?;
+        .map_err(|e| format!("Failed to start properties service: {e}"))?;
 
     Ok((socket_service, properties_service))
 }

@@ -62,7 +62,7 @@ fn main() {
 
     // Validate property name and value
     if let Err(msg) = validate_property(&args.property_name, &args.property_value) {
-        eprintln!("Error: {}", msg);
+        eprintln!("Error: {msg}");
         std::process::exit(1);
     }
 
@@ -108,8 +108,7 @@ fn validate_property(name: &str, value: &str) -> Result<(), String> {
     // Warn about read-only properties
     if name.starts_with("ro.") {
         eprintln!(
-            "Warning: Property '{}' is read-only and may not be settable",
-            name
+            "Warning: Property '{name}' is read-only and may not be settable"
         );
     }
 

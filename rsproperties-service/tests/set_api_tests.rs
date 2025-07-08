@@ -81,8 +81,7 @@ async fn test_set_whitespace() -> anyhow::Result<()> {
         let retrieved_value: String = rsproperties::get(prop_name)?;
         assert_eq!(
             retrieved_value, *prop_value,
-            "Failed for property {}",
-            prop_name
+            "Failed for property {prop_name}"
         );
     }
 
@@ -264,8 +263,7 @@ async fn test_set_display_booleans() -> anyhow::Result<()> {
         let retrieved_value: String = rsproperties::get(prop_name)?;
         assert_eq!(
             retrieved_value, *expected_str,
-            "Failed for property {} with value {}",
-            prop_name, test_value
+            "Failed for property {prop_name} with value {test_value}"
         );
     }
 
@@ -288,8 +286,7 @@ async fn test_set_display_strings() -> anyhow::Result<()> {
         let retrieved_value: String = rsproperties::get(prop_name)?;
         assert_eq!(
             retrieved_value, *test_value,
-            "Failed for property {} with value '{}'",
-            prop_name, test_value
+            "Failed for property {prop_name} with value '{test_value}'"
         );
     }
 
@@ -312,8 +309,7 @@ async fn test_set_display_string_slices() -> anyhow::Result<()> {
         assert_eq!(
             retrieved_value,
             test_value.to_string(),
-            "Failed for property {}",
-            prop_name
+            "Failed for property {prop_name}"
         );
     }
 
@@ -369,8 +365,7 @@ async fn test_set_multiple_properties() -> anyhow::Result<()> {
         let retrieved_value: String = rsproperties::get(prop_name)?;
         assert_eq!(
             retrieved_value, *expected_value,
-            "Failed for property {}",
-            prop_name
+            "Failed for property {prop_name}"
         );
     }
 
@@ -398,8 +393,7 @@ async fn test_set_property_name_validation() {
         let result = rsproperties::set(prop_name, "test_value");
         assert!(
             result.is_ok(),
-            "Valid property name should succeed: {}",
-            prop_name
+            "Valid property name should succeed: {prop_name}"
         );
     }
 }
@@ -439,8 +433,8 @@ async fn test_set_concurrent_properties() -> anyhow::Result<()> {
     let handles: Vec<_> = (0..10)
         .map(|i| {
             tokio::spawn(async move {
-                let prop_name = format!("test.concurrent.prop_{}", i);
-                let prop_value = format!("value_{}", i);
+                let prop_name = format!("test.concurrent.prop_{i}");
+                let prop_value = format!("value_{i}");
 
                 rsproperties::set(&prop_name, &prop_value).unwrap();
 
@@ -485,8 +479,7 @@ async fn test_set_real_world_android_properties() -> anyhow::Result<()> {
         let retrieved: String = rsproperties::get(prop_name)?;
         assert_eq!(
             retrieved, *prop_value,
-            "Failed for Android-style property {}",
-            prop_name
+            "Failed for Android-style property {prop_name}"
         );
     }
 
@@ -507,14 +500,14 @@ async fn test_set_error_handling() {
     // But we ensure it doesn't panic
     match result {
         Ok(_) => println!("Long property name was accepted"),
-        Err(e) => println!("Long property name was rejected: {}", e),
+        Err(e) => println!("Long property name was rejected: {e}"),
     }
 
     // Very long property value - should either succeed or fail gracefully
     let result = rsproperties::set("test.long.value", &very_long_value);
     match result {
         Ok(_) => println!("Long property value was accepted"),
-        Err(e) => println!("Long property value was rejected: {}", e),
+        Err(e) => println!("Long property value was rejected: {e}"),
     }
 }
 

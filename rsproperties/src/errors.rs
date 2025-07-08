@@ -73,13 +73,13 @@ impl Error {
 
     pub fn new_io(io_error: std::io::Error) -> Error {
         let error = Error::Io(io_error);
-        log::error!("I/O error: {}", error);
+        log::error!("I/O error: {error}");
         error
     }
 
     pub fn new_errno(errno: rustix::io::Errno) -> Error {
         let error = Error::Errno(errno);
-        log::error!("System error: {}", error);
+        log::error!("System error: {error}");
         error
     }
 }
@@ -87,7 +87,7 @@ impl Error {
 impl From<rustix::io::Errno> for Error {
     fn from(source: rustix::io::Errno) -> Self {
         let error = Error::Errno(source);
-        log::error!("Converting errno to Error: {}", source);
+        log::error!("Converting errno to Error: {source}");
         error
     }
 }
@@ -95,38 +95,38 @@ impl From<rustix::io::Errno> for Error {
 impl From<std::io::Error> for Error {
     fn from(source: std::io::Error) -> Self {
         let error = Error::Io(source);
-        log::error!("Converting I/O error to Error: {}", error);
+        log::error!("Converting I/O error to Error: {error}");
         error
     }
 }
 
 impl From<std::str::Utf8Error> for Error {
     fn from(source: std::str::Utf8Error) -> Self {
-        let error_msg = format!("UTF-8 conversion error: {}", source);
-        log::error!("{}", error_msg);
+        let error_msg = format!("UTF-8 conversion error: {source}");
+        log::error!("{error_msg}");
         Error::Encoding(error_msg)
     }
 }
 
 impl From<std::ffi::OsString> for Error {
     fn from(source: std::ffi::OsString) -> Self {
-        let error_msg = format!("OsString conversion error: {:?}", source);
-        log::error!("{}", error_msg);
+        let error_msg = format!("OsString conversion error: {source:?}");
+        log::error!("{error_msg}");
         Error::Conversion(error_msg)
     }
 }
 
 impl From<&str> for Error {
     fn from(source: &str) -> Self {
-        log::error!("String error: {}", source);
+        log::error!("String error: {source}");
         Error::Parse(source.to_owned())
     }
 }
 
 impl From<ParseIntError> for Error {
     fn from(source: ParseIntError) -> Self {
-        let error_msg = format!("Parse integer error: {}", source);
-        log::error!("{}", error_msg);
+        let error_msg = format!("Parse integer error: {source}");
+        log::error!("{error_msg}");
         Error::Parse(error_msg)
     }
 }
@@ -172,7 +172,7 @@ pub fn validate_file_metadata(
             min_size,
             path
         );
-        log::error!("{}", error_msg);
+        log::error!("{error_msg}");
         return Err(Error::new_file_size(error_msg));
     }
 
@@ -190,7 +190,7 @@ pub fn validate_file_metadata(
             metadata.st_mode(),
             path
         );
-        log::error!("{}", error_msg);
+        log::error!("{error_msg}");
         return Err(Error::new_permission_denied(error_msg));
     }
 
@@ -208,7 +208,7 @@ pub fn validate_file_metadata(
             metadata.st_gid(),
             path
         );
-        log::error!("{}", error_msg);
+        log::error!("{error_msg}");
         return Err(Error::new_file_ownership(error_msg));
     }
 
@@ -229,7 +229,7 @@ mod tests {
     fn test_error_location() {
         try_open_file()
             .map_err(|e| {
-                println!("Error: {}", e);
+                println!("Error: {e}");
                 e
             })
             .unwrap_err();

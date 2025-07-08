@@ -37,7 +37,7 @@ fn init_test_and_dirname() {
     );
 
     println!("✓ init() and dirname() work correctly");
-    println!("  Property directory: {:?}", dirname);
+    println!("  Property directory: {dirname:?}");
 }
 
 #[test]
@@ -111,7 +111,7 @@ mod write_tests {
                 println!("✓ Property read/write cycle successful");
             }
             Err(e) => {
-                println!("⚠ set() function failed: {}", e);
+                println!("⚠ set() function failed: {e}");
             }
         }
     }
@@ -123,7 +123,7 @@ mod write_tests {
         let result = rsproperties::set("test.empty.value", "");
         match result {
             Ok(_) => println!("✓ Setting empty value succeeded"),
-            Err(e) => println!("⚠ Setting empty value failed: {}", e),
+            Err(e) => println!("⚠ Setting empty value failed: {e}"),
         }
 
         // Test setting very long value (should respect PROP_VALUE_MAX)
@@ -131,14 +131,14 @@ mod write_tests {
         let result = rsproperties::set("test.long.value", &long_value);
         match result {
             Ok(_) => println!("✓ Setting long value succeeded"),
-            Err(e) => println!("⚠ Setting long value failed (expected): {}", e),
+            Err(e) => println!("⚠ Setting long value failed (expected): {e}"),
         }
 
         // Test setting property with special characters in name
         let result = rsproperties::set("test.special.chars!@#", "special_value");
         match result {
             Ok(_) => println!("✓ Setting property with special chars succeeded"),
-            Err(e) => println!("⚠ Setting property with special chars failed: {}", e),
+            Err(e) => println!("⚠ Setting property with special chars failed: {e}"),
         }
     }
 }
@@ -167,8 +167,7 @@ fn test_property_name_validation() {
         let result = rsproperties::get_or(name, "default".to_string());
         assert_eq!(
             result, "default",
-            "Should handle edge case: {}",
-            description
+            "Should handle edge case: {description}"
         );
     }
 
@@ -196,7 +195,7 @@ fn test_thread_safety() {
 
                 // Each thread performs multiple property operations
                 for i in 0..iterations {
-                    let prop_name = format!("thread.{}.property.{}", thread_id, i);
+                    let prop_name = format!("thread.{thread_id}.property.{i}");
 
                     // Test get_or (should not crash)
                     let _result = rsproperties::get_or(&prop_name, "default".to_string());
@@ -292,7 +291,7 @@ fn test_performance_characteristics() {
     let iterations = 1000;
 
     for i in 0..iterations {
-        let prop_name = format!("perf.test.property.{}", i);
+        let prop_name = format!("perf.test.property.{i}");
         let _result = rsproperties::get_or(&prop_name, "default".to_string());
     }
 
@@ -300,8 +299,8 @@ fn test_performance_characteristics() {
     let avg_time_ns = duration.as_nanos() / iterations as u128;
 
     println!("✓ Performance test completed");
-    println!("  {} iterations in {:?}", iterations, duration);
-    println!("  Average time per operation: {} ns", avg_time_ns);
+    println!("  {iterations} iterations in {duration:?}");
+    println!("  Average time per operation: {avg_time_ns} ns");
 
     // Reasonable performance expectation (less than 100 microseconds per operation)
     assert!(
@@ -334,7 +333,7 @@ fn test_real_android_properties() {
         match rsproperties::get::<String>(prop) {
             Ok(value) => {
                 found_count += 1;
-                println!("  {} = {}", prop, value);
+                println!("  {prop} = {value}");
             }
             Err(_) => {
                 // Property doesn't exist, which is fine
@@ -348,7 +347,7 @@ fn test_real_android_properties() {
     }
 
     println!("✓ Real Android property tests completed");
-    println!("  Found {} real properties", found_count);
+    println!("  Found {found_count} real properties");
 
     if found_count == 0 {
         println!("  ⚠ No real Android properties found (running on non-Android system)");

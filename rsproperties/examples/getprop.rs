@@ -74,7 +74,7 @@ fn main() {
                     }
                 }
             };
-            println!("{}", value);
+            println!("{value}");
         }
         None => {
             // List all properties (simplified implementation)

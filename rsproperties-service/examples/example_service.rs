@@ -39,8 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     create_dir_all(&socket_dir)?;
 
     println!("📁 Created directories:");
-    println!("   Properties: {:?}", properties_dir);
-    println!("   Sockets: {:?}", socket_dir);
+    println!("   Properties: {properties_dir:?}");
+    println!("   Sockets: {socket_dir:?}");
 
     // Create PropertyConfig
     let config = rsproperties::PropertyConfig::with_both_dirs(properties_dir, socket_dir);
@@ -65,12 +65,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         result1 = socket_service.join_handle => {
             if let Err(e) = result1 {
-                eprintln!("❌ Socket service error: {}", e);
+                eprintln!("❌ Socket service error: {e}");
             }
         }
         result2 = properties_service.join_handle => {
             if let Err(e) = result2 {
-                eprintln!("❌ Properties service error: {}", e);
+                eprintln!("❌ Properties service error: {e}");
             }
         }
     }

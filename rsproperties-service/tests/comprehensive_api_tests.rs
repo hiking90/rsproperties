@@ -36,23 +36,21 @@ async fn test_numeric_round_trip() -> anyhow::Result<()> {
 
     for (type_name, min_val, max_val) in test_cases.iter() {
         // Test minimum value
-        let prop_name_min = format!("test.round_trip.{}_min", type_name);
+        let prop_name_min = format!("test.round_trip.{type_name}_min");
         rsproperties::set(&prop_name_min, min_val)?;
         let parsed_min: i64 = rsproperties::get(&prop_name_min)?;
         assert_eq!(
             parsed_min, *min_val,
-            "Round trip failed for {} min value",
-            type_name
+            "Round trip failed for {type_name} min value"
         );
 
         // Test maximum value
-        let prop_name_max = format!("test.round_trip.{}_max", type_name);
+        let prop_name_max = format!("test.round_trip.{type_name}_max");
         rsproperties::set(&prop_name_max, max_val)?;
         let parsed_max: i64 = rsproperties::get(&prop_name_max)?;
         assert_eq!(
             parsed_max, *max_val,
-            "Round trip failed for {} max value",
-            type_name
+            "Round trip failed for {type_name} max value"
         );
     }
 
@@ -74,7 +72,7 @@ async fn test_float_precision_round_trip() -> anyhow::Result<()> {
     ];
 
     for (name, original_value) in test_cases.iter() {
-        let prop_name = format!("test.float_precision.{}", name);
+        let prop_name = format!("test.float_precision.{name}");
 
         rsproperties::set(&prop_name, original_value)?;
         let parsed_value: f64 = rsproperties::get(&prop_name)?;
@@ -89,11 +87,7 @@ async fn test_float_precision_round_trip() -> anyhow::Result<()> {
 
         assert!(
             diff < epsilon,
-            "Float precision lost for {}: original={}, parsed={}, diff={}",
-            name,
-            original_value,
-            parsed_value,
-            diff
+            "Float precision lost for {name}: original={original_value}, parsed={parsed_value}, diff={diff}"
         );
     }
 
@@ -118,7 +112,7 @@ async fn test_string_consistency() -> anyhow::Result<()> {
     ];
 
     for (i, test_string) in test_strings.iter().enumerate() {
-        let prop_name = format!("test.string_consistency.set_{}", i);
+        let prop_name = format!("test.string_consistency.set_{i}");
 
         // Skip empty strings as they may not be supported by the underlying property system
         if test_string.is_empty() {
@@ -133,8 +127,7 @@ async fn test_string_consistency() -> anyhow::Result<()> {
 
         assert_eq!(
             retrieved_value, *test_string,
-            "String value not preserved for: '{}'",
-            test_string
+            "String value not preserved for: '{test_string}'"
         );
     }
 
@@ -220,7 +213,7 @@ async fn test_concurrent_mixed_operations() -> anyhow::Result<()> {
         .map(|task_id| {
             tokio::spawn(async move {
                 for op_id in 0..operations_per_task {
-                    let prop_name = format!("test.concurrent.task_{}.op_{}", task_id, op_id);
+                    let prop_name = format!("test.concurrent.task_{task_id}.op_{op_id}");
 
                     // Mix of different operations
                     match op_id % 4 {
@@ -240,7 +233,7 @@ async fn test_concurrent_mixed_operations() -> anyhow::Result<()> {
                         }
                         2 => {
                             // Set string and get
-                            let value = format!("task_{}_{}", task_id, op_id);
+                            let value = format!("task_{task_id}_{op_id}");
                             rsproperties::set(&prop_name, &value)?;
                             let retrieved: String = rsproperties::get(&prop_name)?;
                             assert_eq!(retrieved, value);
@@ -286,18 +279,17 @@ async fn test_numeric_edge_cases() -> anyhow::Result<()> {
     ];
 
     for (name, string_value, expected) in edge_cases.iter() {
-        let prop_name = format!("test.edge_cases.{}", name);
+        let prop_name = format!("test.edge_cases.{name}");
 
         rsproperties::set(&prop_name, string_value)?;
         let parsed: i64 = rsproperties::get(&prop_name)?;
-        assert_eq!(parsed, *expected, "Edge case failed for {}", name);
+        assert_eq!(parsed, *expected, "Edge case failed for {name}");
 
         // Also test with get_or
         let with_default: i64 = rsproperties::get_or(&prop_name, 42);
         assert_eq!(
             with_default, *expected,
-            "get_parsed_with_default failed for {}",
-            name
+            "get_parsed_with_default failed for {name}"
         );
     }
 
@@ -329,38 +321,35 @@ async fn test_boolean_string_variations() -> anyhow::Result<()> {
 
     // Test valid true cases
     for (name, string_value, expected) in valid_true_cases.iter() {
-        let prop_name = format!("test.bool_valid.{}", name);
+        let prop_name = format!("test.bool_valid.{name}");
         rsproperties::set(&prop_name, string_value)?;
         let parsed: bool = rsproperties::get(&prop_name)?;
-        assert_eq!(parsed, *expected, "Valid bool case failed for {}", name);
+        assert_eq!(parsed, *expected, "Valid bool case failed for {name}");
     }
 
     // Test valid false cases
     for (name, string_value, expected) in valid_false_cases.iter() {
-        let prop_name = format!("test.bool_valid.{}", name);
+        let prop_name = format!("test.bool_valid.{name}");
         rsproperties::set(&prop_name, string_value)?;
         let parsed: bool = rsproperties::get(&prop_name)?;
-        assert_eq!(parsed, *expected, "Valid bool case failed for {}", name);
+        assert_eq!(parsed, *expected, "Valid bool case failed for {name}");
     }
 
     // Test invalid cases (should fail to parse)
     for (name, string_value) in invalid_cases.iter() {
-        let prop_name = format!("test.bool_invalid.{}", name);
+        let prop_name = format!("test.bool_invalid.{name}");
         rsproperties::set(&prop_name, string_value)?;
         let result: Result<bool, _> = rsproperties::get(&prop_name);
         assert!(
             result.is_err(),
-            "Invalid bool case should fail for {} ({})",
-            name,
-            string_value
+            "Invalid bool case should fail for {name} ({string_value})"
         );
 
         // But get_parsed_with_default should return the default
         let with_default: bool = rsproperties::get_or(&prop_name, true);
         assert!(
             with_default,
-            "get_parsed_with_default should return default for {}",
-            name
+            "get_parsed_with_default should return default for {name}"
         );
     }
 
@@ -435,24 +424,21 @@ async fn test_android_property_patterns() -> anyhow::Result<()> {
         let parsed_int: i32 = rsproperties::get(prop_name)?;
         assert_eq!(
             parsed_int, *expected_int,
-            "Failed for property {}",
-            prop_name
+            "Failed for property {prop_name}"
         );
 
         // Get with default (safe app usage)
         let with_default: i32 = rsproperties::get_or(prop_name, -1);
         assert_eq!(
             with_default, *expected_int,
-            "get_parsed_with_default failed for {}",
-            prop_name
+            "get_parsed_with_default failed for {prop_name}"
         );
 
         // Verify string representation is preserved
         let as_string: String = rsproperties::get(prop_name)?;
         assert_eq!(
             as_string, *string_val,
-            "String representation changed for {}",
-            prop_name
+            "String representation changed for {prop_name}"
         );
     }
 
@@ -468,7 +454,7 @@ async fn test_performance_characteristics() -> anyhow::Result<()> {
     let start_time = std::time::Instant::now();
 
     for i in 0..num_operations {
-        let prop_name = format!("test.perf_reduced.prop_{}", i);
+        let prop_name = format!("test.perf_reduced.prop_{i}");
 
         // Set operation
         rsproperties::set(&prop_name, &i)?;
@@ -492,8 +478,7 @@ async fn test_performance_characteristics() -> anyhow::Result<()> {
     // Ensure reasonable performance (should complete 100 ops in reasonable time)
     assert!(
         elapsed.as_secs() < 5,
-        "Performance test took too long: {:?}",
-        elapsed
+        "Performance test took too long: {elapsed:?}"
     );
 
     Ok(())

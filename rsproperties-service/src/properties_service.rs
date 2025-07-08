@@ -30,7 +30,7 @@ impl Actor for PropertiesService {
             let (mut property_info, errors) =
                 PropertyInfoEntry::parse_from_file(&file, false).unwrap();
             if !errors.is_empty() {
-                log::error!("{:?}", errors);
+                log::error!("{errors:?}");
             }
             property_infos.append(&mut property_info);
         }
@@ -51,8 +51,7 @@ impl Actor for PropertiesService {
 
         let mut system_properties = SystemProperties::new_area(dir).unwrap_or_else(|e| {
             panic!(
-                "Cannot create system properties: {}. Please check if {dir:?} exists.",
-                e
+                "Cannot create system properties: {e}. Please check if {dir:?} exists."
             )
         });
         for (key, value) in properties.iter() {
@@ -117,7 +116,7 @@ impl rsactor::Message<crate::PropertyMessage> for PropertiesService {
         message: crate::PropertyMessage,
         _actor_ref: &ActorRef<Self>,
     ) -> Self::Reply {
-        log::debug!("Handling property message: {:?}", message);
+        log::debug!("Handling property message: {message:?}");
         // Process the property message
         let key = message.key;
         let value = message.value;
@@ -127,25 +126,25 @@ impl rsactor::Message<crate::PropertyMessage> for PropertiesService {
             Ok(Some(prop_ref)) => {
                 // Update the existing property
                 if let Err(e) = self.system_properties.update(&prop_ref, &value) {
-                    log::error!("Failed to update property '{}': {}", key, e);
+                    log::error!("Failed to update property '{key}': {e}");
                     false // Indicate failure
                 } else {
-                    log::info!("Updated property: {} = {}", key, value);
+                    log::info!("Updated property: {key} = {value}");
                     true // Indicate success
                 }
             }
             Ok(None) => {
                 // Property does not exist, add it
                 if let Err(e) = self.system_properties.add(&key, &value) {
-                    log::error!("Failed to add property '{}': {}", key, e);
+                    log::error!("Failed to add property '{key}': {e}");
                     false // Indicate failure
                 } else {
-                    log::info!("Added property: {} = {}", key, value);
+                    log::info!("Added property: {key} = {value}");
                     true // Indicate success
                 }
             }
             Err(e) => {
-                log::error!("Failed to find property '{}': {}", key, e);
+                log::error!("Failed to find property '{key}': {e}");
                 false // Indicate failure
             }
         }

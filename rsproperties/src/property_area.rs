@@ -110,7 +110,7 @@ impl PropertyAreaMap {
         context: Option<&CStr>,
         fsetxattr_failed: &mut bool,
     ) -> Result<Self> {
-        debug!("Creating new read-write property area map: {:?}", filename);
+        debug!("Creating new read-write property area map: {filename:?}");
 
         let file = OpenOptions::new()
             .read(true) // O_RDWR
@@ -130,7 +130,7 @@ impl PropertyAreaMap {
             )
             .is_err()
             {
-                warn!("Failed to set SELinux context for {:?}", filename);
+                warn!("Failed to set SELinux context for {filename:?}");
                 *fsetxattr_failed = true;
             }
         }
@@ -150,15 +150,14 @@ impl PropertyAreaMap {
             .init(PROP_AREA_MAGIC, PROP_AREA_VERSION);
 
         info!(
-            "Successfully created read-write property area map: {:?}",
-            filename
+            "Successfully created read-write property area map: {filename:?}"
         );
         Ok(thiz)
     }
 
     // Initialize the property area map with the given file to read-only property area map.
     pub(crate) fn new_ro(filename: &Path) -> Result<Self> {
-        debug!("Opening read-only property area map: {:?}", filename);
+        debug!("Opening read-only property area map: {filename:?}");
 
         let file = OpenOptions::new()
             .read(true) // read only
@@ -200,8 +199,7 @@ impl PropertyAreaMap {
             ))
         } else {
             info!(
-                "Successfully opened read-only property area map: {:?}",
-                filename
+                "Successfully opened read-only property area map: {filename:?}"
             );
             Ok(thiz)
         }
@@ -233,7 +231,7 @@ impl PropertyAreaMap {
             };
 
             if substr_size == 0 {
-                error!("Invalid property name (empty segment): '{}'", name);
+                error!("Invalid property name (empty segment): '{name}'");
                 return Err(Error::new_parse(format!("Invalid property name: {name}")));
             }
 
@@ -271,7 +269,7 @@ impl PropertyAreaMap {
     // Add the property information with the given name and value.
     #[cfg(feature = "builder")]
     pub(crate) fn add(&mut self, name: &str, value: &str) -> Result<()> {
-        debug!("Adding property: '{}' = '{}'", name, value);
+        debug!("Adding property: '{name}' = '{value}'");
 
         let mut remaining_name = name;
         let mut current = 0;
@@ -283,7 +281,7 @@ impl PropertyAreaMap {
             };
 
             if substr_size == 0 {
-                error!("Invalid property name (empty segment): '{}'", name);
+                error!("Invalid property name (empty segment): '{name}'");
                 return Err(Error::new_parse(format!("Invalid property name: {name}")));
             }
 
@@ -563,7 +561,7 @@ unsafe impl Sync for MemoryMap {}
 
 impl MemoryMap {
     pub(crate) fn new(file: File, size: usize, wriable: bool) -> Result<Self> {
-        debug!("Creating memory map: size={}, writable={}", size, wriable);
+        debug!("Creating memory map: size={size}, writable={wriable}");
 
         let flags = if wriable {
             mm::ProtFlags::READ.union(mm::ProtFlags::WRITE)
@@ -658,7 +656,7 @@ impl std::ops::Drop for MemoryMap {
     fn drop(&mut self) {
         unsafe {
             if let Err(e) = mm::munmap(self.data as _, self.size) {
-                error!("Failed to unmap memory: {:?}", e);
+                error!("Failed to unmap memory: {e:?}");
             }
         }
     }

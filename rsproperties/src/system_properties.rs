@@ -49,7 +49,7 @@ fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> 
                 }
             }
             Err(e) => {
-                log::error!("Failed to wait for property change: {}", e);
+                log::error!("Failed to wait for property change: {e}");
                 return None;
             }
         }
@@ -76,7 +76,7 @@ impl SystemProperties {
         let contexts = match ContextsSerialized::new(false, filename, &mut false, false) {
             Ok(contexts) => contexts,
             Err(e) => {
-                log::error!("Failed to load contexts from {:?}: {}", filename, e);
+                log::error!("Failed to load contexts from {filename:?}: {e}");
                 return Err(e);
             }
         };
@@ -91,7 +91,7 @@ impl SystemProperties {
         let contexts = match ContextsSerialized::new(true, dirname, &mut false, false) {
             Ok(contexts) => contexts,
             Err(e) => {
-                log::error!("Failed to create area from {:?}: {}", dirname, e);
+                log::error!("Failed to create area from {dirname:?}: {e}");
                 return Err(e);
             }
         };
@@ -121,7 +121,7 @@ impl SystemProperties {
                 let value = match pa.dirty_backup_area() {
                     Ok(value) => value,
                     Err(e) => {
-                        log::error!("Failed to read dirty backup area: {}", e);
+                        log::error!("Failed to read dirty backup area: {e}");
                         return Err(e);
                     }
                 };
@@ -162,7 +162,7 @@ impl SystemProperties {
         let res = match self.contexts.prop_area_for_name(name) {
             Ok(res) => res,
             Err(e) => {
-                log::error!("Failed to find property area for {}: {}", name, e);
+                log::error!("Failed to find property area for {name}: {e}");
                 return Err(e);
             }
         };
@@ -173,7 +173,7 @@ impl SystemProperties {
                 let (_name, value) = match self.read(pi.0, false) {
                     Ok(result) => result,
                     Err(e) => {
-                        log::error!("Failed to read property {}: {}", name, e);
+                        log::error!("Failed to read property {name}: {e}");
                         return Err(e);
                     }
                 };
@@ -190,7 +190,7 @@ impl SystemProperties {
         let res = match self.contexts.prop_area_for_name(name) {
             Ok(res) => res,
             Err(e) => {
-                log::error!("Failed to find property area for {}: {}", name, e);
+                log::error!("Failed to find property area for {name}: {e}");
                 return Err(e);
             }
         };
@@ -218,14 +218,14 @@ impl SystemProperties {
             Some(prop_ref) => match self.update(&prop_ref, value) {
                 Ok(_) => {}
                 Err(e) => {
-                    log::error!("Failed to update property {}: {}", key, e);
+                    log::error!("Failed to update property {key}: {e}");
                     return Err(e);
                 }
             },
             None => match self.add(key, value) {
                 Ok(_) => {}
                 Err(e) => {
-                    log::error!("Failed to create property {}: {}", key, e);
+                    log::error!("Failed to create property {key}: {e}");
                     return Err(e);
                 }
             },
@@ -238,7 +238,7 @@ impl SystemProperties {
     pub fn update(&mut self, index: &PropertyIndex, value: &str) -> Result<bool> {
         if value.len() >= PROP_VALUE_MAX {
             let error_msg = format!("Value too long: {} (max: {})", value.len(), PROP_VALUE_MAX);
-            log::error!("{}", error_msg);
+            log::error!("{error_msg}");
             return Err(Error::new_file_validation(error_msg));
         }
 
@@ -269,7 +269,7 @@ impl SystemProperties {
         let name = pi.name().to_bytes();
         if !name.is_empty() && &name[0..3] == b"ro." {
             let error_msg = format!("Try to update the read-only property: {name:?}");
-            log::error!("{}", error_msg);
+            log::error!("{error_msg}");
             return Err(Error::new_permission_denied(error_msg));
         }
 
@@ -280,7 +280,7 @@ impl SystemProperties {
         match pa.set_dirty_backup_area(&backup_value) {
             Ok(_) => {}
             Err(e) => {
-                log::error!("Failed to set backup area: {}", e);
+                log::error!("Failed to set backup area: {e}");
                 return Err(e);
             }
         }
@@ -291,7 +291,7 @@ impl SystemProperties {
         let pi = match pa.property_info(index.property_index) {
             Ok(pi) => pi,
             Err(e) => {
-                log::error!("Failed to get property info after backup: {}", e);
+                log::error!("Failed to get property info after backup: {e}");
                 return Err(e);
             }
         };
@@ -309,7 +309,7 @@ impl SystemProperties {
         match futex_wake(&pi.serial) {
             Ok(_) => {}
             Err(e) => {
-                log::error!("Failed to wake property futex: {}", e);
+                log::error!("Failed to wake property futex: {e}");
                 return Err(e);
             }
         }
@@ -321,7 +321,7 @@ impl SystemProperties {
         match futex_wake(serial_pa.serial()) {
             Ok(_) => {}
             Err(e) => {
-                log::error!("Failed to wake global serial futex: {}", e);
+                log::error!("Failed to wake global serial futex: {e}");
                 return Err(e);
             }
         }
@@ -338,14 +338,14 @@ impl SystemProperties {
                 PROP_VALUE_MAX,
                 name
             );
-            log::error!("{}", error_msg);
+            log::error!("{error_msg}");
             return Err(Error::new_file_validation(error_msg));
         }
 
         let mut res = match self.contexts.prop_area_mut_for_name(name) {
             Ok(res) => res,
             Err(e) => {
-                log::error!("Failed to get mutable property area for {}: {}", name, e);
+                log::error!("Failed to get mutable property area for {name}: {e}");
                 return Err(e);
             }
         };
@@ -354,7 +354,7 @@ impl SystemProperties {
         match pa.add(name, value) {
             Ok(_) => {}
             Err(e) => {
-                log::error!("Failed to add property {} to area: {}", name, e);
+                log::error!("Failed to add property {name} to area: {e}");
                 return Err(e);
             }
         }
@@ -367,8 +367,7 @@ impl SystemProperties {
             Ok(_) => {}
             Err(e) => {
                 log::error!(
-                    "Failed to wake global serial futex after adding property: {}",
-                    e
+                    "Failed to wake global serial futex after adding property: {e}"
                 );
                 return Err(e);
             }

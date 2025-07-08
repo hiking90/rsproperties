@@ -54,7 +54,7 @@ impl ContextsSerialized {
 
         let serial_property_area_map = if writable {
             if !dirname.is_dir() {
-                info!("Creating directory: {:?}", dirname);
+                info!("Creating directory: {dirname:?}");
                 fs::mkdir(
                     dirname.as_path(),
                     fs::Mode::RWXU | fs::Mode::XGRP | fs::Mode::XOTH,
@@ -98,8 +98,7 @@ impl ContextsSerialized {
         match &result {
             Ok(_) => {}
             Err(e) => error!(
-                "Failed to map serial property area {:?}: {}",
-                serial_filename, e
+                "Failed to map serial property area {serial_filename:?}: {e}"
             ),
         }
 
@@ -127,7 +126,7 @@ impl ContextsSerialized {
         match context_node.property_area() {
             Ok(area) => Ok((area, index)),
             Err(e) => {
-                error!("Failed to get property area for {}: {}", name, e);
+                error!("Failed to get property area for {name}: {e}");
                 Err(e)
             }
         }
@@ -160,7 +159,7 @@ impl ContextsSerialized {
         match context_node.property_area_mut() {
             Ok(area) => Ok((area, index)),
             Err(e) => {
-                error!("Failed to get mutable property area for {}: {}", name, e);
+                error!("Failed to get mutable property area for {name}: {e}");
                 Err(e)
             }
         }
@@ -182,8 +181,7 @@ impl ContextsSerialized {
                 self.context_nodes.len()
             );
             return Err(Error::new_parse(format!(
-                "Invalid context index: {}",
-                context_index
+                "Invalid context index: {context_index}"
             )));
         }
 
@@ -192,8 +190,7 @@ impl ContextsSerialized {
             Ok(area) => Ok(area),
             Err(e) => {
                 error!(
-                    "Failed to get property area for context index {}: {}",
-                    context_index, e
+                    "Failed to get property area for context index {context_index}: {e}"
                 );
                 Err(e)
             }
@@ -212,8 +209,7 @@ impl ContextsSerialized {
                 self.context_nodes.len()
             );
             return Err(Error::new_parse(format!(
-                "Invalid context index: {}",
-                context_index
+                "Invalid context index: {context_index}"
             )));
         }
 
@@ -222,8 +218,7 @@ impl ContextsSerialized {
             Ok(area) => Ok(area),
             Err(e) => {
                 error!(
-                    "Failed to get mutable property area for context index {}: {}",
-                    context_index, e
+                    "Failed to get mutable property area for context index {context_index}: {e}"
                 );
                 Err(e)
             }

@@ -20,7 +20,7 @@ async fn example_basic_usage() -> Result<()> {
 
     // Reading a property that doesn't exist - use get_with_default
     let sdk_version = rsproperties::get_or("ro.build.version.sdk", "unknown".to_string());
-    println!("SDK Version: {}", sdk_version);
+    println!("SDK Version: {sdk_version}");
     assert_eq!(sdk_version, "unknown"); // Should return default since property doesn't exist
 
     // Reading a property that might not exist - get returns String directly now
@@ -28,7 +28,7 @@ async fn example_basic_usage() -> Result<()> {
     if model.is_empty() {
         println!("Product model not available");
     } else {
-        println!("Product Model: {}", model);
+        println!("Product Model: {model}");
     }
 
     Ok(())
@@ -45,13 +45,13 @@ async fn example_setting_properties() -> Result<()> {
     // Read it back
     let version: String = rsproperties::get("my.app.version")?;
     assert_eq!(version, "1.0.0");
-    println!("App version: {}", version);
+    println!("App version: {version}");
 
     // Update the property
     rsproperties::set("my.app.version", "1.0.1")?;
     let updated_version: String = rsproperties::get("my.app.version")?;
     assert_eq!(updated_version, "1.0.1");
-    println!("Updated app version: {}", updated_version);
+    println!("Updated app version: {updated_version}");
 
     // Set multiple properties
     let app_properties = vec![
@@ -68,7 +68,7 @@ async fn example_setting_properties() -> Result<()> {
     for (key, expected_value) in &app_properties {
         let actual_value: String = rsproperties::get(key)?;
         assert_eq!(actual_value, *expected_value);
-        println!("{} = {}", key, actual_value);
+        println!("{key} = {actual_value}");
     }
 
     Ok(())
@@ -82,12 +82,12 @@ async fn example_error_handling() {
     // Safe way - always get a value, using default for missing properties
     let timeout = rsproperties::get_or("network.timeout", "30".to_string());
     let timeout_seconds: u32 = timeout.parse().unwrap_or(30);
-    println!("Network timeout: {} seconds", timeout_seconds);
+    println!("Network timeout: {timeout_seconds} seconds");
 
     // Check property value
     let status: String = rsproperties::get("service.status").unwrap_or_default();
     if !status.is_empty() {
-        println!("Service status: {}", status);
+        println!("Service status: {status}");
         // Process the status...
     } else {
         eprintln!("Could not get service status: property not found");
@@ -106,8 +106,8 @@ async fn example_error_handling() {
     }
 
     match get_required_config() {
-        Ok(config) => println!("Config: {}", config),
-        Err(e) => println!("Configuration error: {}", e),
+        Ok(config) => println!("Config: {config}"),
+        Err(e) => println!("Configuration error: {e}"),
     }
 }
 
@@ -141,19 +141,19 @@ async fn example_android_property_patterns() {
 
     for (prop, description) in android_properties {
         let value = rsproperties::get_or(prop, "not_set".to_string());
-        println!("{}: {} = {}", description, prop, value);
+        println!("{description}: {prop} = {value}");
 
         // Demonstrate type conversion for numeric properties
         if prop.contains("sdk") || prop.contains("port") {
             if let Ok(numeric_value) = value.parse::<i32>() {
-                println!("  Parsed as number: {}", numeric_value);
+                println!("  Parsed as number: {numeric_value}");
             }
         }
 
         // Demonstrate boolean conversion
         if prop.contains("completed") || prop.contains("debug") {
             let bool_value = value == "1" || value.to_lowercase() == "true";
-            println!("  Parsed as boolean: {}", bool_value);
+            println!("  Parsed as boolean: {bool_value}");
         }
     }
 }
@@ -176,7 +176,7 @@ async fn example_configuration_management() -> Result<()> {
     println!("Setting up default configuration...");
     for (key, value) in &default_config {
         rsproperties::set(key, value)?;
-        println!("  {} = {}", key, value);
+        println!("  {key} = {value}");
     }
 
     // Simulate configuration updates
@@ -188,20 +188,20 @@ async fn example_configuration_management() -> Result<()> {
     println!("\nReading current configuration:");
 
     let log_level: String = rsproperties::get("app.log.level")?;
-    println!("Log level: {}", log_level);
+    println!("Log level: {log_level}");
 
     let max_connections: i32 = rsproperties::get("app.max.connections").unwrap_or(50);
-    println!("Max connections: {}", max_connections);
+    println!("Max connections: {max_connections}");
 
     let timeout: u64 = rsproperties::get("app.timeout.seconds").unwrap_or(10);
-    println!("Timeout: {} seconds", timeout);
+    println!("Timeout: {timeout} seconds");
 
     let experimental_enabled =
         rsproperties::get_or("app.feature.experimental", "".to_owned()).to_lowercase() == "true";
-    println!("Experimental features: {}", experimental_enabled);
+    println!("Experimental features: {experimental_enabled}");
 
     let cache_size: u32 = rsproperties::get("app.cache.size.mb").unwrap_or(128);
-    println!("Cache size: {} MB", cache_size);
+    println!("Cache size: {cache_size} MB");
 
     // Demonstrate conditional logic based on properties
     if experimental_enabled {
@@ -236,7 +236,7 @@ async fn example_property_monitoring() {
 
     for prop in &monitored_properties {
         let current_value = rsproperties::get_or(prop, "unknown".to_string());
-        println!("Currently monitoring {}: {}", prop, current_value);
+        println!("Currently monitoring {prop}: {current_value}");
     }
 
     // In a real application, you might:
@@ -268,13 +268,13 @@ async fn example_best_practices() {
         .parse()
         .unwrap_or(1);
 
-    println!("Cache enabled: {}", cache_enabled);
-    println!("Retry count: {}", retry_count);
+    println!("Cache enabled: {cache_enabled}");
+    println!("Retry count: {retry_count}");
 
     // ✅ Good: Handle missing properties appropriately
     let setting: String = rsproperties::get("com.myapp.critical.setting").unwrap_or_default();
     if !setting.is_empty() {
-        println!("Critical setting: {}", setting);
+        println!("Critical setting: {setting}");
         // Proceed with the setting
     } else {
         println!("Critical setting not found, using safe defaults");
@@ -286,11 +286,11 @@ async fn example_best_practices() {
     let valid_theme = match theme.as_str() {
         "light" | "dark" | "auto" => theme,
         _ => {
-            println!("Invalid theme '{}', using 'light'", theme);
+            println!("Invalid theme '{theme}', using 'light'");
             "light".to_string()
         }
     };
-    println!("Using theme: {}", valid_theme);
+    println!("Using theme: {valid_theme}");
 
     // ✅ Good: Use constants for property names to avoid typos
     const FEATURE_FLAG_ANALYTICS: &str = "com.myapp.feature.analytics.enabled";
@@ -302,7 +302,6 @@ async fn example_best_practices() {
         rsproperties::get_or(FEATURE_FLAG_TELEMETRY, "false".to_string()) == "true";
 
     println!(
-        "Analytics: {}, Telemetry: {}",
-        analytics_enabled, telemetry_enabled
+        "Analytics: {analytics_enabled}, Telemetry: {telemetry_enabled}"
     );
 }

@@ -50,10 +50,9 @@ async fn test_property_get_performance() -> Result<()> {
     let avg_time = elapsed / iterations as u32;
 
     println!(
-        "Get performance: {} iterations in {:?}",
-        iterations, elapsed
+        "Get performance: {iterations} iterations in {elapsed:?}"
     );
-    println!("Average time per get: {:?}", avg_time);
+    println!("Average time per get: {avg_time:?}");
     println!(
         "Gets per second: {:.0}",
         iterations as f64 / elapsed.as_secs_f64()
@@ -62,8 +61,7 @@ async fn test_property_get_performance() -> Result<()> {
     // Verify performance is reasonable (less than 100μs per get on average)
     assert!(
         avg_time < Duration::from_micros(100),
-        "Get operation too slow: {:?} per operation",
-        avg_time
+        "Get operation too slow: {avg_time:?} per operation"
     );
 
     Ok(())
@@ -121,8 +119,8 @@ async fn test_property_set_performance() -> Result<()> {
     let start = Instant::now();
 
     for i in 0..iterations {
-        let prop_name = format!("perf.set.prop.{}", i);
-        let prop_value = format!("value_{}", i);
+        let prop_name = format!("perf.set.prop.{i}");
+        let prop_value = format!("value_{i}");
         rsproperties::set(&prop_name, &prop_value)?;
     }
 
@@ -130,10 +128,9 @@ async fn test_property_set_performance() -> Result<()> {
     let avg_time = elapsed / iterations;
 
     println!(
-        "Set performance: {} iterations in {:?}",
-        iterations, elapsed
+        "Set performance: {iterations} iterations in {elapsed:?}"
     );
-    println!("Average time per set: {:?}", avg_time);
+    println!("Average time per set: {avg_time:?}");
     println!(
         "Sets per second: {:.0}",
         iterations as f64 / elapsed.as_secs_f64()
@@ -142,8 +139,7 @@ async fn test_property_set_performance() -> Result<()> {
     // Verify set performance (should be under 1ms per operation)
     assert!(
         avg_time < Duration::from_millis(1),
-        "Set operation too slow: {:?} per operation",
-        avg_time
+        "Set operation too slow: {avg_time:?} per operation"
     );
 
     Ok(())
@@ -157,7 +153,7 @@ async fn test_large_property_values() -> Result<()> {
     let sizes = vec![10, 50, 80, rsproperties::PROP_VALUE_MAX - 5];
 
     for size in sizes {
-        let prop_name = format!("perf.large.prop.{}", size);
+        let prop_name = format!("perf.large.prop.{size}");
         let large_value = "x".repeat(size);
 
         let start = Instant::now();
@@ -170,7 +166,7 @@ async fn test_large_property_values() -> Result<()> {
 
         assert_eq!(retrieved, large_value);
 
-        println!("Size {}: set={:?}, get={:?}", size, set_time, get_time);
+        println!("Size {size}: set={set_time:?}, get={get_time:?}");
 
         // Performance should not degrade significantly with size
         assert!(set_time < Duration::from_millis(10));
@@ -187,8 +183,8 @@ async fn test_concurrent_reads() -> Result<()> {
     // Set up test properties
     let num_props = 100;
     for i in 0..num_props {
-        let prop_name = format!("concurrent.read.prop.{}", i);
-        let prop_value = format!("value_{}", i);
+        let prop_name = format!("concurrent.read.prop.{i}");
+        let prop_value = format!("value_{i}");
         rsproperties::set(&prop_name, &prop_value)?;
     }
 
@@ -208,13 +204,12 @@ async fn test_concurrent_reads() -> Result<()> {
                     let prop_name = format!("concurrent.read.prop.{}", i % num_props);
                     let expected = format!("value_{}", i % num_props);
                     let value: String = rsproperties::get(&prop_name).unwrap_or_default();
-                    assert_eq!(value, expected, "Failed to get property {}", prop_name);
+                    assert_eq!(value, expected, "Failed to get property {prop_name}");
                 }
                 let elapsed = start.elapsed();
 
                 println!(
-                    "Thread {} completed {} reads in {:?}",
-                    thread_id, reads_per_thread, elapsed
+                    "Thread {thread_id} completed {reads_per_thread} reads in {elapsed:?}"
                 );
                 elapsed
             })
@@ -254,15 +249,14 @@ async fn test_concurrent_writes() -> Result<()> {
 
                 let start = Instant::now();
                 for i in 0..writes_per_thread {
-                    let prop_name = format!("concurrent.write.{}.prop.{}", thread_id, i);
-                    let prop_value = format!("thread_{}_value_{}", thread_id, i);
+                    let prop_name = format!("concurrent.write.{thread_id}.prop.{i}");
+                    let prop_value = format!("thread_{thread_id}_value_{i}");
                     rsproperties::set(&prop_name, &prop_value)?;
                 }
                 let elapsed = start.elapsed();
 
                 println!(
-                    "Thread {} completed {} writes in {:?}",
-                    thread_id, writes_per_thread, elapsed
+                    "Thread {thread_id} completed {writes_per_thread} writes in {elapsed:?}"
                 );
                 Ok(elapsed)
             })
@@ -278,8 +272,8 @@ async fn test_concurrent_writes() -> Result<()> {
     // Verify writes completed
     for thread_id in 0..num_threads {
         for i in 0..writes_per_thread {
-            let prop_name = format!("concurrent.write.{}.prop.{}", thread_id, i);
-            let expected = format!("thread_{}_value_{}", thread_id, i);
+            let prop_name = format!("concurrent.write.{thread_id}.prop.{i}");
+            let expected = format!("thread_{thread_id}_value_{i}");
             let value: String = rsproperties::get(&prop_name).unwrap_or_default();
             assert_eq!(value, expected);
         }
@@ -301,8 +295,8 @@ async fn test_mixed_read_write_workload() -> Result<()> {
 
     // Set up initial properties
     for i in 0..50 {
-        let prop_name = format!("mixed.initial.prop.{}", i);
-        let prop_value = format!("initial_value_{}", i);
+        let prop_name = format!("mixed.initial.prop.{i}");
+        let prop_value = format!("initial_value_{i}");
         rsproperties::set(&prop_name, &prop_value)?;
     }
 
@@ -321,8 +315,8 @@ async fn test_mixed_read_write_workload() -> Result<()> {
                 for i in 0..operations_per_thread {
                     if i % 3 == 0 {
                         // Write operation
-                        let prop_name = format!("mixed.thread.{}.prop.{}", thread_id, i);
-                        let prop_value = format!("value_{}_{}", thread_id, i);
+                        let prop_name = format!("mixed.thread.{thread_id}.prop.{i}");
+                        let prop_value = format!("value_{thread_id}_{i}");
                         rsproperties::set(&prop_name, &prop_value)?;
                     } else {
                         // Read operation
@@ -333,8 +327,7 @@ async fn test_mixed_read_write_workload() -> Result<()> {
                 let elapsed = start.elapsed();
 
                 println!(
-                    "Mixed workload thread {} completed in {:?}",
-                    thread_id, elapsed
+                    "Mixed workload thread {thread_id} completed in {elapsed:?}"
                 );
                 Ok(())
             })

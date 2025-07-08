@@ -205,7 +205,7 @@ impl<'a> PropertyInfoArea<'a> {
 
         // Ensure proper alignment - prefix should be empty for u32-aligned data
         if !prefix.is_empty() {
-            log::warn!("Data at offset {} is not properly aligned for u32", offset);
+            log::warn!("Data at offset {offset} is not properly aligned for u32");
             return &[];
         }
 
@@ -346,8 +346,7 @@ impl<'a> PropertyInfoArea<'a> {
                 };
 
                 info!(
-                    "Property '{}' resolved: context_index={}, type_index={}",
-                    name, context_index, type_index
+                    "Property '{name}' resolved: context_index={context_index}, type_index={type_index}"
                 );
                 return (context_index, type_index);
             }

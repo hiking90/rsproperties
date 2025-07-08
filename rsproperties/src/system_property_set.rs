@@ -88,7 +88,7 @@ impl ServiceConnection {
             {
                 system_socket
             } else {
-                log::warn!("System property service socket is not writable or does not exist, falling back to default: {}", property_service_socket);
+                log::warn!("System property service socket is not writable or does not exist, falling back to default: {property_service_socket}");
                 property_service_socket
             }
         } else {
@@ -288,10 +288,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
 
             if res != PROP_SUCCESS {
                 log::error!(
-                    "Property service returned error for '{}' = '{}': 0x{:X}",
-                    name,
-                    value,
-                    res
+                    "Property service returned error for '{name}' = '{value}': 0x{res:X}"
                 );
                 return Err(Error::new_io(std::io::Error::other(format!(
                     "Unable to set property \"{name}\" to \"{value}\": error code: 0x{res:X}"

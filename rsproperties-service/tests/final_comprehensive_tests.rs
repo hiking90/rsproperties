@@ -28,8 +28,8 @@ fn test_api_constants() {
     );
 
     println!("✓ API constants validation passed");
-    println!("  PROP_VALUE_MAX = {}", PROP_VALUE_MAX);
-    println!("  PROP_DIRNAME = '{}'", PROP_DIRNAME);
+    println!("  PROP_VALUE_MAX = {PROP_VALUE_MAX}");
+    println!("  PROP_DIRNAME = '{PROP_DIRNAME}'");
 }
 
 #[tokio::test]
@@ -69,7 +69,7 @@ async fn test_get_with_default_comprehensive() {
 
     for (property, default, description) in &test_cases {
         let result = rsproperties::get_or(property, default.to_string());
-        assert_eq!(result, *default, "{}", description);
+        assert_eq!(result, *default, "{description}");
     }
 
     println!(
@@ -94,7 +94,7 @@ async fn test_get_nonexistent_properties() {
 
     for property in &nonexistent_properties {
         let result = rsproperties::get::<String>(property);
-        assert!(result.is_err(), "Property '{}' should not exist", property);
+        assert!(result.is_err(), "Property '{property}' should not exist");
     }
 
     println!(
@@ -114,12 +114,11 @@ async fn test_dirname_functionality() {
     assert!(!dirname_str.is_empty(), "dirname should not be empty");
     assert!(
         dirname_str.contains("properties") || dirname_str.starts_with("/"),
-        "dirname should be a valid path, got: '{}'",
-        dirname_str
+        "dirname should be a valid path, got: '{dirname_str}'"
     );
 
     println!("✓ dirname functionality test passed");
-    println!("  Current dirname: '{}'", dirname_str);
+    println!("  Current dirname: '{dirname_str}'");
 }
 
 #[tokio::test]
@@ -184,7 +183,7 @@ async fn test_property_value_length_limits() {
     assert_eq!(result2, too_long_value);
 
     println!("✓ Property value length limits test passed");
-    println!("  PROP_VALUE_MAX = {}", PROP_VALUE_MAX);
+    println!("  PROP_VALUE_MAX = {PROP_VALUE_MAX}");
     println!(
         "  Tested values of length {} and {}",
         max_length_value.len(),
@@ -210,7 +209,7 @@ async fn test_thread_safety() {
         let handle = thread::spawn(move || {
             // Each thread performs multiple operations
             for op_id in 0..5 {
-                let property_name = format!("test.thread.{}.{}", thread_id, op_id);
+                let property_name = format!("test.thread.{thread_id}.{op_id}");
 
                 // Test get_with_default (should always succeed)
                 let result = rsproperties::get_or(&property_name, "default".to_string());
@@ -284,7 +283,7 @@ async fn test_performance_basic() {
     let iterations = 1000;
 
     for i in 0..iterations {
-        let property_name = format!("test.perf.{}", i);
+        let property_name = format!("test.perf.{i}");
         let _result = rsproperties::get_or(&property_name, "default".to_string());
     }
 
@@ -292,14 +291,13 @@ async fn test_performance_basic() {
     let ops_per_sec = iterations as f64 / elapsed.as_secs_f64();
 
     println!("✓ Performance test completed");
-    println!("  {} operations in {:?}", iterations, elapsed);
-    println!("  {:.0} operations per second", ops_per_sec);
+    println!("  {iterations} operations in {elapsed:?}");
+    println!("  {ops_per_sec:.0} operations per second");
 
     // Performance should be reasonable (at least 1000 ops/sec)
     assert!(
         ops_per_sec > 1000.0,
-        "Performance should be at least 1000 ops/sec, got {:.0}",
-        ops_per_sec
+        "Performance should be at least 1000 ops/sec, got {ops_per_sec:.0}"
     );
 }
 
@@ -320,12 +318,11 @@ mod builder_tests {
                 // Try to read it back
                 let value: String = rsproperties::get("test.basic.set").unwrap_or_default();
                 assert_eq!(value, "test_value");
-                println!("✓ Property read back successfully: '{}'", value);
+                println!("✓ Property read back successfully: '{value}'");
             }
             Err(e) => {
                 println!(
-                    "⚠ Property set failed (expected without property service): {}",
-                    e
+                    "⚠ Property set failed (expected without property service): {e}"
                 );
                 // This is expected when property service is not running
             }
@@ -347,8 +344,8 @@ mod builder_tests {
 
         for (property, value) in &test_cases {
             match rsproperties::set(property, value) {
-                Ok(_) => println!("✓ Set property '{}' = '{}'", property, value),
-                Err(e) => println!("⚠ Failed to set property '{}': {}", property, e),
+                Ok(_) => println!("✓ Set property '{property}' = '{value}'"),
+                Err(e) => println!("⚠ Failed to set property '{property}': {e}"),
             }
         }
 
@@ -365,10 +362,9 @@ mod builder_tests {
 
         match result {
             Ok(_) => println!(
-                "✓ Successfully set property with max length ({})",
-                PROP_VALUE_MAX
+                "✓ Successfully set property with max length ({PROP_VALUE_MAX})"
             ),
-            Err(e) => println!("⚠ Failed to set max length property: {}", e),
+            Err(e) => println!("⚠ Failed to set max length property: {e}"),
         }
 
         // Test setting property with value that exceeds maximum length
@@ -406,12 +402,12 @@ mod builder_tests {
                         // Verify the update
                         let value: String = rsproperties::get(property_name).unwrap_or_default();
                         assert_eq!(value, "updated_value");
-                        println!("✓ Property update verified: '{}'", value);
+                        println!("✓ Property update verified: '{value}'");
                     }
-                    Err(e) => println!("⚠ Property update failed: {}", e),
+                    Err(e) => println!("⚠ Property update failed: {e}"),
                 }
             }
-            Err(e) => println!("⚠ Initial property set failed: {}", e),
+            Err(e) => println!("⚠ Initial property set failed: {e}"),
         }
 
         println!("✓ Property update test completed");
@@ -428,26 +424,25 @@ mod builder_tests {
         // Spawn multiple threads that try to set properties
         for thread_id in 0..5 {
             let handle = thread::spawn(move || {
-                let property_name = format!("test.concurrent.set.{}", thread_id);
-                let property_value = format!("thread_{}_value", thread_id);
+                let property_name = format!("test.concurrent.set.{thread_id}");
+                let property_value = format!("thread_{thread_id}_value");
 
                 match rsproperties::set(&property_name, &property_value) {
                     Ok(_) => {
                         println!(
-                            "Thread {}: Set property '{}' = '{}'",
-                            thread_id, property_name, property_value
+                            "Thread {thread_id}: Set property '{property_name}' = '{property_value}'"
                         );
 
                         // Try to read it back
                         let value: String = rsproperties::get(&property_name).unwrap_or_default();
-                        println!("Thread {}: Read back value: '{}'", thread_id, value);
+                        println!("Thread {thread_id}: Read back value: '{value}'");
                         if value == property_value {
-                            println!("Thread {}: ✓ Value matches", thread_id);
+                            println!("Thread {thread_id}: ✓ Value matches");
                         } else {
-                            println!("Thread {}: ⚠ Value mismatch", thread_id);
+                            println!("Thread {thread_id}: ⚠ Value mismatch");
                         }
                     }
-                    Err(e) => println!("Thread {}: ⚠ Set failed: {}", thread_id, e),
+                    Err(e) => println!("Thread {thread_id}: ⚠ Set failed: {e}"),
                 }
             });
 
@@ -485,7 +480,7 @@ async fn test_integration_comprehensive() {
     ];
 
     for (i, property) in test_properties.iter().enumerate() {
-        let default_value = format!("default_{}", i);
+        let default_value = format!("default_{i}");
         let result = rsproperties::get_or(property, default_value.to_string());
         assert_eq!(result, default_value);
     }
