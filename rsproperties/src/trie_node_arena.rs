@@ -26,7 +26,7 @@ impl TrieNodeArena {
         // Bounds checking
         let size = mem::size_of::<T>();
         assert!(
-            offset.checked_add(size).unwrap_or(usize::MAX) <= self.data.len(),
+            offset.saturating_add(size) <= self.data.len(),
             "Object access out of bounds: offset={}, size={}, data_len={}",
             offset,
             size,
@@ -127,7 +127,7 @@ impl TrieNodeArena {
         self.current_data_pointer
     }
 
-    pub(crate) fn info(&self) -> PropertyInfoArea {
+    pub(crate) fn info(&'_ self) -> PropertyInfoArea<'_> {
         PropertyInfoArea::new(&self.data)
     }
 

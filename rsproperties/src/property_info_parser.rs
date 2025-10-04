@@ -112,14 +112,14 @@ impl<'a> TrieNode<'a> {
         self.data().num_child_nodes
     }
 
-    fn child_node(&self, n: usize) -> TrieNode {
+    fn child_node(&'_ self, n: usize) -> TrieNode<'_> {
         let child_node_offset = self
             .property_info_area
             .u32_slice_from(self.data().child_nodes as usize)[n];
         TrieNode::new(&self.property_info_area, child_node_offset as usize)
     }
 
-    fn find_child_for_string(&self, input: &str) -> Option<TrieNode> {
+    fn find_child_for_string(&'_ self, input: &str) -> Option<TrieNode<'_>> {
         let node_index = find(self.num_child_nodes(), |i| {
             let child = self.child_node(i as _);
             let child_name = child.name().to_str().unwrap();
@@ -167,7 +167,7 @@ impl<'a> PropertyInfoArea<'a> {
     }
 
     // To resolve lifetime issues, we need to clone the TrieNode.
-    fn clone_trie_node(&self, trie_node: &TrieNode) -> TrieNode {
+    fn clone_trie_node(&'_ self, trie_node: &TrieNode) -> TrieNode<'_> {
         TrieNode::new(self, trie_node.trie_node_offset)
     }
 
@@ -244,7 +244,7 @@ impl<'a> PropertyInfoArea<'a> {
         self.u32_slice_from(self.header().types_offset as usize)[0] as _
     }
 
-    pub(crate) fn root_node(&self) -> TrieNode {
+    pub(crate) fn root_node(&'_ self) -> TrieNode<'_> {
         TrieNode::new(self, self.header().root_offset as usize)
     }
 
@@ -427,7 +427,7 @@ impl PropertyInfoAreaFile {
         })
     }
 
-    pub(crate) fn property_info_area(&self) -> PropertyInfoArea {
+    pub(crate) fn property_info_area(&'_ self) -> PropertyInfoArea<'_> {
         PropertyInfoArea::new(
             self.mmap
                 .data(0, 0, self.mmap.size())
