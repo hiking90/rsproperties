@@ -9,7 +9,7 @@
 
 #![cfg(target_os = "android")]
 
-use rsproperties::{self, Result};
+use rsproperties;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;

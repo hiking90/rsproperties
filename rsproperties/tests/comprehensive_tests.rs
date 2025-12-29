@@ -7,8 +7,10 @@
 //! real Android property system files.
 
 use rsproperties::{PROP_DIRNAME, PROP_VALUE_MAX};
+#[cfg(not(target_os = "android"))]
 use std::sync::Once;
 
+#[cfg(not(target_os = "android"))]
 static INIT_ONCE: Once = Once::new();
 
 fn ensure_init() {

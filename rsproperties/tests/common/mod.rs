@@ -1,12 +1,17 @@
+#[cfg(not(target_os = "android"))]
 use std::fs::{create_dir_all, remove_dir_all};
+#[cfg(not(target_os = "android"))]
 use std::sync::Once;
+#[cfg(not(target_os = "android"))]
 use std::{path::PathBuf, str::FromStr};
 
+#[cfg(not(target_os = "android"))]
 use rsproperties::PropertyConfig;
 
+#[cfg(not(target_os = "android"))]
 pub static TEST_PROPERTIES_DIR: &str = "__properties__";
 
-#[allow(dead_code)]
+#[cfg(not(target_os = "android"))]
 static INIT: Once = Once::new();
 
 #[allow(dead_code)]
