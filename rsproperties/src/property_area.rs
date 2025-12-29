@@ -57,7 +57,7 @@ impl Debug for PropertyTrieNode {
             .field("left", &self.left)
             .field("right", &self.right)
             .field("children", &self.children)
-            .field("name", &self.name().to_str().unwrap())
+            .field("name", &self.name().to_string_lossy())
             .finish()
     }
 }
@@ -556,10 +556,10 @@ unsafe impl Send for MemoryMap {}
 unsafe impl Sync for MemoryMap {}
 
 impl MemoryMap {
-    pub(crate) fn new(file: File, size: usize, wriable: bool) -> Result<Self> {
-        debug!("Creating memory map: size={size}, writable={wriable}");
+    pub(crate) fn new(file: File, size: usize, writable: bool) -> Result<Self> {
+        debug!("Creating memory map: size={size}, writable={writable}");
 
-        let flags = if wriable {
+        let flags = if writable {
             mm::ProtFlags::READ.union(mm::ProtFlags::WRITE)
         } else {
             mm::ProtFlags::READ
