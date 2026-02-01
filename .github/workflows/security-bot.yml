@@ -148,7 +148,7 @@ jobs:
           echo "outdated_count=$COUNT" >> $GITHUB_OUTPUT
 
       - name: Upload outdated report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: outdated-report
           path: outdated-report.txt
