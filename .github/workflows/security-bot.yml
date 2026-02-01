@@ -1,0 +1,155 @@
+name: Security Bot
+
+on:
+  schedule:
+    # Run daily at 09:00 KST (00:00 UTC)
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  security-events: write
+
+jobs:
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Run security audit
+        id: audit
+        continue-on-error: true
+        run: |
+          cargo audit --json > audit-report.json 2>&1 || true
+          cargo audit 2>&1 | tee audit-report.txt || echo "AUDIT_FAILED=true" >> $GITHUB_ENV
+
+      - name: Check for vulnerabilities
+        id: check-vulns
+        run: |
+          if [ -f audit-report.json ]; then
+            VULN_COUNT=$(cat audit-report.json | jq '.vulnerabilities.count // 0' 2>/dev/null || echo "0")
+            echo "vuln_count=$VULN_COUNT" >> $GITHUB_OUTPUT
+            if [ "$VULN_COUNT" -gt 0 ]; then
+              echo "has_vulns=true" >> $GITHUB_OUTPUT
+            else
+              echo "has_vulns=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "has_vulns=false" >> $GITHUB_OUTPUT
+            echo "vuln_count=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create or update security issue
+        if: steps.check-vulns.outputs.has_vulns == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('audit-report.txt', 'utf8');
+            const vulnCount = '${{ steps.check-vulns.outputs.vuln_count }}';
+
+            const title = `🔒 Security Alert: ${vulnCount} vulnerabilities found`;
+            const body = `## Security Audit Report
+
+            **Date:** ${new Date().toISOString().split('T')[0]}
+            **Vulnerabilities Found:** ${vulnCount}
+
+            ### Audit Details
+
+            \`\`\`
+            ${report.substring(0, 60000)}
+            \`\`\`
+
+            ### Recommended Actions
+
+            1. Review the vulnerabilities listed above
+            2. Update affected dependencies if patches are available
+            3. If no patch exists, consider alternatives or apply mitigations
+
+            ---
+            *This issue was automatically created by the Security Bot workflow.*
+            `;
+
+            // Check for existing open security issues
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'security',
+              state: 'open'
+            });
+
+            const existingIssue = issues.data.find(issue =>
+              issue.title.includes('Security Alert:')
+            );
+
+            if (existingIssue) {
+              // Update existing issue
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                body: body
+              });
+              console.log(`Updated existing issue #${existingIssue.number}`);
+            } else {
+              // Create new issue
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['security', 'dependencies']
+              });
+              console.log('Created new security issue');
+            }
+
+  dependency-review:
+    name: Check Outdated Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-outdated-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-outdated
+        run: cargo install cargo-outdated
+
+      - name: Check outdated dependencies
+        id: outdated
+        run: |
+          cargo outdated --format json > outdated-report.json 2>&1 || true
+          cargo outdated 2>&1 | tee outdated-report.txt || true
+
+          # Count outdated deps
+          if [ -f outdated-report.json ]; then
+            COUNT=$(cat outdated-report.json | jq 'if type == "object" then (.dependencies | length) else 0 end' 2>/dev/null || echo "0")
+          else
+            COUNT=$(grep -c "^Name" outdated-report.txt 2>/dev/null || echo "0")
+          fi
+          echo "outdated_count=$COUNT" >> $GITHUB_OUTPUT
+
+      - name: Upload outdated report
+        uses: actions/upload-artifact@v4
+        with:
+          name: outdated-report
+          path: outdated-report.txt
+          retention-days: 7
