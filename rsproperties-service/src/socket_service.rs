@@ -109,7 +109,7 @@ impl Actor for SocketService {
     async fn on_run(
         &mut self,
         _actor_weak: &ActorWeak<Self>,
-    ) -> std::result::Result<(), Self::Error> {
+    ) -> std::result::Result<bool, Self::Error> {
         tokio::select! {
             _ = Self::handle_socket_connections(&self.property_listener, self.properties_service.clone()) => {
                 trace!("Property socket service task completed");
@@ -118,7 +118,7 @@ impl Actor for SocketService {
                 trace!("System property socket service task completed");
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn on_stop(
