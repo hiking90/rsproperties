@@ -36,3 +36,7 @@ updates:
     labels:
       - "dependencies"
       - "github-actions"
+    ignore:
+      # The @ref in dtolnay/rust-toolchain specifies the Rust version to install,
+      # not the action version. Dependabot incorrectly treats it as an action version bump.
+      - dependency-name: "dtolnay/rust-toolchain"

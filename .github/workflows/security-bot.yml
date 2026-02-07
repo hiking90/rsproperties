@@ -29,23 +29,24 @@ jobs:
         id: audit
         continue-on-error: true
         run: |
-          cargo audit --json > audit-report.json 2>&1 || true
+          cargo audit --json 2>/dev/null > audit-report.json || true
           cargo audit 2>&1 | tee audit-report.txt || echo "AUDIT_FAILED=true" >> $GITHUB_ENV
 
       - name: Check for vulnerabilities
         id: check-vulns
         run: |
-          if [ -f audit-report.json ]; then
-            VULN_COUNT=$(cat audit-report.json | jq '.vulnerabilities.count // 0' 2>/dev/null || echo "0")
-            echo "vuln_count=$VULN_COUNT" >> $GITHUB_OUTPUT
-            if [ "$VULN_COUNT" -gt 0 ]; then
-              echo "has_vulns=true" >> $GITHUB_OUTPUT
-            else
-              echo "has_vulns=false" >> $GITHUB_OUTPUT
-            fi
+          VULN_COUNT=0
+          if [ -f audit-report.json ] && [ -s audit-report.json ]; then
+            VULN_COUNT=$(jq '.vulnerabilities.count // 0' audit-report.json 2>/dev/null | head -1)
+          fi
+          if ! [[ "${VULN_COUNT}" =~ ^[0-9]+$ ]]; then
+            VULN_COUNT=0
+          fi
+          echo "vuln_count=$VULN_COUNT" >> $GITHUB_OUTPUT
+          if [ "$VULN_COUNT" -gt 0 ]; then
+            echo "has_vulns=true" >> $GITHUB_OUTPUT
           else
             echo "has_vulns=false" >> $GITHUB_OUTPUT
-            echo "vuln_count=0" >> $GITHUB_OUTPUT
           fi
 
       - name: Create or update security issue
@@ -136,14 +137,16 @@ jobs:
       - name: Check outdated dependencies
         id: outdated
         run: |
-          cargo outdated --format json > outdated-report.json 2>&1 || true
+          cargo outdated --format json 2>/dev/null > outdated-report.json || true
           cargo outdated 2>&1 | tee outdated-report.txt || true
 
           # Count outdated deps
-          if [ -f outdated-report.json ]; then
-            COUNT=$(cat outdated-report.json | jq 'if type == "object" then (.dependencies | length) else 0 end' 2>/dev/null || echo "0")
-          else
-            COUNT=$(grep -c "^Name" outdated-report.txt 2>/dev/null || echo "0")
+          COUNT=0
+          if [ -f outdated-report.json ] && [ -s outdated-report.json ]; then
+            COUNT=$(jq 'if type == "object" then (.dependencies | length) else 0 end' outdated-report.json 2>/dev/null | head -1)
+          fi
+          if ! [[ "${COUNT}" =~ ^[0-9]+$ ]]; then
+            COUNT=0
           fi
           echo "outdated_count=$COUNT" >> $GITHUB_OUTPUT
 
