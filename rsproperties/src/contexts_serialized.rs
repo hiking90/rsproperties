@@ -46,8 +46,8 @@ impl ContextsSerialized {
         let mut context_nodes = Vec::with_capacity(num_context_nodes);
 
         for i in 0..num_context_nodes {
-            let context_offset = property_info_area.context_offset(i);
-            let context_name = property_info_area.cstr(context_offset).to_str().unwrap();
+            let context_offset = property_info_area.context_offset(i)?;
+            let context_name = property_info_area.cstr(context_offset).to_str()?;
             let filename = dirname.join(context_name);
             context_nodes.push(ContextNode::new(writable, context_offset, filename))
         }

@@ -39,7 +39,12 @@ impl ContextNode {
             panic!("open() must be called with access_rw == true");
         }
 
-        let mut prop_area = self.property_area.write().unwrap();
+        let mut prop_area = self.property_area.write().map_err(|e| {
+            Error::new_lock_error(format!(
+                "Failed to acquire write lock on property area: {}",
+                e
+            ))
+        })?;
         if prop_area.is_some() {
             return Ok(());
         }
@@ -60,12 +65,22 @@ impl ContextNode {
     pub(crate) fn property_area(&self) -> Result<PropertyAreaGuard<'_>> {
         loop {
             {
-                let guard = self.property_area.read().unwrap();
+                let guard = self.property_area.read().map_err(|e| {
+                    Error::new_lock_error(format!(
+                        "Failed to acquire read lock on property area: {}",
+                        e
+                    ))
+                })?;
                 if guard.is_some() {
                     return Ok(PropertyAreaGuard { guard });
                 }
             }
-            let mut guard = self.property_area.write().unwrap();
+            let mut guard = self.property_area.write().map_err(|e| {
+                Error::new_lock_error(format!(
+                    "Failed to acquire write lock on property area: {}",
+                    e
+                ))
+            })?;
             if guard.is_none() {
                 *guard = Some(PropertyAreaMap::new_ro(self.filename.as_path())?);
             }
@@ -76,7 +91,12 @@ impl ContextNode {
     pub(crate) fn property_area_mut(&self) -> Result<PropertyAreaMutGuard<'_>> {
         self.property_area()?;
         Ok(PropertyAreaMutGuard {
-            guard: self.property_area.write().unwrap(),
+            guard: self.property_area.write().map_err(|e| {
+                Error::new_lock_error(format!(
+                    "Failed to acquire write lock on property area guard: {}",
+                    e
+                ))
+            })?,
         })
     }
 }

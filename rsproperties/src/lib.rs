@@ -267,9 +267,19 @@ pub fn system_properties() -> &'static system_properties::SystemProperties {
     })
 }
 
-// Get alignment value for bionic style.
+/// Aligns size to the specified alignment (bionic style)
+///
+/// # Panics
+/// Panics if alignment is not a power of 2
 pub(crate) fn bionic_align(value: usize, alignment: usize) -> usize {
-    (value + alignment - 1) & !(alignment - 1)
+    assert!(
+        alignment.is_power_of_two(),
+        "Alignment must be a power of 2"
+    );
+
+    // Use saturating_add to prevent overflow
+    // (value + alignment - 1) & !(alignment - 1)
+    value.saturating_add(alignment - 1) & !(alignment - 1)
 }
 
 /// Get a property value parsed to specified type
@@ -579,5 +589,53 @@ mod tests {
 
         handle.join().unwrap();
         handle_any.join().unwrap();
+    }
+
+    #[test]
+    fn test_bionic_align_normal() {
+        // Test normal alignment
+        assert_eq!(bionic_align(0, 4), 0);
+        assert_eq!(bionic_align(1, 4), 4);
+        assert_eq!(bionic_align(4, 4), 4);
+        assert_eq!(bionic_align(5, 4), 8);
+        assert_eq!(bionic_align(7, 4), 8);
+        assert_eq!(bionic_align(8, 4), 8);
+
+        // Test with 8-byte alignment
+        assert_eq!(bionic_align(0, 8), 0);
+        assert_eq!(bionic_align(1, 8), 8);
+        assert_eq!(bionic_align(8, 8), 8);
+        assert_eq!(bionic_align(9, 8), 16);
+    }
+
+    #[test]
+    fn test_bionic_align_overflow_safety() {
+        // Test that bionic_align doesn't overflow with large values
+        let size = usize::MAX - 10;
+        let align = 16;
+        let result = bionic_align(size, align);
+
+        // Should saturate and then align down
+        // Result should be aligned and not panic
+        assert_eq!(result % align, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Alignment must be a power of 2")]
+    fn test_bionic_align_invalid_alignment() {
+        // Test that non-power-of-2 alignment panics
+        bionic_align(100, 3);
+    }
+
+    #[test]
+    fn test_bionic_align_edge_cases() {
+        // Test with alignment of 1 (trivial case)
+        assert_eq!(bionic_align(5, 1), 5);
+        assert_eq!(bionic_align(0, 1), 0);
+
+        // Test with larger alignment
+        assert_eq!(bionic_align(100, 64), 128);
+        assert_eq!(bionic_align(64, 64), 64);
+        assert_eq!(bionic_align(65, 64), 128);
     }
 }

@@ -39,29 +39,26 @@ impl PropertyInfo {
     #[cfg(feature = "builder")]
     pub(crate) fn init_with_long_offset(&mut self, name: &str, offset: u32) {
         init_name_with_trailing_data(self, name);
-        let error_value_len = LONG_LEGACY_ERROR.len();
+        let error_bytes = LONG_LEGACY_ERROR.as_bytes();
+        let error_value_len = error_bytes.len();
         let serial_value = ((error_value_len << 24) | LONG_FLAG) as u32;
 
         self.serial
             .store(serial_value, std::sync::atomic::Ordering::Relaxed);
 
-        // Safe memory copy with proper bounds checking
         unsafe {
             let long_property = &mut self.data.long_property;
-            let error_bytes = LONG_LEGACY_ERROR.as_bytes();
-            let copy_len = error_value_len
-                .min(error_bytes.len())
-                .min(long_property.error_message.len());
 
-            // Always use safe bounds-checked copy
-            let dest_slice = &mut long_property.error_message[..copy_len];
-            dest_slice.copy_from_slice(&error_bytes[..copy_len]);
+            // Calculate copy length - simply take minimum of source and destination
+            let copy_len = error_bytes.len().min(long_property.error_message.len());
 
-            // Clear remaining bytes if needed
-            if copy_len < long_property.error_message.len() {
-                long_property.error_message[copy_len..].fill(0);
-            }
+            // Copy error message
+            long_property.error_message[..copy_len].copy_from_slice(&error_bytes[..copy_len]);
 
+            // Zero-fill remaining space
+            long_property.error_message[copy_len..].fill(0);
+
+            // Set offset
             long_property.offset = offset;
         }
     }
@@ -99,11 +96,11 @@ impl PropertyInfo {
             }
         }
     */
-    pub(crate) fn name(&self) -> &CStr {
+    pub(crate) fn name(&self) -> crate::errors::Result<&CStr> {
         name_from_trailing_data(self, None)
     }
 
-    pub(crate) fn value(&self) -> &CStr {
+    pub(crate) fn value(&self) -> crate::errors::Result<&CStr> {
         if self.is_long() {
             unsafe {
                 let long_property = &self.data.long_property;
@@ -111,14 +108,18 @@ impl PropertyInfo {
                 let value_ptr = self_ptr.add(long_property.offset as usize) as *const i8;
 
                 // Don't know the length of the long property value, so it depends on the null terminator.
-                CStr::from_ptr(value_ptr as _)
+                Ok(CStr::from_ptr(value_ptr as _))
             }
         } else {
             unsafe {
                 let value_ptr = self.data.value.as_ptr() as _;
                 // The length of the property value is limited to PROP_VALUE_MAX, so we can safely convert it to CStr.
                 CStr::from_bytes_until_nul(std::slice::from_raw_parts(value_ptr, PROP_VALUE_MAX))
-                    .expect("Failed to convert value to CStr")
+                    .map_err(|e| {
+                        crate::errors::Error::new_encoding(format!(
+                            "Failed to convert property value to CStr: {e}"
+                        ))
+                    })
             }
         }
     }
@@ -154,14 +155,21 @@ impl PropertyInfo {
 }
 
 #[inline(always)]
-pub(crate) fn name_from_trailing_data<I: Sized>(thiz: &I, len: Option<usize>) -> &CStr {
+pub(crate) fn name_from_trailing_data<I: Sized>(
+    thiz: &I,
+    len: Option<usize>,
+) -> crate::errors::Result<&CStr> {
     unsafe {
         let thiz_ptr = thiz as *const _ as *const u8;
         let name_ptr = thiz_ptr.add(mem::size_of::<I>()) as _;
         match len {
             Some(len) => CStr::from_bytes_until_nul(std::slice::from_raw_parts(name_ptr, len + 1))
-                .expect("Failed to convert name to CStr"),
-            None => CStr::from_ptr(name_ptr as *const _),
+                .map_err(|e| {
+                    crate::errors::Error::new_encoding(format!(
+                        "Failed to convert name to CStr: {e}"
+                    ))
+                }),
+            None => Ok(CStr::from_ptr(name_ptr as *const _)),
         }
     }
 }

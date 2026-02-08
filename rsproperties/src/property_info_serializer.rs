@@ -141,7 +141,7 @@ impl PropertyInfoEntry {
 }
 
 pub fn build_trie(
-    property_info: &Vec<PropertyInfoEntry>,
+    property_info: &[PropertyInfoEntry],
     default_context: &str,
     default_type: &str,
 ) -> Result<Vec<u8>> {
@@ -163,7 +163,7 @@ pub fn build_trie(
         )?;
     }
 
-    let mut serializer = TrieSerializer::new(&trie);
+    let mut serializer = TrieSerializer::new(&trie)?;
     let data = serializer.take_data();
 
     info!(
