@@ -53,8 +53,7 @@ impl PropertyInfo {
             let copy_len = error_bytes.len().min(long_property.error_message.len());
 
             // Copy error message
-            long_property.error_message[..copy_len]
-                .copy_from_slice(&error_bytes[..copy_len]);
+            long_property.error_message[..copy_len].copy_from_slice(&error_bytes[..copy_len]);
 
             // Zero-fill remaining space
             long_property.error_message[copy_len..].fill(0);
@@ -116,8 +115,11 @@ impl PropertyInfo {
                 let value_ptr = self.data.value.as_ptr() as _;
                 // The length of the property value is limited to PROP_VALUE_MAX, so we can safely convert it to CStr.
                 CStr::from_bytes_until_nul(std::slice::from_raw_parts(value_ptr, PROP_VALUE_MAX))
-                    .map_err(|e| crate::errors::Error::new_encoding(
-                        format!("Failed to convert property value to CStr: {e}")))
+                    .map_err(|e| {
+                        crate::errors::Error::new_encoding(format!(
+                            "Failed to convert property value to CStr: {e}"
+                        ))
+                    })
             }
         }
     }
@@ -163,7 +165,9 @@ pub(crate) fn name_from_trailing_data<I: Sized>(
         match len {
             Some(len) => CStr::from_bytes_until_nul(std::slice::from_raw_parts(name_ptr, len + 1))
                 .map_err(|e| {
-                    crate::errors::Error::new_encoding(format!("Failed to convert name to CStr: {e}"))
+                    crate::errors::Error::new_encoding(format!(
+                        "Failed to convert name to CStr: {e}"
+                    ))
                 }),
             None => Ok(CStr::from_ptr(name_ptr as *const _)),
         }

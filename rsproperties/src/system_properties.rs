@@ -106,7 +106,10 @@ impl SystemProperties {
             let _len: u32 = serial_value_len(serial);
 
             let value = if serial_dirty(serial) {
-                let res = match self.contexts.prop_area_for_name(prop_info.name()?.to_str()?) {
+                let res = match self
+                    .contexts
+                    .prop_area_for_name(prop_info.name()?.to_str()?)
+                {
                     Ok(res) => res,
                     Err(e) => {
                         log::error!(

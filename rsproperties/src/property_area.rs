@@ -482,10 +482,7 @@ impl PropertyAreaMap {
 
         // Convert aligned to u32 with overflow check
         let aligned_u32 = u32::try_from(aligned).map_err(|_| {
-            Error::new_file_size(format!(
-                "Aligned size too large to fit in u32: {}",
-                aligned
-            ))
+            Error::new_file_size(format!("Aligned size too large to fit in u32: {}", aligned))
         })?;
 
         // checked_add to prevent overflow

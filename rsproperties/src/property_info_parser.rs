@@ -121,15 +121,13 @@ impl<'a> TrieNode<'a> {
     }
 
     pub(crate) fn num_child_nodes(&self) -> u32 {
-        self.data()
-            .map(|d| d.num_child_nodes)
-            .unwrap_or_else(|e| {
-                warn!(
-                    "Failed to read TrieNodeData at offset {}: {e}",
-                    self.trie_node_offset
-                );
-                0
-            })
+        self.data().map(|d| d.num_child_nodes).unwrap_or_else(|e| {
+            warn!(
+                "Failed to read TrieNodeData at offset {}: {e}",
+                self.trie_node_offset
+            );
+            0
+        })
     }
 
     fn child_node(&'_ self, n: usize) -> Result<TrieNode<'_>> {
@@ -150,14 +148,12 @@ impl<'a> TrieNode<'a> {
     }
 
     fn find_child_for_string(&'_ self, input: &str) -> Option<TrieNode<'_>> {
-        let node_index = find(self.num_child_nodes(), |i| {
-            match self.child_node(i as _) {
-                Ok(child) => match child.name() {
-                    Ok(name) => name.to_str().unwrap_or_default().cmp(input),
-                    Err(_) => Ordering::Less,
-                },
+        let node_index = find(self.num_child_nodes(), |i| match self.child_node(i as _) {
+            Ok(child) => match child.name() {
+                Ok(name) => name.to_str().unwrap_or_default().cmp(input),
                 Err(_) => Ordering::Less,
-            }
+            },
+            Err(_) => Ordering::Less,
         });
 
         if node_index < 0 {
@@ -168,15 +164,13 @@ impl<'a> TrieNode<'a> {
     }
 
     pub(crate) fn num_prefixes(&self) -> u32 {
-        self.data()
-            .map(|d| d.num_prefixes)
-            .unwrap_or_else(|e| {
-                warn!(
-                    "Failed to read TrieNodeData at offset {}: {e}",
-                    self.trie_node_offset
-                );
-                0
-            })
+        self.data().map(|d| d.num_prefixes).unwrap_or_else(|e| {
+            warn!(
+                "Failed to read TrieNodeData at offset {}: {e}",
+                self.trie_node_offset
+            );
+            0
+        })
     }
 
     pub(crate) fn prefix(&self, n: usize) -> Result<&PropertyEntry> {
@@ -255,22 +249,21 @@ impl<'a> PropertyInfoArea<'a> {
         T: zerocopy::FromBytes + zerocopy::KnownLayout + zerocopy::Immutable,
     {
         let size_of = size_of::<T>();
-        let end = offset
-            .checked_add(size_of)
-            .ok_or_else(|| Error::new_file_validation(format!("Offset overflow: {offset} + {size_of}")))?;
-        let slice = self
-            .data_base
-            .get(offset..end)
-            .ok_or_else(|| {
-                Error::new_file_validation(format!(
-                    "Offset out of bounds: {end} > {}",
-                    self.data_base.len()
-                ))
-            })?;
+        let end = offset.checked_add(size_of).ok_or_else(|| {
+            Error::new_file_validation(format!("Offset overflow: {offset} + {size_of}"))
+        })?;
+        let slice = self.data_base.get(offset..end).ok_or_else(|| {
+            Error::new_file_validation(format!(
+                "Offset out of bounds: {end} > {}",
+                self.data_base.len()
+            ))
+        })?;
         zerocopy::Ref::<&[u8], T>::from_bytes(slice)
             .map(zerocopy::Ref::into_ref)
             .map_err(|e| {
-                Error::new_file_validation(format!("Reference creation failed at offset {offset}: {e}"))
+                Error::new_file_validation(format!(
+                    "Reference creation failed at offset {offset}: {e}"
+                ))
             })
     }
 
@@ -495,11 +488,7 @@ impl<'a> PropertyInfoArea<'a> {
     pub(crate) fn find_context_index(&self, context: &str) -> i32 {
         find(self.num_contexts() as _, |i| {
             match self.context_offset(i as _) {
-                Ok(offset) => self
-                    .cstr(offset)
-                    .to_str()
-                    .unwrap_or_default()
-                    .cmp(context),
+                Ok(offset) => self.cstr(offset).to_str().unwrap_or_default().cmp(context),
                 Err(_) => Ordering::Less,
             }
         })
@@ -507,15 +496,9 @@ impl<'a> PropertyInfoArea<'a> {
 
     #[cfg(feature = "builder")]
     pub(crate) fn find_type_index(&self, rtype: &str) -> i32 {
-        find(self.num_types() as _, |i| {
-            match self.type_offset(i as _) {
-                Ok(offset) => self
-                    .cstr(offset)
-                    .to_str()
-                    .unwrap_or_default()
-                    .cmp(rtype),
-                Err(_) => Ordering::Less,
-            }
+        find(self.num_types() as _, |i| match self.type_offset(i as _) {
+            Ok(offset) => self.cstr(offset).to_str().unwrap_or_default().cmp(rtype),
+            Err(_) => Ordering::Less,
         })
     }
 }

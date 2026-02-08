@@ -30,7 +30,9 @@ impl TrieNodeArena {
         if offset.saturating_add(size) > self.data.len() {
             return Err(Error::new_file_validation(format!(
                 "Object access out of bounds: offset={}, size={}, data_len={}",
-                offset, size, self.data.len()
+                offset,
+                size,
+                self.data.len()
             )));
         }
 
@@ -71,7 +73,8 @@ impl TrieNodeArena {
         if offset > self.data.len() {
             return Err(Error::new_file_validation(format!(
                 "Array access out of bounds: offset={}, data_len={}",
-                offset, self.data.len()
+                offset,
+                self.data.len()
             )));
         }
 

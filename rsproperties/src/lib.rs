@@ -272,7 +272,10 @@ pub fn system_properties() -> &'static system_properties::SystemProperties {
 /// # Panics
 /// Panics if alignment is not a power of 2
 pub(crate) fn bionic_align(value: usize, alignment: usize) -> usize {
-    assert!(alignment.is_power_of_two(), "Alignment must be a power of 2");
+    assert!(
+        alignment.is_power_of_two(),
+        "Alignment must be a power of 2"
+    );
 
     // Use saturating_add to prevent overflow
     // (value + alignment - 1) & !(alignment - 1)
