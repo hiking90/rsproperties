@@ -39,29 +39,27 @@ impl PropertyInfo {
     #[cfg(feature = "builder")]
     pub(crate) fn init_with_long_offset(&mut self, name: &str, offset: u32) {
         init_name_with_trailing_data(self, name);
-        let error_value_len = LONG_LEGACY_ERROR.len();
+        let error_bytes = LONG_LEGACY_ERROR.as_bytes();
+        let error_value_len = error_bytes.len();
         let serial_value = ((error_value_len << 24) | LONG_FLAG) as u32;
 
         self.serial
             .store(serial_value, std::sync::atomic::Ordering::Relaxed);
 
-        // Safe memory copy with proper bounds checking
         unsafe {
             let long_property = &mut self.data.long_property;
-            let error_bytes = LONG_LEGACY_ERROR.as_bytes();
-            let copy_len = error_value_len
-                .min(error_bytes.len())
-                .min(long_property.error_message.len());
 
-            // Always use safe bounds-checked copy
-            let dest_slice = &mut long_property.error_message[..copy_len];
-            dest_slice.copy_from_slice(&error_bytes[..copy_len]);
+            // Calculate copy length - simply take minimum of source and destination
+            let copy_len = error_bytes.len().min(long_property.error_message.len());
 
-            // Clear remaining bytes if needed
-            if copy_len < long_property.error_message.len() {
-                long_property.error_message[copy_len..].fill(0);
-            }
+            // Copy error message
+            long_property.error_message[..copy_len]
+                .copy_from_slice(&error_bytes[..copy_len]);
 
+            // Zero-fill remaining space
+            long_property.error_message[copy_len..].fill(0);
+
+            // Set offset
             long_property.offset = offset;
         }
     }

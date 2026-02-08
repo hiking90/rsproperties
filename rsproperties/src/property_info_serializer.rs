@@ -163,7 +163,7 @@ pub fn build_trie(
         )?;
     }
 
-    let mut serializer = TrieSerializer::new(&trie);
+    let mut serializer = TrieSerializer::new(&trie)?;
     let data = serializer.take_data();
 
     info!(

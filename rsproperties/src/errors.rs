@@ -36,6 +36,9 @@ pub enum Error {
 
     #[error("File ownership error: {0}")]
     FileOwnership(String),
+
+    #[error("Lock error: {0}")]
+    LockError(String),
 }
 
 impl Error {
@@ -69,6 +72,10 @@ impl Error {
 
     pub fn new_file_ownership(msg: String) -> Error {
         Error::FileOwnership(msg)
+    }
+
+    pub fn new_lock_error(msg: String) -> Error {
+        Error::LockError(msg)
     }
 
     pub fn new_io(io_error: std::io::Error) -> Error {

@@ -480,15 +480,36 @@ impl PropertyAreaMap {
         let aligned = crate::bionic_align(size, mem::size_of::<u32>());
         let offset = self.property_area().bytes_used;
 
-        if offset + (aligned as u32) > self.pa_data_size as u32 {
+        // Convert aligned to u32 with overflow check
+        let aligned_u32 = u32::try_from(aligned).map_err(|_| {
+            Error::new_file_size(format!(
+                "Aligned size too large to fit in u32: {}",
+                aligned
+            ))
+        })?;
+
+        // checked_add to prevent overflow
+        let new_offset = offset.checked_add(aligned_u32).ok_or_else(|| {
+            Error::new_file_size(format!(
+                "Offset overflow: {} + {} would exceed u32::MAX",
+                offset, aligned_u32
+            ))
+        })?;
+
+        // Bounds check
+        if new_offset > self.pa_data_size as u32 {
             error!(
-                "Out of memory: {} + {} > {}",
-                offset, aligned, self.pa_data_size
+                "Out of memory: new_offset={} > pa_data_size={}",
+                new_offset, self.pa_data_size
             );
-            return Err(Error::new_file_size("Out of memory".to_string()));
+            return Err(Error::new_file_size(format!(
+                "Out of memory: {} + {} = {} > {}",
+                offset, aligned_u32, new_offset, self.pa_data_size
+            )));
         }
 
-        self.property_area_mut().bytes_used += aligned as u32;
+        // Update bytes_used
+        self.property_area_mut().bytes_used = new_offset;
         Ok(offset)
     }
 
