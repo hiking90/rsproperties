@@ -99,11 +99,11 @@ impl PropertyInfo {
             }
         }
     */
-    pub(crate) fn name(&self) -> &CStr {
+    pub(crate) fn name(&self) -> crate::errors::Result<&CStr> {
         name_from_trailing_data(self, None)
     }
 
-    pub(crate) fn value(&self) -> &CStr {
+    pub(crate) fn value(&self) -> crate::errors::Result<&CStr> {
         if self.is_long() {
             unsafe {
                 let long_property = &self.data.long_property;
@@ -111,14 +111,15 @@ impl PropertyInfo {
                 let value_ptr = self_ptr.add(long_property.offset as usize) as *const i8;
 
                 // Don't know the length of the long property value, so it depends on the null terminator.
-                CStr::from_ptr(value_ptr as _)
+                Ok(CStr::from_ptr(value_ptr as _))
             }
         } else {
             unsafe {
                 let value_ptr = self.data.value.as_ptr() as _;
                 // The length of the property value is limited to PROP_VALUE_MAX, so we can safely convert it to CStr.
                 CStr::from_bytes_until_nul(std::slice::from_raw_parts(value_ptr, PROP_VALUE_MAX))
-                    .expect("Failed to convert value to CStr")
+                    .map_err(|e| crate::errors::Error::new_encoding(
+                        format!("Failed to convert property value to CStr: {e}")))
             }
         }
     }
@@ -154,14 +155,19 @@ impl PropertyInfo {
 }
 
 #[inline(always)]
-pub(crate) fn name_from_trailing_data<I: Sized>(thiz: &I, len: Option<usize>) -> &CStr {
+pub(crate) fn name_from_trailing_data<I: Sized>(
+    thiz: &I,
+    len: Option<usize>,
+) -> crate::errors::Result<&CStr> {
     unsafe {
         let thiz_ptr = thiz as *const _ as *const u8;
         let name_ptr = thiz_ptr.add(mem::size_of::<I>()) as _;
         match len {
             Some(len) => CStr::from_bytes_until_nul(std::slice::from_raw_parts(name_ptr, len + 1))
-                .expect("Failed to convert name to CStr"),
-            None => CStr::from_ptr(name_ptr as *const _),
+                .map_err(|e| {
+                    crate::errors::Error::new_encoding(format!("Failed to convert name to CStr: {e}"))
+                }),
+            None => Ok(CStr::from_ptr(name_ptr as *const _)),
         }
     }
 }

@@ -106,12 +106,12 @@ impl SystemProperties {
             let _len: u32 = serial_value_len(serial);
 
             let value = if serial_dirty(serial) {
-                let res = match self.contexts.prop_area_for_name(prop_info.name().to_str()?) {
+                let res = match self.contexts.prop_area_for_name(prop_info.name()?.to_str()?) {
                     Ok(res) => res,
                     Err(e) => {
                         log::error!(
                             "Failed to get property area for name {:?}: {}",
-                            prop_info.name(),
+                            prop_info.name().unwrap_or(c"<unknown>"),
                             e
                         );
                         return Err(e);
@@ -127,7 +127,7 @@ impl SystemProperties {
                 };
                 value.as_str().map_err(Error::from)?.to_owned()
             } else {
-                let value = prop_info.value();
+                let value = prop_info.value()?;
                 value.as_str().map_err(Error::from)?.to_owned()
             };
 
@@ -146,7 +146,7 @@ impl SystemProperties {
 
     fn read(&self, prop_info: &PropertyInfo, is_name: bool) -> Result<(Option<String>, String)> {
         let (_serial, value) = self.read_mutable_property_value(prop_info)?;
-        let name_cstr = prop_info.name();
+        let name_cstr = prop_info.name()?;
 
         let name = if is_name {
             Some(name_cstr.to_str()?.to_owned())
@@ -266,7 +266,7 @@ impl SystemProperties {
             }
         };
 
-        let name = pi.name().to_bytes();
+        let name = pi.name()?.to_bytes();
         if !name.is_empty() && &name[0..3] == b"ro." {
             let error_msg = format!("Try to update the read-only property: {name:?}");
             log::error!("{error_msg}");
@@ -274,7 +274,7 @@ impl SystemProperties {
         }
 
         let mut serial = pi.serial.load(Ordering::Relaxed);
-        let backup_value = pi.value().to_owned();
+        let backup_value = pi.value()?.to_owned();
 
         // Before updating, the property value must be backed up
         match pa.set_dirty_backup_area(&backup_value) {

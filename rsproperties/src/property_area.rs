@@ -44,7 +44,7 @@ impl PropertyTrieNode {
         init_name_with_trailing_data(self, name);
     }
 
-    pub(crate) fn name(&self) -> &CStr {
+    pub(crate) fn name(&self) -> crate::errors::Result<&CStr> {
         name_from_trailing_data(self, Some(self.namelen as _))
     }
 }
@@ -57,7 +57,13 @@ impl Debug for PropertyTrieNode {
             .field("left", &self.left)
             .field("right", &self.right)
             .field("children", &self.children)
-            .field("name", &self.name().to_string_lossy())
+            .field(
+                "name",
+                &self
+                    .name()
+                    .map(|n| n.to_str().unwrap_or("<invalid>"))
+                    .unwrap_or("<error>"),
+            )
             .finish()
     }
 }
@@ -383,7 +389,7 @@ impl PropertyAreaMap {
                 .mmap
                 .to_object::<PropertyTrieNode>(current_offset as usize, self.data_offset)?;
 
-            match cmp_prop_name(name_bytes, current_node.name().to_bytes()) {
+            match cmp_prop_name(name_bytes, current_node.name()?.to_bytes()) {
                 std::cmp::Ordering::Less => {
                     let left_offset = current_node.left.load(std::sync::atomic::Ordering::Relaxed);
                     if left_offset != 0 {
@@ -442,7 +448,7 @@ impl PropertyAreaMap {
         let name_bytes = name.as_bytes();
         let mut current = trie;
         loop {
-            match cmp_prop_name(name_bytes, current.name().to_bytes()) {
+            match cmp_prop_name(name_bytes, current.name()?.to_bytes()) {
                 std::cmp::Ordering::Less => {
                     let left_offset = current.left.load(std::sync::atomic::Ordering::Relaxed);
                     if left_offset != 0 {
