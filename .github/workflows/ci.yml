@@ -198,7 +198,7 @@ jobs:
         targets: ${{ matrix.target }}
 
     - name: Setup Android SDK
-      uses: android-actions/setup-android@v3
+      uses: android-actions/setup-android@v4
       with:
         packages: platform-tools platforms;android-34 ndk;26.1.10909125
 
