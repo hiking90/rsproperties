@@ -159,6 +159,16 @@ pub(crate) fn name_from_trailing_data<I: Sized>(
     thiz: &I,
     len: Option<usize>,
 ) -> crate::errors::Result<&CStr> {
+    // SAFETY: `thiz` points into a memory-mapped property file laid out as a
+    // header (`I`) immediately followed by `len + 1` bytes of name data when
+    // `len` is `Some`, or a null-terminated C string when `len` is `None`.
+    // - `Some(len)` branch: caller guarantees `len + 1` bytes (including the
+    //   terminator) are mapped after `thiz`. `from_bytes_until_nul` reads at
+    //   most that many bytes and returns `Err` if no null is found.
+    // - `None` branch: caller guarantees the bytes after `thiz` form a
+    //   null-terminated string within the mapping. Without an upper bound,
+    //   a missing terminator would read past the mapping — this is a known
+    //   residual risk that requires propagating the buffer length to fix.
     unsafe {
         let thiz_ptr = thiz as *const _ as *const u8;
         let name_ptr = thiz_ptr.add(mem::size_of::<I>()) as _;

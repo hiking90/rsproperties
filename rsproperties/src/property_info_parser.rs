@@ -34,6 +34,22 @@ where
     -1
 }
 
+/// Decodes a trie entry name into a non-empty UTF-8 string.
+///
+/// Returns `None` and skips silently for empty names (the corruption-fallback
+/// `c""` returned by `cstr()`). Returns `None` and logs a warning on UTF-8
+/// failure so corrupted entries are observable in logs.
+fn entry_name_str<'a>(name: &'a CStr, kind: &str, idx: usize) -> Option<&'a str> {
+    match name.to_str() {
+        Ok(s) if !s.is_empty() => Some(s),
+        Ok(_) => None,
+        Err(e) => {
+            warn!("{kind} entry {idx} has non-UTF-8 name: {e}");
+            None
+        }
+    }
+}
+
 #[derive(FromBytes, KnownLayout, Immutable, Debug)]
 #[repr(C, align(4))]
 pub(crate) struct PropertyEntry {
@@ -365,24 +381,25 @@ impl<'a> PropertyInfoArea<'a> {
         for i in 0..trie_node.num_prefixes() {
             let prefix = match trie_node.prefix(i as _) {
                 Ok(p) => p,
-                Err(_) => continue,
+                Err(e) => {
+                    warn!("Failed to read prefix entry {i}: {e}");
+                    continue;
+                }
             };
             if prefix.namelen > remaining_name_size as u32 {
                 continue;
             }
-            if let Ok(prefix_name) = prefix.name(self).to_str() {
-                if prefix_name.is_empty() {
-                    continue; // Empty name is not a valid prefix
+            let Some(prefix_name) = entry_name_str(prefix.name(self), "Prefix", i as usize) else {
+                continue;
+            };
+            if remaining_name.starts_with(prefix_name) {
+                if prefix.context_index != !0 {
+                    *context_index = prefix.context_index;
                 }
-                if remaining_name.starts_with(prefix_name) {
-                    if prefix.context_index != !0 {
-                        *context_index = prefix.context_index;
-                    }
-                    if prefix.type_index != !0 {
-                        *type_index = prefix.type_index;
-                    }
-                    return;
+                if prefix.type_index != !0 {
+                    *type_index = prefix.type_index;
                 }
+                return;
             }
         }
     }
@@ -432,30 +449,33 @@ impl<'a> PropertyInfoArea<'a> {
         for i in 0..trie_node.num_exact_matches() {
             let exact_match = match trie_node.exact_match(i as _) {
                 Ok(em) => em,
-                Err(_) => continue,
+                Err(e) => {
+                    warn!("Failed to read exact_match entry {i}: {e}");
+                    continue;
+                }
             };
-            if let Ok(exact_match_name) = exact_match.name(self).to_str() {
-                if exact_match_name.is_empty() {
-                    continue; // Empty name is not a valid exact match
-                }
-                if exact_match_name == remaining_name {
-                    let context_index = if exact_match.context_index != !0 {
-                        exact_match.context_index
-                    } else {
-                        return_context_index
-                    };
+            let Some(exact_match_name) =
+                entry_name_str(exact_match.name(self), "Exact match", i as usize)
+            else {
+                continue;
+            };
+            if exact_match_name == remaining_name {
+                let context_index = if exact_match.context_index != !0 {
+                    exact_match.context_index
+                } else {
+                    return_context_index
+                };
 
-                    let type_index = if exact_match.type_index != !0 {
-                        exact_match.type_index
-                    } else {
-                        return_type_index
-                    };
+                let type_index = if exact_match.type_index != !0 {
+                    exact_match.type_index
+                } else {
+                    return_type_index
+                };
 
-                    info!(
-                        "Property '{name}' resolved: context_index={context_index}, type_index={type_index}"
-                    );
-                    return (context_index, type_index);
-                }
+                info!(
+                    "Property '{name}' resolved: context_index={context_index}, type_index={type_index}"
+                );
+                return (context_index, type_index);
             }
         }
 
