@@ -102,7 +102,7 @@ impl TrieSerializer {
 
         // Sort prefixes by length (longest first)
         let mut sorted_prefix_matches: Vec<_> = builder_node.prefixes.iter().collect();
-        sorted_prefix_matches.sort_by(|a, b| b.name.len().cmp(&a.name.len()));
+        sorted_prefix_matches.sort_by_key(|b| std::cmp::Reverse(b.name.len()));
 
         self.arena
             .get_object::<TrieNodeData>(trie_offset)?
