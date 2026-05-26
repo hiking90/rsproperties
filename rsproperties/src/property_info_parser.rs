@@ -10,28 +10,25 @@ use zerocopy_derive::*;
 use crate::errors::*;
 use crate::property_area::MemoryMap;
 
-fn find<F>(array_length: u32, f: F) -> i32
+/// Binary search returning the matching index or `None` for miss. Internal
+/// indexing uses `usize` to avoid `u32 → i32` truncation when
+/// `array_length > i32::MAX`. The callback is `FnMut` so it can record
+/// out-of-band signals (e.g. a corrupted entry) for the caller to inspect.
+fn find<F>(array_length: u32, mut f: F) -> Option<usize>
 where
-    F: Fn(i32) -> Ordering,
+    F: FnMut(usize) -> Ordering,
 {
-    let mut bottom = 0;
-    let mut top = array_length as i32 - 1;
-    while top >= bottom {
-        let search = (top + bottom) / 2;
-
-        match f(search) {
-            Ordering::Equal => {
-                return search;
-            }
-            Ordering::Less => {
-                bottom = search + 1;
-            }
-            Ordering::Greater => {
-                top = search - 1;
-            }
-        };
+    let len = array_length as usize;
+    let (mut lo, mut hi) = (0usize, len);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match f(mid) {
+            Ordering::Equal => return Some(mid),
+            Ordering::Less => lo = mid + 1,
+            Ordering::Greater => hi = mid,
+        }
     }
-    -1
+    None
 }
 
 /// Decodes a trie entry name into a non-empty UTF-8 string.
@@ -152,7 +149,7 @@ impl<'a> TrieNode<'a> {
             .property_info_area
             .u32_slice_from(data.child_nodes as usize);
         let child_node_offset = slice.get(n).ok_or_else(|| {
-            Error::new_file_validation(format!(
+            Error::FileValidation(format!(
                 "Child node index {n} out of bounds: array length {}",
                 slice.len()
             ))
@@ -164,19 +161,38 @@ impl<'a> TrieNode<'a> {
     }
 
     fn find_child_for_string(&'_ self, input: &str) -> Option<TrieNode<'_>> {
-        let node_index = find(self.num_child_nodes(), |i| match self.child_node(i as _) {
+        // On corruption we return `Ordering::Equal`; `find` exits the binary
+        // search immediately so the closure runs at most once after the flag
+        // is set. `corrupted` then disqualifies the index because the
+        // sorted-invariant can no longer be trusted.
+        let mut corrupted = false;
+        let node_index = find(self.num_child_nodes(), |i| match self.child_node(i) {
             Ok(child) => match child.name() {
-                Ok(name) => name.to_str().unwrap_or_default().cmp(input),
-                Err(_) => Ordering::Less,
+                Ok(name) => match name.to_str() {
+                    Ok(s) => s.cmp(input),
+                    Err(e) => {
+                        warn!("child node {i} has non-UTF-8 name: {e}");
+                        corrupted = true;
+                        Ordering::Equal
+                    }
+                },
+                Err(e) => {
+                    warn!("child node {i} name read failed: {e}");
+                    corrupted = true;
+                    Ordering::Equal
+                }
             },
-            Err(_) => Ordering::Less,
+            Err(e) => {
+                warn!("child node {i} read failed: {e}");
+                corrupted = true;
+                Ordering::Equal
+            }
         });
 
-        if node_index < 0 {
-            None
-        } else {
-            self.child_node(node_index as _).ok()
+        if corrupted {
+            return None;
         }
+        node_index.and_then(|i| self.child_node(i).ok())
     }
 
     pub(crate) fn num_prefixes(&self) -> u32 {
@@ -195,7 +211,7 @@ impl<'a> TrieNode<'a> {
             .property_info_area
             .u32_slice_from(data.prefix_entries as usize);
         let offset = *slice.get(n).ok_or_else(|| {
-            Error::new_file_validation(format!(
+            Error::FileValidation(format!(
                 "Prefix index {n} out of bounds: array length {}",
                 slice.len()
             ))
@@ -221,7 +237,7 @@ impl<'a> TrieNode<'a> {
             .property_info_area
             .u32_slice_from(data.exact_match_entries as usize);
         let offset = *slice.get(n).ok_or_else(|| {
-            Error::new_file_validation(format!(
+            Error::FileValidation(format!(
                 "Exact match index {n} out of bounds: array length {}",
                 slice.len()
             ))
@@ -266,10 +282,10 @@ impl<'a> PropertyInfoArea<'a> {
     {
         let size_of = size_of::<T>();
         let end = offset.checked_add(size_of).ok_or_else(|| {
-            Error::new_file_validation(format!("Offset overflow: {offset} + {size_of}"))
+            Error::FileValidation(format!("Offset overflow: {offset} + {size_of}"))
         })?;
         let slice = self.data_base.get(offset..end).ok_or_else(|| {
-            Error::new_file_validation(format!(
+            Error::FileValidation(format!(
                 "Offset out of bounds: {end} > {}",
                 self.data_base.len()
             ))
@@ -277,9 +293,7 @@ impl<'a> PropertyInfoArea<'a> {
         zerocopy::Ref::<&[u8], T>::from_bytes(slice)
             .map(zerocopy::Ref::into_ref)
             .map_err(|e| {
-                Error::new_file_validation(format!(
-                    "Reference creation failed at offset {offset}: {e}"
-                ))
+                Error::FileValidation(format!("Reference creation failed at offset {offset}: {e}"))
             })
     }
 
@@ -349,7 +363,7 @@ impl<'a> PropertyInfoArea<'a> {
         let context_array_offset = self.header().contexts_offset as usize + size_of::<u32>();
         let slice = self.u32_slice_from(context_array_offset);
         let value = slice.get(index).ok_or_else(|| {
-            Error::new_file_validation(format!(
+            Error::FileValidation(format!(
                 "Context index {index} out of bounds: array length {} at offset {context_array_offset}",
                 slice.len()
             ))
@@ -362,7 +376,7 @@ impl<'a> PropertyInfoArea<'a> {
         let type_array_offset = self.header().types_offset as usize + size_of::<u32>();
         let slice = self.u32_slice_from(type_array_offset);
         let value = slice.get(index).ok_or_else(|| {
-            Error::new_file_validation(format!(
+            Error::FileValidation(format!(
                 "Type index {index} out of bounds: array length {} at offset {type_array_offset}",
                 slice.len()
             ))
@@ -488,38 +502,55 @@ impl<'a> PropertyInfoArea<'a> {
         (return_context_index, return_type_index)
     }
 
-    // pub(crate) fn get_property_info(&self, name: &str) -> (Option<&CStr>, Option<&CStr>) {
-    //     let (context_index, type_index) = self.get_property_info_indexes(name);
-    //     let context_cstr = if context_index == !0 {
-    //         None
-    //     } else {
-    //         Some(self.cstr(self.context_offset(context_index as _) as _))
-    //     };
-
-    //     let type_cstr = if type_index == !0 {
-    //         None
-    //     } else {
-    //         Some(self.cstr(self.type_offset(type_index as _) as _))
-    //     };
-    //     (context_cstr, type_cstr)
-    // }
-
     #[cfg(feature = "builder")]
-    pub(crate) fn find_context_index(&self, context: &str) -> i32 {
-        find(self.num_contexts() as _, |i| {
-            match self.context_offset(i as _) {
-                Ok(offset) => self.cstr(offset).to_str().unwrap_or_default().cmp(context),
-                Err(_) => Ordering::Less,
-            }
+    pub(crate) fn find_context_index(&self, context: &str) -> Option<usize> {
+        self.find_string_index(self.num_contexts() as u32, context, "context", |i| {
+            self.context_offset(i)
         })
     }
 
     #[cfg(feature = "builder")]
-    pub(crate) fn find_type_index(&self, rtype: &str) -> i32 {
-        find(self.num_types() as _, |i| match self.type_offset(i as _) {
-            Ok(offset) => self.cstr(offset).to_str().unwrap_or_default().cmp(rtype),
-            Err(_) => Ordering::Less,
+    pub(crate) fn find_type_index(&self, rtype: &str) -> Option<usize> {
+        self.find_string_index(self.num_types() as u32, rtype, "type", |i| {
+            self.type_offset(i)
         })
+    }
+
+    /// Shared binary search for context/type tables. Treats any entry that
+    /// fails to read or is not valid UTF-8 as a corruption signal; once set,
+    /// the search is short-circuited and returns `None` (the table's sorted
+    /// invariant can no longer be trusted).
+    #[cfg(feature = "builder")]
+    fn find_string_index(
+        &self,
+        n: u32,
+        needle: &str,
+        kind: &str,
+        offset_at: impl Fn(usize) -> Result<usize>,
+    ) -> Option<usize> {
+        // Same corruption-handling pattern as `find_child_for_string`: on
+        // failure we return `Equal` (which terminates `find`'s binary
+        // search) and surface the inability-to-trust-sort via `corrupted`.
+        let mut corrupted = false;
+        let idx = find(n, |i| {
+            match offset_at(i).and_then(|off| {
+                self.cstr(off)
+                    .to_str()
+                    .map_err(|e| Error::FileValidation(format!("{kind} entry {i} not UTF-8: {e}")))
+            }) {
+                Ok(s) => s.cmp(needle),
+                Err(e) => {
+                    warn!("{kind} entry {i} read failed: {e}");
+                    corrupted = true;
+                    Ordering::Equal
+                }
+            }
+        });
+        if corrupted {
+            None
+        } else {
+            idx
+        }
     }
 }
 
@@ -560,37 +591,3 @@ impl PropertyInfoAreaFile {
         )
     }
 }
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-
-//     fn test_info_area(info_area: &PropertyInfoArea) {
-//         assert_eq!(info_area.current_version(), 1);
-//         assert_eq!(info_area.minimum_supported_version(), 1);
-
-//         let _num_context_nodes = info_area.num_contexts();
-
-//         let (context_cstr, type_cstr) = info_area.get_property_info("ro.build.version.sdk");
-//         assert_eq!(context_cstr.unwrap().to_str().unwrap(), "u:object_r:build_prop:s0");
-//         assert_eq!(type_cstr.unwrap().to_str().unwrap(), "int");
-//     }
-
-//     #[cfg(target_os = "android")]
-//     #[test]
-//     fn test_property_info_area_file() -> Result<()> {
-//         test_info_area(&PropertyInfoAreaFile::load_default_path()?.property_info_area());
-//         Ok(())
-//     }
-
-//     #[cfg(feature = "builder")]
-//     #[test]
-//     fn test_property_info_area_with_builder() -> Result<()> {
-//         let entries = crate::property_info_serializer::PropertyInfoEntry::parse_from_file(Path::new("tests/android/plat_property_contexts"), false).unwrap();
-//         let data: Vec<u8> = crate::property_info_serializer::build_trie(&entries.0, "u:object_r:build_prop:s0", "string").unwrap();
-
-//         test_info_area(&PropertyInfoArea::new(&data));
-
-//         Ok(())
-//     }
-// }

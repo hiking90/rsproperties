@@ -33,13 +33,7 @@ impl PropertyInfoEntry {
 
         const NO_PARAMETER_TYPES: &[&str] = &["string", "int", "bool", "uint", "double", "size"];
 
-        for no_parameter_type in NO_PARAMETER_TYPES {
-            if type_strings[0] == *no_parameter_type {
-                return true;
-            }
-        }
-
-        false
+        NO_PARAMETER_TYPES.contains(&type_strings[0].as_str())
     }
 
     // Parse a line from the property info file.
@@ -52,20 +46,17 @@ impl PropertyInfoEntry {
     fn parse_from_line(line: &str, require_prefix_or_exact: bool) -> Result<PropertyInfoEntry> {
         let mut tokenizer = line.split_whitespace();
 
-        let property = tokenizer.next().ok_or_else(|| {
-            Error::new_parse(format!("Did not find a property entry in '{line}'"))
-        })?;
+        let property = tokenizer
+            .next()
+            .ok_or_else(|| Error::Parse(format!("Did not find a property entry in '{line}'")))?;
 
         let context = tokenizer
             .next()
-            .ok_or_else(|| Error::new_parse(format!("Did not find a context entry in '{line}'")))?;
+            .ok_or_else(|| Error::Parse(format!("Did not find a context entry in '{line}'")))?;
 
         let match_operation = tokenizer.next();
 
-        let mut type_strings = Vec::new();
-        for type_str in tokenizer {
-            type_strings.push(type_str.to_owned());
-        }
+        let type_strings: Vec<String> = tokenizer.map(str::to_owned).collect();
 
         let mut exact_match = false;
 
@@ -73,14 +64,14 @@ impl PropertyInfoEntry {
             exact_match = true;
         } else if match_operation != Some("prefix") && require_prefix_or_exact {
             error!("Invalid match operation '{match_operation:?}' - must be 'prefix' or 'exact'");
-            return Err(Error::new_parse(format!(
+            return Err(Error::Parse(format!(
                 "Match operation '{match_operation:?}' is not valid. Must be 'prefix' or 'exact'"
             )));
         }
 
         if !type_strings.is_empty() && !Self::is_type_valid(&type_strings) {
             error!("Invalid type specification: '{}'", type_strings.join(" "));
-            return Err(Error::new_parse(format!(
+            return Err(Error::Parse(format!(
                 "Type '{}' is not valid.",
                 type_strings.join(" ")
             )));
@@ -104,7 +95,7 @@ impl PropertyInfoEntry {
             "Parsing property info file: {filename:?} (require_prefix_or_exact={require_prefix_or_exact})"
         );
 
-        let file = File::open(filename).map_err(Error::new_io)?;
+        let file = File::open(filename)?;
         let reader = BufReader::new(file);
 
         let mut errors = Vec::new();
@@ -163,8 +154,8 @@ pub fn build_trie(
         )?;
     }
 
-    let mut serializer = TrieSerializer::new(&trie)?;
-    let data = serializer.take_data();
+    let serializer = TrieSerializer::new(&trie)?;
+    let data = serializer.into_data();
 
     info!(
         "Trie built and serialized successfully: {} bytes",

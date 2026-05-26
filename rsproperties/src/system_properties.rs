@@ -3,23 +3,20 @@
 
 use std::path::Path;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use std::time::{Duration, Instant};
 
+use rustix::fs::Timespec;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use rustix::thread::futex;
-use rustix::{fs::Timespec, path::Arg};
 
 use crate::errors::*;
 
 use crate::contexts_serialized::ContextsSerialized;
 use crate::property_info::PropertyInfo;
 
-pub(crate) const PROP_VALUE_MAX: usize = 92;
+pub(crate) use crate::wire::PROP_VALUE_MAX;
 pub(crate) const PROP_TREE_FILE: &str = "/dev/__properties__/property_info";
-
-#[inline(always)]
-fn serial_value_len(serial: u32) -> u32 {
-    serial >> 24
-}
 
 #[inline(always)]
 fn serial_dirty(serial: u32) -> bool {
@@ -32,7 +29,6 @@ fn futex_wake(_addr: &AtomicU32) -> Result<usize> {
     {
         futex::wake(_addr, futex::Flags::empty(), i32::MAX as u32)
             .context_with_location("Failed to wake futex")
-        // .map_err(Error::new_errno)
     }
     #[cfg(target_os = "macos")]
     Ok(0)
@@ -40,22 +36,61 @@ fn futex_wake(_addr: &AtomicU32) -> Result<usize> {
 
 fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> Option<u32> {
     #[cfg(any(target_os = "android", target_os = "linux"))]
-    loop {
-        match futex::wait(_serial, futex::Flags::empty(), _value as _, _timeout) {
-            Ok(_) => {
-                let new_serial = _serial.load(Ordering::Acquire);
-                if _value != new_serial {
-                    return Some(new_serial);
-                }
-            }
-            Err(e) => {
-                log::error!("Failed to wait for property change: {e}");
+    {
+        // Linux futex_wait takes a *relative* timeout. Spurious wakes restart
+        // the syscall, so we track a deadline and shrink the remaining timeout
+        // each iteration to keep the total wait bounded by the caller-supplied
+        // value.
+        //
+        // `Timespec.tv_sec`/`tv_nsec` are signed (i64). Negative values are
+        // not valid timeouts; treat them as immediate timeout to avoid
+        // panicking in `Instant + Duration` from a `usize::MAX`-ish wrap.
+        let deadline = match _timeout {
+            None => None,
+            Some(t) if t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec >= 1_000_000_000 => {
                 return None;
+            }
+            Some(t) => Some(Instant::now() + Duration::new(t.tv_sec as u64, t.tv_nsec as u32)),
+        };
+        loop {
+            let remaining_ts = match deadline {
+                None => None,
+                Some(d) => {
+                    let r = d.saturating_duration_since(Instant::now());
+                    if r.is_zero() {
+                        return None;
+                    }
+                    Some(Timespec {
+                        tv_sec: r.as_secs() as _,
+                        tv_nsec: r.subsec_nanos() as _,
+                    })
+                }
+            };
+            match futex::wait(
+                _serial,
+                futex::Flags::empty(),
+                _value as _,
+                remaining_ts.as_ref(),
+            ) {
+                Ok(_) => {
+                    let new_serial = _serial.load(Ordering::Acquire);
+                    if _value != new_serial {
+                        return Some(new_serial);
+                    }
+                    // Spurious wake — loop with the recomputed remaining timeout.
+                }
+                Err(e) => {
+                    log::error!("Failed to wait for property change: {e}");
+                    return None;
+                }
             }
         }
     }
     #[cfg(target_os = "macos")]
-    None
+    {
+        let _ = (_serial, _value, _timeout);
+        None
+    }
 }
 
 // To avoid lifetime issues, the property index is used to access the property value.
@@ -99,60 +134,74 @@ impl SystemProperties {
         Ok(Self { contexts })
     }
 
-    fn read_mutable_property_value(&self, prop_info: &PropertyInfo) -> Result<(u32, String)> {
+    fn read_mutable_property_value(
+        &self,
+        pa: &crate::property_area::PropertyAreaMap,
+        prop_info: &PropertyInfo,
+    ) -> Result<String> {
+        let bound = pa.max_value_bound(prop_info);
+        // Reused across retries — short-variant reads borrow from this
+        // stack buffer so the seqlock loop allocates nothing.
+        let mut buf = [0u8; PROP_VALUE_MAX];
         loop {
             // Read current serial at the beginning of each iteration
             let serial = prop_info.serial.load(Ordering::Acquire);
-            let _len: u32 = serial_value_len(serial);
 
-            let value = if serial_dirty(serial) {
-                let res = match self
-                    .contexts
-                    .prop_area_for_name(prop_info.name()?.to_str()?)
-                {
-                    Ok(res) => res,
-                    Err(e) => {
-                        log::error!(
-                            "Failed to get property area for name {:?}: {}",
-                            prop_info.name().unwrap_or(c"<unknown>"),
-                            e
-                        );
-                        return Err(e);
-                    }
-                };
-                let pa = res.0.property_area();
-                let value = match pa.dirty_backup_area() {
-                    Ok(value) => value,
-                    Err(e) => {
-                        log::error!("Failed to read dirty backup area: {e}");
-                        return Err(e);
-                    }
-                };
-                value.as_str().map_err(Error::from)?.to_owned()
+            // Read RAW bytes (no UTF-8 validation yet) — byte-wise atomic
+            // reads can surface partially-written multi-byte sequences when
+            // a writer is mid-update. Deferring UTF-8 validation until
+            // *after* the serial re-check lets the retry loop absorb those
+            // spurious decodes instead of bailing on `?`.
+            let bytes: &[u8] = if serial_dirty(serial) {
+                let backup = pa.dirty_backup_area().map_err(|e| {
+                    log::error!("Failed to read dirty backup area: {e}");
+                    e
+                })?;
+                backup.to_bytes()
             } else {
-                let value = prop_info.value()?;
-                value.as_str().map_err(Error::from)?.to_owned()
+                // `value_bytes` returns Cow — short variant borrows `buf`,
+                // long variant materialises a Vec. We bind via match to
+                // keep the borrow alive across the serial re-check.
+                let cow = prop_info.value_bytes(bound, &mut buf)?;
+                // Materialise once-per-iteration into a temporary to feed
+                // the serial-check; on success we'll re-validate UTF-8.
+                let serial_check = {
+                    fence(Ordering::Acquire);
+                    prop_info.serial.load(Ordering::Acquire)
+                };
+                if serial_check == serial {
+                    return std::str::from_utf8(&cow).map(str::to_owned).map_err(|e| {
+                        Error::Encoding(format!("property value is not valid UTF-8: {e}"))
+                    });
+                }
+                continue;
             };
 
-            // Ensure all previous loads are completed before checking serial again
+            // Dirty path: backup is a `&CStr` that doesn't borrow from `buf`,
+            // so the original fence/recheck pattern works as before.
             fence(Ordering::Acquire);
-
-            // Check if serial hasn't changed during our read operation
             let final_serial = prop_info.serial.load(Ordering::Acquire);
             if final_serial == serial {
-                return Ok((serial, value));
+                return std::str::from_utf8(bytes).map(str::to_owned).map_err(|e| {
+                    Error::Encoding(format!("property value is not valid UTF-8: {e}"))
+                });
             }
-
-            // No need for additional fence here as we'll acquire again at loop start
+            // serial changed → retry; spurious UTF-8 from a torn read is
+            // naturally absorbed here.
         }
     }
 
-    fn read(&self, prop_info: &PropertyInfo, is_name: bool) -> Result<(Option<String>, String)> {
-        let (_serial, value) = self.read_mutable_property_value(prop_info)?;
-        let name_cstr = prop_info.name()?;
+    fn read(
+        &self,
+        pa: &crate::property_area::PropertyAreaMap,
+        prop_info: &PropertyInfo,
+        is_name: bool,
+    ) -> Result<(Option<String>, String)> {
+        let value = self.read_mutable_property_value(pa, prop_info)?;
 
         let name = if is_name {
-            Some(name_cstr.to_str()?.to_owned())
+            let bound = pa.max_value_bound(prop_info);
+            Some(prop_info.name(bound)?.to_str()?.to_owned())
         } else {
             None
         };
@@ -173,7 +222,7 @@ impl SystemProperties {
 
         match pa.find(name) {
             Ok(pi) => {
-                let (_name, value) = match self.read(pi.0, false) {
+                let (_name, value) = match self.read(pa, pi.0, false) {
                     Ok(result) => result,
                     Err(e) => {
                         log::error!("Failed to read property {name}: {e}");
@@ -239,10 +288,13 @@ impl SystemProperties {
 
     #[cfg(feature = "builder")]
     pub fn update(&mut self, index: &PropertyIndex, value: &str) -> Result<bool> {
-        if value.len() >= PROP_VALUE_MAX {
-            let error_msg = format!("Value too long: {} (max: {})", value.len(), PROP_VALUE_MAX);
-            log::error!("{error_msg}");
-            return Err(Error::new_file_validation(error_msg));
+        // Pre-flight value-length check — `update` cannot promote to a long
+        // property in-place (`PropertyInfoWriter::apply_write` rejects on
+        // LONG_FLAG). Pass an empty name so the `ro.` exception in
+        // `validate_value_len` doesn't apply here.
+        if let Err(e) = crate::wire::validate_value_len("", value) {
+            log::error!("{e}");
+            return Err(Error::FileValidation(e));
         }
 
         let mut res = match self.contexts.prop_area_mut_with_index(index.context_index) {
@@ -257,76 +309,67 @@ impl SystemProperties {
             }
         };
         let pa = res.property_area_mut();
-        let pi = match pa.property_info(index.property_index) {
-            Ok(pi) => pi,
-            Err(e) => {
+
+        // Inspect through `&pi` first: validate ro., snapshot backup.
+        // `pi` borrow is dropped at the end of this block so we can take
+        // `&mut pa` for `set_dirty_backup_area` immediately after.
+        let backup_value = {
+            let pi = pa.property_info(index.property_index).map_err(|e| {
                 log::error!(
-                    "Failed to get property info for index {}: {}",
-                    index.property_index,
-                    e
+                    "Failed to get property info for index {}: {e}",
+                    index.property_index
                 );
-                return Err(e);
+                e
+            })?;
+            let bound = pa.max_value_bound(pi);
+            let name = pi.name(bound)?.to_bytes();
+            if name.starts_with(b"ro.") {
+                let error_msg = format!("Try to update the read-only property: {name:?}");
+                log::error!("{error_msg}");
+                return Err(Error::PermissionDenied(error_msg));
             }
+            // Pre-flight LONG check: if the entry was created long, we can't
+            // overwrite it in-place. Checking *before* writing the backup
+            // keeps backup_area aligned with the entry it shadows.
+            if pi.is_long() {
+                let error_msg =
+                    format!("in-place update of long property is not supported: {name:?}");
+                log::error!("{error_msg}");
+                return Err(Error::FileValidation(error_msg));
+            }
+            pi.value(bound)?
         };
 
-        let name = pi.name()?.to_bytes();
-        if !name.is_empty() && &name[0..3] == b"ro." {
-            let error_msg = format!("Try to update the read-only property: {name:?}");
-            log::error!("{error_msg}");
-            return Err(Error::new_permission_denied(error_msg));
-        }
+        // Back up the current value so concurrent readers can observe a
+        // consistent snapshot via the dirty bit. No standalone fence needed:
+        // the Release stores inside `apply_write` synchronize this write
+        // with readers.
+        pa.set_dirty_backup_area(&backup_value).map_err(|e| {
+            log::error!("Failed to set backup area: {e}");
+            e
+        })?;
 
-        let mut serial = pi.serial.load(Ordering::Relaxed);
-        let backup_value = pi.value()?.to_owned();
+        // Single-transaction publish: set_dirty → write → publish_serial.
+        // Encapsulated in writer so a half-published state is impossible.
+        let pi = pa.property_info_mut(index.property_index).map_err(|e| {
+            log::error!("Failed to get mutable property info after backup: {e}");
+            e
+        })?;
+        pi.writer().apply_write(value)?;
 
-        // Before updating, the property value must be backed up
-        match pa.set_dirty_backup_area(&backup_value) {
-            Ok(_) => {}
-            Err(e) => {
-                log::error!("Failed to set backup area: {e}");
-                return Err(e);
-            }
-        }
-        fence(Ordering::Release);
-
-        // Set dirty flag
-        serial |= 1;
-        let pi = match pa.property_info(index.property_index) {
-            Ok(pi) => pi,
-            Err(e) => {
-                log::error!("Failed to get property info after backup: {e}");
-                return Err(e);
-            }
-        };
-        pi.serial.store(serial, Ordering::Relaxed);
-
-        // Set the new value
-        pi.set_value(value);
-        fence(Ordering::Release);
-
-        // Set the new serial. It is cleared the dirty flag and set the new length of the value.
-        let new_serial = (value.len() << 24) as u32 | ((serial + 1) & 0xffffff);
-        pi.serial
-            .store(new_serial, std::sync::atomic::Ordering::Relaxed);
-
-        match futex_wake(&pi.serial) {
-            Ok(_) => {}
-            Err(e) => {
-                log::error!("Failed to wake property futex: {e}");
-                return Err(e);
-            }
+        if let Err(e) = futex_wake(&pi.serial) {
+            log::error!("Failed to wake property futex: {e}");
+            return Err(e);
         }
 
         let serial_pa = self.contexts.serial_prop_area();
-        let old_serial = serial_pa.serial().load(Ordering::Relaxed);
-        serial_pa.serial().store(old_serial + 1, Ordering::Release);
+        // Atomic RMW: multiple service writers (or multi-process mmap sharing)
+        // would otherwise lose updates with a load + store pair.
+        serial_pa.serial().fetch_add(1, Ordering::Release);
 
-        match futex_wake(serial_pa.serial()) {
-            Ok(_) => {}
-            Err(e) => {
-                log::error!("Failed to wake global serial futex: {e}");
-                return Err(e);
-            }
+        if let Err(e) = futex_wake(serial_pa.serial()) {
+            log::error!("Failed to wake global serial futex: {e}");
+            return Err(e);
         }
 
         Ok(true)
@@ -334,15 +377,11 @@ impl SystemProperties {
 
     #[cfg(feature = "builder")]
     pub fn add(&mut self, name: &str, value: &str) -> Result<()> {
-        if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
-            let error_msg = format!(
-                "Value too long: {} (max: {}) for property: {}",
-                value.len(),
-                PROP_VALUE_MAX,
-                name
-            );
-            log::error!("{error_msg}");
-            return Err(Error::new_file_validation(error_msg));
+        // Shared policy across client/server: only `ro.` names may exceed
+        // PROP_VALUE_MAX (stored as long properties).
+        if let Err(e) = crate::wire::validate_value_len(name, value) {
+            log::error!("{e}");
+            return Err(Error::FileValidation(e));
         }
 
         let mut res = match self.contexts.prop_area_mut_for_name(name) {
@@ -363,8 +402,8 @@ impl SystemProperties {
         }
 
         let serial_pa = self.contexts.serial_prop_area();
-        let old_serial = serial_pa.serial().load(Ordering::Relaxed);
-        serial_pa.serial().store(old_serial + 1, Ordering::Release);
+        // Atomic RMW: see note in `update`.
+        serial_pa.serial().fetch_add(1, Ordering::Release);
 
         match futex_wake(serial_pa.serial()) {
             Ok(_) => {}
@@ -382,29 +421,33 @@ impl SystemProperties {
         serial_pa.serial().load(Ordering::Acquire)
     }
 
-    pub fn serial(&self, idx: &PropertyIndex) -> u32 {
-        match self.contexts.prop_area_with_index(idx.context_index).ok() {
-            Some(guard) => {
-                let pa = guard.property_area();
-                match pa.property_info(idx.property_index).ok() {
-                    Some(pi) => pi.serial.load(Ordering::Acquire),
-                    None => {
-                        log::error!(
-                            "Failed to get PropertyInfo for index: {}",
-                            idx.property_index
-                        );
-                        0
-                    }
-                }
-            }
-            None => {
+    /// Reads the per-property serial counter, or `None` if the context/property
+    /// lookup fails. `0` is a valid initial serial, so callers cannot use a
+    /// numeric sentinel — use the `Option` to distinguish absence.
+    pub fn serial(&self, idx: &PropertyIndex) -> Option<u32> {
+        let guard = self
+            .contexts
+            .prop_area_with_index(idx.context_index)
+            .map_err(|e| {
                 log::error!(
-                    "Failed to get PropertyArea for index: {}",
+                    "Failed to get PropertyArea for index {}: {e}",
                     idx.context_index
                 );
-                0
-            }
-        }
+                e
+            })
+            .ok()?;
+        let pa = guard.property_area();
+        let pi = pa
+            .property_info(idx.property_index)
+            .map_err(|e| {
+                log::error!(
+                    "Failed to get PropertyInfo for index {}: {e}",
+                    idx.property_index
+                );
+                e
+            })
+            .ok()?;
+        Some(pi.serial.load(Ordering::Acquire))
     }
 
     pub fn wait_any(&self) -> Option<u32> {

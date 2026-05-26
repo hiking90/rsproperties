@@ -8,10 +8,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("I/O error: {0}")]
-    Io(std::io::Error),
+    Io(#[from] std::io::Error),
 
     #[error("System error: {0}")]
-    Errno(rustix::io::Errno),
+    Errno(#[from] rustix::io::Errno),
 
     #[error("Property not found: {0}")]
     NotFound(String),
@@ -39,106 +39,38 @@ pub enum Error {
 
     #[error("Lock error: {0}")]
     LockError(String),
-}
 
-impl Error {
-    pub fn new_not_found(key: String) -> Error {
-        Error::NotFound(key)
-    }
-
-    pub fn new_encoding(msg: String) -> Error {
-        Error::Encoding(msg)
-    }
-
-    pub fn new_parse(msg: String) -> Error {
-        Error::Parse(msg)
-    }
-
-    pub fn new_file_validation(msg: String) -> Error {
-        Error::FileValidation(msg)
-    }
-
-    pub fn new_conversion(msg: String) -> Error {
-        Error::Conversion(msg)
-    }
-
-    pub fn new_permission_denied(msg: String) -> Error {
-        Error::PermissionDenied(msg)
-    }
-
-    pub fn new_file_size(msg: String) -> Error {
-        Error::FileSize(msg)
-    }
-
-    pub fn new_file_ownership(msg: String) -> Error {
-        Error::FileOwnership(msg)
-    }
-
-    pub fn new_lock_error(msg: String) -> Error {
-        Error::LockError(msg)
-    }
-
-    pub fn new_io(io_error: std::io::Error) -> Error {
-        let error = Error::Io(io_error);
-        log::error!("I/O error: {error}");
-        error
-    }
-
-    pub fn new_errno(errno: rustix::io::Errno) -> Error {
-        let error = Error::Errno(errno);
-        log::error!("System error: {error}");
-        error
-    }
-}
-
-impl From<rustix::io::Errno> for Error {
-    fn from(source: rustix::io::Errno) -> Self {
-        let error = Error::Errno(source);
-        log::error!("Converting errno to Error: {source}");
-        error
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(source: std::io::Error) -> Self {
-        let error = Error::Io(source);
-        log::error!("Converting I/O error to Error: {error}");
-        error
-    }
+    /// A wrapped error with caller-supplied context and the source error
+    /// preserved for `Error::source()` chain traversal.
+    #[error("{msg} (at {location}): {source}")]
+    Context {
+        msg: String,
+        location: &'static std::panic::Location<'static>,
+        #[source]
+        source: Box<Error>,
+    },
 }
 
 impl From<std::str::Utf8Error> for Error {
     fn from(source: std::str::Utf8Error) -> Self {
-        let error_msg = format!("UTF-8 conversion error: {source}");
-        log::error!("{error_msg}");
-        Error::Encoding(error_msg)
+        Error::Encoding(format!("UTF-8 conversion error: {source}"))
     }
 }
 
 impl From<std::ffi::OsString> for Error {
     fn from(source: std::ffi::OsString) -> Self {
-        let error_msg = format!("OsString conversion error: {source:?}");
-        log::error!("{error_msg}");
-        Error::Conversion(error_msg)
-    }
-}
-
-impl From<&str> for Error {
-    fn from(source: &str) -> Self {
-        log::error!("String error: {source}");
-        Error::Parse(source.to_owned())
+        Error::Conversion(format!("OsString conversion error: {source:?}"))
     }
 }
 
 impl From<ParseIntError> for Error {
     fn from(source: ParseIntError) -> Self {
-        let error_msg = format!("Parse integer error: {source}");
-        log::error!("{error_msg}");
-        Error::Parse(error_msg)
+        Error::Parse(format!("Parse integer error: {source}"))
     }
 }
 
 pub trait ContextWithLocation<T> {
+    #[track_caller]
     fn context_with_location(self, msg: impl Into<String>) -> Result<T>;
 }
 
@@ -146,9 +78,14 @@ impl<T, E> ContextWithLocation<T> for std::result::Result<T, E>
 where
     E: Into<Error>,
 {
+    #[track_caller]
     fn context_with_location(self, msg: impl Into<String>) -> Result<T> {
-        self.map_err(|e| e.into())
-            .map_err(|_| Error::new_file_validation(msg.into()))
+        let location = std::panic::Location::caller();
+        self.map_err(|e| Error::Context {
+            msg: msg.into(),
+            location,
+            source: Box::new(e.into()),
+        })
     }
 }
 
@@ -180,7 +117,7 @@ pub fn validate_file_metadata(
             path
         );
         log::error!("{error_msg}");
-        return Err(Error::new_file_size(error_msg));
+        return Err(Error::FileSize(error_msg));
     }
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -198,7 +135,7 @@ pub fn validate_file_metadata(
             path
         );
         log::error!("{error_msg}");
-        return Err(Error::new_permission_denied(error_msg));
+        return Err(Error::PermissionDenied(error_msg));
     }
 
     // In production mode, also check ownership
@@ -216,7 +153,7 @@ pub fn validate_file_metadata(
             path
         );
         log::error!("{error_msg}");
-        return Err(Error::new_file_ownership(error_msg));
+        return Err(Error::FileOwnership(error_msg));
     }
 
     Ok(())
@@ -225,23 +162,28 @@ pub fn validate_file_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Context;
+
+    #[test]
+    fn test_error_io_via_question_mark() {
+        let err = try_open_file().unwrap_err();
+        assert!(matches!(err, Error::Io(_)));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn test_error_context_with_location() {
+        let err: Error = std::fs::File::open("non-existent-file")
+            .context_with_location("opening test file")
+            .unwrap_err();
+        assert!(matches!(err, Error::Context { .. }));
+        let msg = format!("{err}");
+        assert!(msg.contains("opening test file"));
+        assert!(msg.contains("non-existent-file") || msg.contains("No such"));
+        assert!(std::error::Error::source(&err).is_some());
+    }
 
     fn try_open_file() -> Result<()> {
         std::fs::File::open("non-existent-file")?;
         Ok(())
-    }
-
-    #[test]
-    fn test_error_location() {
-        try_open_file()
-            .map_err(|e| {
-                println!("Error: {e}");
-                e
-            })
-            .unwrap_err();
-        std::fs::File::open("non-existent-file")
-            .context("Failed to open file")
-            .unwrap_err();
     }
 }

@@ -21,7 +21,7 @@ pub(crate) struct ReadyMessage {}
 
 #[derive(Debug, Clone)]
 pub(crate) struct PropertyMessage {
-    pub key: String,
+    pub name: String,
     pub value: String,
 }
 
@@ -56,12 +56,12 @@ pub async fn run(
         properties_service: properties_service.actor_ref.clone(),
     });
 
-    let _ = socket_service
+    socket_service
         .actor_ref
         .ask(ReadyMessage {})
         .await
         .map_err(|e| format!("Failed to start socket service: {e}"))?;
-    let _ = properties_service
+    properties_service
         .actor_ref
         .ask(ReadyMessage {})
         .await
@@ -77,10 +77,10 @@ mod tests {
     #[test]
     fn test_property_message() {
         let msg = PropertyMessage {
-            key: "test.key".to_string(),
+            name: "test.key".to_string(),
             value: "test.value".to_string(),
         };
-        assert_eq!(msg.key, "test.key");
+        assert_eq!(msg.name, "test.key");
         assert_eq!(msg.value, "test.value");
     }
 }

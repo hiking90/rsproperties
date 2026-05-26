@@ -1,19 +1,31 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use log::{debug, error, info, trace, warn};
+use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 
 use rsactor::{Actor, ActorRef, ActorWeak};
 
 use rsproperties::errors::*;
+use rsproperties::wire::{PROP_ERROR, PROP_MSG_SETPROP2, PROP_SUCCESS};
 
-const PROP_MSG_SETPROP2: u32 = 0x00020001;
-const PROP_SUCCESS: i32 = 0;
-const PROP_ERROR: i32 = -1;
+/// Upper bound on simultaneously serviced client connections. Each accepted
+/// connection takes one permit from the semaphore; further connections wait
+/// in the kernel's accept queue. Sized to allow comfortable concurrency
+/// without permitting an unbounded fan-out of spawned tasks.
+const MAX_CONCURRENT_CLIENTS: usize = 64;
+
+/// Wall-clock timeout for an entire `handle_client` exchange. Trusted
+/// clients (init, system services) complete well under this; untrusted or
+/// stuck clients are torn down rather than tying up a task indefinitely.
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct SocketServiceArgs {
     pub socket_dir: PathBuf,
@@ -41,6 +53,8 @@ pub struct SocketService {
     property_listener: UnixListener,
     system_listener: UnixListener,
     properties_service: ActorRef<crate::PropertiesService>,
+    /// Limits concurrently in-flight client tasks.
+    connection_sem: Arc<Semaphore>,
 }
 
 impl Actor for SocketService {
@@ -51,10 +65,13 @@ impl Actor for SocketService {
         args: Self::Args,
         _actor_ref: &ActorRef<Self>,
     ) -> std::result::Result<Self, Self::Error> {
-        // Create parent directory if it doesn't exist
-        if !args.socket_dir.exists() {
+        // Create parent directory if it doesn't exist. `try_exists`
+        // distinguishes "doesn't exist" (Ok(false)) from "couldn't ask"
+        // (Err) — propagate the latter so permission/ENOTDIR errors don't
+        // silently degrade to `create_dir_all` racing the same error.
+        if !fs::try_exists(&args.socket_dir).await? {
             debug!("Creating parent directory: {:?}", args.socket_dir);
-            fs::create_dir_all(&args.socket_dir).map_err(rsproperties::errors::Error::new_io)?;
+            fs::create_dir_all(&args.socket_dir).await?;
         }
 
         let property_socket_path = args
@@ -64,19 +81,19 @@ impl Actor for SocketService {
             .socket_dir
             .join(rsproperties::PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
         // Remove existing socket files if they exist
-        if property_socket_path.exists() {
+        if fs::try_exists(&property_socket_path).await? {
             debug!(
                 "Removing existing property socket file: {}",
                 property_socket_path.display()
             );
-            fs::remove_file(&property_socket_path).map_err(rsproperties::errors::Error::new_io)?;
+            fs::remove_file(&property_socket_path).await?;
         }
-        if system_socket_path.exists() {
+        if fs::try_exists(&system_socket_path).await? {
             debug!(
                 "Removing existing system socket file: {}",
                 system_socket_path.display()
             );
-            fs::remove_file(&system_socket_path).map_err(rsproperties::errors::Error::new_io)?;
+            fs::remove_file(&system_socket_path).await?;
         }
         info!(
             "Property socket services successfully created at: {} and {}",
@@ -88,14 +105,12 @@ impl Actor for SocketService {
             "Binding property service Unix domain socket: {}",
             property_socket_path.display()
         );
-        let property_listener = UnixListener::bind(&property_socket_path)
-            .map_err(rsproperties::errors::Error::new_io)?;
+        let property_listener = UnixListener::bind(&property_socket_path)?;
         trace!(
             "Binding system property service Unix domain socket: {}",
             system_socket_path.display()
         );
-        let system_listener =
-            UnixListener::bind(&system_socket_path).map_err(rsproperties::errors::Error::new_io)?;
+        let system_listener = UnixListener::bind(&system_socket_path)?;
         info!("AsyncPropertySocketService started successfully");
 
         Ok(Self {
@@ -103,6 +118,7 @@ impl Actor for SocketService {
             property_listener,
             system_listener,
             properties_service: args.properties_service,
+            connection_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS)),
         })
     }
 
@@ -110,14 +126,47 @@ impl Actor for SocketService {
         &mut self,
         _actor_weak: &ActorWeak<Self>,
     ) -> std::result::Result<bool, Self::Error> {
-        tokio::select! {
-            _ = Self::handle_socket_connections(&self.property_listener, self.properties_service.clone()) => {
-                trace!("Property socket service task completed");
+        // Race accept() on both listeners. Whichever fires first wins; the
+        // cancelled accept restarts on the next on_run cycle (accept is
+        // cancel-safe). Permit is acquired *after* a connection is in hand
+        // so we don't burn a permit on every losing select! arm.
+        let (stream, source) = tokio::select! {
+            r = self.property_listener.accept() => (r, "property"),
+            r = self.system_listener.accept() => (r, "system"),
+        };
+
+        let (stream, _addr) = match stream {
+            Ok(ok) => ok,
+            Err(e) => {
+                error!("Error accepting connection on {source} listener: {e}");
+                return Ok(true);
             }
-            _ = Self::handle_socket_connections(&self.system_listener, self.properties_service.clone()) => {
-                trace!("System property socket service task completed");
+        };
+
+        let permit = match self.connection_sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => {
+                error!("Connection semaphore closed");
+                return Ok(true);
             }
-        }
+        };
+
+        let connection_sender = self.properties_service.clone();
+        tokio::spawn(async move {
+            let _permit = permit; // dropped when the task ends
+            match tokio::time::timeout(
+                CLIENT_TIMEOUT,
+                Self::handle_client(stream, connection_sender),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => error!("Error handling client: {e}"),
+                Err(_elapsed) => {
+                    warn!("Client exchange timed out after {CLIENT_TIMEOUT:?}, dropping connection")
+                }
+            }
+        });
         Ok(true)
     }
 
@@ -146,45 +195,17 @@ impl Actor for SocketService {
 }
 
 impl rsactor::Message<crate::ReadyMessage> for SocketService {
-    type Reply = bool;
+    type Reply = ();
 
     async fn handle(
         &mut self,
         _message: crate::ReadyMessage,
         _actor_ref: &ActorRef<Self>,
     ) -> Self::Reply {
-        true
     }
 }
 
 impl SocketService {
-    /// Handles socket connections for a specific socket type
-    async fn handle_socket_connections(
-        listener: &UnixListener,
-        service: ActorRef<crate::PropertiesService>,
-    ) -> Result<()> {
-        // Try to accept a connection with timeout
-        let connection_result = listener.accept().await;
-
-        match connection_result {
-            Ok((stream, _)) => {
-                // Clone sender for this connection
-                let connection_sender = service.clone();
-
-                // Handle each connection in a separate task
-                tokio::spawn(async move {
-                    if let Err(e) = Self::handle_client(stream, connection_sender).await {
-                        error!("Error handling client: {e}");
-                    }
-                });
-            }
-            Err(e) => {
-                error!("Error accepting connection: {e}");
-            }
-        }
-        Ok(())
-    }
-
     /// Handles a client connection
     async fn handle_client(
         mut stream: UnixStream,
@@ -194,10 +215,7 @@ impl SocketService {
 
         // Read the command (u32)
         let mut cmd_buf = [0u8; 4];
-        stream
-            .read_exact(&mut cmd_buf)
-            .await
-            .map_err(rsproperties::errors::Error::new_io)?;
+        stream.read_exact(&mut cmd_buf).await?;
         let cmd = u32::from_ne_bytes(cmd_buf);
 
         debug!("Received command: 0x{cmd:08X}");
@@ -210,9 +228,6 @@ impl SocketService {
             _ => {
                 warn!("Unknown command received: 0x{cmd:08X}");
                 Self::send_response(&mut stream, PROP_ERROR).await?;
-                return Err(rsproperties::errors::Error::new_parse(format!(
-                    "Unknown command: 0x{cmd:08X}"
-                )));
             }
         }
 
@@ -235,7 +250,7 @@ impl SocketService {
             // Reasonable limit
             error!("Name length too large: {name_len}");
             Self::send_response(stream, PROP_ERROR).await?;
-            return Err(rsproperties::errors::Error::new_file_validation(format!(
+            return Err(rsproperties::errors::Error::FileValidation(format!(
                 "Name length too large: {name_len}"
             )));
         }
@@ -251,7 +266,7 @@ impl SocketService {
             // Reasonable limit for property values
             error!("Value length too large: {value_len}");
             Self::send_response(stream, PROP_ERROR).await?;
-            return Err(rsproperties::errors::Error::new_file_validation(format!(
+            return Err(rsproperties::errors::Error::FileValidation(format!(
                 "Value length too large: {value_len}"
             )));
         }
@@ -259,28 +274,18 @@ impl SocketService {
         let value = Self::read_string(stream, value_len as usize).await?;
         debug!("Property value: '{value}'");
 
-        // Process the property setting
-        info!("Successfully set property: '{name}' = '{value}'");
+        info!("Forwarding property: '{name}' = '{value}'");
 
-        // Send property data through channel if sender is available
-        let property_msg = crate::PropertyMessage {
-            key: name.clone(),
-            value: value.clone(),
-        };
+        let property_msg = crate::PropertyMessage { name, value };
 
         match service.ask(property_msg).await {
-            Ok(true) => {
-                debug!("Property message sent successfully: '{name}' = '{value}'");
-                Self::send_response(stream, PROP_SUCCESS).await?;
-            }
+            Ok(true) => Self::send_response(stream, PROP_SUCCESS).await?,
             Ok(false) => {
-                warn!("Property message was not processed by service: '{name}' = '{value}'");
-                // Don't fail the operation if service doesn't process it
+                warn!("Property message was not processed by service");
                 Self::send_response(stream, PROP_ERROR).await?;
             }
             Err(e) => {
                 error!("Failed to send property message through channel: {e}");
-                // Don't fail the operation if channel send fails
                 Self::send_response(stream, PROP_ERROR).await?;
             }
         }
@@ -291,10 +296,7 @@ impl SocketService {
     /// Reads a u32 value from the stream
     async fn read_u32(stream: &mut UnixStream) -> Result<u32> {
         let mut buf = [0u8; 4];
-        stream
-            .read_exact(&mut buf)
-            .await
-            .map_err(rsproperties::errors::Error::new_io)?;
+        stream.read_exact(&mut buf).await?;
         Ok(u32::from_ne_bytes(buf))
     }
 
@@ -305,30 +307,21 @@ impl SocketService {
         }
 
         let mut buf = vec![0u8; len];
-        stream
-            .read_exact(&mut buf)
-            .await
-            .map_err(rsproperties::errors::Error::new_io)?;
+        stream.read_exact(&mut buf).await?;
 
         // Remove null terminator if present
         if let Some(null_pos) = buf.iter().position(|&x| x == 0) {
             buf.truncate(null_pos);
         }
 
-        String::from_utf8(buf).map_err(|e| rsproperties::errors::Error::new_encoding(e.to_string()))
+        String::from_utf8(buf).map_err(|e| rsproperties::errors::Error::Encoding(e.to_string()))
     }
 
     /// Sends a response to the client
     async fn send_response(stream: &mut UnixStream, response: i32) -> Result<()> {
         trace!("Sending response: {response}");
-        stream
-            .write_all(&response.to_ne_bytes())
-            .await
-            .map_err(rsproperties::errors::Error::new_io)?;
-        stream
-            .flush()
-            .await
-            .map_err(rsproperties::errors::Error::new_io)?;
+        stream.write_all(&response.to_ne_bytes()).await?;
+        stream.flush().await?;
         trace!("Response sent successfully");
         Ok(())
     }
@@ -338,40 +331,17 @@ impl Drop for SocketService {
     fn drop(&mut self) {
         debug!("Cleaning up async socket service");
 
-        // Remove socket files
-        let property_socket_path = self
-            .socket_dir
-            .join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
-        if property_socket_path.exists() {
-            if let Err(e) = fs::remove_file(&property_socket_path) {
-                warn!(
-                    "Failed to remove property socket file {}: {}",
-                    property_socket_path.display(),
-                    e
-                );
-            } else {
-                debug!(
-                    "Property socket file removed: {}",
-                    property_socket_path.display()
-                );
-            }
-        }
-
-        let system_socket_path = self
-            .socket_dir
-            .join(rsproperties::PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
-        if system_socket_path.exists() {
-            if let Err(e) = fs::remove_file(&system_socket_path) {
-                warn!(
-                    "Failed to remove system socket file {}: {}",
-                    system_socket_path.display(),
-                    e
-                );
-            } else {
-                debug!(
-                    "System socket file removed: {}",
-                    system_socket_path.display()
-                );
+        // Drop runs in sync context — keep blocking std::fs here (rare path).
+        for socket_name in [
+            rsproperties::PROPERTY_SERVICE_SOCKET_NAME,
+            rsproperties::PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME,
+        ] {
+            let path = self.socket_dir.join(socket_name);
+            if path.exists() {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => debug!("Socket file removed: {}", path.display()),
+                    Err(e) => warn!("Failed to remove socket file {}: {e}", path.display()),
+                }
             }
         }
     }
