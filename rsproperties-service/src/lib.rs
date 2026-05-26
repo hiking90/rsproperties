@@ -19,10 +19,24 @@ pub use properties_service::PropertiesService;
 
 pub(crate) struct ReadyMessage {}
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct PropertyMessage {
     pub name: String,
     pub value: String,
+}
+
+// Mask `value` in `Debug` output so log-level captures don't spill
+// property contents. Property names are public knowledge (they cross the
+// AOSP wire by name and appear in `getprop` output), but values may be
+// sensitive — persisted tokens, device identifiers, configuration knobs.
+// Logging `value.len()` is enough for diagnostics.
+impl std::fmt::Debug for PropertyMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PropertyMessage")
+            .field("name", &self.name)
+            .field("value", &format_args!("<{} bytes>", self.value.len()))
+            .finish()
+    }
 }
 
 pub struct ServiceContext<T: Actor> {
@@ -46,7 +60,14 @@ pub async fn run(
     ),
     Box<dyn std::error::Error>,
 > {
-    rsproperties::init(config);
+    // Use `try_init` rather than `init`: if the global properties_dir /
+    // socket_dir cells were already committed (e.g. earlier service
+    // instance, double-init, hostile race), the silent `init` swallow
+    // would let the service start with the *previous* directories while
+    // the caller believes their new config took effect. `?`-propagating
+    // surfaces that drift at startup instead of producing a service bound
+    // to wrong paths.
+    rsproperties::try_init(config)?;
 
     let properties_service = properties_service::run(property_contexts_files, build_prop_files);
 

@@ -1,7 +1,8 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +27,42 @@ const MAX_CONCURRENT_CLIENTS: usize = 64;
 /// clients (init, system services) complete well under this; untrusted or
 /// stuck clients are torn down rather than tying up a task indefinitely.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Sanity upper bound on a V2 wire-protocol property name length. The real
+/// AOSP limit is `PROP_NAME_MAX = 32`, but the wire format is
+/// length-prefixed so we accept up to a much higher cap here and let
+/// `validate_property_name` reject anything actually malformed. The cap
+/// only exists to bound an upfront allocation against a hostile peer.
+const MAX_WIRE_NAME_LEN: u32 = 1024;
+
+/// Sanity upper bound on a V2 wire-protocol property value length.
+/// Long-value `ro.` properties can legitimately exceed `PROP_VALUE_MAX`,
+/// so the cap is generous; the actual length policy is enforced by
+/// `validate_value_len` after the bytes are read.
+const MAX_WIRE_VALUE_LEN: u32 = 8192;
+
+/// Permissions applied to the bound Unix socket files. `0o660`
+/// (rw-rw----) matches the AOSP init policy for property service sockets
+/// — readable/writable by owner and group, denied to others. Without
+/// this explicit chmod the file would inherit the process umask, which
+/// is environment-dependent and frequently leaves the socket
+/// world-readable.
+const SOCKET_FILE_MODE: u32 = 0o660;
+
+/// Backoff applied when `accept()` returns an error. Without it, a
+/// permanent failure (EMFILE, ENFILE, listener torn down) would re-enter
+/// `on_run` immediately and spin the worker producing a high-rate log
+/// flood. 100ms is short enough to recover quickly when the condition
+/// clears, long enough to dampen the loop.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Applies `SOCKET_FILE_MODE` to a freshly-bound Unix socket file.
+/// `UnixListener::bind` creates the socket with permissions derived from
+/// the process umask; an explicit chmod removes that environmental
+/// dependency.
+async fn chmod_socket(path: &Path) -> std::io::Result<()> {
+    fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_FILE_MODE)).await
+}
 
 pub struct SocketServiceArgs {
     pub socket_dir: PathBuf,
@@ -106,11 +143,13 @@ impl Actor for SocketService {
             property_socket_path.display()
         );
         let property_listener = UnixListener::bind(&property_socket_path)?;
+        chmod_socket(&property_socket_path).await?;
         trace!(
             "Binding system property service Unix domain socket: {}",
             system_socket_path.display()
         );
         let system_listener = UnixListener::bind(&system_socket_path)?;
+        chmod_socket(&system_socket_path).await?;
         info!("AsyncPropertySocketService started successfully");
 
         Ok(Self {
@@ -126,10 +165,25 @@ impl Actor for SocketService {
         &mut self,
         _actor_weak: &ActorWeak<Self>,
     ) -> std::result::Result<bool, Self::Error> {
+        // Acquire the connection permit *before* accepting. Pre-acquire
+        // means once all 64 in-flight handlers are busy the accept loop
+        // simply parks here — new connect() attempts then queue in the
+        // kernel's listen backlog (and clients block in their own
+        // connect call) instead of completing the accept, sitting idle
+        // for up to CLIENT_TIMEOUT, and then failing. That's better
+        // observable behaviour and avoids fooling clients into thinking
+        // their request was accepted.
+        let permit = match self.connection_sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => {
+                error!("Connection semaphore closed");
+                return Ok(true);
+            }
+        };
+
         // Race accept() on both listeners. Whichever fires first wins; the
         // cancelled accept restarts on the next on_run cycle (accept is
-        // cancel-safe). Permit is acquired *after* a connection is in hand
-        // so we don't burn a permit on every losing select! arm.
+        // cancel-safe).
         let (stream, source) = tokio::select! {
             r = self.property_listener.accept() => (r, "property"),
             r = self.system_listener.accept() => (r, "system"),
@@ -138,15 +192,13 @@ impl Actor for SocketService {
         let (stream, _addr) = match stream {
             Ok(ok) => ok,
             Err(e) => {
+                // Permanent conditions (EMFILE, ENFILE, broken listener)
+                // would otherwise let `on_run` spin at full speed and
+                // saturate the log with the same error every microsecond.
+                // A small sleep both dampens the loop and gives the kernel
+                // time to recover the resource.
                 error!("Error accepting connection on {source} listener: {e}");
-                return Ok(true);
-            }
-        };
-
-        let permit = match self.connection_sem.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => {
-                error!("Connection semaphore closed");
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 return Ok(true);
             }
         };
@@ -246,9 +298,8 @@ impl SocketService {
         let name_len = Self::read_u32(stream).await?;
         trace!("Name length: {name_len}");
 
-        if name_len > 1024 {
-            // Reasonable limit
-            error!("Name length too large: {name_len}");
+        if name_len > MAX_WIRE_NAME_LEN {
+            error!("Name length too large: {name_len} (max {MAX_WIRE_NAME_LEN})");
             Self::send_response(stream, PROP_ERROR).await?;
             return Err(rsproperties::errors::Error::FileValidation(format!(
                 "Name length too large: {name_len}"
@@ -262,9 +313,8 @@ impl SocketService {
         let value_len = Self::read_u32(stream).await?;
         trace!("Value length: {value_len}");
 
-        if value_len > 8192 {
-            // Reasonable limit for property values
-            error!("Value length too large: {value_len}");
+        if value_len > MAX_WIRE_VALUE_LEN {
+            error!("Value length too large: {value_len} (max {MAX_WIRE_VALUE_LEN})");
             Self::send_response(stream, PROP_ERROR).await?;
             return Err(rsproperties::errors::Error::FileValidation(format!(
                 "Value length too large: {value_len}"
@@ -272,9 +322,12 @@ impl SocketService {
         }
 
         let value = Self::read_string(stream, value_len as usize).await?;
-        debug!("Property value: '{value}'");
+        // Do NOT log the value; it may carry sensitive payloads. Names
+        // are public on the wire (and surface in getprop output), but
+        // values are not.
+        debug!("Property value length: {} bytes", value.len());
 
-        info!("Forwarding property: '{name}' = '{value}'");
+        info!("Forwarding property: '{name}' ({} bytes)", value.len());
 
         let property_msg = crate::PropertyMessage { name, value };
 
