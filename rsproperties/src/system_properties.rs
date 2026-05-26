@@ -134,15 +134,32 @@ impl SystemProperties {
         Ok(Self { contexts })
     }
 
-    fn read_mutable_property_value(
+    /// Reads the mutable property value under the seqlock protocol and
+    /// hands the validated `&str` to `f`. The callback is invoked exactly
+    /// once, on the iteration whose pre/post serial reads agree — earlier
+    /// iterations (torn reads, dirty bit set then cleared) are absorbed by
+    /// the retry loop.
+    ///
+    /// Returning a value through `f` instead of allocating a `String` is
+    /// what makes the parse-and-discard hot path (`get<T>`/`get_or<T>`)
+    /// allocation-free for short and long properties alike.
+    fn read_with_callback<R, F>(
         &self,
         pa: &crate::property_area::PropertyAreaMap,
         prop_info: &PropertyInfo,
-    ) -> Result<String> {
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&str) -> R,
+    {
         let bound = pa.max_value_bound(prop_info);
         // Reused across retries — short-variant reads borrow from this
         // stack buffer so the seqlock loop allocates nothing.
         let mut buf = [0u8; PROP_VALUE_MAX];
+        // `FnOnce` must be consumed exactly once, but the retry loop may
+        // iterate multiple times. Park it in `Option` so a successful
+        // serial match can `take()` and call it.
+        let mut f = Some(f);
         loop {
             // Read current serial at the beginning of each iteration
             let serial = prop_info.serial.load(Ordering::Acquire);
@@ -159,20 +176,20 @@ impl SystemProperties {
                 })?;
                 backup.to_bytes()
             } else {
-                // `value_bytes` returns Cow — short variant borrows `buf`,
-                // long variant materialises a Vec. We bind via match to
-                // keep the borrow alive across the serial re-check.
+                // `value_bytes` returns Cow — short borrows `buf`, long
+                // borrows directly from the mmap. Either way no heap
+                // allocation. The borrow is alive across the serial
+                // re-check below so we can hand it to `f` on success.
                 let cow = prop_info.value_bytes(bound, &mut buf)?;
-                // Materialise once-per-iteration into a temporary to feed
-                // the serial-check; on success we'll re-validate UTF-8.
                 let serial_check = {
                     fence(Ordering::Acquire);
                     prop_info.serial.load(Ordering::Acquire)
                 };
                 if serial_check == serial {
-                    return std::str::from_utf8(&cow).map(str::to_owned).map_err(|e| {
+                    let s = std::str::from_utf8(&cow).map_err(|e| {
                         Error::Encoding(format!("property value is not valid UTF-8: {e}"))
-                    });
+                    })?;
+                    return Ok(f.take().expect("callback consumed once on success")(s));
                 }
                 continue;
             };
@@ -182,35 +199,29 @@ impl SystemProperties {
             fence(Ordering::Acquire);
             let final_serial = prop_info.serial.load(Ordering::Acquire);
             if final_serial == serial {
-                return std::str::from_utf8(bytes).map(str::to_owned).map_err(|e| {
+                let s = std::str::from_utf8(bytes).map_err(|e| {
                     Error::Encoding(format!("property value is not valid UTF-8: {e}"))
-                });
+                })?;
+                return Ok(f.take().expect("callback consumed once on success")(s));
             }
             // serial changed → retry; spurious UTF-8 from a torn read is
             // naturally absorbed here.
         }
     }
 
-    fn read(
-        &self,
-        pa: &crate::property_area::PropertyAreaMap,
-        prop_info: &PropertyInfo,
-        is_name: bool,
-    ) -> Result<(Option<String>, String)> {
-        let value = self.read_mutable_property_value(pa, prop_info)?;
-
-        let name = if is_name {
-            let bound = pa.max_value_bound(prop_info);
-            Some(prop_info.name(bound)?.to_str()?.to_owned())
-        } else {
-            None
-        };
-
-        Ok((name, value))
-    }
-
-    /// Get property value that returns error for missing properties
-    pub fn get_with_result(&self, name: &str) -> Result<String> {
+    /// Reads `name`'s value and passes it to `f` as `&str` without ever
+    /// materialising an owned `String`. Intended for the parse-and-discard
+    /// hot path (`get<T>`, `get_or<T>`) where the caller does not need
+    /// ownership of the value bytes.
+    ///
+    /// Mirrors bionic's `__system_property_read_callback` pattern. The
+    /// callback runs while the seqlock-validated bytes are still borrowed
+    /// (from `buf` for short properties, from the mmap for long ones), so
+    /// it should be cheap and non-blocking.
+    pub fn read_with<R, F>(&self, name: &str, f: F) -> Result<R>
+    where
+        F: FnOnce(&str) -> R,
+    {
         let res = match self.contexts.prop_area_for_name(name) {
             Ok(res) => res,
             Err(e) => {
@@ -221,18 +232,24 @@ impl SystemProperties {
         let pa = res.0.property_area();
 
         match pa.find(name) {
-            Ok(pi) => {
-                let (_name, value) = match self.read(pa, pi.0, false) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        log::error!("Failed to read property {name}: {e}");
-                        return Err(e);
-                    }
-                };
-                Ok(value)
-            }
+            Ok(pi) => match self.read_with_callback(pa, pi.0, f) {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    log::error!("Failed to read property {name}: {e}");
+                    Err(e)
+                }
+            },
             Err(e) => Err(e),
         }
+    }
+
+    /// Get property value that returns error for missing properties.
+    ///
+    /// Allocates a `String`; for the parse-and-discard hot path prefer
+    /// [`Self::read_with`], which hands the value as `&str` without
+    /// allocating.
+    pub fn get_with_result(&self, name: &str) -> Result<String> {
+        self.read_with(name, str::to_owned)
     }
 
     /// Get the property index of a system property by name.

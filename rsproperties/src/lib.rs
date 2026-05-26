@@ -367,12 +367,17 @@ where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
-    let value = try_system_properties()?.get_with_result(name)?;
-    value.parse().map_err(|e| {
-        Error::Parse(format!(
-            "Failed to parse '{value}' for property '{name}': {e}"
-        ))
-    })
+    // Route through `read_with` so the parse-and-discard path never
+    // allocates a `String` — the value bytes are handed to `FromStr` as
+    // `&str` borrowed from the seqlock buffer (short variant) or the mmap
+    // (long variant).
+    try_system_properties()?.read_with(name, |value| {
+        value.parse().map_err(|e| {
+            Error::Parse(format!(
+                "Failed to parse '{value}' for property '{name}': {e}"
+            ))
+        })
+    })?
 }
 
 /// Get a property value with default fallback
@@ -393,8 +398,17 @@ where
     let Ok(props) = try_system_properties() else {
         return default;
     };
-    match props.get_with_result(name) {
-        Ok(value) if !value.is_empty() => value.parse().unwrap_or(default),
+    // Two-stage closure: the inner `Result<T, T>` carries either the
+    // parsed value or the default back out of `read_with` without ever
+    // allocating a `String`. `Err(default)` is used to signal "use the
+    // default" because the callback can't capture-and-move it twice.
+    match props.read_with(name, |value| {
+        if value.is_empty() {
+            return Err(());
+        }
+        value.parse::<T>().map_err(|_| ())
+    }) {
+        Ok(Ok(v)) => v,
         _ => default,
     }
 }

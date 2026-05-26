@@ -134,12 +134,18 @@ impl PropertyInfo {
     /// `long_value_bound` is an upper bound on how far past `self` the
     /// long variant may extend. For the short variant this argument is
     /// ignored.
-    /// Reads short-variant bytes into `buf` (no allocation); returns the
-    /// populated prefix. The long variant still allocates because its data
-    /// lives out-of-line in the mmap and a stack buffer can't bound its
-    /// length statically.
+    /// Reads short-variant bytes into `buf`; returns the populated prefix.
+    /// The long variant borrows bytes directly from the mmap — long
+    /// properties are write-once (`apply_write` rejects LONG entries), so
+    /// the out-of-line bytes are stable for the lifetime of the mapping.
+    ///
+    /// Lifetime invariant: both `self` and `buf` are bound to `'a`, so the
+    /// returned `Cow` is valid for whichever of the two ends first (the
+    /// shorter, in practice usually `buf`'s scope). Tying both to a single
+    /// lifetime is what lets the long path return `Cow::Borrowed` from the
+    /// mmap without leaking past `self`'s borrow.
     pub(crate) fn value_bytes<'a>(
-        &self,
+        &'a self,
         long_value_bound: usize,
         buf: &'a mut [u8; PROP_VALUE_MAX],
     ) -> Result<std::borrow::Cow<'a, [u8]>> {
@@ -152,7 +158,7 @@ impl PropertyInfo {
                 let offset = long_property.offset.load(Ordering::Relaxed) as usize;
                 long_value_bytes(self, offset, long_value_bound)?
             };
-            Ok(std::borrow::Cow::Owned(bytes))
+            Ok(std::borrow::Cow::Borrowed(bytes))
         } else {
             // SAFETY: when the LONG flag is clear the union variant is the
             // byte-wise atomic `value` array of size `PROP_VALUE_MAX`.
@@ -314,8 +320,12 @@ fn init_value_bytes(slot: &mut [AtomicU8; PROP_VALUE_MAX], bytes: &[u8]) {
 }
 
 /// Bounds-checked NUL scan for the long-property variant, returning the raw
-/// bytes (no UTF-8 validation). Callers in the seqlock read loop should
-/// validate the serial first and only then decode.
+/// bytes (no UTF-8 validation) borrowed from the mmap.
+///
+/// Long properties are write-once: `apply_write` rejects entries with the
+/// LONG flag set, so once the entry is initialised the out-of-line bytes
+/// never change. That immutability is what lets the reader borrow the
+/// bytes directly instead of copying them into a `Vec<u8>`.
 ///
 /// # Safety
 /// Caller must guarantee that `info + bound_from_info` does not exceed the
@@ -325,7 +335,7 @@ unsafe fn long_value_bytes(
     info: &PropertyInfo,
     offset: usize,
     bound_from_info: usize,
-) -> Result<Vec<u8>> {
+) -> Result<&[u8]> {
     let scan_len = bound_from_info.checked_sub(offset).ok_or_else(|| {
         Error::Encoding(format!(
             "Long property offset {offset} exceeds mmap bound {bound_from_info}"
@@ -340,12 +350,13 @@ unsafe fn long_value_bytes(
     // bound_from_info` is in-bounds.
     let value_ptr = unsafe { self_ptr.add(offset) };
     // SAFETY: `value_ptr` is in-bounds for `scan_len` bytes by the same
-    // argument. `u8` has no alignment requirement.
+    // argument. `u8` has no alignment requirement. The borrow is tied to
+    // `'a` (the `&'a PropertyInfo`), so it can't outlive the mmap.
     let bytes = unsafe { std::slice::from_raw_parts(value_ptr, scan_len) };
     let cstr = CStr::from_bytes_until_nul(bytes).map_err(|e| {
         Error::Encoding(format!("Long property value missing NUL within bound: {e}"))
     })?;
-    Ok(cstr.to_bytes().to_vec())
+    Ok(cstr.to_bytes())
 }
 
 #[inline(always)]
