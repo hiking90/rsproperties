@@ -327,10 +327,13 @@ impl SystemProperties {
         };
         let pa = res.property_area_mut();
 
-        // Inspect through `&pi` first: validate ro., snapshot backup.
-        // `pi` borrow is dropped at the end of this block so we can take
-        // `&mut pa` for `set_dirty_backup_area` immediately after.
-        let backup_value = {
+        // Inspect through `&pi` first: validate ro., snapshot backup into a
+        // stack buffer. `pi` borrow is dropped at the end of this block so
+        // we can take `&mut pa` for `set_dirty_backup_area` immediately
+        // after. The buffer outlives the inner borrow scope, so the bytes
+        // it captured remain valid after `pi`/`cow` go out of scope.
+        let mut backup_buf = [0u8; crate::wire::PROP_VALUE_MAX];
+        let backup_len = {
             let pi = pa.property_info(index.property_index).map_err(|e| {
                 log::error!(
                     "Failed to get property info for index {}: {e}",
@@ -354,17 +357,22 @@ impl SystemProperties {
                 log::error!("{error_msg}");
                 return Err(Error::FileValidation(error_msg));
             }
-            pi.value(bound)?
+            // After the LONG check, `value_bytes` is guaranteed to return
+            // the short variant — a `Cow::Borrowed(&backup_buf[..len])`.
+            // Capturing only the length lets us drop the borrow without
+            // losing the bytes that already live in `backup_buf`.
+            pi.value_bytes(bound, &mut backup_buf)?.len()
         };
 
         // Back up the current value so concurrent readers can observe a
         // consistent snapshot via the dirty bit. No standalone fence needed:
         // the Release stores inside `apply_write` synchronize this write
         // with readers.
-        pa.set_dirty_backup_area(&backup_value).map_err(|e| {
-            log::error!("Failed to set backup area: {e}");
-            e
-        })?;
+        pa.set_dirty_backup_area(&backup_buf[..backup_len])
+            .map_err(|e| {
+                log::error!("Failed to set backup area: {e}");
+                e
+            })?;
 
         // Single-transaction publish: set_dirty → write → publish_serial.
         // Encapsulated in writer so a half-published state is impossible.

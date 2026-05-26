@@ -106,6 +106,11 @@ impl PropertyInfo {
     ///
     /// `bound` caps the NUL scan at the remaining mmap extent past `self`,
     /// computed by the enclosing `PropertyAreaMap` via `max_value_bound`.
+    ///
+    /// Gated on `builder` because the only caller is `update`'s `ro.`
+    /// validation, which itself is builder-only. Without the gate this
+    /// would be dead code in default Android builds.
+    #[cfg(feature = "builder")]
     pub(crate) fn name(&self, bound: usize) -> Result<&CStr> {
         let header = mem::size_of::<PropertyInfo>();
         // `name_from_trailing_data` reads `len + 1` bytes; bail out when the
@@ -167,17 +172,6 @@ impl PropertyInfo {
                 Ok(std::borrow::Cow::Borrowed(read_value_atomic(slot, buf)))
             }
         }
-    }
-
-    /// Convenience: reads the value AND validates UTF-8 in one step. Use
-    /// only outside the seqlock read loop — for retry-friendly reads, call
-    /// [`Self::value_bytes`] and validate after the serial re-check.
-    pub(crate) fn value(&self, long_value_bound: usize) -> Result<String> {
-        let mut buf = [0u8; PROP_VALUE_MAX];
-        let bytes = self.value_bytes(long_value_bound, &mut buf)?;
-        std::str::from_utf8(&bytes)
-            .map(str::to_owned)
-            .map_err(|e| Error::Encoding(format!("property value is not valid UTF-8: {e}")))
     }
 
     pub(crate) fn is_long(&self) -> bool {

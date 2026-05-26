@@ -339,8 +339,14 @@ impl PropertyAreaMap {
 
     // Set the dirty backup area.
     // It is used to store the backup of the property area.
+    //
+    // Accepts raw bytes (not `&str`) so the caller can stream the current
+    // property value directly from the byte-atomic mmap slot into the
+    // backup area without first materialising a `String`. The reader side
+    // already validates UTF-8 after the seqlock re-check, so the backup
+    // area itself stores raw bytes verbatim.
     #[cfg(feature = "builder")]
-    pub(crate) fn set_dirty_backup_area(&mut self, value: &str) -> Result<()> {
+    pub(crate) fn set_dirty_backup_area(&mut self, value: &[u8]) -> Result<()> {
         let offset = mem::size_of::<PropertyTrieNode>();
         // Checked arithmetic so a wrapping `usize` doesn't bypass the size
         // gate. Realistically `value.len()` is < PROP_VALUE_MAX (92), but
@@ -363,7 +369,7 @@ impl PropertyAreaMap {
         }
 
         let dst = self.mmap.data_mut(offset, self.data_offset, total_len)?;
-        dst[..value.len()].copy_from_slice(value.as_bytes());
+        dst[..value.len()].copy_from_slice(value);
         dst[value.len()] = 0;
         Ok(())
     }
