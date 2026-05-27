@@ -94,7 +94,7 @@ pub struct TrieNode<'a> {
 impl<'a> TrieNode<'a> {
     fn new(property_info_area: &'a PropertyInfoArea, trie_node_offset: usize) -> Self {
         Self {
-            property_info_area: property_info_area.clone(),
+            property_info_area: *property_info_area,
             trie_node_offset,
         }
     }
@@ -246,7 +246,7 @@ impl<'a> TrieNode<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct PropertyInfoArea<'a> {
     data_base: &'a [u8],
 }
@@ -254,11 +254,6 @@ pub struct PropertyInfoArea<'a> {
 impl<'a> PropertyInfoArea<'a> {
     pub(crate) fn new(data_base: &'a [u8]) -> Self {
         Self { data_base }
-    }
-
-    // To resolve lifetime issues, we need to clone the TrieNode.
-    fn clone_trie_node(&'_ self, trie_node: &TrieNode) -> TrieNode<'_> {
-        TrieNode::new(self, trie_node.trie_node_offset)
     }
 
     pub(crate) fn cstr(&self, offset: usize) -> &CStr {
@@ -447,7 +442,7 @@ impl<'a> PropertyInfoArea<'a> {
                     match trie_node.find_child_for_string(segment) {
                         Some(node) => {
                             remaining_name = &remaining_name[index + 1..];
-                            trie_node = self.clone_trie_node(&node);
+                            trie_node = TrieNode::new(self, node.trie_node_offset);
                         }
                         None => {
                             break;

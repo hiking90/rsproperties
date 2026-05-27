@@ -246,10 +246,10 @@ pub fn try_init(config: PropertyConfig) -> Result<()> {
         ));
     }
 
-    SYSTEM_PROPERTIES_DIR.set(props_dir.clone()).map_err(|_| {
+    log::info!("Setting system properties directory to: {props_dir:?}");
+    SYSTEM_PROPERTIES_DIR.set(props_dir).map_err(|_| {
         Error::FileValidation("System properties directory already initialized".into())
     })?;
-    log::info!("Successfully set system properties directory to: {props_dir:?}");
 
     if let Some(socket_dir) = config.socket_dir {
         if !system_property_set::set_socket_dir(&socket_dir) {
