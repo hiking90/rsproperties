@@ -8,23 +8,13 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use crate::errors::*;
-use rustix::process::{Gid, Pid, Uid};
-
-#[cfg(any(target_os = "android", target_os = "linux"))]
-use rustix::net::UCred;
-#[cfg(target_os = "macos")]
-pub struct UCred {
-    pub pid: Pid,
-    pub uid: Uid,
-    pub gid: Gid,
-}
 
 const RESTORECON_PROPERTY: &str = "selinux.restorecon_recursive";
-// const INIT_CONTEXT: &str = "u:r:init:s0";
 
-pub fn check_permissions(_key: &str, _value: &str, _context: &str, _cr: &UCred) -> Result<()> {
+/// Placeholder for future per-property SELinux permission enforcement.
+/// Currently a no-op; see TODO in caller.
+pub fn check_permissions(_key: &str, _value: &str, _context: &str) {
     // TODO: Implement proper permission checking
-    Ok(())
 }
 
 pub fn load_properties_from_file(
@@ -34,79 +24,55 @@ pub fn load_properties_from_file(
     properties: &mut HashMap<String, String>,
 ) -> Result<()> {
     let file =
-        File::open(filename).context_with_location(format!("Failed to open to {filename:?}"))?;
+        File::open(filename).context_with_location(format!("Failed to open {filename:?}"))?;
     let reader = BufReader::new(file);
-    let has_filter = match filter {
-        Some(filter) => !filter.is_empty(),
-        None => false,
-    };
+    let filter = filter.filter(|s| !s.is_empty());
 
-    let mut line_count = 0;
-    let mut _processed_properties = 0;
-    let mut _skipped_lines = 0;
-
-    for line in reader.lines() {
-        line_count += 1;
+    for (line_count, line) in reader.lines().enumerate() {
+        let line_count = line_count + 1;
         let line = line.map_err(Error::from)?;
         let line = line.trim();
 
         if line.is_empty() || line.starts_with('#') {
-            _skipped_lines += 1;
             continue;
         }
 
-        if !has_filter && line.starts_with("import ") {
-            warn!("Line {line_count}: Import statements not implemented: {line}");
-            // let line = line[7..].trim();
-            unimplemented!("import")
-        } else {
-            let (key, value) = match line.find('=') {
-                Some(pos) => (&line[..pos], line[pos + 1..].trim()),
-                None => {
-                    _skipped_lines += 1;
+        if filter.is_none() && line.starts_with("import ") {
+            // Pre-change: `unimplemented!()` panic. A silent skip would
+            // drop dependent properties without the caller noticing, so
+            // escalate to a hard error. Callers that intentionally want
+            // to ignore imports can pass a non-empty filter.
+            error!("Line {line_count} in {filename:?}: 'import' not supported: {line}");
+            return Err(Error::Parse(format!(
+                "import statement is not supported (line {line_count} of {filename:?})"
+            )));
+        }
+
+        let (key, value) = match line.find('=') {
+            Some(pos) => (line[..pos].trim_end(), line[pos + 1..].trim()),
+            None => continue,
+        };
+
+        if let Some(filter) = filter {
+            if let Some(prefix) = filter.strip_suffix('*') {
+                if !key.starts_with(prefix) {
                     continue;
                 }
-            };
-
-            if has_filter {
-                let filter = filter.expect("filter must be valid.");
-                if filter.ends_with('*') {
-                    if let Some(prefix) = filter.strip_suffix('*') {
-                        if !key.starts_with(prefix) {
-                            continue;
-                        }
-                    }
-                } else if line != filter {
-                    continue;
-                }
-            }
-
-            if key.starts_with("ctl.") || key == "sys.powerctl" || key == RESTORECON_PROPERTY {
-                error!("Line {line_count}: Ignoring disallowed property '{key}' with special meaning in prop file '{filename:?}'");
+            } else if key != filter {
                 continue;
             }
+        }
 
-            // Create UCred with safe initialization
-            let cr = UCred {
-                pid: Pid::from_raw(1).expect("Valid PID for init process"),
-                uid: Uid::from_raw(0),
-                gid: Gid::from_raw(0),
-            };
+        if key.starts_with("ctl.") || key == "sys.powerctl" || key == RESTORECON_PROPERTY {
+            error!("Line {line_count}: Ignoring disallowed property '{key}' with special meaning in prop file '{filename:?}'");
+            continue;
+        }
 
-            match check_permissions(key, value, context, &cr) {
-                Ok(_) => {
-                    if let Some(old_value) = properties.insert(key.to_string(), value.to_string()) {
-                        warn!(
-                            "Line {line_count}: Overriding previous property '{key}':'{old_value}' with new value '{value}'"
-                        );
-                    }
-                    _processed_properties += 1;
-                }
-                Err(e) => {
-                    error!("Line {line_count}: Failed to check permissions for '{key}': {e}");
-                    continue;
-                }
-            }
+        check_permissions(key, value, context);
+        if let Some(old_value) = properties.insert(key.to_string(), value.to_string()) {
+            warn!(
+                "Line {line_count}: Overriding previous property '{key}':'{old_value}' with new value '{value}'"
+            );
         }
     }
 

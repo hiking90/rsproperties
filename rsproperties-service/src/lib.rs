@@ -19,10 +19,24 @@ pub use properties_service::PropertiesService;
 
 pub(crate) struct ReadyMessage {}
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct PropertyMessage {
-    pub key: String,
+    pub name: String,
     pub value: String,
+}
+
+// Mask `value` in `Debug` output so log-level captures don't spill
+// property contents. Property names are public knowledge (they cross the
+// AOSP wire by name and appear in `getprop` output), but values may be
+// sensitive — persisted tokens, device identifiers, configuration knobs.
+// Logging `value.len()` is enough for diagnostics.
+impl std::fmt::Debug for PropertyMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PropertyMessage")
+            .field("name", &self.name)
+            .field("value", &format_args!("<{} bytes>", self.value.len()))
+            .finish()
+    }
 }
 
 pub struct ServiceContext<T: Actor> {
@@ -46,7 +60,14 @@ pub async fn run(
     ),
     Box<dyn std::error::Error>,
 > {
-    rsproperties::init(config);
+    // Use `try_init` rather than `init`: if the global properties_dir /
+    // socket_dir cells were already committed (e.g. earlier service
+    // instance, double-init, hostile race), the silent `init` swallow
+    // would let the service start with the *previous* directories while
+    // the caller believes their new config took effect. `?`-propagating
+    // surfaces that drift at startup instead of producing a service bound
+    // to wrong paths.
+    rsproperties::try_init(config)?;
 
     let properties_service = properties_service::run(property_contexts_files, build_prop_files);
 
@@ -56,12 +77,12 @@ pub async fn run(
         properties_service: properties_service.actor_ref.clone(),
     });
 
-    let _ = socket_service
+    socket_service
         .actor_ref
         .ask(ReadyMessage {})
         .await
         .map_err(|e| format!("Failed to start socket service: {e}"))?;
-    let _ = properties_service
+    properties_service
         .actor_ref
         .ask(ReadyMessage {})
         .await
@@ -77,10 +98,10 @@ mod tests {
     #[test]
     fn test_property_message() {
         let msg = PropertyMessage {
-            key: "test.key".to_string(),
+            name: "test.key".to_string(),
             value: "test.value".to_string(),
         };
-        assert_eq!(msg.key, "test.key");
+        assert_eq!(msg.name, "test.key");
         assert_eq!(msg.value, "test.value");
     }
 }

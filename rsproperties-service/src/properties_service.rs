@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rsactor::{Actor, ActorRef, ActorWeak};
 use rsproperties::{build_trie, load_properties_from_file, PropertyInfoEntry, SystemProperties};
@@ -15,7 +15,77 @@ pub struct PropertiesService {
     system_properties: SystemProperties,
 }
 
-impl PropertiesService {}
+/// Wrap any error implementing the standard `Error` trait into an
+/// `io::Error` preserving the source chain. The previous `e.to_string()`
+/// flattening lost `Error::source()` and made anyhow/backtrace useless.
+fn io_other<E>(e: E) -> std::io::Error
+where
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    std::io::Error::other(e)
+}
+
+/// Synchronous initialisation: parses property_contexts files, writes the
+/// trie to `property_info`, loads build.prop files, and applies them to a
+/// freshly-mapped `SystemProperties` area.
+///
+/// Kept synchronous on purpose — every step is blocking I/O against the
+/// filesystem and we don't want to scatter `spawn_blocking` calls through
+/// the loop body. Callers invoke this once via `spawn_blocking` so the
+/// tokio worker isn't held for the duration of init.
+///
+/// Build-prop entries are collected into a `BTreeMap` so the apply order
+/// is deterministic across runs (`HashMap`'s seed-randomised iteration
+/// made the "which file wins on conflict" outcome irreproducible during
+/// debugging).
+fn init_system_properties_sync(
+    property_contexts_files: Vec<PathBuf>,
+    build_prop_files: Vec<PathBuf>,
+    dir: &Path,
+) -> std::io::Result<SystemProperties> {
+    let mut property_infos = Vec::new();
+    for file in property_contexts_files {
+        let (mut property_info, errors) =
+            PropertyInfoEntry::parse_from_file(&file, false).map_err(io_other)?;
+        if !errors.is_empty() {
+            log::error!("{errors:?}");
+        }
+        property_infos.append(&mut property_info);
+    }
+
+    let data: Vec<u8> =
+        build_trie(&property_infos, "u:object_r:build_prop:s0", "string").map_err(io_other)?;
+
+    File::create(dir.join("property_info"))?.write_all(&data)?;
+
+    // `load_properties_from_file` only accepts `&mut HashMap` (other
+    // callers depend on that signature). Re-collect into a `BTreeMap`
+    // before the apply loop so the iteration order is fully determined
+    // by the keys, not by HashMap's randomised hash seed.
+    let mut properties_unordered: HashMap<String, String> = HashMap::new();
+    for file in build_prop_files {
+        load_properties_from_file(&file, None, "u:r:init:s0", &mut properties_unordered)
+            .map_err(io_other)?;
+    }
+    let properties: BTreeMap<String, String> = properties_unordered.into_iter().collect();
+
+    let mut system_properties = SystemProperties::new_area(dir).map_err(io_other)?;
+    for (key, value) in properties.iter() {
+        match system_properties.find(key.as_str()).map_err(io_other)? {
+            Some(prop_ref) => {
+                system_properties
+                    .update(&prop_ref, value.as_str())
+                    .map_err(io_other)?;
+            }
+            None => {
+                system_properties
+                    .add(key.as_str(), value.as_str())
+                    .map_err(io_other)?;
+            }
+        }
+    }
+    Ok(system_properties)
+}
 
 impl Actor for PropertiesService {
     type Args = PropertiesServiceArgs;
@@ -25,48 +95,18 @@ impl Actor for PropertiesService {
         args: Self::Args,
         _actor_ref: &rsactor::ActorRef<Self>,
     ) -> std::result::Result<Self, Self::Error> {
-        let mut property_infos = Vec::new();
-        for file in args.property_contexts_files {
-            let (mut property_info, errors) =
-                PropertyInfoEntry::parse_from_file(&file, false).unwrap();
-            if !errors.is_empty() {
-                log::error!("{errors:?}");
-            }
-            property_infos.append(&mut property_info);
-        }
-
-        let data: Vec<u8> =
-            build_trie(&property_infos, "u:object_r:build_prop:s0", "string").unwrap();
-
-        let dir = rsproperties::properties_dir();
-        File::create(dir.join("property_info"))
-            .unwrap()
-            .write_all(&data)
-            .unwrap();
-
-        let mut properties = HashMap::new();
-        for file in args.build_prop_files {
-            load_properties_from_file(&file, None, "u:r:init:s0", &mut properties).unwrap();
-        }
-
-        let mut system_properties = SystemProperties::new_area(dir).unwrap_or_else(|e| {
-            panic!("Cannot create system properties: {e}. Please check if {dir:?} exists.")
-        });
-        for (key, value) in properties.iter() {
-            match system_properties.find(key.as_str()).unwrap() {
-                Some(prop_ref) => {
-                    system_properties.update(&prop_ref, value.as_str()).unwrap();
-                }
-                None => {
-                    system_properties.add(key.as_str(), value.as_str()).unwrap();
-                }
-            }
-        }
-
-        Ok(PropertiesService {
-            // Initialize the service with the provided arguments
-            system_properties,
+        let dir = rsproperties::properties_dir().to_path_buf();
+        // Filesystem + mmap + trie build all block. Run them on a blocking
+        // task so the tokio worker that polls this actor is free to drive
+        // other tasks (notably the sibling SocketService) while
+        // initialisation runs.
+        let system_properties = tokio::task::spawn_blocking(move || {
+            init_system_properties_sync(args.property_contexts_files, args.build_prop_files, &dir)
         })
+        .await
+        .map_err(|e| std::io::Error::other(format!("init join failed: {e}")))??;
+
+        Ok(PropertiesService { system_properties })
     }
 
     async fn on_stop(
@@ -95,16 +135,17 @@ impl Actor for PropertiesService {
 }
 
 impl rsactor::Message<crate::ReadyMessage> for PropertiesService {
-    type Reply = bool;
+    type Reply = ();
 
     async fn handle(
         &mut self,
         _message: crate::ReadyMessage,
         _actor_ref: &ActorRef<Self>,
     ) -> Self::Reply {
-        true
     }
 }
+
+use rsproperties::wire::{validate_property_name, validate_value_len};
 
 impl rsactor::Message<crate::PropertyMessage> for PropertiesService {
     type Reply = bool;
@@ -115,35 +156,46 @@ impl rsactor::Message<crate::PropertyMessage> for PropertiesService {
         _actor_ref: &ActorRef<Self>,
     ) -> Self::Reply {
         log::debug!("Handling property message: {message:?}");
-        // Process the property message
-        let key = message.key;
+        let name = message.name;
         let value = message.value;
 
+        // Single source-of-truth for name + length policy — client and
+        // server use the same `rsproperties::wire` functions so policy
+        // drift (e.g. `>` vs `>=`) cannot reappear.
+        if let Err(e) = validate_property_name(&name) {
+            log::error!("Rejected setprop: {e}");
+            return false;
+        }
+        if let Err(e) = validate_value_len(&name, &value) {
+            log::error!("Rejected setprop: {e}");
+            return false;
+        }
+
         // Check if the property exists in the system properties
-        match self.system_properties.find(&key) {
+        match self.system_properties.find(&name) {
             Ok(Some(prop_ref)) => {
                 // Update the existing property
                 if let Err(e) = self.system_properties.update(&prop_ref, &value) {
-                    log::error!("Failed to update property '{key}': {e}");
-                    false // Indicate failure
+                    log::error!("Failed to update property '{name}': {e}");
+                    false
                 } else {
-                    log::info!("Updated property: {key} = {value}");
-                    true // Indicate success
+                    log::info!("Updated property: {name} = {value}");
+                    true
                 }
             }
             Ok(None) => {
                 // Property does not exist, add it
-                if let Err(e) = self.system_properties.add(&key, &value) {
-                    log::error!("Failed to add property '{key}': {e}");
-                    false // Indicate failure
+                if let Err(e) = self.system_properties.add(&name, &value) {
+                    log::error!("Failed to add property '{name}': {e}");
+                    false
                 } else {
-                    log::info!("Added property: {key} = {value}");
-                    true // Indicate success
+                    log::info!("Added property: {name} = {value}");
+                    true
                 }
             }
             Err(e) => {
-                log::error!("Failed to find property '{key}': {e}");
-                false // Indicate failure
+                log::error!("Failed to find property '{name}': {e}");
+                false
             }
         }
     }

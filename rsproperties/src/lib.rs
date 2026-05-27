@@ -30,6 +30,12 @@
 //! }
 //! ```
 
+// Forward-compat with Rust 2024 edition: `unsafe fn` bodies must wrap
+// individual unsafe ops in their own `unsafe {}` blocks rather than
+// inheriting the function's effect. Enabling this lint as a warning today
+// keeps the codebase ready and surfaces regressions in PRs.
+#![warn(unsafe_op_in_unsafe_fn)]
+
 use std::{
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -144,6 +150,7 @@ impl PropertyConfigBuilder {
 }
 
 pub mod errors;
+pub mod wire;
 pub use errors::{ContextWithLocation, Error, Result};
 
 #[cfg(feature = "builder")]
@@ -180,8 +187,9 @@ pub const PROP_DIRNAME: &str = "/dev/__properties__";
 
 // System properties directory.
 static SYSTEM_PROPERTIES_DIR: OnceLock<PathBuf> = OnceLock::new();
-// Global system properties.
-static SYSTEM_PROPERTIES: OnceLock<system_properties::SystemProperties> = OnceLock::new();
+// Global system properties. Stores Result so initialization failure does not
+// poison the OnceLock and callers can observe the error.
+static SYSTEM_PROPERTIES: OnceLock<Result<system_properties::SystemProperties>> = OnceLock::new();
 
 /// Initialize system properties with flexible configuration options.
 ///
@@ -207,64 +215,121 @@ static SYSTEM_PROPERTIES: OnceLock<system_properties::SystemProperties> = OnceLo
 /// init(config);
 /// ```
 pub fn init(config: PropertyConfig) {
-    // Initialize properties directory
+    // The `Result` form (`try_init`) is preferred for new code; this wrapper
+    // exists for backward compatibility and logs failures instead of returning
+    // them.
+    if let Err(e) = try_init(config) {
+        log::warn!("init: {e}");
+    }
+}
+
+/// Initialize system properties, returning an error when an option cannot be
+/// applied (typically because it was already set on a previous call).
+pub fn try_init(config: PropertyConfig) -> Result<()> {
     let props_dir = config.properties_dir.unwrap_or_else(|| {
         log::info!("Using default properties directory: {PROP_DIRNAME}");
         PathBuf::from(PROP_DIRNAME)
     });
 
-    match SYSTEM_PROPERTIES_DIR.set(props_dir.clone()) {
-        Ok(_) => {
-            log::info!("Successfully set system properties directory to: {props_dir:?}");
-        }
-        Err(_) => {
-            log::warn!("System properties directory already set, ignoring new value");
-        }
+    // Both `SYSTEM_PROPERTIES_DIR` and the socket-dir cell are first-write-
+    // wins. Pre-check both *before* committing either to avoid leaving the
+    // global state in a half-applied form (properties_dir locked, socket_dir
+    // unset) when the caller's intent was an atomic init.
+    if SYSTEM_PROPERTIES_DIR.get().is_some() {
+        return Err(Error::FileValidation(
+            "System properties directory already initialized".into(),
+        ));
+    }
+    if config.socket_dir.is_some() && system_property_set::socket_dir_is_set() {
+        return Err(Error::FileValidation(
+            "Socket directory already initialized".into(),
+        ));
     }
 
-    // Initialize socket directory if specified
+    SYSTEM_PROPERTIES_DIR.set(props_dir.clone()).map_err(|_| {
+        Error::FileValidation("System properties directory already initialized".into())
+    })?;
+    log::info!("Successfully set system properties directory to: {props_dir:?}");
+
     if let Some(socket_dir) = config.socket_dir {
-        let success = system_property_set::set_socket_dir(&socket_dir);
-        if success {
-            log::info!("Successfully set socket directory to: {socket_dir:?}");
-        } else {
-            log::warn!("Socket directory already set, ignoring new value");
+        if !system_property_set::set_socket_dir(&socket_dir) {
+            // Lost a race between the pre-check and the set; properties_dir
+            // is now committed but socket_dir is owned by another caller.
+            // Cannot un-set a `OnceLock`, so surface the inconsistency.
+            return Err(Error::FileValidation(
+                "Socket directory already initialized (race after pre-check)".into(),
+            ));
         }
+        log::info!("Successfully set socket directory to: {socket_dir:?}");
     }
+    Ok(())
 }
 
 /// Get the system properties directory.
 /// Returns the configured directory if init() was called,
 /// otherwise returns the default PROP_DIRNAME (/dev/__properties__).
 pub fn properties_dir() -> &'static Path {
-    let path = SYSTEM_PROPERTIES_DIR
+    SYSTEM_PROPERTIES_DIR
         .get_or_init(|| {
             log::info!("Using default properties directory: {PROP_DIRNAME}");
             PathBuf::from(PROP_DIRNAME)
         })
-        .as_path();
-    path
+        .as_path()
+}
+
+/// Get the system properties, returning an error if initialization fails.
+///
+/// This is the panic-free variant; `init()` should typically be called first
+/// to choose the properties directory. The initialization is cached, so
+/// subsequent calls reuse the same result (success or failure).
+pub fn try_system_properties() -> Result<&'static system_properties::SystemProperties> {
+    SYSTEM_PROPERTIES
+        .get_or_init(|| {
+            let dir = properties_dir();
+            log::debug!("Initializing global SystemProperties instance from: {dir:?}");
+
+            system_properties::SystemProperties::new(dir).inspect_err(|e| {
+                log::error!("Failed to initialize SystemProperties from {dir:?}: {e}");
+            })
+        })
+        .as_ref()
+        .map_err(|e| {
+            // We only have `&Error` from the cache, and `Error` isn't
+            // `Clone` (it transitively wraps `std::io::Error`). To avoid
+            // losing the failure context we walk `Error::source()` and
+            // flatten the chain into the Display string. Programmatic
+            // `source()` traversal is sacrificed here — preserving it
+            // would require caching `Arc<Error>` and changing the public
+            // return type.
+            Error::FileValidation(format_error_chain("SystemProperties init failed", e))
+        })
+}
+
+/// Formats `err` and its `source()` chain as `"<prefix>: <e0>: <e1>: ..."`.
+/// Used to surface root-cause info when we hold only `&Error` and can't
+/// build a `Error::Context` (which needs an owned source).
+fn format_error_chain(prefix: &str, err: &dyn std::error::Error) -> String {
+    use std::fmt::Write;
+    let mut out = format!("{prefix}: {err}");
+    let mut source = err.source();
+    while let Some(s) = source {
+        // ignore write! errors — String never fails to write
+        let _ = write!(&mut out, ": {s}");
+        source = s.source();
+    }
+    out
 }
 
 /// Get the system properties.
 /// Before calling this function, init() must be called.
 /// It panics if init() is not called or the system properties cannot be opened.
+///
+/// Prefer [`try_system_properties`] in code that must not panic.
 pub fn system_properties() -> &'static system_properties::SystemProperties {
-    SYSTEM_PROPERTIES.get_or_init(|| {
-        let dir = properties_dir();
-        log::debug!("Initializing global SystemProperties instance from: {dir:?}");
-
-        match system_properties::SystemProperties::new(dir) {
-            Ok(props) => {
-                log::debug!("Successfully initialized global SystemProperties instance");
-                props
-            }
-            Err(e) => {
-                log::error!("Failed to initialize SystemProperties from {dir:?}: {e}");
-                panic!("Failed to initialize SystemProperties from {dir:?}: {e}");
-            }
-        }
-    })
+    match try_system_properties() {
+        Ok(props) => props,
+        Err(e) => panic!("Failed to initialize SystemProperties: {e}"),
+    }
 }
 
 /// Aligns size to the specified alignment (bionic style)
@@ -302,12 +367,17 @@ where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
-    let value = system_properties().get_with_result(name)?;
-    value.parse().map_err(|e| {
-        Error::Parse(format!(
-            "Failed to parse '{value}' for property '{name}': {e}"
-        ))
-    })
+    // Route through `read_with` so the parse-and-discard path never
+    // allocates a `String` — the value bytes are handed to `FromStr` as
+    // `&str` borrowed from the seqlock buffer (short variant) or the mmap
+    // (long variant).
+    try_system_properties()?.read_with(name, |value| {
+        value.parse().map_err(|e| {
+            Error::Parse(format!(
+                "Failed to parse '{value}' for property '{name}': {e}"
+            ))
+        })
+    })?
 }
 
 /// Get a property value with default fallback
@@ -323,10 +393,22 @@ where
 /// ```
 pub fn get_or<T>(name: &str, default: T) -> T
 where
-    T: std::str::FromStr + Clone,
+    T: std::str::FromStr,
 {
-    match system_properties().get_with_result(name) {
-        Ok(value) if !value.is_empty() => value.parse().unwrap_or(default),
+    let Ok(props) = try_system_properties() else {
+        return default;
+    };
+    // Two-stage closure: the inner `Result<T, T>` carries either the
+    // parsed value or the default back out of `read_with` without ever
+    // allocating a `String`. `Err(default)` is used to signal "use the
+    // default" because the callback can't capture-and-move it twice.
+    match props.read_with(name, |value| {
+        if value.is_empty() {
+            return Err(());
+        }
+        value.parse::<T>().map_err(|_| ())
+    }) {
+        Ok(Ok(v)) => v,
         _ => default,
     }
 }

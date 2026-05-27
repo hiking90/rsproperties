@@ -74,7 +74,7 @@ impl TrieBuilderNode {
             Ok(())
         } else {
             error!("Exact match already exists for '{name}'");
-            Err(Error::new_file_validation(format!(
+            Err(Error::FileValidation(format!(
                 "Exact match already exists for '{name}'"
             )))
         }
@@ -96,7 +96,7 @@ impl TrieBuilderNode {
             Ok(())
         } else {
             error!("Prefix already exists for '{name}'");
-            Err(Error::new_file_validation(format!(
+            Err(Error::FileValidation(format!(
                 "Prefix already exists for '{name}'"
             )))
         }
@@ -164,7 +164,7 @@ impl TrieBuilder {
 
         let last_name: &str = name_parts
             .pop()
-            .ok_or(Error::new_parse(format!("No name parts for '{name}'")))?;
+            .ok_or(Error::Parse(format!("No name parts for '{name}'")))?;
 
         for part in name_parts {
             let part = Rc::new(part.to_owned());
@@ -192,7 +192,7 @@ impl TrieBuilder {
 
             if child.context().is_some() || child.rtype().is_some() {
                 error!("Duplicate prefix match detected for '{name}'");
-                return Err(Error::new_file_validation(format!(
+                return Err(Error::FileValidation(format!(
                     "Duplicate prefix match detected for '{name}'"
                 )));
             }

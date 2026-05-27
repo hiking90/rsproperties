@@ -14,19 +14,20 @@ use crate::property_area::PropertyAreaMap;
 pub(crate) struct ContextNode {
     access_rw: bool,
     filename: PathBuf,
-    _context_offset: usize,
+    /// Lazy-initialized property area. Once a writer puts `Some`, no code
+    /// path ever resets it to `None` — this is the invariant that lets the
+    /// `*Guard` types below skip the `expect()` runtime panic. The
+    /// invariant is enforced by keeping the field private and only
+    /// exposing it through this module's API.
     property_area: RwLock<Option<PropertyAreaMap>>,
-    _no_access: bool,
 }
 
 impl ContextNode {
-    pub(crate) fn new(access_rw: bool, _context_offset: usize, filename: PathBuf) -> Self {
+    pub(crate) fn new(access_rw: bool, filename: PathBuf) -> Self {
         Self {
             access_rw,
             filename,
-            _context_offset,
             property_area: RwLock::new(None),
-            _no_access: false,
         }
     }
 
@@ -36,15 +37,13 @@ impl ContextNode {
                 "Attempted to open context node without write access: {:?}",
                 self.filename
             );
-            panic!("open() must be called with access_rw == true");
+            return Err(Error::LockError(format!(
+                "open() requires access_rw == true: {:?}",
+                self.filename
+            )));
         }
 
-        let mut prop_area = self.property_area.write().map_err(|e| {
-            Error::new_lock_error(format!(
-                "Failed to acquire write lock on property area: {}",
-                e
-            ))
-        })?;
+        let mut prop_area = self.property_area.write().map_err(lock_err("write"))?;
         if prop_area.is_some() {
             return Ok(());
         }
@@ -58,76 +57,95 @@ impl ContextNode {
         Ok(())
     }
 
-    // pub(crate) fn context_offset(&self) -> usize {
-    //     self.context_offset
-    // }
-
     pub(crate) fn property_area(&self) -> Result<PropertyAreaGuard<'_>> {
-        loop {
-            {
-                let guard = self.property_area.read().map_err(|e| {
-                    Error::new_lock_error(format!(
-                        "Failed to acquire read lock on property area: {}",
-                        e
-                    ))
-                })?;
-                if guard.is_some() {
-                    return Ok(PropertyAreaGuard { guard });
-                }
+        // Fast path: already initialized.
+        {
+            let guard = self.property_area.read().map_err(lock_err("read"))?;
+            if guard.is_some() {
+                return Ok(PropertyAreaGuard::from_initialized(guard));
             }
-            let mut guard = self.property_area.write().map_err(|e| {
-                Error::new_lock_error(format!(
-                    "Failed to acquire write lock on property area: {}",
-                    e
-                ))
-            })?;
+        }
+        // Slow path: initialize under the write lock if still empty.
+        {
+            let mut guard = self.property_area.write().map_err(lock_err("write"))?;
             if guard.is_none() {
                 *guard = Some(PropertyAreaMap::new_ro(self.filename.as_path())?);
             }
         }
+        // Re-acquire read lock for the typed guard.
+        let guard = self.property_area.read().map_err(lock_err("read"))?;
+        Ok(PropertyAreaGuard::from_initialized(guard))
     }
 
     #[cfg(feature = "builder")]
     pub(crate) fn property_area_mut(&self) -> Result<PropertyAreaMutGuard<'_>> {
-        self.property_area()?;
-        Ok(PropertyAreaMutGuard {
-            guard: self.property_area.write().map_err(|e| {
-                Error::new_lock_error(format!(
-                    "Failed to acquire write lock on property area guard: {}",
-                    e
-                ))
-            })?,
-        })
+        let mut guard = self.property_area.write().map_err(lock_err("write"))?;
+        if guard.is_none() {
+            *guard = Some(PropertyAreaMap::new_ro(self.filename.as_path())?);
+        }
+        Ok(PropertyAreaMutGuard::from_initialized(guard))
     }
 }
 
-// PropertyAreaGuard is used to get a reference to the PropertyAreaMap.
+fn lock_err<T>(kind: &'static str) -> impl Fn(std::sync::PoisonError<T>) -> Error {
+    move |e| {
+        Error::LockError(format!(
+            "Failed to acquire {kind} lock on property area: {e}"
+        ))
+    }
+}
+
+/// Read-guard that only exists once the underlying `Option` has been
+/// initialized. The `from_initialized` constructor is the single entry
+/// point and is `pub(self)` so callers in this module cannot bypass the
+/// `is_some()` check.
 pub(crate) struct PropertyAreaGuard<'a> {
     guard: RwLockReadGuard<'a, Option<PropertyAreaMap>>,
 }
 
-impl PropertyAreaGuard<'_> {
+impl<'a> PropertyAreaGuard<'a> {
+    /// Caller MUST have verified `guard.is_some()`. The `debug_assert!`
+    /// is a development-time tripwire; release builds rely on the
+    /// type-level invariant documented on `ContextNode::property_area`.
+    fn from_initialized(guard: RwLockReadGuard<'a, Option<PropertyAreaMap>>) -> Self {
+        debug_assert!(
+            guard.is_some(),
+            "PropertyAreaGuard constructed from uninitialized Option — \
+             this would have panicked in release at the access site"
+        );
+        Self { guard }
+    }
+
     pub(crate) fn property_area(&self) -> &PropertyAreaMap {
+        // SAFETY-level invariant: `from_initialized` is the only ctor; it
+        // requires `Some(...)`. No code path in this module resets the
+        // underlying `Option<PropertyAreaMap>` back to `None`.
         self.guard
             .as_ref()
-            .expect("PropertyAreaMap is not initialized")
+            .expect("PropertyAreaGuard constructed only from Some(...); see ContextNode invariant")
     }
 }
 
-// PropertyAreaMutGuard is used to get a mutable reference to the PropertyAreaMap.
-// Option<PropertyAreaMap> is initialized when the PropertyAreaMap is first accessed.
-// After that, the PropertyAreaMap is never replaced.
-// This is to ensure that the PropertyAreaMap is not replaced by another PropertyAreaMap.
+/// Write-guard counterpart of [`PropertyAreaGuard`]. Same invariant.
 #[cfg(feature = "builder")]
 pub(crate) struct PropertyAreaMutGuard<'a> {
     guard: RwLockWriteGuard<'a, Option<PropertyAreaMap>>,
 }
 
 #[cfg(feature = "builder")]
-impl PropertyAreaMutGuard<'_> {
+impl<'a> PropertyAreaMutGuard<'a> {
+    fn from_initialized(guard: RwLockWriteGuard<'a, Option<PropertyAreaMap>>) -> Self {
+        debug_assert!(
+            guard.is_some(),
+            "PropertyAreaMutGuard constructed from uninitialized Option — \
+             this would have panicked in release at the access site"
+        );
+        Self { guard }
+    }
+
     pub(crate) fn property_area_mut(&mut self) -> &mut PropertyAreaMap {
-        self.guard
-            .as_mut()
-            .expect("PropertyAreaMap is not initialized")
+        self.guard.as_mut().expect(
+            "PropertyAreaMutGuard constructed only from Some(...); see ContextNode invariant",
+        )
     }
 }

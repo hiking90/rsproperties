@@ -12,7 +12,22 @@ use rustix::fs;
 use crate::context_node::PropertyAreaMutGuard;
 use crate::context_node::{ContextNode, PropertyAreaGuard};
 use crate::property_area::{PropertyArea, PropertyAreaMap};
-use crate::property_info_parser::PropertyInfoAreaFile;
+use crate::property_info_parser::{PropertyInfoArea, PropertyInfoAreaFile};
+
+/// Decodes one `ContextNode` entry from the property-info area. Returns
+/// `Err` on corrupt offset, missing NUL terminator, or non-UTF-8 name —
+/// callers tag the slot as `None` so the surrounding `Vec<Option<_>>`
+/// indices stay aligned with the parser's `context_index` values.
+fn try_build_context_node(
+    area: &PropertyInfoArea<'_>,
+    dirname: &Path,
+    writable: bool,
+    i: usize,
+) -> Result<ContextNode> {
+    let context_offset = area.context_offset(i)?;
+    let context_name = area.cstr(context_offset).to_str()?;
+    Ok(ContextNode::new(writable, dirname.join(context_name)))
+}
 
 // Pre-defined CStr constants to avoid unsafe code at runtime
 // Using const_str macro or safer compile-time construction
@@ -20,7 +35,10 @@ const PROPERTIES_SERIAL_CONTEXT: &CStr = c"u:object_r:properties_serial:s0";
 
 pub(crate) struct ContextsSerialized {
     property_info_area_file: PropertyInfoAreaFile,
-    context_nodes: Vec<ContextNode>,
+    /// `None` slots are corrupt context entries that were skipped during init.
+    /// We keep the slot so that `context_index` values produced by the
+    /// property-info parser line up with the vector's indices.
+    context_nodes: Vec<Option<ContextNode>>,
     serial_property_area_map: PropertyAreaMap,
 }
 
@@ -43,13 +61,16 @@ impl ContextsSerialized {
 
         let property_info_area = property_info_area_file.property_info_area();
         let num_context_nodes = property_info_area.num_contexts();
-        let mut context_nodes = Vec::with_capacity(num_context_nodes);
+        let mut context_nodes: Vec<Option<ContextNode>> = Vec::with_capacity(num_context_nodes);
 
         for i in 0..num_context_nodes {
-            let context_offset = property_info_area.context_offset(i)?;
-            let context_name = property_info_area.cstr(context_offset).to_str()?;
-            let filename = dirname.join(context_name);
-            context_nodes.push(ContextNode::new(writable, context_offset, filename))
+            match try_build_context_node(&property_info_area, dirname.as_path(), writable, i) {
+                Ok(n) => context_nodes.push(Some(n)),
+                Err(e) => {
+                    warn!("context entry {i} skipped: {e}");
+                    context_nodes.push(None);
+                }
+            }
         }
 
         let serial_property_area_map = if writable {
@@ -64,7 +85,7 @@ impl ContextsSerialized {
 
             *fsetxattr_failed = false;
 
-            for node in context_nodes.iter_mut() {
+            for node in context_nodes.iter_mut().flatten() {
                 node.open(fsetxattr_failed)?;
             }
 
@@ -116,10 +137,13 @@ impl ContextsSerialized {
                 index,
                 self.context_nodes.len()
             );
-            return Err(Error::new_not_found(name.to_owned()));
+            return Err(Error::NotFound(name.to_owned()));
         }
 
-        let context_node = &self.context_nodes[index as usize];
+        let context_node = self.context_nodes[index as usize].as_ref().ok_or_else(|| {
+            error!("Context entry {index} for property {name} was skipped during init");
+            Error::NotFound(name.to_owned())
+        })?;
 
         match context_node.property_area() {
             Ok(area) => Ok((area, index)),
@@ -147,12 +171,15 @@ impl ContextsSerialized {
                 index,
                 self.context_nodes.len()
             );
-            return Err(Error::new_not_found(format!(
+            return Err(Error::NotFound(format!(
                 "Could not find context for property {name}"
             )));
         }
 
-        let context_node = &self.context_nodes[index as usize];
+        let context_node = self.context_nodes[index as usize].as_ref().ok_or_else(|| {
+            error!("Context entry {index} for property {name} was skipped during init");
+            Error::NotFound(format!("Could not find context for property {name}"))
+        })?;
 
         match context_node.property_area_mut() {
             Ok(area) => Ok((area, index)),
@@ -162,10 +189,6 @@ impl ContextsSerialized {
             }
         }
     }
-
-    // pub(crate) fn get_serial_prop_name(&self) -> Result<&PropertyAreaMap> {
-    //     unimplemented!("get_serial_prop_name")
-    // }
 
     pub(crate) fn serial_prop_area(&self) -> &PropertyArea {
         self.serial_property_area_map.property_area()
@@ -178,12 +201,19 @@ impl ContextsSerialized {
                 context_index,
                 self.context_nodes.len()
             );
-            return Err(Error::new_parse(format!(
+            return Err(Error::Parse(format!(
                 "Invalid context index: {context_index}"
             )));
         }
 
-        let context_node = &self.context_nodes[context_index as usize];
+        let context_node = self.context_nodes[context_index as usize]
+            .as_ref()
+            .ok_or_else(|| {
+                error!("Context entry {context_index} was skipped during init");
+                Error::NotFound(format!(
+                    "Context entry {context_index} is unavailable (corrupt at init)"
+                ))
+            })?;
         match context_node.property_area() {
             Ok(area) => Ok(area),
             Err(e) => {
@@ -204,12 +234,19 @@ impl ContextsSerialized {
                 context_index,
                 self.context_nodes.len()
             );
-            return Err(Error::new_parse(format!(
+            return Err(Error::Parse(format!(
                 "Invalid context index: {context_index}"
             )));
         }
 
-        let context_node = &self.context_nodes[context_index as usize];
+        let context_node = self.context_nodes[context_index as usize]
+            .as_ref()
+            .ok_or_else(|| {
+                error!("Context entry {context_index} was skipped during init");
+                Error::NotFound(format!(
+                    "Context entry {context_index} is unavailable (corrupt at init)"
+                ))
+            })?;
         match context_node.property_area_mut() {
             Ok(area) => Ok(area),
             Err(e) => {

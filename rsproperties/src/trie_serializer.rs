@@ -4,13 +4,27 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use crate::errors::Result;
+use crate::errors::{Error, Result};
 use crate::property_info_parser::*;
 use crate::trie_builder::*;
 use crate::trie_node_arena::TrieNodeArena;
 
 pub(crate) struct TrieSerializer {
     arena: TrieNodeArena,
+}
+
+/// Resolves an optional context/type name to a u32 index, returning the
+/// `u32::MAX` sentinel for absent or empty values, or when the lookup misses.
+fn resolve_index<F>(name: Option<&str>, mut lookup: F) -> u32
+where
+    F: FnMut(&str) -> Option<usize>,
+{
+    match name {
+        Some(s) if !s.is_empty() => lookup(s)
+            .and_then(|i| u32::try_from(i).ok())
+            .unwrap_or(u32::MAX),
+        _ => u32::MAX,
+    }
 }
 
 impl TrieSerializer {
@@ -28,68 +42,65 @@ impl TrieSerializer {
             header.minimum_supported_version = 1;
         }
 
+        // `arena.size()` is the running write position of the in-memory
+        // `Vec<u8>` arena. The on-disk format stores offsets as `u32`, so
+        // an input that needed > 4 GiB of serialised data couldn't be
+        // expressed regardless — the silent `as u32` truncation here is
+        // bounded by the same format constraint. User-input lengths
+        // (e.g. `property_entry.name.len()` in `write_property_entry`)
+        // use `u32::try_from` so they fail loudly instead.
         this.arena
             .get_object::<PropertyInfoAreaHeader>(header_offset)?
-            .contexts_offset = this.arena.size() as _;
+            .contexts_offset = this.arena.size() as u32;
         this.serialize_strings(&trie_builder.contexts)?;
 
         this.arena
             .get_object::<PropertyInfoAreaHeader>(header_offset)?
-            .types_offset = this.arena.size() as _;
+            .types_offset = this.arena.size() as u32;
         this.serialize_strings(&trie_builder.types)?;
 
         this.arena
             .get_object::<PropertyInfoAreaHeader>(header_offset)?
-            .size = this.arena.size() as _;
+            .size = this.arena.size() as u32;
 
         let root_trie_offset = this.write_trie_node(&trie_builder.root)?;
         this.arena
             .get_object::<PropertyInfoAreaHeader>(header_offset)?
-            .root_offset = root_trie_offset as _;
+            .root_offset = root_trie_offset;
 
         let final_size = this.arena.size();
         this.arena
             .get_object::<PropertyInfoAreaHeader>(header_offset)?
-            .size = final_size as _;
+            .size = final_size as u32;
 
         Ok(this)
     }
 
     fn write_property_entry(&mut self, property_entry: &PropertyEntryBuilder) -> Result<u32> {
-        let context_index = match property_entry.context {
-            Some(ref context) => {
-                if context.is_empty() {
-                    !0
-                } else {
-                    let index = self.arena.info().find_context_index(context);
-                    index
-                }
-            }
-            None => !0,
-        };
-
-        let type_index = match property_entry.rtype {
-            Some(ref rtype) => {
-                if rtype.is_empty() {
-                    !0
-                } else {
-                    let index = self.arena.info().find_type_index(rtype);
-                    index
-                }
-            }
-            None => !0,
-        };
+        let context_index =
+            resolve_index(property_entry.context.as_ref().map(|s| s.as_str()), |s| {
+                self.arena.info().find_context_index(s)
+            });
+        let type_index = resolve_index(property_entry.rtype.as_ref().map(|s| s.as_str()), |s| {
+            self.arena.info().find_type_index(s)
+        });
 
         let entry_offset = self.arena.allocate_object::<PropertyEntry>();
-        let name_offset = self.arena.allocate_and_write_string(&property_entry.name) as _;
+        let name_offset = self.arena.allocate_and_write_string(&property_entry.name) as u32;
+        let namelen = u32::try_from(property_entry.name.len()).map_err(|_| {
+            Error::FileValidation(format!(
+                "Property name too long: {} bytes",
+                property_entry.name.len()
+            ))
+        })?;
 
         let entry = self.arena.get_object::<PropertyEntry>(entry_offset)?;
         entry.name_offset = name_offset;
-        entry.namelen = property_entry.name.len() as _;
-        entry.context_index = context_index as _;
-        entry.type_index = type_index as _;
+        entry.namelen = namelen;
+        entry.context_index = context_index;
+        entry.type_index = type_index;
 
-        Ok(entry_offset as _)
+        Ok(entry_offset as u32)
     }
 
     fn write_trie_node(&mut self, builder_node: &TrieBuilderNode) -> Result<u32> {
@@ -98,26 +109,30 @@ impl TrieSerializer {
         let property_entry = self.write_property_entry(&builder_node.property_entry)?;
         self.arena
             .get_object::<TrieNodeData>(trie_offset)?
-            .property_entry = property_entry as _;
+            .property_entry = property_entry;
 
         // Sort prefixes by length (longest first)
         let mut sorted_prefix_matches: Vec<_> = builder_node.prefixes.iter().collect();
         sorted_prefix_matches.sort_by_key(|b| std::cmp::Reverse(b.name.len()));
 
+        // Counts are bounded by trie input size (≤ a few thousand entries per
+        // pixel build), well below u32::MAX.
         self.arena
             .get_object::<TrieNodeData>(trie_offset)?
-            .num_prefixes = sorted_prefix_matches.len() as _;
+            .num_prefixes = sorted_prefix_matches.len() as u32;
 
         let prefix_entries_array_offset = self
             .arena
             .allocate_uint32_array(sorted_prefix_matches.len());
         self.arena
             .get_object::<TrieNodeData>(trie_offset)?
-            .prefix_entries = prefix_entries_array_offset as _;
+            .prefix_entries = prefix_entries_array_offset as u32;
 
+        let prefix_count = sorted_prefix_matches.len();
         for (i, prefix_entry) in sorted_prefix_matches.iter().enumerate() {
             let offset = self.write_property_entry(prefix_entry)?;
-            self.arena.uint32_array(prefix_entries_array_offset)?[i] = offset;
+            self.arena
+                .uint32_array(prefix_entries_array_offset, prefix_count)?[i] = offset;
         }
 
         // Sort exact matches alphabetically
@@ -126,16 +141,18 @@ impl TrieSerializer {
 
         self.arena
             .get_object::<TrieNodeData>(trie_offset)?
-            .num_exact_matches = sorted_exact_matches.len() as _;
+            .num_exact_matches = sorted_exact_matches.len() as u32;
         let exact_match_entries_array_offset =
             self.arena.allocate_uint32_array(sorted_exact_matches.len());
         self.arena
             .get_object::<TrieNodeData>(trie_offset)?
-            .exact_match_entries = exact_match_entries_array_offset as _;
+            .exact_match_entries = exact_match_entries_array_offset as u32;
 
+        let exact_count = sorted_exact_matches.len();
         for (i, exact_entry) in sorted_exact_matches.iter().enumerate() {
             let offset = self.write_property_entry(exact_entry)?;
-            self.arena.uint32_array(exact_match_entries_array_offset)?[i] = offset;
+            self.arena
+                .uint32_array(exact_match_entries_array_offset, exact_count)?[i] = offset;
         }
 
         // Sort children alphabetically
@@ -144,33 +161,36 @@ impl TrieSerializer {
 
         self.arena
             .get_object::<TrieNodeData>(trie_offset)?
-            .num_child_nodes = sorted_children.len() as _;
+            .num_child_nodes = sorted_children.len() as u32;
         let children_offset_array_offset = self.arena.allocate_uint32_array(sorted_children.len());
         self.arena
             .get_object::<TrieNodeData>(trie_offset)?
-            .child_nodes = children_offset_array_offset as _;
+            .child_nodes = children_offset_array_offset as u32;
 
+        let children_count = sorted_children.len();
         for (i, child_node) in sorted_children.iter().enumerate() {
             let child_offset = self.write_trie_node(child_node)?;
-            self.arena.uint32_array(children_offset_array_offset)?[i] = child_offset;
+            self.arena
+                .uint32_array(children_offset_array_offset, children_count)?[i] = child_offset;
         }
 
-        Ok(trie_offset as _)
+        Ok(trie_offset as u32)
     }
 
     fn serialize_strings(&mut self, strings: &BTreeSet<Rc<String>>) -> Result<()> {
-        self.arena.allocate_and_write_uint32(strings.len() as _);
-        let offset_array_offset = self.arena.allocate_uint32_array(strings.len());
+        self.arena.allocate_and_write_uint32(strings.len() as u32);
+        let n = strings.len();
+        let offset_array_offset = self.arena.allocate_uint32_array(n);
 
         for (i, string) in strings.iter().enumerate() {
             let offset = self.arena.allocate_and_write_string(string);
-            self.arena.uint32_array(offset_array_offset)?[i] = offset as _;
+            self.arena.uint32_array(offset_array_offset, n)?[i] = offset as u32;
         }
 
         Ok(())
     }
 
-    pub(crate) fn take_data(&mut self) -> Vec<u8> {
-        self.arena.take_data()
+    pub(crate) fn into_data(self) -> Vec<u8> {
+        self.arena.into_data()
     }
 }

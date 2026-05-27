@@ -26,7 +26,7 @@ zerocopy-derive = "0.8"
 thiserror = "2.0"
 anyhow = "1.0"
 pretty-hex = "0.4"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal", "fs"] }
 rsactor = "0.15"
 
 # Dev dependencies
