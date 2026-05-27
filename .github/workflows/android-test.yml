@@ -127,7 +127,7 @@ jobs:
         $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager list avd
         if [ -f "$HOME/.android/avd/test-api${{ matrix.api-level }}.avd/config.ini" ]; then
           echo "AVD config found, starting emulator..."
-          nohup $ANDROID_SDK_ROOT/emulator/emulator -avd test-api${{ matrix.api-level }} -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot -wipe-data > emulator.log 2>&1 &
+          nohup $ANDROID_SDK_ROOT/emulator/emulator -avd test-api${{ matrix.api-level }} -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot -wipe-data -memory 4096 -partition-size 2048 > emulator.log 2>&1 &
           echo "Emulator started in background"
           sleep 10
           echo "Checking emulator log..."
