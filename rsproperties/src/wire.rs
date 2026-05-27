@@ -10,7 +10,7 @@
 
 /// Hard cap on property-value byte length (NUL **not** included). Matches the
 /// historical bionic `PROP_VALUE_MAX = 92` constant. Long `ro.` properties
-/// bypass this via the long-property path in [`crate::property_info`].
+/// bypass this via the long-property path in `property_info`.
 pub const PROP_VALUE_MAX: usize = 92;
 
 /// Hard cap on property-name byte length in the **V1 wire protocol** only

@@ -133,8 +133,7 @@ impl PropertyInfo {
     /// reader may observe partially-written multi-byte sequences that
     /// would otherwise spuriously fail `String::from_utf8` and abort the
     /// retry loop. Callers that need a `String` should validate the
-    /// serial first, then call [`Self::value_as_string`] or convert
-    /// directly via `String::from_utf8`.
+    /// serial first, then convert via `String::from_utf8`.
     ///
     /// `long_value_bound` is an upper bound on how far past `self` the
     /// long variant may extend. For the short variant this argument is
