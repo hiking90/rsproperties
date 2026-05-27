@@ -162,21 +162,18 @@ pub struct ServiceContext<T: Actor> {
 
 ### Message Types
 
-The services communicate using these message types:
+`PropertyMessage` and `ReadyMessage` are crate-private — the
+ready-handshake and property-update message round-trips are performed
+by `run()` itself and by the socket-server task respectively. External
+callers drive property updates by **connecting to the Unix socket and
+sending an AOSP `SETPROP2` frame**, exactly as the Android client does;
+the in-process actor surface is intentionally not part of the public
+API. See [Protocol Compatibility](#protocol-compatibility) below.
 
-- **ReadyMessage**: Check if service is ready
-- **PropertyMessage**: Set/update property values
-
-```rust
-// Check if service is ready
-let is_ready = properties_service.actor_ref.ask(ReadyMessage {}).await?;
-
-// Send property update
-let success = properties_service.actor_ref.ask(PropertyMessage {
-    key: "my.app.debug".to_string(),
-    value: "true".to_string(),
-}).await?;
-```
+If you need to read or set properties from the same process that owns
+the service, use the `rsproperties` crate directly
+(`rsproperties::get_or`, `rsproperties::set`, etc.) — it talks to the
+same socket the external clients use.
 
 ## Protocol Compatibility
 
@@ -229,12 +226,50 @@ socket_dir/
 └── property_service_for_system        # System property socket
 ```
 
-## Security Features
+## Security & Hardening
 
-- **Path Validation**: Validates all file and directory paths
-- **Size Limits**: Enforces reasonable limits on property names (1KB) and values (8KB)
-- **SELinux Support**: Handles SELinux property contexts when provided
-- **Permission Handling**: Respects file system permissions
+### Hardening highlights (0.4.0)
+
+- **Socket permissions**: bound Unix sockets are `chmod`ed to `0o660`
+  immediately after `bind()` so the file does not inherit the process
+  umask. Matches the AOSP init policy for the property-service sockets.
+- **Backpressure**: the connection-limit semaphore permit is acquired
+  *before* `accept()`. Saturation parks the accept loop and lets the
+  kernel backlog queue connect attempts, instead of accept-then-stall.
+- **`accept()` back-off**: a 100 ms sleep is inserted after an `accept()`
+  error so an `EMFILE`/`ENFILE` storm cannot spin the worker and flood
+  the log.
+- **Value masking**: `PropertyMessage::value` is masked in `Debug`
+  output and service logs (`<N bytes>` placeholder). Property values
+  may carry tokens or device identifiers; names are still logged in
+  full.
+- **Panic-free init propagation**: `run()` calls `rsproperties::try_init`,
+  so a misconfigured directory or a double-init surfaces as a `Result`
+  rather than silently leaving the service bound to whatever paths a
+  previous instance committed.
+- **Deterministic `build.prop` apply order**: entries are collected
+  into a `BTreeMap` before apply. Earlier `HashMap` iteration meant the
+  "winning" value on a key conflict varied per run due to hash-seed
+  randomisation.
+
+### Size limits
+
+The wire layer caps the upfront allocation for a single message at
+1 KB (name) / 8 KB (value) to bound damage from a hostile peer. These
+are *transport* caps; the actual property-system policy is stricter
+and enforced after the bytes arrive:
+
+- **Names**: `validate_property_name` — ASCII alphanumeric plus
+  `_ . - @ :`, no leading `. - @ :`; `PROP_NAME_MAX = 32` bytes on the
+  V1 wire path.
+- **Values**: `validate_value_len` — `PROP_VALUE_MAX = 92` bytes,
+  with the long-`ro.*` exception that allows larger out-of-line storage.
+
+### Other security features
+
+- **Path validation**: all file and directory paths are validated
+- **SELinux**: property-context files are honoured when supplied
+- **Permission handling**: respects file system permissions
 
 ## Logging
 
@@ -258,8 +293,10 @@ Log levels:
 
 ### Running the Example Service
 
+From the workspace root:
+
 ```bash
-cargo run --example example_service -- \
+cargo run -p rsproperties-service --example example_service -- \
     --properties-dir /tmp/test_properties \
     --socket-dir /tmp/test_sockets
 ```

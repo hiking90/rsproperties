@@ -64,11 +64,36 @@ match rsproperties::get::<String>("ro.build.version.release") {
     Err(e) => eprintln!("Failed to get version: {}", e),
 }
 
+// Zero-allocation read: borrow the value as `&str` without
+// materializing a `String` (read_with returns an error if the
+// property is missing).
+let len: rsproperties::Result<usize> =
+    rsproperties::system_properties().read_with("ro.build.version.sdk", |v| v.len());
+
 // Set property (requires property service to be running)
 if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
     eprintln!("Failed to set property: {}", e);
 }
 ```
+
+### Panic-free Initialization
+
+By default `init()` and `system_properties()` may panic when initialization
+fails (e.g. missing directory, corrupt mmap). For embedded use or where
+panics are unacceptable, use the `try_*` variants:
+
+```rust
+use rsproperties::{try_init, try_system_properties, PropertyConfig};
+
+try_init(PropertyConfig::with_properties_dir("/dev/__properties__"))?;
+let props = try_system_properties()?;          // &'static SystemProperties
+let sdk: String = rsproperties::get_or("ro.build.version.sdk", "0".into());
+```
+
+`try_init` succeeds only on the first call; later calls return an error
+without poisoning the global state. `try_system_properties` caches both
+success *and* failure in a `OnceLock`, so repeated calls observe a
+consistent result.
 
 ### Property Monitoring and Waiting
 
@@ -211,26 +236,30 @@ With the `builder` feature enabled, you can create property databases:
 
 ```rust
 #[cfg(feature = "builder")]
-use rsproperties::{load_properties_from_file, build_trie, SystemProperties};
-use std::collections::HashMap;
+use rsproperties::{
+    build_trie, load_properties_from_file, PropertyInfoEntry, SystemProperties,
+};
+use std::{collections::HashMap, path::Path};
 
-// Load properties from build.prop files
+// Load build.prop-format entries (key=value) into a HashMap.
 let mut properties = HashMap::new();
 load_properties_from_file(
-    &Path::new("system_build.prop"),
-    None,
-    "u:r:init:s0",
-    &mut properties
+    Path::new("system_build.prop"),
+    None,                       // optional name filter (e.g. "ro.*")
+    "u:r:init:s0",              // SELinux context to tag entries with
+    &mut properties,
 )?;
 
-// Build property database
-let property_infos = vec![/* PropertyInfoEntry objects */];
-let trie_data = build_trie(&property_infos, "u:object_r:build_prop:s0", "string")?;
+// Serialize a property-info trie from `property_contexts`-style entries.
+let property_infos: Vec<PropertyInfoEntry> = vec![/* parsed entries */];
+let trie_data = build_trie(
+    &property_infos,
+    "u:object_r:build_prop:s0", // default context
+    "string",                    // default type
+)?;
 
-// Create system properties area
-let mut system_properties = SystemProperties::new_area(&properties_dir)?;
-
-// Add properties to the area
+// Create the on-disk property area and populate it.
+let mut system_properties = SystemProperties::new_area(Path::new("./properties"))?;
 for (key, value) in properties {
     system_properties.add(&key, &value)?;
 }
@@ -238,18 +267,28 @@ for (key, value) in properties {
 
 ### Error Handling
 
-```rust
-use rsproperties::{Result, Error};
+`rsproperties::Error` is a `thiserror`-derived enum with `#[from]` impls
+for `std::io::Error`, `rustix::io::Errno`, `Utf8Error`, and `ParseIntError`.
+The `Error::Context` variant carries a `panic::Location` so the caller
+site is preserved across error boundaries.
 
-fn handle_property_operation() -> Result<()> {
-    match rsproperties::set("ro.test.readonly", "value") {
-        Ok(_) => println!("Property set successfully"),
-        Err(e) => {
-            eprintln!("Failed to set property: {}", e);
-            // Error type is concrete, handle specific error types if needed
-        }
+```rust
+use rsproperties::{ContextWithLocation, Error, Result};
+
+fn read_sdk() -> Result<i32> {
+    // `.context_with_location("…")` attaches caller info to any error
+    // whose type implements `Into<Error>`.
+    rsproperties::get::<i32>("ro.build.version.sdk")
+        .context_with_location("reading ro.build.version.sdk")
+}
+
+fn handle_property_operation() {
+    match rsproperties::set("debug.my_app.config", "value") {
+        Ok(_) => println!("Property set"),
+        Err(Error::Io(e))            => eprintln!("I/O failure: {e}"),
+        Err(Error::PermissionDenied(m)) => eprintln!("denied: {m}"),
+        Err(e)                       => eprintln!("other: {e}"),
     }
-    Ok(())
 }
 ```
 
@@ -259,13 +298,12 @@ All operations are thread-safe and can be used concurrently:
 
 ```rust
 use std::thread;
-use std::sync::Arc;
 
 // Multiple threads can safely access properties
 let handles: Vec<_> = (0..10).map(|i| {
     thread::spawn(move || {
         let prop_name = format!("debug.thread.{}", i);
-        let value = rsproperties::get_with_default(&prop_name, "default");
+        let value: String = rsproperties::get_or(&prop_name, "default".to_string());
         println!("Thread {}: {} = {}", i, prop_name, value);
     })
 }).collect();
@@ -305,9 +343,16 @@ The library follows Android property naming conventions:
 - **Vendor properties**: `vendor.*` (e.g., `vendor.audio.config`)
 
 ### Property Constraints
-- **Name length**: Maximum 32 characters
-- **Value length**: Maximum 92 characters (except ro.* properties)
-- **Character set**: Alphanumeric, dots, underscores, and hyphens
+- **Name length**: 32 bytes max in the V1 wire protocol (`PROP_NAME_MAX`).
+  V2 is length-prefixed and does not impose a wire-layer cap.
+- **Value length**: 92 bytes max (`PROP_VALUE_MAX`, NUL not included).
+  `ro.*` properties may exceed this via the long-property out-of-line
+  storage path.
+- **Character set**: ASCII alphanumeric plus `_`, `.`, `-`, `@`, `:`.
+  Names must not begin with `.`, `-`, `@`, or `:`. See
+  [`rsproperties::wire::validate_property_name`] for the canonical check.
+
+[`rsproperties::wire::validate_property_name`]: https://docs.rs/rsproperties/latest/rsproperties/wire/fn.validate_property_name.html
 
 ## Performance Characteristics
 
@@ -331,11 +376,11 @@ cargo test --workspace
 # Run tests with logging
 RUST_LOG=debug cargo test --workspace
 
-# Build examples
-cargo build --examples
+# Build examples (workspace-wide)
+cargo build --workspace --examples
 
-# Run property service example
-cargo run --bin property_service_example
+# Run the property-service example
+cargo run -p rsproperties-service --example example_service
 ```
 
 ### Cross-compilation for Android

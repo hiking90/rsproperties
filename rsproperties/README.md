@@ -59,6 +59,51 @@ if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
 }
 ```
 
+### Panic-free Initialization
+
+`init()` and `system_properties()` panic when initialization fails (e.g.
+missing properties directory, corrupt mmap). The `try_*` variants surface
+those errors as `Result` instead — preferable for embedded use, tests,
+and any code that must not unwind through `OnceLock` initialization.
+
+```rust
+use rsproperties::{try_init, try_system_properties, PropertyConfig};
+
+fn boot() -> rsproperties::Result<()> {
+    try_init(PropertyConfig::with_properties_dir("/dev/__properties__"))?;
+    let props = try_system_properties()?;             // &'static SystemProperties
+    let sdk: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
+    Ok(())
+}
+```
+
+`try_init` is first-write-wins: subsequent calls return
+`Error::FileValidation` without poisoning the global state.
+`try_system_properties` caches both the success and the failure in a
+`OnceLock`, so every later call observes the same outcome.
+
+### Zero-Allocation Reads (`read_with`)
+
+`get<T>` and `get_or<T>` already route through a zero-allocation path,
+but if you want raw access to the validated value without parsing,
+`SystemProperties::read_with` hands you a `&str` borrowed from the
+seqlock-protected mmap buffer:
+
+```rust
+let props = rsproperties::system_properties();
+
+// Compute over the value without ever allocating a String.
+let prefix_len: rsproperties::Result<usize> =
+    props.read_with("ro.build.version.release", |v| v.split('.').next().map(str::len).unwrap_or(0));
+
+// Borrow into a stack buffer; the callback runs while the bytes are
+// still seqlock-validated, so keep it cheap and non-blocking.
+let mut buf = String::new();
+props.read_with("ro.product.model", |v| buf.push_str(v))?;
+```
+
+This mirrors bionic's `__system_property_read_callback` pattern.
+
 ### Property Monitoring
 
 ```rust
@@ -155,35 +200,33 @@ rsproperties::set("sys.my_service.pid", "1234")?;
 
 ### Error Handling
 
-```rust
-use rsproperties::{Result, Error};
+`Error` is a `thiserror`-derived enum with `#[from]` conversions for
+`std::io::Error`, `rustix::io::Errno`, `Utf8Error`, and `ParseIntError`.
+The `Error::Context` variant carries a `panic::Location` so the failing
+call site is preserved across error boundaries, and `ContextWithLocation`
+attaches that context to any `Result` whose `Err` implements
+`Into<Error>`.
 
-fn handle_property_operation() -> Result<()> {
-    match rsproperties::set("debug.my_app.config", "value") {
-        Ok(_) => println!("Property set successfully"),
-        Err(e) => {
-            eprintln!("Failed to set property: {}", e);
-            // Error provides context and location information
-        }
-    }
-    Ok(())
+```rust
+use rsproperties::{ContextWithLocation, Error, Result};
+
+fn read_sdk() -> Result<i32> {
+    rsproperties::get::<i32>("ro.build.version.sdk")
+        .context_with_location("reading ro.build.version.sdk")
 }
 
 // Batch property operations with error handling
 fn set_app_config() -> Result<()> {
-    let properties = [
+    for (key, value) in [
         ("debug.my_app.enabled", "true"),
         ("debug.my_app.log_level", "info"),
         ("debug.my_app.trace", "disabled"),
-    ];
-
-    for (key, value) in &properties {
+    ] {
         match rsproperties::set(key, value) {
-            Ok(_) => println!("Set {}: {}", key, value),
-            Err(e) => {
-                eprintln!("Failed to set {}: {}", key, e);
-                return Err(e);
-            }
+            Ok(_)                            => println!("set {key}: {value}"),
+            Err(Error::PermissionDenied(m))  => return Err(Error::PermissionDenied(m)),
+            Err(Error::Io(e))                => return Err(Error::Io(e)),
+            Err(e)                           => return Err(e),
         }
     }
     Ok(())
@@ -233,40 +276,65 @@ rsproperties::init(PropertyConfig::with_properties_dir("/my/props"));
 
 ### Configuration
 
-- `PropertyConfig` - Configuration for property system initialization
-- `PropertyConfig::builder()` - Builder pattern for configuration
-- `PropertyConfig::with_properties_dir()` - Create config with only properties directory
-- `PropertyConfig::with_socket_dir()` - Create config with only socket directory
-- `PropertyConfig::with_both_dirs()` - Create config with both directories
-- `init(config)` - Initialize the property system
+- `PropertyConfig` — public-fields struct describing the properties &
+  socket directories
+- `PropertyConfig::builder()` / `with_properties_dir()` /
+  `with_socket_dir()` / `with_both_dirs()` — construction helpers
+- `init(config)` — initialize globals; logs and swallows failures
+- `try_init(config)` — initialize globals, returning `Result`
+- `properties_dir()` — currently-configured properties directory
+- `socket_dir()` — currently-configured socket directory.
+  Priority: `PropertyConfig.socket_dir` (via `init`/`try_init`) >
+  `PROPERTY_SERVICE_SOCKET_DIR` env var > `/dev/socket`
 
 ### Property Operations
 
-- `get<T>(name)` - Get property value parsed to specified type (returns Err if not found)
-- `get_or<T>(name, default)` - Get property with default fallback (never fails)
-- `set<T>(name, value)` - Set property value (requires property service)
+- `get<T>(name)` — parse-typed read; `Err` on missing / parse failure
+- `get_or<T>(name, default)` — infallible read with fallback
+- `set<T>(name, value)` — `Display`-format and send to the property
+  service over the socket
+- `system_properties()` — `&'static SystemProperties` or **panic**
+- `try_system_properties()` — `&'static SystemProperties` or `Err`
 
-### System Properties
+### `SystemProperties` (read side)
 
-- `system_properties()` - Get global SystemProperties instance
-- `properties_dir()` - Get the configured properties directory
-- `SystemProperties::get_with_result(name)` - Get property with error handling
-- `SystemProperties::find(name)` - Find property index by name
-- `SystemProperties::wait_any()` - Wait for any property change
-- `SystemProperties::wait(index, timeout)` - Wait for specific property change
+- `read_with(name, |&str| -> R)` — zero-alloc callback reader
+- `get_with_result(name)` — `String`-allocating convenience wrapper
+- `find(name)` — resolve a name to a `PropertyIndex`
+- `serial(index)` / `context_serial()` — current generation counters
+- `wait_any()` — futex-wait for any property change
+- `wait(index, timeout)` — futex-wait for a specific property
 
-### Socket Configuration
+### Wire-protocol constants & validators (`rsproperties::wire`)
 
-- `socket_dir()` - Get the configured socket directory for property service
-- Socket directory priority: `set_socket_dir()` > `PROPERTY_SERVICE_SOCKET_DIR` env var > `/dev/socket`
+- `PROP_VALUE_MAX`, `PROP_NAME_MAX` — AOSP wire-format size caps
+- `PROP_MSG_SETPROP`, `PROP_MSG_SETPROP2` — command IDs
+- `PROP_SUCCESS`, `PROP_ERROR` — V2 response codes
+- `validate_property_name(name)` — name charset / leading-char check
+- `validate_value_len(name, value)` — value-length policy with the
+  long-`ro.*` exception
 
-### Advanced Features (with `builder` feature)
+### Errors
 
-- `SystemProperties::new_area(dir)` - Create new property area
-- `SystemProperties::add(name, value)` - Add new property
-- `SystemProperties::update(index, value)` - Update existing property
-- `SystemProperties::set(name, value)` - Set property (create or update)
-- `load_properties_from_file()` - Load properties from build.prop files
+- `Error` — non-exhaustive enum (`Io`, `Errno`, `NotFound`, `Encoding`,
+  `Parse`, `FileValidation`, `Conversion`, `PermissionDenied`,
+  `FileSize`, `FileOwnership`, `LockError`, `Context`)
+- `Result<T>` = `Result<T, Error>`
+- `ContextWithLocation::context_with_location(msg)` — attach
+  `panic::Location` to any `Result<_, impl Into<Error>>`
+
+### `SystemProperties` write side (`builder` feature)
+
+- `SystemProperties::new_area(dir)` — create/serialize an on-disk
+  property area
+- `SystemProperties::add(name, value)` — append a new entry
+- `SystemProperties::update(index, value)` — overwrite an existing
+  entry (seqlock-guarded)
+- `SystemProperties::set(name, value)` — add-or-update
+- `load_properties_from_file(path, filter, context, &mut HashMap)` —
+  parse build.prop entries
+- `build_trie(entries, default_context, default_type)` — serialize a
+  property-info trie
 
 ## Thread Safety
 
@@ -320,16 +388,24 @@ let sdk_version: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
 
 ## Constants
 
-The library exposes Android-compatible constants:
+The library exposes Android-compatible constants. `PROP_VALUE_MAX` is
+re-exported at the crate root for source-compatibility; the canonical
+home (along with the wire-protocol opcodes and validators) is the
+`wire` module:
 
 ```rust
-use rsproperties::{PROP_VALUE_MAX, PROP_DIRNAME};
+use rsproperties::{PROP_DIRNAME, PROP_VALUE_MAX};
+use rsproperties::wire::{
+    PROP_NAME_MAX, PROP_MSG_SETPROP2, validate_property_name, validate_value_len,
+};
 
-// Maximum property value length (92 bytes for most properties)
-assert_eq!(PROP_VALUE_MAX, 92);
-
-// Default Android properties directory
+assert_eq!(PROP_VALUE_MAX, 92);              // bytes, NUL not included
+assert_eq!(PROP_NAME_MAX, 32);               // V1 wire only; V2 is length-prefixed
 assert_eq!(PROP_DIRNAME, "/dev/__properties__");
+assert_eq!(PROP_MSG_SETPROP2, 0x00020001);
+
+validate_property_name("ro.build.version.sdk").unwrap();
+validate_value_len("ro.long.prop", &"x".repeat(200)).unwrap(); // ro.* may exceed PROP_VALUE_MAX
 ```
 
 ## Performance
