@@ -41,7 +41,7 @@ static SOCKET_DIR: OnceLock<PathBuf> = OnceLock::new();
 pub(crate) fn set_socket_dir<P: AsRef<Path>>(dir: P) -> bool {
     let dir_path = dir.as_ref().to_path_buf();
 
-    SOCKET_DIR.set(dir_path.clone()).is_ok()
+    SOCKET_DIR.set(dir_path).is_ok()
 }
 
 /// `true` once `set_socket_dir` has succeeded (or `socket_dir()` was called
