@@ -345,9 +345,10 @@ The library follows Android property naming conventions:
 ### Property Constraints
 - **Name length**: 32 bytes max in the V1 wire protocol (`PROP_NAME_MAX`).
   V2 is length-prefixed and does not impose a wire-layer cap.
-- **Value length**: 92 bytes max (`PROP_VALUE_MAX`, NUL not included).
-  `ro.*` properties may exceed this via the long-property out-of-line
-  storage path.
+- **Value length**: `PROP_VALUE_MAX = 92` is the **buffer size including
+  the trailing NUL**, so user content is capped at **91 bytes**
+  (matching bionic's `__system_property_set`). `ro.*` properties may
+  exceed this via the long-property out-of-line storage path.
 - **Character set**: ASCII alphanumeric plus `_`, `.`, `-`, `@`, `:`.
   Names must not begin with `.`, `-`, `@`, or `:`. See
   [`rsproperties::wire::validate_property_name`] for the canonical check.

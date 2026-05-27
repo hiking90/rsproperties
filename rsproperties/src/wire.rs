@@ -8,9 +8,13 @@
 //! and the server (`rsproperties-service`) must agree on these — duplicating
 //! them in each crate would let "client rejects, server accepts" drift sneak in.
 
-/// Hard cap on property-value byte length (NUL **not** included). Matches the
-/// historical bionic `PROP_VALUE_MAX = 92` constant. Long `ro.` properties
-/// bypass this via the long-property path in `property_info`.
+/// Size of the in-memory property-value buffer **including** the trailing
+/// NUL — matches the historical bionic `PROP_VALUE_MAX = 92` definition.
+/// User content is therefore capped at `PROP_VALUE_MAX - 1 = 91` bytes,
+/// enforced via `validate_value_len`'s `>= PROP_VALUE_MAX` check (bionic
+/// `__system_property_set` does the same `strlen(value) >= PROP_VALUE_MAX`).
+/// Long `ro.` properties bypass this via the long-property out-of-line
+/// path in `property_info`.
 pub const PROP_VALUE_MAX: usize = 92;
 
 /// Hard cap on property-name byte length in the **V1 wire protocol** only

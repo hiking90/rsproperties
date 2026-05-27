@@ -154,9 +154,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Each service returns a `ServiceContext` containing:
 
 ```rust
+use rsactor::{Actor, ActorRef, ActorResult};
+use tokio::task::JoinHandle;
+
 pub struct ServiceContext<T: Actor> {
-    pub actor_ref: ActorRef<T>,           // Reference for sending messages
-    pub join_handle: JoinHandle<ActorResult<T>>, // Handle for awaiting completion
+    pub actor_ref: ActorRef<T>,                  // send messages to the actor
+    pub join_handle: JoinHandle<ActorResult<T>>, // await actor termination
 }
 ```
 
@@ -262,8 +265,10 @@ and enforced after the bytes arrive:
 - **Names**: `validate_property_name` — ASCII alphanumeric plus
   `_ . - @ :`, no leading `. - @ :`; `PROP_NAME_MAX = 32` bytes on the
   V1 wire path.
-- **Values**: `validate_value_len` — `PROP_VALUE_MAX = 92` bytes,
-  with the long-`ro.*` exception that allows larger out-of-line storage.
+- **Values**: `validate_value_len` — `PROP_VALUE_MAX = 92` is the
+  buffer size including the trailing NUL, so user content is capped
+  at 91 bytes for non-`ro.*` properties. `ro.*` properties may exceed
+  this via the long-property out-of-line storage path.
 
 ### Other security features
 
@@ -319,9 +324,9 @@ cargo test
 # Run with logging
 RUST_LOG=debug cargo test -- --nocapture
 
-# Run specific test category
-cargo test integration_tests
-cargo test performance_tests
+# Run a single integration-test binary (file under `tests/`)
+cargo test --test integration_tests
+cargo test --test performance_tests
 ```
 
 ## Dependencies
@@ -334,7 +339,7 @@ cargo test performance_tests
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](../LICENSE) for details.
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
 
 ## Contributing
 

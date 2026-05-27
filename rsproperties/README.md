@@ -300,7 +300,8 @@ rsproperties::init(PropertyConfig::with_properties_dir("/my/props"));
 
 - `read_with(name, |&str| -> R)` — zero-alloc callback reader
 - `get_with_result(name)` — `String`-allocating convenience wrapper
-- `find(name)` — resolve a name to a `PropertyIndex`
+- `find(name)` — `Result<Option<PropertyIndex>>`; `Ok(None)` for a
+  missing property, `Err` only for I/O / mmap problems
 - `serial(index)` / `context_serial()` — current generation counters
 - `wait_any()` — futex-wait for any property change
 - `wait(index, timeout)` — futex-wait for a specific property
@@ -313,6 +314,13 @@ rsproperties::init(PropertyConfig::with_properties_dir("/my/props"));
 - `validate_property_name(name)` — name charset / leading-char check
 - `validate_value_len(name, value)` — value-length policy with the
   long-`ro.*` exception
+
+Two socket-name constants are re-exported at the crate root for
+clients that want to point at a custom socket directory:
+
+- `PROPERTY_SERVICE_SOCKET_NAME` — `"property_service"`
+- `PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME` —
+  `"property_service_for_system"`
 
 ### Errors
 
@@ -333,6 +341,10 @@ rsproperties::init(PropertyConfig::with_properties_dir("/my/props"));
 - `SystemProperties::set(name, value)` — add-or-update
 - `load_properties_from_file(path, filter, context, &mut HashMap)` —
   parse build.prop entries
+- `PropertyInfoEntry::parse_from_file(path, require_prefix_or_exact)` —
+  parse a `property_contexts`-format file into
+  `(Vec<PropertyInfoEntry>, Vec<Error>)` (the entries that survived
+  and the per-line errors)
 - `build_trie(entries, default_context, default_type)` — serialize a
   property-info trie
 
@@ -399,7 +411,7 @@ use rsproperties::wire::{
     PROP_NAME_MAX, PROP_MSG_SETPROP2, validate_property_name, validate_value_len,
 };
 
-assert_eq!(PROP_VALUE_MAX, 92);              // bytes, NUL not included
+assert_eq!(PROP_VALUE_MAX, 92);              // buffer size including NUL; content cap = 91 bytes
 assert_eq!(PROP_NAME_MAX, 32);               // V1 wire only; V2 is length-prefixed
 assert_eq!(PROP_DIRNAME, "/dev/__properties__");
 assert_eq!(PROP_MSG_SETPROP2, 0x00020001);

@@ -282,19 +282,19 @@ impl SystemProperties {
     /// If the property is read-only, it returns an error.
     /// If the property is updated successfully, it returns Ok(()).
     #[cfg(feature = "builder")]
-    pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
-        match self.find(key)? {
+    pub fn set(&mut self, name: &str, value: &str) -> Result<()> {
+        match self.find(name)? {
             Some(prop_ref) => match self.update(&prop_ref, value) {
                 Ok(_) => {}
                 Err(e) => {
-                    log::error!("Failed to update property {key}: {e}");
+                    log::error!("Failed to update property {name}: {e}");
                     return Err(e);
                 }
             },
-            None => match self.add(key, value) {
+            None => match self.add(name, value) {
                 Ok(_) => {}
                 Err(e) => {
-                    log::error!("Failed to create property {key}: {e}");
+                    log::error!("Failed to create property {name}: {e}");
                     return Err(e);
                 }
             },
