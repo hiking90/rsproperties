@@ -34,9 +34,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rsproperties = "0.2"
+rsproperties = "0.4"
 # For Linux property service daemon
-rsproperties-service = "0.2"
+rsproperties-service = "0.4"
 
 # Optional features
 [features]
