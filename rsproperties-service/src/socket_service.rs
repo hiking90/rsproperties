@@ -11,6 +11,8 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
+use tokio_stream::wrappers::UnixListenerStream;
+use tokio_stream::StreamExt;
 
 use rsactor::{Actor, ActorRef, ActorWeak};
 
@@ -51,7 +53,7 @@ const SOCKET_FILE_MODE: u32 = 0o660;
 
 /// Backoff applied when `accept()` returns an error. Without it, a
 /// permanent failure (EMFILE, ENFILE, listener torn down) would re-enter
-/// `on_run` immediately and spin the worker producing a high-rate log
+/// `on_idle` immediately and spin the worker producing a high-rate log
 /// flood. 100ms is short enough to recover quickly when the condition
 /// clears, long enough to dampen the loop.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
@@ -77,7 +79,12 @@ pub struct SocketServiceArgs {
 /// The actor can be stopped by calling `actor_ref.stop()` when the service is no longer needed.
 ///
 pub fn run(args: SocketServiceArgs) -> crate::ServiceContext<SocketService> {
-    let (actor_ref, join_handle) = rsactor::spawn(args);
+    // `with_idle()` is required in 0.16: the idle-event channel is opt-in, and
+    // this actor drives its accept loop through `subscribe_idle` / `on_idle`.
+    // Without it `subscribe_idle` would return `IdleChannelNotEnabled` and the
+    // listeners would never be polled.
+    let (actor_ref, join_handle) =
+        rsactor::spawn_with_options(args, rsactor::SpawnOptions::new().with_idle());
     crate::ServiceContext {
         actor_ref,
         join_handle,
@@ -87,8 +94,6 @@ pub fn run(args: SocketServiceArgs) -> crate::ServiceContext<SocketService> {
 /// Tokio-based property socket service
 pub struct SocketService {
     socket_dir: PathBuf,
-    property_listener: UnixListener,
-    system_listener: UnixListener,
     properties_service: ActorRef<crate::PropertiesService>,
     /// Limits concurrently in-flight client tasks.
     connection_sem: Arc<Semaphore>,
@@ -97,10 +102,15 @@ pub struct SocketService {
 impl Actor for SocketService {
     type Args = SocketServiceArgs;
     type Error = rsproperties::errors::Error;
+    /// Each idle event is one accepted connection (or an `accept()` error)
+    /// tagged with the listener it came from, so logging can name the source.
+    /// In 0.16 the accept loop is modelled as `Stream`s of connections
+    /// subscribed via `subscribe_idle`, replacing the removed `on_run`.
+    type IdleEvent = (std::io::Result<UnixStream>, &'static str);
 
     async fn on_start(
         args: Self::Args,
-        _actor_ref: &ActorRef<Self>,
+        actor_ref: &ActorRef<Self>,
     ) -> std::result::Result<Self, Self::Error> {
         // Create parent directory if it doesn't exist. `try_exists`
         // distinguishes "doesn't exist" (Ok(false)) from "couldn't ask"
@@ -152,54 +162,59 @@ impl Actor for SocketService {
         chmod_socket(&system_socket_path).await?;
         info!("AsyncPropertySocketService started successfully");
 
+        // Model each listener as a `Stream` of accepted connections and hand
+        // it to the actor's idle loop. The runtime owns the stream state, so
+        // — unlike the old `on_run` — accept progress is never lost to
+        // `select!` cancellation. Subscribing from `on_start` is safe:
+        // `subscribe_idle` is synchronous (`try_send`) and the runtime drains
+        // queued subscriptions before the first loop iteration.
+        actor_ref
+            .subscribe_idle(UnixListenerStream::new(property_listener).map(|r| (r, "property")))
+            .map_err(|e| std::io::Error::other(format!("subscribe property listener: {e}")))?;
+        actor_ref
+            .subscribe_idle(UnixListenerStream::new(system_listener).map(|r| (r, "system")))
+            .map_err(|e| std::io::Error::other(format!("subscribe system listener: {e}")))?;
+
         Ok(Self {
             socket_dir: args.socket_dir,
-            property_listener,
-            system_listener,
             properties_service: args.properties_service,
             connection_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS)),
         })
     }
 
-    async fn on_run(
+    async fn on_idle(
         &mut self,
+        event: Self::IdleEvent,
         _actor_weak: &ActorWeak<Self>,
-    ) -> std::result::Result<bool, Self::Error> {
-        // Acquire the connection permit *before* accepting. Pre-acquire
-        // means once all 64 in-flight handlers are busy the accept loop
-        // simply parks here — new connect() attempts then queue in the
-        // kernel's listen backlog (and clients block in their own
-        // connect call) instead of completing the accept, sitting idle
-        // for up to CLIENT_TIMEOUT, and then failing. That's better
-        // observable behaviour and avoids fooling clients into thinking
-        // their request was accepted.
+    ) -> std::result::Result<(), Self::Error> {
+        let (accepted, source) = event;
+
+        let stream = match accepted {
+            Ok(stream) => stream,
+            Err(e) => {
+                // Permanent conditions (EMFILE, ENFILE, broken listener)
+                // would otherwise let the idle loop spin at full speed and
+                // saturate the log with the same error every microsecond. A
+                // small sleep both dampens the loop and gives the kernel time
+                // to recover the resource. `UnixListenerStream` keeps yielding
+                // after an error, so the listener is not lost.
+                error!("Error accepting connection on {source} listener: {e}");
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                return Ok(());
+            }
+        };
+
+        // Bound the number of concurrently in-flight client handlers. The old
+        // on_run acquired the permit *before* accepting; here the stream has
+        // already accepted one connection, so we acquire after. The idle loop
+        // is not polled again until this returns, so when all 64 permits are
+        // taken at most one extra connection is held here while the rest queue
+        // in the kernel's listen backlog — the same backpressure, off by one.
         let permit = match self.connection_sem.clone().acquire_owned().await {
             Ok(p) => p,
             Err(_) => {
                 error!("Connection semaphore closed");
-                return Ok(true);
-            }
-        };
-
-        // Race accept() on both listeners. Whichever fires first wins; the
-        // cancelled accept restarts on the next on_run cycle (accept is
-        // cancel-safe).
-        let (stream, source) = tokio::select! {
-            r = self.property_listener.accept() => (r, "property"),
-            r = self.system_listener.accept() => (r, "system"),
-        };
-
-        let (stream, _addr) = match stream {
-            Ok(ok) => ok,
-            Err(e) => {
-                // Permanent conditions (EMFILE, ENFILE, broken listener)
-                // would otherwise let `on_run` spin at full speed and
-                // saturate the log with the same error every microsecond.
-                // A small sleep both dampens the loop and gives the kernel
-                // time to recover the resource.
-                error!("Error accepting connection on {source} listener: {e}");
-                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
-                return Ok(true);
+                return Ok(());
             }
         };
 
@@ -219,7 +234,7 @@ impl Actor for SocketService {
                 }
             }
         });
-        Ok(true)
+        Ok(())
     }
 
     async fn on_stop(

@@ -20,6 +20,7 @@ rsproperties = { path = "../rsproperties", features = ["builder"] }
 log.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 rsactor.workspace = true
 
 [dev-dependencies]

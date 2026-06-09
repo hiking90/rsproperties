@@ -485,9 +485,9 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rsactor"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1203dcdc2982b5ebea387de942a4905838975b40954bf69336c04f99ab7f436"
+checksum = "3a8fe40ccb56316045667a08fa7fb562e4b5601fb332613dcf370cd6c40487f8"
 dependencies = [
  "futures",
  "rsactor-derive",
@@ -497,9 +497,9 @@ dependencies = [
 
 [[package]]
 name = "rsactor-derive"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a36233d402aa75c2b7a3d379c961a950f54a5eff6daa0c6d656f427400dbb5f8"
+checksum = "a97e063567221ff983eb14a55b214bc33976ca8148a4d3017186d54426bf25e6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -535,6 +535,7 @@ dependencies = [
  "rsproperties",
  "thiserror",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -658,6 +659,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-stream"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]

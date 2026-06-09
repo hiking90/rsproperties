@@ -90,6 +90,10 @@ fn init_system_properties_sync(
 impl Actor for PropertiesService {
     type Args = PropertiesServiceArgs;
     type Error = std::io::Error;
+    // This actor does no periodic / event-driven idle work, so the idle event
+    // type is unit and `on_idle` is left at its default no-op. (0.16 requires
+    // the associated type even when unused; manual impls must spell it out.)
+    type IdleEvent = ();
 
     async fn on_start(
         args: Self::Args,
