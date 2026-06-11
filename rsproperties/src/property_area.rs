@@ -114,6 +114,20 @@ impl PropertyAreaMap {
     ) -> Result<Self> {
         debug!("Creating new read-write property area map: {filename:?}");
 
+        // A leftover area file from a previous writer instance would make
+        // the O_EXCL create below fail — and the 0444 mode means it could
+        // not be reopened read-write either. AOSP avoids this via the fresh
+        // tmpfs mounted at /dev on every boot; that assumption doesn't hold
+        // for an arbitrary properties dir, so treat `new_rw` as "build a
+        // fresh area" and remove any stale file first. O_EXCL still guards
+        // the create itself (no symlink / pre-created-file substitution
+        // between the unlink and the open).
+        match std::fs::remove_file(filename) {
+            Ok(()) => debug!("Removed stale property area file: {filename:?}"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("Failed to remove stale property area file {filename:?}: {e}"),
+        }
+
         let file = OpenOptions::new()
             .read(true) // O_RDWR
             .write(true) // O_RDWR
@@ -123,9 +137,13 @@ impl PropertyAreaMap {
             .open(filename)?;
 
         if let Some(context) = context {
+            // Full xattr name required — the bare "selinux" (no namespace
+            // prefix) is rejected by the kernel with EOPNOTSUPP, which made
+            // this call fail unconditionally. bionic uses XATTR_NAME_SELINUX,
+            // which is "security.selinux".
             if fs::fsetxattr(
                 &file,
-                "selinux",
+                "security.selinux",
                 context.to_bytes_with_nul(),
                 fs::XattrFlags::empty(),
             )

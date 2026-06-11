@@ -658,7 +658,7 @@ mod tests {
             let system_properties = system_properties();
             let index = system_properties.find(test_prop).unwrap();
             // let serial = system_properties.serial(index.as_ref().unwrap());
-            system_properties.wait(index.as_ref(), None);
+            system_properties.wait(index.as_ref(), None, None);
         });
 
         let handle_any = wait_any();

@@ -148,6 +148,13 @@ async fn test_large_property_values() -> Result<()> {
     // Test with various sizes approaching PROP_VALUE_MAX
     let sizes = vec![10, 50, 80, rsproperties::PROP_VALUE_MAX - 5];
 
+    // Warm-up: the first set() pays one-time costs (socket connect, the
+    // service's lazy property-area open) that are unrelated to the
+    // size-scaling property asserted below. Without it the first timed
+    // iteration occasionally exceeds the 10ms bound under full-workspace
+    // test load.
+    rsproperties::set("perf.large.prop.warmup", "warmup")?;
+
     for size in sizes {
         let prop_name = format!("perf.large.prop.{size}");
         let large_value = "x".repeat(size);

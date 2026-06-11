@@ -6,6 +6,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: minor bumps may include API changes).
 
+## [0.5.0] - 2026-06-12
+
+Android-parity release: futex wait correctness, SELinux labeling, service
+restart support, and V1 wire-protocol support in the service.
+
+### Changed
+
+- **Breaking:** `SystemProperties::wait` now takes an `old_serial:
+  Option<u32>` parameter — `wait(index, old_serial, timeout)` — mirroring
+  bionic `__system_property_wait(pi, old_serial, …)`. Passing the serial
+  observed at read time closes the lost-wakeup window between reading a
+  value and entering the wait; `None` keeps the previous sample-at-entry
+  behavior.
+- `SystemProperties::new_area` now treats the target directory as
+  "build a fresh area": stale area files left by a previous writer
+  instance are removed before the exclusive create, so a service restart
+  over an existing directory succeeds (AOSP's fresh-/dev-tmpfs assumption
+  doesn't hold for arbitrary dirs). A `.writer_lock` file (non-blocking
+  exclusive `flock`, held for the writer's lifetime) makes a concurrent
+  second writer fail fast instead of silently destroying the first
+  writer's files.
+
+### Added
+
+- V1 (`PROP_MSG_SETPROP`) wire-protocol support in
+  `rsproperties-service`: fixed 128-byte frames are decoded with AOSP
+  parity (last byte of name/value forced to NUL) and answered V1-style —
+  connection close as the implicit ack, no status word.
+- Doc on `SystemProperties::add` stating the bionic-parity contract:
+  adding an existing name is a silent no-op that does not update the
+  value.
+
+### Fixed
+
+- `futex_wait` treated every syscall error as fatal. `EAGAIN` (the serial
+  changed between the caller's load and the wait — the common race) now
+  re-reads and returns the new serial like bionic; `EINTR` retries with
+  the remaining timeout; `ETIMEDOUT` returns `None` without logging an
+  error.
+- SELinux labeling never worked: the xattr name was the bare `"selinux"`
+  (kernel rejects it; the correct name is `"security.selinux"`,
+  bionic's `XATTR_NAME_SELINUX`), and per-context area files were created
+  with no context at all. `ContextNode` now carries its context and labels
+  the file on create, matching bionic `context_node::open`.
+- `ServiceWriter::send` issued a single `write_vectored` with no
+  short-write handling; a partial write would desynchronise the
+  length-prefixed protocol. It now loops until all bytes are written,
+  retrying on `EINTR`.
+
 ## [0.4.0] - 2026-05-27
 
 Hardening release: protocol correctness, panic-safety, allocation-free

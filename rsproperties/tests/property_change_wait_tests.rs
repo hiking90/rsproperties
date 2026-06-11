@@ -77,7 +77,7 @@ fn test_wait_for_property_change() {
 
                         // Wait for property change (no timeout)
                         println!("Waiter thread: Now waiting for property change...");
-                        match system_properties.wait(Some(&index), None) {
+                        match system_properties.wait(Some(&index), None, None) {
                             Some(_serial) => {
                                 // Wait completed successfully
                                 let new_value =
