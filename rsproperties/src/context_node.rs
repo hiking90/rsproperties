@@ -1,6 +1,7 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use std::ffi::CString;
 use std::path::PathBuf;
 #[cfg(feature = "builder")]
 use std::sync::RwLockWriteGuard;
@@ -13,6 +14,13 @@ use crate::property_area::PropertyAreaMap;
 
 pub(crate) struct ContextNode {
     access_rw: bool,
+    /// SELinux context this area belongs to (e.g.
+    /// `u:object_r:system_prop:s0`). Applied as the `security.selinux`
+    /// xattr when the area file is created read-write, mirroring bionic's
+    /// `context_node::open` which labels each per-context file. `Some`
+    /// only for writable nodes — read-only instances never label files,
+    /// so they skip the allocation.
+    context: Option<CString>,
     filename: PathBuf,
     /// Lazy-initialized property area. Once a writer puts `Some`, no code
     /// path ever resets it to `None` — this is the invariant that lets the
@@ -23,9 +31,10 @@ pub(crate) struct ContextNode {
 }
 
 impl ContextNode {
-    pub(crate) fn new(access_rw: bool, filename: PathBuf) -> Self {
+    pub(crate) fn new(access_rw: bool, context: Option<CString>, filename: PathBuf) -> Self {
         Self {
             access_rw,
+            context,
             filename,
             property_area: RwLock::new(None),
         }
@@ -50,7 +59,7 @@ impl ContextNode {
 
         *prop_area = Some(PropertyAreaMap::new_rw(
             self.filename.as_path(),
-            None,
+            self.context.as_deref(),
             fsetxattr_failed,
         )?);
 

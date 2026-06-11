@@ -34,9 +34,14 @@ fn futex_wake(_addr: &AtomicU32) -> Result<usize> {
     Ok(0)
 }
 
+/// Waits until `_serial` differs from `_value`, returning the new serial.
+///
+/// Returns `None` on timeout (or on macOS, where no futex is available and
+/// this is an immediate no-op — see `SystemProperties::wait`).
 fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> Option<u32> {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     {
+        use rustix::io::Errno;
         // Linux futex_wait takes a *relative* timeout. Spurious wakes restart
         // the syscall, so we track a deadline and shrink the remaining timeout
         // each iteration to keep the total wait bounded by the caller-supplied
@@ -79,6 +84,25 @@ fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> 
                     }
                     // Spurious wake — loop with the recomputed remaining timeout.
                 }
+                // EAGAIN: the serial no longer equals `_value` at syscall
+                // time — i.e. the property changed between the caller's load
+                // and the wait. This is the *common* race, not a failure;
+                // bionic's wait loop falls through to the serial re-check
+                // and reports success. Treating it as an error here would
+                // silently swallow a real property change.
+                Err(Errno::AGAIN) => {
+                    let new_serial = _serial.load(Ordering::Acquire);
+                    if _value != new_serial {
+                        return Some(new_serial);
+                    }
+                    // Serial changed and wrapped back to `_value` between the
+                    // syscall and the reload — vanishingly unlikely; retry.
+                }
+                // Interrupted by a signal — retry with the recomputed
+                // remaining timeout so the total wait stays bounded.
+                Err(Errno::INTR) => {}
+                // Timeout is a normal outcome, not an error worth logging.
+                Err(Errno::TIMEDOUT) => return None,
                 Err(e) => {
                     log::error!("Failed to wait for property change: {e}");
                     return None;
@@ -400,6 +424,12 @@ impl SystemProperties {
         Ok(true)
     }
 
+    /// Adds a new property.
+    ///
+    /// If a property with `name` already exists this is a silent no-op that
+    /// returns `Ok(())` **without** updating the value — the same contract
+    /// as bionic `prop_area::add`. Use [`Self::set`] (or `find` +
+    /// [`Self::update`]) for create-or-update semantics.
     #[cfg(feature = "builder")]
     pub fn add(&mut self, name: &str, value: &str) -> Result<()> {
         // Shared policy across client/server: only `ro.` names may exceed
@@ -475,18 +505,43 @@ impl SystemProperties {
         Some(pi.serial.load(Ordering::Acquire))
     }
 
+    /// Waits for any property to change. Equivalent to
+    /// `wait(None, None, None)`; see [`Self::wait`] for the race caveat of
+    /// not passing an `old_serial`.
     pub fn wait_any(&self) -> Option<u32> {
-        self.wait(None, None)
+        self.wait(None, None, None)
     }
 
-    pub fn wait(&self, index: Option<&PropertyIndex>, timeout: Option<&Timespec>) -> Option<u32> {
+    /// Waits until the property at `index` (or, with `index == None`, the
+    /// global serial — i.e. any property) changes, returning the new serial.
+    /// Returns `None` on timeout or lookup failure.
+    ///
+    /// `old_serial` should be the serial observed when the caller last read
+    /// the value (via [`Self::serial`] / [`Self::context_serial`]). Passing
+    /// `Some` closes the lost-wakeup window between reading a value and
+    /// entering the wait: if the property already changed since
+    /// `old_serial`, this returns immediately with the new serial — the
+    /// same contract as bionic `__system_property_wait(pi, old_serial, …)`.
+    /// With `None`, the current serial is sampled at entry, so a change
+    /// that lands before this call is only observed at the *next* change.
+    ///
+    /// On macOS there is no futex; this returns `None` immediately, so do
+    /// not call it in a polling loop there.
+    pub fn wait(
+        &self,
+        index: Option<&PropertyIndex>,
+        old_serial: Option<u32>,
+        timeout: Option<&Timespec>,
+    ) -> Option<u32> {
         match index {
             Some(idx) => match self.contexts.prop_area_with_index(idx.context_index).ok() {
                 Some(guard) => {
                     let pa = guard.property_area();
                     match pa.property_info(idx.property_index).ok() {
                         Some(pi) => {
-                            futex_wait(&pi.serial, pi.serial.load(Ordering::Acquire), timeout)
+                            let old =
+                                old_serial.unwrap_or_else(|| pi.serial.load(Ordering::Acquire));
+                            futex_wait(&pi.serial, old, timeout)
                         }
                         None => {
                             log::error!(
@@ -507,7 +562,8 @@ impl SystemProperties {
             },
             None => {
                 let serial_pa = self.contexts.serial_prop_area().serial();
-                futex_wait(serial_pa, serial_pa.load(Ordering::Acquire), timeout)
+                let old = old_serial.unwrap_or_else(|| serial_pa.load(Ordering::Acquire));
+                futex_wait(serial_pa, old, timeout)
             }
         }
     }

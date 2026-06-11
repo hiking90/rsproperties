@@ -114,7 +114,11 @@ impl ServiceConnection {
 }
 
 struct ServiceWriter<'a> {
-    buffers: Vec<IoSlice<'a>>,
+    // Raw byte slices rather than `IoSlice`s: the short-write loop in
+    // `send` needs to re-slice past already-written bytes, and `IoSlice`
+    // doesn't expose its inner slice on stable (`advance_slices` is
+    // 1.81+, above this crate's MSRV).
+    buffers: Vec<&'a [u8]>,
 }
 
 impl<'a> ServiceWriter<'a> {
@@ -126,24 +130,52 @@ impl<'a> ServiceWriter<'a> {
 
     fn write_str(self, value: &'a str, len: &'a u32) -> Self {
         let mut thiz = self.write_u32(len);
-        thiz.buffers.push(IoSlice::new(value.as_bytes()));
+        thiz.buffers.push(value.as_bytes());
         thiz
     }
 
     fn write_u32(mut self, value: &'a u32) -> Self {
-        self.buffers.push(IoSlice::new(value.as_bytes()));
+        self.buffers.push(value.as_bytes());
         self
     }
 
     fn write_bytes(mut self, value: &'a [u8]) -> Self {
-        self.buffers.push(IoSlice::new(value));
+        self.buffers.push(value);
         self
     }
 
     fn send(self, conn: &mut ServiceConnection) -> Result<()> {
-        conn.stream
-            .write_vectored(&self.buffers)
-            .map_err(Error::Io)?;
+        // A single `write_vectored` may write fewer bytes than requested
+        // (signal after a partial transfer, full socket buffer). Loop until
+        // every byte is on the wire — a short write would otherwise
+        // desynchronise the length-prefixed protocol and leave the server
+        // waiting for bytes that never arrive.
+        let total: usize = self.buffers.iter().map(|b| b.len()).sum();
+        let mut written = 0usize;
+        while written < total {
+            // Rebuild the IoSlice list, skipping what already went out.
+            let mut skip = written;
+            let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(self.buffers.len());
+            for buf in &self.buffers {
+                if skip >= buf.len() {
+                    skip -= buf.len();
+                    continue;
+                }
+                slices.push(IoSlice::new(&buf[skip..]));
+                skip = 0;
+            }
+            match conn.stream.write_vectored(&slices) {
+                Ok(0) => {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "property service socket closed mid-write",
+                    )))
+                }
+                Ok(n) => written += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
         conn.stream.flush()?;
         Ok(())
     }

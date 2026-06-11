@@ -25,8 +25,16 @@ fn try_build_context_node(
     i: usize,
 ) -> Result<ContextNode> {
     let context_offset = area.context_offset(i)?;
-    let context_name = area.cstr(context_offset).to_str()?;
-    Ok(ContextNode::new(writable, dirname.join(context_name)))
+    let context_cstr = area.cstr(context_offset);
+    let context_name = context_cstr.to_str()?;
+    // The owned context is only consumed by `open()` (writable path) for
+    // SELinux labeling; read-only nodes skip the allocation.
+    let context = writable.then(|| context_cstr.to_owned());
+    Ok(ContextNode::new(
+        writable,
+        context,
+        dirname.join(context_name),
+    ))
 }
 
 // Pre-defined CStr constants to avoid unsafe code at runtime
@@ -40,6 +48,13 @@ pub(crate) struct ContextsSerialized {
     /// property-info parser line up with the vector's indices.
     context_nodes: Vec<Option<ContextNode>>,
     serial_property_area_map: PropertyAreaMap,
+    /// Exclusive `flock` held for the lifetime of a writable instance
+    /// (`None` when read-only). `PropertyAreaMap::new_rw` unlinks and
+    /// recreates stale area files, so without this lock a second writer
+    /// would silently destroy the files the first one still owns; with it,
+    /// the loser fails fast before touching anything. The kernel drops the
+    /// lock when the `File` closes — including on crash.
+    _writer_lock: Option<std::fs::File>,
 }
 
 impl ContextsSerialized {
@@ -73,7 +88,7 @@ impl ContextsSerialized {
             }
         }
 
-        let serial_property_area_map = if writable {
+        let (writer_lock, serial_property_area_map) = if writable {
             if !dirname.is_dir() {
                 info!("Creating directory: {dirname:?}");
                 fs::mkdir(
@@ -83,22 +98,55 @@ impl ContextsSerialized {
                 .map_err(Error::from)?;
             }
 
+            // Must precede the `open()` calls below: they unlink and
+            // recreate area files, so a losing second writer has to bail
+            // out *before* touching anything the winner owns.
+            let lock = Self::acquire_writer_lock(dirname.as_path())?;
+
             *fsetxattr_failed = false;
 
             for node in context_nodes.iter_mut().flatten() {
                 node.open(fsetxattr_failed)?;
             }
 
-            Self::map_serial_property_area(serial_filename.as_path(), true, fsetxattr_failed)?
+            (
+                Some(lock),
+                Self::map_serial_property_area(serial_filename.as_path(), true, fsetxattr_failed)?,
+            )
         } else {
-            Self::map_serial_property_area(serial_filename.as_path(), false, fsetxattr_failed)?
+            (
+                None,
+                Self::map_serial_property_area(serial_filename.as_path(), false, fsetxattr_failed)?,
+            )
         };
 
         Ok(Self {
             property_info_area_file,
             context_nodes,
             serial_property_area_map,
+            _writer_lock: writer_lock,
         })
+    }
+
+    /// Opens (creating if needed) `<dirname>/.writer_lock` and takes a
+    /// non-blocking exclusive `flock`. The lock lives exactly as long as
+    /// the returned `File`, so holding it in the struct scopes single-writer
+    /// ownership of the directory to the instance's lifetime.
+    fn acquire_writer_lock(dirname: &Path) -> Result<std::fs::File> {
+        let lock_path = dirname.join(".writer_lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .context_with_location(format!("Failed to open writer lock {lock_path:?}"))?;
+        fs::flock(&lock_file, fs::FlockOperation::NonBlockingLockExclusive).map_err(|e| {
+            error!("Another writer holds the property area lock {lock_path:?}: {e}");
+            Error::LockError(format!(
+                "Writable property area already owned by another instance ({lock_path:?}): {e}"
+            ))
+        })?;
+        Ok(lock_file)
     }
 
     fn map_serial_property_area(

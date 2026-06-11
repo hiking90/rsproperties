@@ -17,7 +17,9 @@ use tokio_stream::StreamExt;
 use rsactor::{Actor, ActorRef, ActorWeak};
 
 use rsproperties::errors::*;
-use rsproperties::wire::{PROP_ERROR, PROP_MSG_SETPROP2, PROP_SUCCESS};
+use rsproperties::wire::{
+    PROP_ERROR, PROP_MSG_SETPROP, PROP_MSG_SETPROP2, PROP_NAME_MAX, PROP_SUCCESS, PROP_VALUE_MAX,
+};
 
 /// Upper bound on simultaneously serviced client connections. Each accepted
 /// connection takes one permit from the semaphore; further connections wait
@@ -288,6 +290,10 @@ impl SocketService {
         debug!("Received command: 0x{cmd:08X}");
 
         match cmd {
+            PROP_MSG_SETPROP => {
+                trace!("Processing SETPROP (V1) command");
+                Self::handle_setprop_v1(&mut stream, service).await?;
+            }
             PROP_MSG_SETPROP2 => {
                 trace!("Processing SETPROP2 command");
                 Self::handle_setprop2(&mut stream, service).await?;
@@ -300,6 +306,54 @@ impl SocketService {
 
         trace!("Client connection handled successfully");
         Ok(())
+    }
+
+    /// Handles the legacy V1 SETPROP command: after the already-consumed
+    /// command word, a fixed-size payload of `PROP_NAME_MAX` name bytes and
+    /// `PROP_VALUE_MAX` value bytes, both NUL-padded.
+    ///
+    /// V1 clients (bionic included) never read a status reply — closing the
+    /// connection is the implicit ack — so failures are logged and the
+    /// connection is closed without a response. Validation still happens in
+    /// `PropertiesService::handle`, identical to the V2 path.
+    async fn handle_setprop_v1(
+        stream: &mut UnixStream,
+        service: ActorRef<crate::PropertiesService>,
+    ) -> Result<()> {
+        trace!("Handling SETPROP (V1) request");
+
+        let mut name_buf = [0u8; PROP_NAME_MAX];
+        stream.read_exact(&mut name_buf).await?;
+        let mut value_buf = [0u8; PROP_VALUE_MAX];
+        stream.read_exact(&mut value_buf).await?;
+        // AOSP V1 parity: init forces the last byte of both fields to NUL
+        // before use (`prop_name[PROP_NAME_MAX-1] = 0`), capping names at
+        // 31 chars and values at 91 bytes. Without this a non-bionic client
+        // could submit a 32-char name that AOSP would have truncated.
+        name_buf[PROP_NAME_MAX - 1] = 0;
+        value_buf[PROP_VALUE_MAX - 1] = 0;
+
+        let name = Self::string_from_fixed(&name_buf)?;
+        let value = Self::string_from_fixed(&value_buf)?;
+        info!("Forwarding V1 property: '{name}' ({} bytes)", value.len());
+
+        let property_msg = crate::PropertyMessage { name, value };
+        match service.ask(property_msg).await {
+            Ok(true) => {}
+            // The property name was already logged by the `info!` above;
+            // mirroring the V2 handler, the result logs omit it.
+            Ok(false) => warn!("V1 property was rejected by service"),
+            Err(e) => error!("Failed to forward V1 property: {e}"),
+        }
+
+        Ok(())
+    }
+
+    /// Decodes a fixed-size NUL-padded V1 wire field into a `String`.
+    fn string_from_fixed(buf: &[u8]) -> Result<String> {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8(buf[..end].to_vec())
+            .map_err(|e| rsproperties::errors::Error::Encoding(e.to_string()))
     }
 
     /// Handles SETPROP2 command
