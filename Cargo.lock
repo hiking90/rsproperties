@@ -485,9 +485,9 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rsactor"
-version = "0.16.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a8fe40ccb56316045667a08fa7fb562e4b5601fb332613dcf370cd6c40487f8"
+checksum = "1e409868dbe4fcb07613291c6894399a38fb55fdf07bf42feecd612fb471461a"
 dependencies = [
  "futures",
  "rsactor-derive",
@@ -497,9 +497,9 @@ dependencies = [
 
 [[package]]
 name = "rsactor-derive"
-version = "0.16.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a97e063567221ff983eb14a55b214bc33976ca8148a4d3017186d54426bf25e6"
+checksum = "e01bc4ce87993a9874d413bd300b73e57282a89d658f799cae248a6ec47cc841"
 dependencies = [
  "proc-macro2",
  "quote",

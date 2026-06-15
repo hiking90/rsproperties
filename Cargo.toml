@@ -28,7 +28,7 @@ anyhow = "1.0"
 pretty-hex = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal", "fs"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-rsactor = "0.16"
+rsactor = "0.17"
 
 # Dev dependencies
 android_system_properties = "0.1"
