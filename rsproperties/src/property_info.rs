@@ -227,9 +227,6 @@ impl PropertyInfoWriter<'_> {
                 "in-place update of long property is not supported (serial={current:#x})"
             )));
         }
-        let len_u32 = u32::try_from(value.len()).map_err(|_| {
-            Error::InvalidArgument(format!("Value length exceeds u32: {}", value.len()))
-        })?;
         if value.len() >= PROP_VALUE_MAX {
             return Err(Error::InvalidArgument(format!(
                 "Value too long: {} (max: {})",
@@ -237,6 +234,9 @@ impl PropertyInfoWriter<'_> {
                 PROP_VALUE_MAX
             )));
         }
+        // Infallible after the check above: len < PROP_VALUE_MAX (92), far
+        // inside both u32 range and the 8-bit serial length field.
+        let len_u32 = value.len() as u32;
 
         // bionic seqlock convention: even serial = clean, odd = dirty. We
         // first publish `current | 1` (dirty), then `(dirty + 1)` carries

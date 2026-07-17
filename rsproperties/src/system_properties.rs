@@ -33,11 +33,28 @@ fn futex_wake(_addr: &AtomicU32) -> Result<usize> {
     Ok(0)
 }
 
-/// Waits until `_serial` differs from `_value`, returning the new serial.
+/// Outcome of one [`futex_wait`] call. A three-way result rather than
+/// `Option`: the sliced wait loop in [`SystemProperties::wait`] must retry
+/// on an ordinary timeout but bail out on a syscall-level failure —
+/// collapsing both into `None` would turn a persistent futex error into a
+/// busy loop.
+#[derive(Clone, Copy, Debug)]
+// On macOS only `Failed` is ever constructed (no futex support).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+enum FutexWaitOutcome {
+    /// The serial changed; carries the freshly-loaded value.
+    Changed(u32),
+    /// The timeout elapsed (or the caller passed an invalid/negative one).
+    TimedOut,
+    /// Unexpected futex error — or no futex support on this platform.
+    Failed,
+}
+
+/// Waits until `_serial` differs from `_value`, or the timeout elapses.
 ///
-/// Returns `None` on timeout (or on macOS, where no futex is available and
-/// this is an immediate no-op — see `SystemProperties::wait`).
-fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> Option<u32> {
+/// On macOS there is no futex; returns [`FutexWaitOutcome::Failed`]
+/// immediately — see `SystemProperties::wait`.
+fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> FutexWaitOutcome {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     {
         use rustix::io::Errno;
@@ -57,7 +74,7 @@ fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> 
         let deadline = match _timeout {
             None => None,
             Some(t) if t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec >= 1_000_000_000 => {
-                return None;
+                return FutexWaitOutcome::TimedOut;
             }
             Some(t) => Instant::now().checked_add(Duration::new(t.tv_sec as u64, t.tv_nsec as u32)),
         };
@@ -67,7 +84,7 @@ fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> 
                 Some(d) => {
                     let r = d.saturating_duration_since(Instant::now());
                     if r.is_zero() {
-                        return None;
+                        return FutexWaitOutcome::TimedOut;
                     }
                     Some(Timespec {
                         tv_sec: r.as_secs() as _,
@@ -84,7 +101,7 @@ fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> 
                 Ok(_) => {
                     let new_serial = _serial.load(Ordering::Acquire);
                     if _value != new_serial {
-                        return Some(new_serial);
+                        return FutexWaitOutcome::Changed(new_serial);
                     }
                     // Spurious wake — loop with the recomputed remaining timeout.
                 }
@@ -97,7 +114,7 @@ fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> 
                 Err(Errno::AGAIN) => {
                     let new_serial = _serial.load(Ordering::Acquire);
                     if _value != new_serial {
-                        return Some(new_serial);
+                        return FutexWaitOutcome::Changed(new_serial);
                     }
                     // Serial changed and wrapped back to `_value` between the
                     // syscall and the reload — vanishingly unlikely; retry.
@@ -106,10 +123,10 @@ fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> 
                 // remaining timeout so the total wait stays bounded.
                 Err(Errno::INTR) => {}
                 // Timeout is a normal outcome, not an error worth logging.
-                Err(Errno::TIMEDOUT) => return None,
+                Err(Errno::TIMEDOUT) => return FutexWaitOutcome::TimedOut,
                 Err(e) => {
                     log::error!("Failed to wait for property change: {e}");
-                    return None;
+                    return FutexWaitOutcome::Failed;
                 }
             }
         }
@@ -117,7 +134,7 @@ fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> 
     #[cfg(target_os = "macos")]
     {
         let _ = (_serial, _value, _timeout);
-        None
+        FutexWaitOutcome::Failed
     }
 }
 
@@ -137,7 +154,7 @@ pub struct SystemProperties {
 impl SystemProperties {
     // Create a new system properties to read system properties from a file or a directory.
     pub(crate) fn new(filename: &Path) -> Result<Self> {
-        let contexts = match ContextsSerialized::new(false, filename, &mut false, false) {
+        let contexts = match ContextsSerialized::new(false, filename, false) {
             Ok(contexts) => contexts,
             Err(e) => {
                 log::error!("Failed to load contexts from {filename:?}: {e}");
@@ -152,7 +169,7 @@ impl SystemProperties {
     // The new area is used by the property service to store system properties.
     #[cfg(feature = "builder")]
     pub fn new_area(dirname: &Path) -> Result<Self> {
-        let contexts = match ContextsSerialized::new(true, dirname, &mut false, false) {
+        let contexts = match ContextsSerialized::new(true, dirname, false) {
             Ok(contexts) => contexts,
             Err(e) => {
                 log::error!("Failed to create area from {dirname:?}: {e}");
@@ -230,7 +247,12 @@ impl SystemProperties {
             };
 
             fence(Ordering::Acquire);
-            let final_serial = prop_info.serial.load(Ordering::Acquire);
+            // `Relaxed` is sufficient for the re-check: the fence above
+            // pairs with the writer's release fence and provides all the
+            // ordering the protocol needs (bionic's post-fence re-load is
+            // likewise relaxed). An Acquire here costs an `ldar` per retry
+            // on aarch64 for nothing.
+            let final_serial = prop_info.serial.load(Ordering::Relaxed);
             if final_serial == serial {
                 // `Error::Utf8`, not `Encoding(String)`: keep every UTF-8
                 // decode failure on the same source-preserving variant.
@@ -253,6 +275,11 @@ impl SystemProperties {
     /// callback runs while the seqlock-validated bytes are still borrowed
     /// (from `buf` for short properties, from the mmap for long ones), so
     /// it should be cheap and non-blocking.
+    ///
+    /// The callback also runs under the context node's read lock: a
+    /// callback that blocks until a *same-process* builder writer makes
+    /// progress deadlocks (the writer needs that node's write lock) —
+    /// same caution as [`Self::wait`].
     pub fn read_with<R, F>(&self, name: &str, f: F) -> Result<R>
     where
         F: FnOnce(&str) -> R,
@@ -356,9 +383,12 @@ impl SystemProperties {
         // property in-place (`PropertyInfoWriter::apply_write` rejects on
         // LONG_FLAG). Pass an empty name so the `ro.` exception in
         // `validate_value_len` doesn't apply here.
+        // `InvalidArgument`, matching `apply_write`'s classification of the
+        // same condition — this is a caller-argument problem, not corrupt
+        // on-disk state.
         if let Err(e) = crate::wire::validate_value_len("", value) {
             log::error!("{e}");
-            return Err(Error::FileValidation(e));
+            return Err(Error::InvalidArgument(e));
         }
 
         let mut res = match self.contexts.prop_area_mut_with_index(index.context_index) {
@@ -410,12 +440,15 @@ impl SystemProperties {
                 e
             })?;
             if pi.is_long() {
+                // `InvalidArgument` like `apply_write`'s own LONG check —
+                // an unsupported operation on this entry kind, not file
+                // corruption.
                 let error_msg = format!(
                     "in-place update of long property is not supported: {}",
                     String::from_utf8_lossy(name)
                 );
                 log::error!("{error_msg}");
-                return Err(Error::FileValidation(error_msg));
+                return Err(Error::InvalidArgument(error_msg));
             }
             // After the LONG check, `property_value_bytes` is guaranteed to
             // take the short path — a snapshot into `backup_buf`. Capturing
@@ -478,10 +511,11 @@ impl SystemProperties {
     #[cfg(feature = "builder")]
     pub fn add(&mut self, name: &str, value: &str) -> Result<()> {
         // Shared policy across client/server: only `ro.` names may exceed
-        // PROP_VALUE_MAX (stored as long properties).
+        // PROP_VALUE_MAX (stored as long properties). `InvalidArgument`
+        // for the same reason as in `update`.
         if let Err(e) = crate::wire::validate_value_len(name, value) {
             log::error!("{e}");
-            return Err(Error::FileValidation(e));
+            return Err(Error::InvalidArgument(e));
         }
 
         let mut res = match self.contexts.prop_area_mut_for_name(name) {
@@ -522,30 +556,109 @@ impl SystemProperties {
     /// Reads the per-property serial counter, or `None` if the context/property
     /// lookup fails. `0` is a valid initial serial, so callers cannot use a
     /// numeric sentinel — use the `Option` to distinguish absence.
+    ///
+    /// bionic parity (`__system_property_serial`): if a writer is
+    /// mid-update (dirty bit set), waits for the clean serial before
+    /// returning — otherwise a caller comparing serials would observe one
+    /// logical update as two transitions. Unlike bionic the wait is
+    /// *bounded* to 200ms total (dirty windows are microseconds; the bound
+    /// only triggers if a writer crashed mid-update, where bionic would
+    /// hang): on expiry the dirty serial is returned as-is with a warning.
+    /// The wait is sliced like [`Self::wait`] — the node's read lock is
+    /// released between 20ms slices so a queued same-process builder
+    /// writer (and, behind it on a writer-preferring `RwLock`, new
+    /// readers) is never blocked for the whole bound. On macOS (no futex)
+    /// the raw — possibly dirty — serial is returned immediately.
     pub fn serial(&self, idx: &PropertyIndex) -> Option<u32> {
-        let guard = self
-            .contexts
-            .prop_area_with_index(idx.context_index)
-            .map_err(|e| {
-                log::error!(
-                    "Failed to get PropertyArea for index {}: {e}",
-                    idx.context_index
-                );
-                e
-            })
-            .ok()?;
-        let pa = guard.property_area();
-        let pi = pa
-            .property_info(idx.property_index)
-            .map_err(|e| {
-                log::error!(
-                    "Failed to get PropertyInfo for index {}: {e}",
-                    idx.property_index
-                );
-                e
-            })
-            .ok()?;
-        Some(pi.serial.load(Ordering::Acquire))
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            // A same-process builder writer cannot be mid-update while we
+            // hold the read guard — it takes the node's write lock for the
+            // whole update — so a dirty serial implies a *cross-process*
+            // writer and each bounded slice below cannot deadlock.
+            const DIRTY_SLICE: Duration = Duration::from_millis(20);
+            const DIRTY_WAIT_TOTAL: Duration = Duration::from_millis(200);
+            let start = Instant::now();
+            loop {
+                // (Re-)acquire the node lock for this slice only.
+                let guard = self
+                    .contexts
+                    .prop_area_with_index(idx.context_index)
+                    .inspect_err(|e| {
+                        log::error!(
+                            "Failed to get PropertyArea for index {}: {e}",
+                            idx.context_index
+                        )
+                    })
+                    .ok()?;
+                let pi = guard
+                    .property_area()
+                    .property_info(idx.property_index)
+                    .inspect_err(|e| {
+                        log::error!(
+                            "Failed to get PropertyInfo for index {}: {e}",
+                            idx.property_index
+                        )
+                    })
+                    .ok()?;
+                let serial = pi.serial.load(Ordering::Acquire);
+                if !serial_dirty(serial) {
+                    return Some(serial);
+                }
+                // Clamp the final slice so the total bound is exact, and
+                // check it BEFORE waiting so expiry never adds a slice.
+                let remaining = DIRTY_WAIT_TOTAL.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    log::warn!(
+                        "serial: entry still dirty after {DIRTY_WAIT_TOTAL:?} \
+                         (writer crashed mid-update?); returning the dirty serial"
+                    );
+                    return Some(serial);
+                }
+                let slice = remaining.min(DIRTY_SLICE);
+                let slice_ts = Timespec {
+                    tv_sec: 0,
+                    tv_nsec: slice.subsec_nanos() as _,
+                };
+                match futex_wait(&pi.serial, serial, Some(&slice_ts)) {
+                    FutexWaitOutcome::Changed(s) if !serial_dirty(s) => return Some(s),
+                    // Still dirty (writer burst) or slice expired: drop the
+                    // guard at the end of this iteration and re-acquire.
+                    FutexWaitOutcome::Changed(_) | FutexWaitOutcome::TimedOut => {}
+                    FutexWaitOutcome::Failed => {
+                        let current = pi.serial.load(Ordering::Acquire);
+                        if serial_dirty(current) {
+                            log::warn!("serial: futex wait failed; returning the dirty serial");
+                        }
+                        return Some(current);
+                    }
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let guard = self
+                .contexts
+                .prop_area_with_index(idx.context_index)
+                .inspect_err(|e| {
+                    log::error!(
+                        "Failed to get PropertyArea for index {}: {e}",
+                        idx.context_index
+                    )
+                })
+                .ok()?;
+            let pi = guard
+                .property_area()
+                .property_info(idx.property_index)
+                .inspect_err(|e| {
+                    log::error!(
+                        "Failed to get PropertyInfo for index {}: {e}",
+                        idx.property_index
+                    )
+                })
+                .ok()?;
+            Some(pi.serial.load(Ordering::Acquire))
+        }
     }
 
     /// Waits for any property to change. Equivalent to
@@ -571,53 +684,119 @@ impl SystemProperties {
     /// On macOS there is no futex; this returns `None` immediately, so do
     /// not call it in a polling loop there.
     ///
-    /// # Deadlock caution (builder feature, same process)
+    /// # Same-process builder writers
     ///
-    /// This holds the context node's read lock for the whole wait (the
-    /// serial reference lives inside the mmap guard, which must outlive
-    /// the futex call). A thread in the *same process* that tries to set a
-    /// property in the same context via the builder path needs that
-    /// node's write lock — it will block on this reader, the property
-    /// never changes, the futex never wakes: deadlock. Cross-process
-    /// waiters (the normal Android arrangement, and this crate's service)
-    /// are unaffected — writers in other processes don't take this lock.
-    /// Do not combine `wait()` with a same-process builder writer on the
-    /// same context.
+    /// Per-property waits need the context node's read lock to reach the
+    /// serial word inside the mmap, and a *same-process* builder writer
+    /// (`set`/`update`) needs that node's write lock. To keep the two from
+    /// deadlocking, the wait is **sliced**: the lock is released and
+    /// re-acquired roughly every 100ms, with a serial re-check on each
+    /// re-acquisition closing the missed-wakeup window. A same-process
+    /// writer is therefore delayed by at most one slice instead of
+    /// blocking forever; cross-process waiters (the normal Android
+    /// arrangement, and this crate's service) never contend on the lock at
+    /// all. Global-serial waits (`index == None`) take no lock and are not
+    /// sliced.
     pub fn wait(
         &self,
         index: Option<&PropertyIndex>,
         old_serial: Option<u32>,
         timeout: Option<&Timespec>,
     ) -> Option<u32> {
-        // No index → wait on the global serial.
+        // No index → wait on the global serial (lock-free, no slicing).
         let Some(idx) = index else {
             let serial_pa = self.contexts.serial_prop_area().serial();
             let old = old_serial.unwrap_or_else(|| serial_pa.load(Ordering::Acquire));
-            return futex_wait(serial_pa, old, timeout);
+            return match futex_wait(serial_pa, old, timeout) {
+                FutexWaitOutcome::Changed(s) => Some(s),
+                FutexWaitOutcome::TimedOut | FutexWaitOutcome::Failed => None,
+            };
         };
 
-        let guard = self
-            .contexts
-            .prop_area_with_index(idx.context_index)
-            .inspect_err(|e| {
-                log::error!(
-                    "Failed to get PropertyArea for index {}: {e}",
-                    idx.context_index
-                )
-            })
-            .ok()?;
-        let pi = guard
-            .property_area()
-            .property_info(idx.property_index)
-            .inspect_err(|e| {
-                log::error!(
-                    "Failed to get PropertyInfo for index {}: {e}",
-                    idx.property_index
-                )
-            })
-            .ok()?;
-        let old = old_serial.unwrap_or_else(|| pi.serial.load(Ordering::Acquire));
-        futex_wait(&pi.serial, old, timeout)
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            /// Upper bound on how long one slice may hold the node's read
+            /// lock — i.e. the worst-case delay imposed on a same-process
+            /// builder writer.
+            const LOCK_SLICE: Duration = Duration::from_millis(100);
+
+            // Convert the caller timeout to a deadline once, mirroring
+            // `futex_wait`'s own validation: negative/invalid → immediate
+            // timeout; unrepresentably-huge → wait forever (like bionic).
+            let deadline = match timeout {
+                None => None,
+                Some(t) if t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec >= 1_000_000_000 => {
+                    return None;
+                }
+                Some(t) => {
+                    Instant::now().checked_add(Duration::new(t.tv_sec as u64, t.tv_nsec as u32))
+                }
+            };
+
+            let mut old = old_serial;
+            loop {
+                // Compute the slice BEFORE (re-)acquiring the lock: an
+                // already-expired deadline must return without another
+                // acquisition, and blocking on a writer-held lock right
+                // after expiry would overshoot the caller's timeout.
+                let slice = match deadline {
+                    None => LOCK_SLICE,
+                    Some(d) => {
+                        let remaining = d.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            return None;
+                        }
+                        remaining.min(LOCK_SLICE)
+                    }
+                };
+                // (Re-)acquire the node lock for this slice only.
+                let guard = self
+                    .contexts
+                    .prop_area_with_index(idx.context_index)
+                    .inspect_err(|e| {
+                        log::error!(
+                            "Failed to get PropertyArea for index {}: {e}",
+                            idx.context_index
+                        )
+                    })
+                    .ok()?;
+                let pi = guard
+                    .property_area()
+                    .property_info(idx.property_index)
+                    .inspect_err(|e| {
+                        log::error!(
+                            "Failed to get PropertyInfo for index {}: {e}",
+                            idx.property_index
+                        )
+                    })
+                    .ok()?;
+                let old_val = *old.get_or_insert_with(|| pi.serial.load(Ordering::Acquire));
+                // The serial may have changed while the lock was released
+                // between slices — the futex wake fired with no waiter, so
+                // this re-check is what closes that window.
+                let current = pi.serial.load(Ordering::Acquire);
+                if current != old_val {
+                    return Some(current);
+                }
+                let slice_ts = Timespec {
+                    tv_sec: slice.as_secs() as _,
+                    tv_nsec: slice.subsec_nanos() as _,
+                };
+                match futex_wait(&pi.serial, old_val, Some(&slice_ts)) {
+                    FutexWaitOutcome::Changed(s) => return Some(s),
+                    // Slice expired: fall through, dropping `guard` at the
+                    // end of the iteration so writers get a window.
+                    FutexWaitOutcome::TimedOut => {}
+                    FutexWaitOutcome::Failed => return None,
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // No futex: immediate None, as documented above.
+            let _ = (idx, old_serial, timeout);
+            None
+        }
     }
 }
 
@@ -647,7 +826,7 @@ mod tests {
             assert_eq!(version1, version2);
         });
 
-        let _ = handle.join().unwrap();
+        handle.join().unwrap();
 
         Ok(())
     }

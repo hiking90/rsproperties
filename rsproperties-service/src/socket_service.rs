@@ -444,8 +444,13 @@ impl SocketService {
     /// client sending them gets the same truncation AOSP would apply.
     fn string_from_fixed(buf: &[u8]) -> Result<String> {
         let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        // `Utf8(e.utf8_error())`, not a `FromUtf8Error` passthrough: the
+        // owned-error form retains the failed bytes — which here may be a
+        // property *value* — and would leak them into any `{e:?}` log,
+        // against this file's don't-log-values policy. `Utf8Error` keeps
+        // the position diagnostics and the source chain without the bytes.
         String::from_utf8(buf[..end].to_vec())
-            .map_err(|e| rsproperties::errors::Error::Encoding(e.to_string()))
+            .map_err(|e| rsproperties::errors::Error::Utf8(e.utf8_error()))
     }
 
     /// Handles SETPROP2 command
@@ -564,7 +569,9 @@ impl SocketService {
             ));
         }
 
-        String::from_utf8(buf).map_err(|e| rsproperties::errors::Error::Encoding(e.to_string()))
+        // See `string_from_fixed`: drop the failed bytes (possibly a
+        // sensitive value), keep the positional diagnostics + source chain.
+        String::from_utf8(buf).map_err(|e| rsproperties::errors::Error::Utf8(e.utf8_error()))
     }
 
     /// Sends a response to the client

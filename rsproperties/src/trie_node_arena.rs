@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::mem;
-use std::vec::Vec;
 
 use zerocopy::FromBytes;
 
@@ -133,11 +132,19 @@ impl TrieNodeArena {
     fn allocate_data(&mut self, size: usize) -> usize {
         let aligned_size = crate::bionic_align(size, mem::size_of::<u32>());
 
-        let needed = self.current_data_pointer + aligned_size;
+        // Checked/saturating arithmetic per the crate discipline; both
+        // expressions can only overflow after an allocation of half the
+        // address space, but wrapping in release mode would silently
+        // corrupt offsets rather than fail.
+        let needed = self
+            .current_data_pointer
+            .checked_add(aligned_size)
+            .expect("arena allocation overflows usize");
         if needed > self.data.len() {
             // Standard doubling growth, but never less than what this
             // allocation needs.
-            self.data.resize(needed.max(self.data.len() * 2), 0);
+            self.data
+                .resize(needed.max(self.data.len().saturating_mul(2)), 0);
         }
 
         let offset = self.current_data_pointer;
@@ -150,7 +157,7 @@ impl TrieNodeArena {
         self.current_data_pointer
     }
 
-    pub(crate) fn info(&'_ self) -> PropertyInfoArea<'_> {
+    pub(crate) fn info(&self) -> PropertyInfoArea<'_> {
         PropertyInfoArea::new(&self.data)
     }
 

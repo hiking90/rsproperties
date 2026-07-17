@@ -146,11 +146,7 @@ pub(crate) struct PropertyAreaMap {
 
 impl PropertyAreaMap {
     // Initialize the property area map with the given file to create a new property area map.
-    pub(crate) fn new_rw(
-        filename: &Path,
-        context: Option<&CStr>,
-        fsetxattr_failed: &mut bool,
-    ) -> Result<Self> {
+    pub(crate) fn new_rw(filename: &Path, context: Option<&CStr>) -> Result<Self> {
         debug!("Creating new read-write property area map: {filename:?}");
 
         // A leftover area file from a previous writer instance would make
@@ -175,16 +171,28 @@ impl PropertyAreaMap {
         let file = OpenOptions::new()
             .read(true) // O_RDWR
             .write(true) // O_RDWR
-            .create(true) // O_CREAT
-            .custom_flags((fs::OFlags::NOFOLLOW.bits() | fs::OFlags::EXCL.bits()) as _) // additional flags
+            .create_new(true) // O_CREAT | O_EXCL — atomic create, never an existing file
+            // O_EXCL alone already fails on a symlink at the final
+            // component (even a dangling one, with EEXIST); NOFOLLOW is
+            // redundant belt-and-suspenders kept so the intent survives a
+            // future change away from create_new.
+            .custom_flags(fs::OFlags::NOFOLLOW.bits() as _)
             .mode(0o444) // permission: 0444
-            .open(filename)?;
+            .open(filename)
+            .context_with_location(format!("Failed to create property area {filename:?}"))?;
 
         if let Some(context) = context {
             // Full xattr name required — the bare "selinux" (no namespace
             // prefix) is rejected by the kernel with EOPNOTSUPP, which made
             // this call fail unconditionally. bionic uses XATTR_NAME_SELINUX,
             // which is "security.selinux".
+            //
+            // Labeling failure is a warning, NOT fatal — a deliberate
+            // deviation from bionic, where init treats it as fatal. This
+            // crate's primary deployments (non-Android hosts, dev
+            // containers) hit EOPNOTSUPP as the normal case; on an SELinux
+            // enforcing system an unlabeled area instead surfaces later as
+            // reader-side denials.
             if fs::fsetxattr(
                 &file,
                 "security.selinux",
@@ -194,11 +202,12 @@ impl PropertyAreaMap {
             .is_err()
             {
                 warn!("Failed to set SELinux context for {filename:?}");
-                *fsetxattr_failed = true;
             }
         }
 
-        fs::ftruncate(&file, PA_SIZE).map_err(Error::from)?;
+        fs::ftruncate(&file, PA_SIZE)
+            .map_err(Error::from)
+            .context_with_location(format!("Failed to size property area {filename:?}"))?;
 
         let pa_size = PA_SIZE as usize;
         let pa_data_size = pa_size - std::mem::size_of::<PropertyArea>();
@@ -217,6 +226,12 @@ impl PropertyAreaMap {
     }
 
     // Initialize the property area map with the given file to read-only property area map.
+    //
+    // Precondition (inherent to mmap-based IPC, same as bionic): the file
+    // must not be truncated below the validated size while this mapping is
+    // alive — an access past the shrunken EOF raises SIGBUS, which no
+    // bounds check here can intercept. The system-level single-writer
+    // policy (see `new_rw`) is what rules this out in practice.
     pub(crate) fn new_ro(filename: &Path) -> Result<Self> {
         debug!("Opening read-only property area map: {filename:?}");
 
@@ -231,7 +246,7 @@ impl PropertyAreaMap {
             .context_with_location("Failed to get metadata")?;
 
         // Validate file metadata using common utility function
-        crate::errors::validate_file_metadata(
+        crate::file_validation::validate_file_metadata(
             &metadata,
             filename,
             mem::size_of::<PropertyArea>() as u64,
@@ -617,13 +632,16 @@ impl PropertyAreaMap {
 
         // Bounds check. Widen to u64 instead of truncating `pa_data_size`
         // with `as u32` — the module's checked-arithmetic discipline.
+        // `AreaFull`, not `FileSize`: exhausting the fixed 128 KiB area is a
+        // reachable operational condition (bionic returns false), not a
+        // corrupt-file diagnosis — callers must be able to tell them apart.
         if u64::from(new_offset) > self.pa_data_size as u64 {
             error!(
-                "Out of memory: new_offset={} > pa_data_size={}",
+                "Property area full: new_offset={} > pa_data_size={}",
                 new_offset, self.pa_data_size
             );
-            return Err(Error::FileSize(format!(
-                "Out of memory: {} + {} = {} > {}",
+            return Err(Error::AreaFull(format!(
+                "property area full: {} + {} = {} > {}",
                 offset, aligned_u32, new_offset, self.pa_data_size
             )));
         }

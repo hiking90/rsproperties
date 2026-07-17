@@ -145,17 +145,45 @@ impl PropertyInfoEntry {
 
         let file = File::open(filename)
             .context_with_location(format!("Failed to open property info file {filename:?}"))?;
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::new(file);
 
         let mut errors = Vec::new();
         let mut entries = Vec::new();
         let mut line_count = 0;
         let mut skipped_lines = 0;
 
-        for line in reader.lines() {
+        // Raw bytes per line instead of `lines()`: this function's contract
+        // is per-line error *collection*, but `lines()` reports a non-UTF-8
+        // byte as an `InvalidData` I/O error, which would abort the whole
+        // parse and discard everything gathered so far. Decode failures are
+        // collected into `errors` like any other bad line (same pattern as
+        // `build_property_parser`).
+        let mut raw_line = Vec::new();
+        loop {
+            raw_line.clear();
+            let read = reader
+                .read_until(b'\n', &mut raw_line)
+                .with_context_location(|| {
+                    format!("Failed to read line {} of {filename:?}", line_count + 1)
+                })?;
+            if read == 0 {
+                break;
+            }
             line_count += 1;
-            let line = line.context_with_location("Failed to read line")?;
-            let line = line.trim();
+
+            let line = match std::str::from_utf8(&raw_line) {
+                Ok(line) => line.trim(),
+                Err(e) => {
+                    warn!("Line {line_count}: skipping non-UTF-8 line: {e}");
+                    // Collected entries must be self-describing: callers
+                    // log the returned Vec, not the warn above, and a bare
+                    // `Utf8Error` only carries an intra-line byte offset.
+                    errors.push(Error::Parse(format!(
+                        "line {line_count} of {filename:?}: non-UTF-8 line: {e}"
+                    )));
+                    continue;
+                }
+            };
 
             if line.is_empty() || line.starts_with('#') {
                 skipped_lines += 1;

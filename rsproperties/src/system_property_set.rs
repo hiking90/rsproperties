@@ -142,7 +142,26 @@ fn connect_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<UnixS
     };
 
     let addr = rnet::SocketAddrUnix::new(path)?;
-    let fd = rnet::socket(rnet::AddressFamily::UNIX, rnet::SocketType::STREAM, None)?;
+    // CLOEXEC: `UnixStream::connect` would set it automatically; going
+    // through rustix for the non-blocking connect must not silently drop
+    // that guarantee, or the fd leaks into children on fork/exec.
+    // `not(macos)` rather than an allowlist so other unix targets (which
+    // all support SOCK_CLOEXEC) keep compiling.
+    #[cfg(not(target_os = "macos"))]
+    let fd = rnet::socket_with(
+        rnet::AddressFamily::UNIX,
+        rnet::SocketType::STREAM,
+        rnet::SocketFlags::CLOEXEC,
+        None,
+    )?;
+    // macOS has no SOCK_CLOEXEC; set the flag via fcntl immediately after
+    // creation (same small race std accepts on this platform).
+    #[cfg(target_os = "macos")]
+    let fd = {
+        let fd = rnet::socket(rnet::AddressFamily::UNIX, rnet::SocketType::STREAM, None)?;
+        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
+        fd
+    };
     rustix::io::ioctl_fionbio(&fd, true)?;
 
     let deadline = Instant::now() + timeout;
@@ -151,27 +170,37 @@ fn connect_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<UnixS
             Ok(()) => break,
             // Backlog full: AF_UNIX reports EAGAIN with nothing to poll on
             // (unlike TCP there is no in-flight handshake) — back off and
-            // retry until the deadline.
+            // retry until the deadline. The sleep is clamped to the
+            // *remaining* budget so the deadline is never overshot.
             Err(Errno::AGAIN) => {
-                if Instant::now() >= deadline {
-                    return Err(timed_out());
-                }
-                std::thread::sleep(Duration::from_millis(10).min(timeout));
-            }
-            Err(Errno::INPROGRESS) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Err(timed_out());
                 }
-                let timespec = rustix::event::Timespec::try_from(remaining).unwrap_or(
-                    rustix::event::Timespec {
-                        tv_sec: i64::MAX,
-                        tv_nsec: 0,
-                    },
-                );
-                let mut fds = [PollFd::new(&fd, PollFlags::OUT)];
-                if poll(&mut fds, Some(&timespec))? == 0 {
-                    return Err(timed_out());
+                std::thread::sleep(Duration::from_millis(10).min(remaining));
+            }
+            Err(Errno::INPROGRESS) => {
+                // EINTR from `poll` recomputes the remaining budget and
+                // retries — a stray signal must not fail the connect (the
+                // send/drain loops already treat EINTR the same way).
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(timed_out());
+                    }
+                    let timespec = rustix::event::Timespec::try_from(remaining).unwrap_or(
+                        rustix::event::Timespec {
+                            tv_sec: i64::MAX,
+                            tv_nsec: 0,
+                        },
+                    );
+                    let mut fds = [PollFd::new(&fd, PollFlags::OUT)];
+                    match poll(&mut fds, Some(&timespec)) {
+                        Ok(0) => return Err(timed_out()),
+                        Ok(_) => break,
+                        Err(Errno::INTR) => continue,
+                        Err(e) => return Err(e.into()),
+                    }
                 }
                 // Writable does not mean connected — fetch the final status.
                 rnet::sockopt::socket_error(&fd)??;
@@ -286,9 +315,28 @@ impl<'a> ServiceWriter<'a> {
         // every byte is on the wire — a short write would otherwise
         // desynchronise the length-prefixed protocol and leave the server
         // waiting for bytes that never arrive.
+        //
+        // SO_SNDTIMEO re-arms per *syscall*, so with the static timeout a
+        // peer draining one byte per window could stretch "2 seconds" into
+        // hours across a full frame. Enforce SERVICE_IO_TIMEOUT as a total
+        // budget instead: re-arm the write timeout with the remaining
+        // budget before every syscall and fail once it hits zero — the
+        // same pattern `wait_for_socket_close` uses for reads.
+        let deadline = Instant::now() + SERVICE_IO_TIMEOUT;
         let total: usize = self.buffers.iter().map(|b| b.as_slice().len()).sum();
         let mut written = 0usize;
         while written < total {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "timed out sending property service request \
+                         ({SERVICE_IO_TIMEOUT:?} total, {written}/{total} bytes sent)"
+                    ),
+                )));
+            }
+            conn.stream.set_write_timeout(Some(remaining))?;
             // Rebuild the IoSlice list, skipping what already went out.
             let mut skip = written;
             let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(self.buffers.len());
@@ -375,28 +423,75 @@ impl PropertyMessage {
     }
 }
 
+/// Decides the wire protocol version.
+///
+/// Order of authority — bionic consults the `ro.property_service.version`
+/// property, treats a present-but-unparseable value as v1, and defaults to
+/// **v1** when it is unset:
+/// 1. the `ro.property_service.version` system property, when the global
+///    property store is already initialized (never initialized from here —
+///    that would latch the default properties directory as a side effect
+///    of a `set()` call). A present but unparseable value means an old or
+///    odd init → **V1**, like bionic.
+/// 2. the `PROPERTY_SERVICE_VERSION` environment variable;
+/// 3. default: **V2**, a deliberate deviation from bionic's v1 default
+///    for the *unset* case. V1 frames cannot carry names of
+///    `PROP_NAME_MAX` (32) bytes or more — which modern property names
+///    routinely exceed — and this crate's own service dispatches both
+///    protocols by the leading command word. When talking to a
+///    pre-Android-O init that only understands V1, expose the property or
+///    set the env var.
+///
+/// The decision is cached (`OnceLock`) only once the property store is
+/// initialized; before that, calls get a *provisional* answer from
+/// env/default without latching, so a later `init()` still lets the
+/// property win. After the first post-init `set()` the version is fixed
+/// for the process lifetime.
 fn protocol_version() -> ProtocolVersion {
     static PROTOCOL_VERSION: OnceLock<ProtocolVersion> = OnceLock::new();
 
-    *PROTOCOL_VERSION.get_or_init(|| {
-        // Try to get version from environment variable first
+    if let Some(v) = PROTOCOL_VERSION.get() {
+        return *v;
+    }
+
+    let env_or_default = || {
         let version = env::var("PROPERTY_SERVICE_VERSION")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| s.trim().parse::<u32>().ok())
             .unwrap_or(2);
-
         if version >= 2 {
             ProtocolVersion::V2
         } else {
             ProtocolVersion::V1
         }
-    })
+    };
+
+    match crate::system_properties_if_initialized() {
+        Some(sp) => *PROTOCOL_VERSION.get_or_init(|| {
+            sp.read_with("ro.property_service.version", |v| {
+                match v.trim().parse::<u32>() {
+                    Ok(n) if n >= 2 => ProtocolVersion::V2,
+                    // Present but not a parseable ≥2: bionic parity → V1.
+                    _ => ProtocolVersion::V1,
+                }
+            })
+            // Property absent (or store read failed): env var, then the
+            // documented V2 default.
+            .unwrap_or_else(|_| env_or_default())
+        }),
+        // Store not initialized yet: provisional, deliberately NOT latched.
+        None => env_or_default(),
+    }
 }
 
 /// Wait for the V1 server to close the connection by signalling EOF on read.
 /// The server uses connection close as an implicit ack — block until the peer
 /// shuts down its write side or until `timeout` elapses.
-fn wait_for_socket_close(stream: &mut UnixStream, timeout: Duration) -> Result<()> {
+///
+/// Infallible by design: the SET frame already went out before this runs,
+/// and bionic reports success regardless of how its 250ms close-wait ends —
+/// every drain problem here is logged and swallowed, never propagated.
+fn wait_for_socket_close(stream: &mut UnixStream, timeout: Duration) {
     // Half-close our write side so the server can finish; then drain.
     // (No initial `set_read_timeout` here — the loop below re-arms the
     // remaining budget before every read.)
@@ -430,13 +525,18 @@ fn wait_for_socket_close(stream: &mut UnixStream, timeout: Duration) -> Result<(
                     || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => {
-                let _ = stream.set_read_timeout(original_timeout);
-                return Err(Error::Io(e));
+                // The SET frame already went out in full; this drain is
+                // only the V1 implicit ack. bionic returns success after
+                // its 250ms poll regardless of outcome, and a timeout here
+                // is already swallowed — an ECONNRESET-style error (server
+                // closed with our bytes still queued) must not retroactively
+                // fail a write that was likely applied.
+                log::warn!("wait_for_socket_close: drain error ignored ({e})");
+                break;
             }
         }
     }
     let _ = stream.set_read_timeout(original_timeout);
-    Ok(())
 }
 
 // Set a system property via local domain socket.
@@ -491,7 +591,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
                 .write_bytes(prop_msg.as_bytes())
                 .send(&mut conn)?;
 
-            wait_for_socket_close(&mut conn.stream, Duration::from_millis(250))?;
+            wait_for_socket_close(&mut conn.stream, Duration::from_millis(250));
         }
         ProtocolVersion::V2 => {
             // (Name/value policy is validated at the top of `set` — shared

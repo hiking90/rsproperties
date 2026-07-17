@@ -40,7 +40,7 @@ impl ContextNode {
         }
     }
 
-    pub(crate) fn open(&self, fsetxattr_failed: &mut bool) -> Result<()> {
+    pub(crate) fn open(&self) -> Result<()> {
         if !self.access_rw {
             error!(
                 "Attempted to open context node without write access: {:?}",
@@ -77,7 +77,6 @@ impl ContextNode {
         *prop_area = Some(PropertyAreaMap::new_rw(
             self.filename.as_path(),
             self.context.as_deref(),
-            fsetxattr_failed,
         )?);
 
         Ok(())

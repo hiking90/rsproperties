@@ -207,8 +207,11 @@ impl TrieBuilder {
 
         // Intern only after the name has passed validation so rejected
         // lines don't leave their context/type behind in the string
-        // tables (harmless today — build aborts on error — but a
-        // skip-and-continue caller would serialize the orphans).
+        // tables. Duplicate-entry rejections further down still intern
+        // first — the duplicate is only discoverable after the trie walk —
+        // so this ordering covers name-shape errors only. Harmless today
+        // (build aborts on the first error); a skip-and-continue caller
+        // would serialize orphans from the duplicate paths.
         let context = intern(&mut self.contexts, context);
         let rtype = intern(&mut self.types, rtype);
 

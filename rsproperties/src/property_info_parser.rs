@@ -47,7 +47,13 @@ fn entry_name_str<'a>(name: Result<&'a CStr>, kind: &str, idx: usize) -> Option<
     };
     match name.to_str() {
         Ok(s) if !s.is_empty() => Some(s),
-        Ok(_) => None,
+        Ok(_) => {
+            // Warn like the other corruption arms — the doc promises damaged
+            // entries are observable in logs, and an empty name only occurs
+            // in a damaged file (the builder rejects empty segments).
+            warn!("{kind} entry {idx} has an empty name");
+            None
+        }
         Err(e) => {
             warn!("{kind} entry {idx} has non-UTF-8 name: {e}");
             None
@@ -129,21 +135,16 @@ impl<'a> TrieNode<'a> {
             .ref_from(data.property_entry as usize)
     }
 
-    pub(crate) fn context_index(&self) -> u32 {
+    /// Reads `context_index` and `type_index` together through a single
+    /// TrieNodeData → PropertyEntry validation chain. Separate accessors
+    /// would re-run `ref_from` twice each — four validations per node on
+    /// the lookup hot path for two adjacent fields.
+    pub(crate) fn context_and_type_indexes(&self) -> (u32, u32) {
         self.property_entry()
-            .map(|pe| pe.context_index)
+            .map(|pe| (pe.context_index, pe.type_index))
             .unwrap_or_else(|e| {
                 warn!("Failed to read PropertyEntry: {e}");
-                !0
-            })
-    }
-
-    pub(crate) fn type_index(&self) -> u32 {
-        self.property_entry()
-            .map(|pe| pe.type_index)
-            .unwrap_or_else(|e| {
-                warn!("Failed to read PropertyEntry: {e}");
-                !0
+                (!0, !0)
             })
     }
 
@@ -165,10 +166,11 @@ impl<'a> TrieNode<'a> {
     }
 
     /// Reads the `n`-th offset out of a `count`-sized u32 offset array at
-    /// `array_offset` — the shared skeleton of `child_node` / `prefix` /
-    /// `exact_match`. Bounds are validated against the *declared* count, so
-    /// a corrupt count field fails loudly instead of silently reinterpreting
-    /// adjacent data as entries.
+    /// `array_offset` — used by `child_node` (the prefix/exact-match loops
+    /// slice their whole arrays up front via `prefix_offsets` /
+    /// `exact_match_offsets` instead). Bounds are validated against the
+    /// *declared* count, so a corrupt count field fails loudly instead of
+    /// silently reinterpreting adjacent data as entries.
     fn entry_offset_at(
         &self,
         array_offset: u32,
@@ -233,43 +235,28 @@ impl<'a> TrieNode<'a> {
         node_index.and_then(|i| self.child_node(i).ok())
     }
 
-    pub(crate) fn num_prefixes(&self) -> u32 {
-        self.data().map(|d| d.num_prefixes).unwrap_or_else(|e| {
-            warn!(
-                "Failed to read TrieNodeData at offset {}: {e}",
-                self.trie_node_offset
-            );
-            0
-        })
-    }
-
-    pub(crate) fn prefix(&self, n: usize) -> Result<&PropertyEntry> {
+    /// Validated offset array of this node's prefix entries. Fetched once
+    /// per node — the previous per-index accessor re-validated the node
+    /// data and re-sliced the array on every iteration of the lookup hot
+    /// path.
+    fn prefix_offsets(&self) -> Result<&'a [u32]> {
         let data = self.data()?;
-        let offset = self.entry_offset_at(data.prefix_entries, data.num_prefixes, n, "Prefix")?;
-        self.property_info_area.ref_from(offset)
+        self.property_info_area
+            .u32_slice_from(data.prefix_entries as usize, data.num_prefixes as usize)
     }
 
-    pub(crate) fn num_exact_matches(&self) -> u32 {
-        self.data()
-            .map(|d| d.num_exact_matches)
-            .unwrap_or_else(|e| {
-                warn!(
-                    "Failed to read TrieNodeData at offset {}: {e}",
-                    self.trie_node_offset
-                );
-                0
-            })
-    }
-
-    pub(crate) fn exact_match(&self, n: usize) -> Result<&PropertyEntry> {
+    /// Validated offset array of this node's exact-match entries; see
+    /// [`Self::prefix_offsets`].
+    fn exact_match_offsets(&self) -> Result<&'a [u32]> {
         let data = self.data()?;
-        let offset = self.entry_offset_at(
-            data.exact_match_entries,
-            data.num_exact_matches,
-            n,
-            "Exact match",
-        )?;
-        self.property_info_area.ref_from(offset)
+        self.property_info_area.u32_slice_from(
+            data.exact_match_entries as usize,
+            data.num_exact_matches as usize,
+        )
+    }
+
+    fn entry_at(&self, offset: u32) -> Result<&'a PropertyEntry> {
+        self.property_info_area.ref_from(offset as usize)
     }
 }
 
@@ -306,8 +293,11 @@ impl<'a> PropertyInfoArea<'a> {
             .map_err(|_| Error::FileValidation(format!("no NUL terminator after offset {offset}")))
     }
 
+    // `&'a T`, not `&T`: like `cstr` and `u32_slice_from`, the reference
+    // borrows the underlying data, not the (Copy) `self` value it was
+    // reached through — callers can return it up the stack.
     #[inline]
-    pub(crate) fn ref_from<T>(&self, offset: usize) -> Result<&T>
+    pub(crate) fn ref_from<T>(&self, offset: usize) -> Result<&'a T>
     where
         T: zerocopy::FromBytes + zerocopy::KnownLayout + zerocopy::Immutable,
     {
@@ -364,14 +354,17 @@ impl<'a> PropertyInfoArea<'a> {
 
     #[inline]
     pub(crate) fn header(&self) -> &PropertyInfoAreaHeader {
-        // Both construction paths guarantee room and alignment for the
-        // header at offset 0: the mmap path validates the file size on
-        // load (`load_path`), and the builder path (`TrieNodeArena::info`)
-        // allocates the header before anything else (asserted in `new`).
-        // `ref_from` re-checks both at runtime, so a violated invariant
-        // panics here rather than reading garbage.
+        // Both construction paths guarantee room for the header at offset
+        // 0: the mmap path validates the file size on load (`load_path`),
+        // and the builder path (`TrieNodeArena::info`) allocates the header
+        // before anything else (asserted in `new`). Alignment differs by
+        // path: the mmap base is page-aligned, while the arena's `Vec<u8>`
+        // base is only 1-aligned *by the language* — in practice every real
+        // allocator hands back ≥8-byte-aligned blocks. `ref_from` re-checks
+        // both properties on the actual pointer at runtime, so a violated
+        // assumption panics here rather than reading garbage.
         self.ref_from(0)
-            .expect("header at offset 0; guaranteed by load-time validation / arena layout")
+            .expect("header at offset 0; size guaranteed by load-time validation / arena layout")
     }
 
     /// Element count stored at the head of the u32 table at `table_offset`
@@ -454,8 +447,17 @@ impl<'a> PropertyInfoArea<'a> {
         type_index: &mut u32,
     ) {
         let remaining_name_size = remaining_name.len();
-        for i in 0..trie_node.num_prefixes() {
-            let prefix = match trie_node.prefix(i as _) {
+        // One node-data validation + one array slice for the whole loop;
+        // the per-entry `ref_from` below is the only per-iteration check.
+        let offsets = match trie_node.prefix_offsets() {
+            Ok(o) => o,
+            Err(e) => {
+                warn!("Failed to read prefix entries: {e}");
+                return;
+            }
+        };
+        for (i, &entry_offset) in offsets.iter().enumerate() {
+            let prefix = match trie_node.entry_at(entry_offset) {
                 Ok(p) => p,
                 Err(e) => {
                     warn!("Failed to read prefix entry {i}: {e}");
@@ -467,7 +469,7 @@ impl<'a> PropertyInfoArea<'a> {
             if prefix.namelen as usize > remaining_name_size {
                 continue;
             }
-            let Some(prefix_name) = entry_name_str(prefix.name(self), "Prefix", i as usize) else {
+            let Some(prefix_name) = entry_name_str(prefix.name(self), "Prefix", i) else {
                 continue;
             };
             if remaining_name.starts_with(prefix_name) {
@@ -489,16 +491,13 @@ impl<'a> PropertyInfoArea<'a> {
         let mut trie_node = self.root_node();
 
         loop {
-            // Cache each index: every accessor call re-validates the whole
-            // TrieNodeData → PropertyEntry chain (`ref_from` twice), so
-            // calling them twice per field doubled the per-level cost of
-            // this lookup hot path.
-            let context_index = trie_node.context_index();
+            // Single TrieNodeData → PropertyEntry validation per node for
+            // both indexes — separate accessors would double the per-level
+            // cost of this lookup hot path.
+            let (context_index, type_index) = trie_node.context_and_type_indexes();
             if context_index != !0 {
                 return_context_index = context_index;
             }
-
-            let type_index = trie_node.type_index();
             if type_index != !0 {
                 return_type_index = type_index;
             }
@@ -530,16 +529,24 @@ impl<'a> PropertyInfoArea<'a> {
             }
         }
 
-        for i in 0..trie_node.num_exact_matches() {
-            let exact_match = match trie_node.exact_match(i as _) {
+        // One node-data validation + one array slice for the whole loop, as
+        // in `check_prefix_match`.
+        let exact_offsets = match trie_node.exact_match_offsets() {
+            Ok(o) => o,
+            Err(e) => {
+                warn!("Failed to read exact_match entries: {e}");
+                &[][..]
+            }
+        };
+        for (i, &entry_offset) in exact_offsets.iter().enumerate() {
+            let exact_match = match trie_node.entry_at(entry_offset) {
                 Ok(em) => em,
                 Err(e) => {
                     warn!("Failed to read exact_match entry {i}: {e}");
                     continue;
                 }
             };
-            let Some(exact_match_name) =
-                entry_name_str(exact_match.name(self), "Exact match", i as usize)
+            let Some(exact_match_name) = entry_name_str(exact_match.name(self), "Exact match", i)
             else {
                 continue;
             };
@@ -643,7 +650,7 @@ impl PropertyInfoAreaFile {
             .context_with_location(format!("File metadata is failed in: {path:?}"))?;
 
         // Validate file metadata using common utility function
-        crate::errors::validate_file_metadata(
+        crate::file_validation::validate_file_metadata(
             &metadata,
             path,
             size_of::<PropertyInfoAreaHeader>() as u64,
@@ -660,9 +667,31 @@ impl PropertyInfoAreaFile {
             ))
         })?;
 
-        Ok(Self {
+        let this = Self {
             mmap: MemoryMap::new(file, size, false)?,
-        })
+        };
+
+        // AOSP parity (`PropertyInfoAreaFile::LoadPath`): reject files this
+        // parser cannot be trusted to interpret. Without the version gate a
+        // future-format file parses "successfully" into garbage lookups;
+        // without the size cross-check a truncated or concatenated file
+        // degrades into per-lookup warnings instead of one load-time error.
+        let area = this.property_info_area();
+        let header = area.header();
+        if header.minimum_supported_version > 1 {
+            return Err(Error::FileValidation(format!(
+                "Unsupported property_info version in {path:?}: minimum_supported_version={} (max supported 1)",
+                header.minimum_supported_version
+            )));
+        }
+        if header.size as usize != size {
+            return Err(Error::FileValidation(format!(
+                "property_info header size {} does not match file size {size} in {path:?}",
+                header.size
+            )));
+        }
+
+        Ok(this)
     }
 
     pub(crate) fn property_info_area(&'_ self) -> PropertyInfoArea<'_> {

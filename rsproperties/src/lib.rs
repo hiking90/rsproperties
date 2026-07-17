@@ -151,6 +151,7 @@ pub use errors::{ContextWithLocation, Error, Result};
 mod build_property_parser;
 mod context_node;
 mod contexts_serialized;
+mod file_validation;
 mod property_area;
 mod property_info;
 mod property_info_parser;
@@ -173,6 +174,11 @@ pub use build_property_parser::load_properties_from_file;
 pub use property_info_serializer::{build_trie, PropertyInfoEntry};
 pub use system_properties::SystemProperties;
 pub use system_property_set::socket_dir;
+
+/// Timeout type accepted by [`SystemProperties::wait`], re-exported so
+/// callers don't need a direct dependency on the exact `rustix` version
+/// this crate was built against.
+pub use rustix::fs::Timespec;
 
 pub use system_property_set::{
     PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME, PROPERTY_SERVICE_SOCKET_NAME,
@@ -300,6 +306,11 @@ pub fn try_init(config: PropertyConfig) -> Result<()> {
 /// Get the system properties directory.
 /// Returns the configured directory if init() was called,
 /// otherwise returns the default PROP_DIRNAME (/dev/__properties__).
+///
+/// Unlike [`socket_dir`] (which honors `PROPERTY_SERVICE_SOCKET_DIR`),
+/// there is deliberately no environment-variable override here: the
+/// properties directory decides which mmap'd files this process trusts,
+/// so it is configured only through code (`init`/`try_init`).
 pub fn properties_dir() -> &'static Path {
     // Lock-free once initialized; the first call takes `GLOBAL_DIRS_LOCK` so
     // the default-latch cannot slip between `try_init`'s pre-check and set.
@@ -315,11 +326,25 @@ pub fn properties_dir() -> &'static Path {
         .as_path()
 }
 
+/// The cached global instance, or `None` when it has not been initialized
+/// yet or initialization failed. Never *triggers* initialization — used by
+/// call sites (e.g. the wire-protocol version probe in
+/// `system_property_set`) that must not latch the default properties
+/// directory as a side effect.
+pub(crate) fn system_properties_if_initialized(
+) -> Option<&'static system_properties::SystemProperties> {
+    SYSTEM_PROPERTIES.get().and_then(|r| r.as_ref().ok())
+}
+
 /// Get the system properties, returning an error if initialization fails.
 ///
 /// This is the panic-free variant; `init()` should typically be called first
 /// to choose the properties directory. The initialization is cached, so
-/// subsequent calls reuse the same result (success or failure).
+/// subsequent calls reuse the same result — **including failure**: an error
+/// is latched for the process lifetime, so a property store that becomes
+/// available later (e.g. `/dev/__properties__` mounted after this process
+/// started) is not picked up. Early-boot callers should defer their first
+/// property access until the store is ready.
 pub fn try_system_properties() -> Result<&'static system_properties::SystemProperties> {
     SYSTEM_PROPERTIES
         .get_or_init(|| {
@@ -340,8 +365,12 @@ pub fn try_system_properties() -> Result<&'static system_properties::SystemPrope
 }
 
 /// Get the system properties.
-/// Before calling this function, init() must be called.
-/// It panics if init() is not called or the system properties cannot be opened.
+///
+/// Calling this without a prior `init()` does **not** panic by itself: the
+/// default directory (`/dev/__properties__`) is latched on first use, and
+/// a later `init()`/`try_init()` naming a properties directory will then
+/// fail with `AlreadyInitialized`. The panic happens only when the
+/// properties directory (configured or default) cannot be opened.
 ///
 /// Prefer [`try_system_properties`] in code that must not panic.
 pub fn system_properties() -> &'static system_properties::SystemProperties {
@@ -388,8 +417,11 @@ pub(crate) fn bionic_align(value: usize, alignment: usize) -> usize {
 /// use rsproperties::get;
 ///
 /// let sdk_version: i32 = get("ro.build.version.sdk").unwrap();
-/// let is_debuggable: bool = get("ro.debuggable").unwrap();
 /// let version: String = get("ro.build.version.release").unwrap();
+///
+/// // Android stores booleans as "0"/"1", which Rust's `bool: FromStr`
+/// // ("true"/"false" only) does NOT parse — read them numerically:
+/// let is_debuggable: bool = get::<i32>("ro.debuggable").unwrap() != 0;
 ///
 /// // With fallback
 /// let sdk_version: i32 = get("ro.build.version.sdk").unwrap_or(0);
@@ -416,24 +448,53 @@ where
 /// Get a property value with default fallback
 /// Never fails - always returns a valid value
 ///
+/// The default is constructed eagerly; when it is expensive to build
+/// (e.g. an allocated `String`), prefer [`get_or_else`], which only
+/// constructs it on the fallback path.
+///
 /// # Examples
 /// ```rust,no_run
 /// use rsproperties::get_or;
 ///
 /// let sdk_version: i32 = get_or("ro.build.version.sdk", 0);
-/// let is_debuggable: bool = get_or("ro.debuggable", false);
 /// let version: String = get_or("ro.build.version.release", "unknown".to_owned());
+///
+/// // Android stores booleans as "0"/"1", which Rust's `bool: FromStr`
+/// // ("true"/"false" only) does NOT parse — this would ALWAYS yield the
+/// // default:
+/// // let is_debuggable: bool = get_or("ro.debuggable", false);   // wrong
+/// let is_debuggable: bool = get_or("ro.debuggable", 0) != 0; // right
 /// ```
 pub fn get_or<T>(name: &str, default: T) -> T
 where
     T: std::str::FromStr,
 {
+    get_or_else(name, move || default)
+}
+
+/// Like [`get_or`], but the default is produced lazily — the closure runs
+/// only when the property is missing, empty, fails to parse, or the global
+/// property store failed to initialize (see [`try_system_properties`]:
+/// failure is latched), so the found-and-parsed hot path never pays for
+/// constructing it.
+///
+/// # Examples
+/// ```rust,no_run
+/// use rsproperties::get_or_else;
+///
+/// let version: String = get_or_else("ro.build.version.release", || "unknown".to_owned());
+/// ```
+pub fn get_or_else<T, F>(name: &str, default: F) -> T
+where
+    T: std::str::FromStr,
+    F: FnOnce() -> T,
+{
     let Ok(props) = try_system_properties() else {
-        return default;
+        return default();
     };
     // Two-stage closure: the inner `Result<T, ()>` carries the parsed
     // value back out of `read_with` without ever allocating a `String`.
-    // `Err(())` signals "use the default"; the default itself is returned
+    // `Err(())` signals "use the default"; the default itself is produced
     // at the match below, so the `FnOnce` callback never needs to own it.
     match props.read_with(name, |value| {
         if value.is_empty() {
@@ -442,7 +503,7 @@ where
         value.parse::<T>().map_err(|_| ())
     }) {
         Ok(Ok(v)) => v,
-        _ => default,
+        _ => default(),
     }
 }
 

@@ -28,6 +28,13 @@ pub enum Error {
     /// UTF-8 decode failure. A dedicated `#[from]` variant (rather than
     /// stringifying into [`Error::Encoding`]) so `source()` still reaches
     /// the original [`std::str::Utf8Error`].
+    ///
+    /// Deliberately NOT mirrored by a `String::from_utf8` variant:
+    /// [`std::string::FromUtf8Error`] owns the failed byte buffer, and
+    /// carrying wire *values* inside errors would violate the service's
+    /// don't-log-values policy the moment someone logs `{e:?}`. Call sites
+    /// convert with `.map_err(|e| Error::Utf8(e.utf8_error()))`, which
+    /// keeps the diagnostic position info and drops the bytes.
     #[error("UTF-8 conversion error: {0}")]
     Utf8(#[from] std::str::Utf8Error),
 
@@ -42,6 +49,12 @@ pub enum Error {
     #[error("File validation error: {0}")]
     FileValidation(String),
 
+    /// Never constructed by this crate; retained only because removing a
+    /// public variant is semver-breaking.
+    #[deprecated(
+        note = "never produced by rsproperties; match it with a wildcard arm — \
+                it will be removed in the next major release"
+    )]
     #[error("Conversion error: {0}")]
     Conversion(String),
 
@@ -68,6 +81,13 @@ pub enum Error {
 
     #[error("File size error: {0}")]
     FileSize(String),
+
+    /// The fixed-size property area has no room for another allocation —
+    /// an operational limit (bionic returns `false` here), distinct from
+    /// the corrupt-file conditions reported as [`Error::FileValidation`] /
+    /// [`Error::FileSize`].
+    #[error("Property area full: {0}")]
+    AreaFull(String),
 
     #[error("File ownership error: {0}")]
     FileOwnership(String),
@@ -140,79 +160,6 @@ where
             source: Box::new(e.into()),
         })
     }
-}
-
-/// Validates file metadata for system property files.
-///
-/// In test and debug modes, only checks file permissions and size.
-/// In production mode, also enforces that the file is owned by root (uid=0, gid=0).
-pub(crate) fn validate_file_metadata(
-    metadata: &std::fs::Metadata,
-    path: &std::path::Path,
-    min_size: u64,
-) -> Result<()> {
-    // Platform-specific MetadataExt imports
-    #[cfg(target_os = "android")]
-    use std::os::android::fs::MetadataExt;
-    #[cfg(target_os = "linux")]
-    use std::os::linux::fs::MetadataExt;
-    #[cfg(target_os = "macos")]
-    use std::os::macos::fs::MetadataExt;
-
-    use rustix::fs;
-
-    // Check file size first (applies to all modes)
-    if metadata.st_size() < min_size {
-        let error_msg = format!(
-            "File too small: size={}, min_size={} for {:?}",
-            metadata.st_size(),
-            min_size,
-            path
-        );
-        log::error!("{error_msg}");
-        return Err(Error::FileSize(error_msg));
-    }
-
-    #[cfg(any(target_os = "android", target_os = "linux"))]
-    let check_permissions = metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits());
-
-    #[cfg(target_os = "macos")]
-    let check_permissions =
-        metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32;
-
-    // Check write permissions (applies to all modes)
-    if check_permissions != 0 {
-        let error_msg = format!(
-            "File has group or other write permissions: mode={:#o} for {:?}",
-            metadata.st_mode(),
-            path
-        );
-        log::error!("{error_msg}");
-        return Err(Error::PermissionDenied(error_msg));
-    }
-
-    // In production (release) builds, also check ownership.
-    //
-    // `cfg!(test)` is intentionally NOT part of this condition: it is only
-    // true while compiling this crate's own `--test` harness, so it never
-    // covers integration tests, doctests, or downstream crates — relying
-    // on it made `cargo test` and `cargo test --release` behave
-    // differently for the same fixture files. `debug_assertions` alone
-    // draws the line uniformly at dev-vs-release.
-    let skip_ownership_check = cfg!(debug_assertions);
-
-    if !skip_ownership_check && (metadata.st_uid() != 0 || metadata.st_gid() != 0) {
-        let error_msg = format!(
-            "File not owned by root: uid={}, gid={} for {:?}",
-            metadata.st_uid(),
-            metadata.st_gid(),
-            path
-        );
-        log::error!("{error_msg}");
-        return Err(Error::FileOwnership(error_msg));
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

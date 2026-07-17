@@ -92,13 +92,7 @@ pub(crate) struct ContextsSerialized {
 }
 
 impl ContextsSerialized {
-    pub(crate) fn new(
-        writable: bool,
-        dirname: &Path,
-        fsetxattr_failed: &mut bool,
-        load_default_path: bool,
-    ) -> Result<Self> {
-        let dirname = dirname.to_path_buf();
+    pub(crate) fn new(writable: bool, dirname: &Path, load_default_path: bool) -> Result<Self> {
         let tree_filename = dirname.join("property_info");
         let serial_filename = dirname.join("properties_serial");
 
@@ -110,10 +104,35 @@ impl ContextsSerialized {
 
         let property_info_area = property_info_area_file.property_info_area();
         let num_context_nodes = property_info_area.num_contexts();
+        // The count is untrusted file data; it sizes the allocation below
+        // AND bounds the loop. Two gates before allocating:
+        // - the table-bounds check rejects a count whose declared table
+        //   doesn't fit in the file (e.g. u32::MAX), so a small corrupt
+        //   file can't drive a giant `Vec` allocation;
+        // - the absolute cap bounds the ~25x amplification (4 table bytes
+        //   → one `Option<ContextNode>` slot) still reachable from a
+        //   *genuinely large* file that really contains its table. Real
+        //   Android property_info files declare a few thousand contexts;
+        //   the cap is far above any legitimate build.
+        const MAX_CONTEXTS: usize = 65_536;
+        if num_context_nodes > MAX_CONTEXTS {
+            return Err(Error::FileValidation(format!(
+                "context table declares {num_context_nodes} entries (max {MAX_CONTEXTS})"
+            )));
+        }
+        if num_context_nodes > 0 {
+            property_info_area
+                .context_offset(num_context_nodes - 1)
+                .map_err(|e| {
+                    Error::FileValidation(format!(
+                        "context table ({num_context_nodes} entries) exceeds property_info bounds: {e}"
+                    ))
+                })?;
+        }
         let mut context_nodes: Vec<Option<ContextNode>> = Vec::with_capacity(num_context_nodes);
 
         for i in 0..num_context_nodes {
-            match try_build_context_node(&property_info_area, dirname.as_path(), writable, i) {
+            match try_build_context_node(&property_info_area, dirname, writable, i) {
                 Ok(n) => context_nodes.push(Some(n)),
                 Err(e) => {
                     warn!("context entry {i} skipped: {e}");
@@ -125,10 +144,7 @@ impl ContextsSerialized {
         let (writer_lock, serial_property_area_map) = if writable {
             if !dirname.is_dir() {
                 info!("Creating directory: {dirname:?}");
-                match fs::mkdir(
-                    dirname.as_path(),
-                    fs::Mode::RWXU | fs::Mode::XGRP | fs::Mode::XOTH,
-                ) {
+                match fs::mkdir(dirname, fs::Mode::RWXU | fs::Mode::XGRP | fs::Mode::XOTH) {
                     Ok(()) => {}
                     // Lost a create race with a concurrent writer — the
                     // flock below is the real single-writer arbiter, so an
@@ -144,22 +160,20 @@ impl ContextsSerialized {
             // Must precede the `open()` calls below: they unlink and
             // recreate area files, so a losing second writer has to bail
             // out *before* touching anything the winner owns.
-            let lock = Self::acquire_writer_lock(dirname.as_path())?;
-
-            *fsetxattr_failed = false;
+            let lock = Self::acquire_writer_lock(dirname)?;
 
             for node in context_nodes.iter_mut().flatten() {
-                node.open(fsetxattr_failed)?;
+                node.open()?;
             }
 
             (
                 Some(lock),
-                Self::map_serial_property_area(serial_filename.as_path(), true, fsetxattr_failed)?,
+                Self::map_serial_property_area(serial_filename.as_path(), true)?,
             )
         } else {
             (
                 None,
-                Self::map_serial_property_area(serial_filename.as_path(), false, fsetxattr_failed)?,
+                Self::map_serial_property_area(serial_filename.as_path(), false)?,
             )
         };
 
@@ -176,11 +190,23 @@ impl ContextsSerialized {
     /// the returned `File`, so holding it in the struct scopes single-writer
     /// ownership of the directory to the instance's lifetime.
     fn acquire_writer_lock(dirname: &Path) -> Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
         let lock_path = dirname.join(".writer_lock");
+        // O_NOFOLLOW + explicit mode, like the area files opened by
+        // `PropertyAreaMap::new_rw`: this file is the single-writer
+        // arbiter, so a symlink planted at `.writer_lock` must not be able
+        // to redirect the `flock` to a different inode (two writers each
+        // locking a different file would both "win"). Mode 0600, not 0644:
+        // `flock(LOCK_EX)` succeeds on a read-only fd, so any user who can
+        // open the file could otherwise squat the exclusive lock and block
+        // the legitimate writer forever — nobody but the owner ever needs
+        // to open this file.
         let lock_file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
+            .custom_flags(fs::OFlags::NOFOLLOW.bits() as _)
+            .mode(0o600)
             .open(&lock_path)
             .context_with_location(format!("Failed to open writer lock {lock_path:?}"))?;
         fs::flock(&lock_file, fs::FlockOperation::NonBlockingLockExclusive).map_err(|e| {
@@ -195,14 +221,9 @@ impl ContextsSerialized {
     fn map_serial_property_area(
         serial_filename: &Path,
         access_rw: bool,
-        fsetxattr_failed: &mut bool,
     ) -> Result<PropertyAreaMap> {
         let result = if access_rw {
-            PropertyAreaMap::new_rw(
-                serial_filename,
-                Some(PROPERTIES_SERIAL_CONTEXT),
-                fsetxattr_failed,
-            )
+            PropertyAreaMap::new_rw(serial_filename, Some(PROPERTIES_SERIAL_CONTEXT))
         } else {
             PropertyAreaMap::new_ro(serial_filename)
         };
@@ -220,9 +241,10 @@ impl ContextsSerialized {
     /// a name lookup missing is the normal fallback flow on the get hot
     /// path (`debug!`), while an out-of-range *explicit* `context_index` —
     /// which this crate itself produced earlier — signals internal
-    /// inconsistency or corruption (`warn!`). A `None` slot is always an
-    /// `error!`: the entry existed in property_info but was corrupt at
-    /// init.
+    /// inconsistency or corruption (`warn!`). A `None` slot (entry existed
+    /// in property_info but was corrupt at init) logs at `debug!` here:
+    /// the corruption was already reported once with `warn!` during init,
+    /// and this accessor sits on the get hot path.
     fn context_node_at(
         &self,
         index: u32,
@@ -232,7 +254,12 @@ impl ContextsSerialized {
         match self.context_nodes.get(index as usize) {
             Some(Some(node)) => Ok(node),
             Some(None) => {
-                error!("Context entry {index} for {what} was skipped during init");
+                // `debug!`, not `error!`: the corruption was already
+                // reported once (warn) at init; this arm sits on the get
+                // hot path and would otherwise log on every lookup of an
+                // affected property. The returned error still carries the
+                // full context.
+                debug!("Context entry {index} for {what} was skipped during init");
                 Err(Error::NotFound(format!(
                     "context entry {index} for {what} unavailable (corrupt at init)"
                 )))
