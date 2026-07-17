@@ -232,14 +232,12 @@ impl TrieBuilder {
 
         let last_name: Rc<str> = Rc::from(last_name);
 
+        // The three branches are mutually exclusive, so each can consume
+        // `context`/`rtype` directly — no refcount traffic needed.
         if exact {
-            current_node.add_exact_match_context(
-                last_name,
-                Rc::clone(&context),
-                Rc::clone(&rtype),
-            )?;
+            current_node.add_exact_match_context(last_name, context, rtype)?;
         } else if !ends_with_dot {
-            current_node.add_prefix_context(last_name, Rc::clone(&context), Rc::clone(&rtype))?;
+            current_node.add_prefix_context(last_name, context, rtype)?;
         } else {
             let child = current_node
                 .children

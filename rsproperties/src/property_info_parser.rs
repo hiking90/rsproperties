@@ -3,8 +3,9 @@
 
 use std::{cmp::Ordering, ffi::CStr, fs::File, mem::size_of, path::Path};
 
-use log::{info, warn};
+use log::{trace, warn};
 
+use zerocopy::FromBytes;
 use zerocopy_derive::*;
 
 use crate::errors::*;
@@ -33,10 +34,17 @@ where
 
 /// Decodes a trie entry name into a non-empty UTF-8 string.
 ///
-/// Returns `None` and skips silently for empty names (the corruption-fallback
-/// `c""` returned by `cstr()`). Returns `None` and logs a warning on UTF-8
-/// failure so corrupted entries are observable in logs.
-fn entry_name_str<'a>(name: &'a CStr, kind: &str, idx: usize) -> Option<&'a str> {
+/// Returns `None` and logs a warning for corrupt names (out-of-range
+/// offset, missing NUL, non-UTF-8) so damaged entries are observable in
+/// logs; an empty name is skipped as well — no valid trie entry has one.
+fn entry_name_str<'a>(name: Result<&'a CStr>, kind: &str, idx: usize) -> Option<&'a str> {
+    let name = match name {
+        Ok(name) => name,
+        Err(e) => {
+            warn!("{kind} entry {idx} name read failed: {e}");
+            return None;
+        }
+    };
     match name.to_str() {
         Ok(s) if !s.is_empty() => Some(s),
         Ok(_) => None,
@@ -57,7 +65,7 @@ pub(crate) struct PropertyEntry {
 }
 
 impl PropertyEntry {
-    pub(crate) fn name<'a>(&'a self, property_info_area: &'a PropertyInfoArea) -> &'a CStr {
+    pub(crate) fn name<'a>(&'a self, property_info_area: &'a PropertyInfoArea) -> Result<&'a CStr> {
         property_info_area.cstr(self.name_offset as usize)
     }
 }
@@ -76,7 +84,7 @@ pub(crate) struct TrieNodeData {
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug)]
 #[repr(C, align(4))]
-pub struct PropertyInfoAreaHeader {
+pub(crate) struct PropertyInfoAreaHeader {
     pub(crate) current_version: u32,
     pub(crate) minimum_supported_version: u32,
     pub(crate) size: u32,
@@ -86,23 +94,29 @@ pub struct PropertyInfoAreaHeader {
 }
 
 #[derive(Debug)]
-pub struct TrieNode<'a> {
+pub(crate) struct TrieNode<'a> {
     property_info_area: PropertyInfoArea<'a>,
     trie_node_offset: usize,
 }
 
 impl<'a> TrieNode<'a> {
-    fn new(property_info_area: &'a PropertyInfoArea, trie_node_offset: usize) -> Self {
+    // Takes the (Copy) area by value so the returned node borrows the
+    // underlying *data* (`'a`), not the `&self` reference it was created
+    // through — child nodes can then be returned up the call stack without
+    // re-wrapping.
+    fn new(property_info_area: PropertyInfoArea<'a>, trie_node_offset: usize) -> Self {
         Self {
-            property_info_area: *property_info_area,
+            property_info_area,
             trie_node_offset,
         }
     }
 
-    pub(crate) fn name(&self) -> Result<&CStr> {
+    // `&'a CStr`, not `&CStr`: like `child_node`, the name borrows the
+    // underlying data, not this node value.
+    pub(crate) fn name(&self) -> Result<&'a CStr> {
         let property_entry = self.property_entry()?;
         let name_offset = property_entry.name_offset as usize;
-        Ok(self.property_info_area.cstr(name_offset))
+        self.property_info_area.cstr(name_offset)
     }
 
     fn data(&self) -> Result<&TrieNodeData> {
@@ -143,24 +157,38 @@ impl<'a> TrieNode<'a> {
         })
     }
 
-    fn child_node(&'_ self, n: usize) -> Result<TrieNode<'_>> {
+    fn child_node(&self, n: usize) -> Result<TrieNode<'a>> {
         let data = self.data()?;
+        let offset =
+            self.entry_offset_at(data.child_nodes, data.num_child_nodes, n, "Child node")?;
+        Ok(TrieNode::new(self.property_info_area, offset))
+    }
+
+    /// Reads the `n`-th offset out of a `count`-sized u32 offset array at
+    /// `array_offset` — the shared skeleton of `child_node` / `prefix` /
+    /// `exact_match`. Bounds are validated against the *declared* count, so
+    /// a corrupt count field fails loudly instead of silently reinterpreting
+    /// adjacent data as entries.
+    fn entry_offset_at(
+        &self,
+        array_offset: u32,
+        count: u32,
+        n: usize,
+        kind: &str,
+    ) -> Result<usize> {
         let slice = self
             .property_info_area
-            .u32_slice_from(data.child_nodes as usize);
-        let child_node_offset = slice.get(n).ok_or_else(|| {
+            .u32_slice_from(array_offset as usize, count as usize)?;
+        let offset = slice.get(n).ok_or_else(|| {
             Error::FileValidation(format!(
-                "Child node index {n} out of bounds: array length {}",
+                "{kind} index {n} out of bounds: array length {}",
                 slice.len()
             ))
         })?;
-        Ok(TrieNode::new(
-            &self.property_info_area,
-            *child_node_offset as usize,
-        ))
+        Ok(*offset as usize)
     }
 
-    fn find_child_for_string(&'_ self, input: &str) -> Option<TrieNode<'_>> {
+    fn find_child_for_string(&self, input: &str) -> Option<TrieNode<'a>> {
         // On corruption we return `Ordering::Equal`; `find` exits the binary
         // search immediately so the closure runs at most once after the flag
         // is set. `corrupted` then disqualifies the index because the
@@ -169,12 +197,11 @@ impl<'a> TrieNode<'a> {
         let node_index = find(self.num_child_nodes(), |i| match self.child_node(i) {
             Ok(child) => match child.name() {
                 Ok(name) => match name.to_str() {
-                    // `cstr()` swallows out-of-range offsets / missing NUL
-                    // by returning `c""` — an empty name is the corruption
-                    // fallback, not real data, and must disqualify the
-                    // search like the other corruption arms (otherwise
-                    // `"".cmp(input) == Less` silently steers the binary
-                    // search with a broken sort invariant).
+                    // No valid trie node has an empty name — treat it as
+                    // corruption and disqualify the search like the other
+                    // corruption arms (otherwise `"".cmp(input) == Less`
+                    // silently steers the binary search with a broken sort
+                    // invariant).
                     Ok("") => {
                         warn!("child node {i} has empty (corruption-fallback) name");
                         corrupted = true;
@@ -218,15 +245,7 @@ impl<'a> TrieNode<'a> {
 
     pub(crate) fn prefix(&self, n: usize) -> Result<&PropertyEntry> {
         let data = self.data()?;
-        let slice = self
-            .property_info_area
-            .u32_slice_from(data.prefix_entries as usize);
-        let offset = *slice.get(n).ok_or_else(|| {
-            Error::FileValidation(format!(
-                "Prefix index {n} out of bounds: array length {}",
-                slice.len()
-            ))
-        })? as usize;
+        let offset = self.entry_offset_at(data.prefix_entries, data.num_prefixes, n, "Prefix")?;
         self.property_info_area.ref_from(offset)
     }
 
@@ -244,41 +263,47 @@ impl<'a> TrieNode<'a> {
 
     pub(crate) fn exact_match(&self, n: usize) -> Result<&PropertyEntry> {
         let data = self.data()?;
-        let slice = self
-            .property_info_area
-            .u32_slice_from(data.exact_match_entries as usize);
-        let offset = *slice.get(n).ok_or_else(|| {
-            Error::FileValidation(format!(
-                "Exact match index {n} out of bounds: array length {}",
-                slice.len()
-            ))
-        })? as usize;
+        let offset = self.entry_offset_at(
+            data.exact_match_entries,
+            data.num_exact_matches,
+            n,
+            "Exact match",
+        )?;
         self.property_info_area.ref_from(offset)
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct PropertyInfoArea<'a> {
+pub(crate) struct PropertyInfoArea<'a> {
     data_base: &'a [u8],
 }
 
 impl<'a> PropertyInfoArea<'a> {
     pub(crate) fn new(data_base: &'a [u8]) -> Self {
+        // `header()` relies on this holding for both construction paths
+        // (mmap: validated by `load_path`; builder: header pre-allocated by
+        // `TrieNodeArena`) — assert it locally so a future third path can't
+        // silently violate it.
+        debug_assert!(
+            data_base.len() >= size_of::<PropertyInfoAreaHeader>(),
+            "property_info area smaller than its header"
+        );
         Self { data_base }
     }
 
-    pub(crate) fn cstr(&self, offset: usize) -> &CStr {
-        if offset >= self.data_base.len() {
-            return c"";
-        }
-        match self.data_base[offset..].iter().position(|&x| x == 0) {
-            Some(end) => {
-                let end = end + offset + 1;
-                CStr::from_bytes_with_nul(&self.data_base[offset..end])
-                    .expect("null terminator verified by position search")
-            }
-            None => c"",
-        }
+    /// NUL-terminated string at `offset`. Corruption (out-of-range offset,
+    /// missing NUL terminator) is a typed error, *not* an in-band `c""` —
+    /// an empty string is valid data and must stay distinguishable from a
+    /// damaged file.
+    pub(crate) fn cstr(&self, offset: usize) -> Result<&'a CStr> {
+        let tail = self.data_base.get(offset..).ok_or_else(|| {
+            Error::FileValidation(format!(
+                "string offset {offset} out of bounds ({} bytes)",
+                self.data_base.len()
+            ))
+        })?;
+        CStr::from_bytes_until_nul(tail)
+            .map_err(|_| Error::FileValidation(format!("no NUL terminator after offset {offset}")))
     }
 
     #[inline]
@@ -303,31 +328,38 @@ impl<'a> PropertyInfoArea<'a> {
             })
     }
 
+    /// `len`-element u32 array at `offset`. The caller passes the *declared*
+    /// element count (from a header/node field) so a corrupt count larger
+    /// than the file fails here as a validation error — slicing "to the end
+    /// of the buffer" instead would silently reinterpret adjacent unrelated
+    /// data as entries.
+    ///
+    /// zerocopy rather than `align_to`: `align_to`'s middle-slice length is
+    /// documented as a performance property, not a correctness guarantee
+    /// ("it is permissible for all of the input data to be returned as the
+    /// prefix"), while `ref_from_bytes` *contractually* fails on
+    /// misalignment and returns exactly `byte_len / 4` elements.
     #[inline]
-    fn u32_slice_from(&self, offset: usize) -> &[u32] {
-        // Check bounds first
-        if offset >= self.data_base.len() {
-            return &[];
-        }
-
-        let slice = &self.data_base[offset..];
-        // SAFETY: the sole obligation for `align_to::<u32>` is that the
-        // element reinterpretation be valid, and `u8 → u32` is valid for
-        // every bit pattern; the middle slice's alignment is guaranteed by
-        // `align_to` itself. The `prefix.is_empty()` check below is a
-        // *correctness* gate (the array must start exactly at `offset` —
-        // a non-empty prefix means the data there isn't 4-aligned and is
-        // treated as absent), not a safety requirement.
-        let (prefix, u32_slice, _suffix) = unsafe { slice.align_to::<u32>() };
-
-        // Ensure proper alignment - prefix should be empty for u32-aligned data
-        if !prefix.is_empty() {
-            log::warn!("Data at offset {offset} is not properly aligned for u32");
-            return &[];
-        }
-
-        // _suffix can contain trailing bytes which is normal
-        u32_slice
+    fn u32_slice_from(&self, offset: usize, len: usize) -> Result<&'a [u32]> {
+        let byte_len = len.checked_mul(size_of::<u32>()).ok_or_else(|| {
+            Error::FileValidation(format!(
+                "u32 array length overflow: {len} at offset {offset}"
+            ))
+        })?;
+        let end = offset.checked_add(byte_len).ok_or_else(|| {
+            Error::FileValidation(format!("u32 array end overflow: {offset} + {byte_len}"))
+        })?;
+        let slice = self.data_base.get(offset..end).ok_or_else(|| {
+            Error::FileValidation(format!(
+                "u32 array out of bounds: {offset}..{end} > {}",
+                self.data_base.len()
+            ))
+        })?;
+        <[u32]>::ref_from_bytes(slice).map_err(|_| {
+            Error::FileValidation(format!(
+                "u32 array at offset {offset} is not 4-byte aligned"
+            ))
+        })
     }
 
     #[inline]
@@ -335,47 +367,41 @@ impl<'a> PropertyInfoArea<'a> {
         // Both construction paths guarantee room and alignment for the
         // header at offset 0: the mmap path validates the file size on
         // load (`load_path`), and the builder path (`TrieNodeArena::info`)
-        // allocates the header before anything else. `ref_from` re-checks
-        // both at runtime, so a violated invariant panics here rather
-        // than reading garbage.
+        // allocates the header before anything else (asserted in `new`).
+        // `ref_from` re-checks both at runtime, so a violated invariant
+        // panics here rather than reading garbage.
         self.ref_from(0)
             .expect("header at offset 0; guaranteed by load-time validation / arena layout")
     }
 
-    // #[inline]
-    // pub fn current_version(&self) -> u32 {
-    //     self.header().current_version
-    // }
-
-    // #[inline]
-    // pub fn minimum_supported_version(&self) -> u32 {
-    //     self.header().minimum_supported_version
-    // }
-
-    // #[inline]
-    // pub fn size(&self) -> usize {
-    //     self.header().size as _
-    // }
+    /// Element count stored at the head of the u32 table at `table_offset`
+    /// (contexts/types tables both lead with their count). Corruption reads
+    /// as 0 — every consumer treats "no entries" as the safe degenerate —
+    /// but is logged so a damaged table doesn't silently look empty.
+    #[inline]
+    fn table_count(&self, table_offset: u32) -> usize {
+        match self.u32_slice_from(table_offset as usize, 1) {
+            Ok(s) => s.first().copied().unwrap_or(0) as _,
+            Err(e) => {
+                warn!("table count read failed at offset {table_offset}: {e}");
+                0
+            }
+        }
+    }
 
     #[inline]
     pub(crate) fn num_contexts(&self) -> usize {
-        self.u32_slice_from(self.header().contexts_offset as usize)
-            .first()
-            .copied()
-            .unwrap_or(0) as _
+        self.table_count(self.header().contexts_offset)
     }
 
     #[cfg(feature = "builder")]
     #[inline]
     pub(crate) fn num_types(&self) -> usize {
-        self.u32_slice_from(self.header().types_offset as usize)
-            .first()
-            .copied()
-            .unwrap_or(0) as _
+        self.table_count(self.header().types_offset)
     }
 
-    pub(crate) fn root_node(&'_ self) -> TrieNode<'_> {
-        TrieNode::new(self, self.header().root_offset as usize)
+    pub(crate) fn root_node(&self) -> TrieNode<'a> {
+        TrieNode::new(*self, self.header().root_offset as usize)
     }
 
     pub(crate) fn context_offset(&self, index: usize) -> Result<usize> {
@@ -389,7 +415,7 @@ impl<'a> PropertyInfoArea<'a> {
                     self.header().contexts_offset
                 ))
             })?;
-        let slice = self.u32_slice_from(context_array_offset);
+        let slice = self.u32_slice_from(context_array_offset, self.num_contexts())?;
         let value = slice.get(index).ok_or_else(|| {
             Error::FileValidation(format!(
                 "Context index {index} out of bounds: array length {} at offset {context_array_offset}",
@@ -410,7 +436,7 @@ impl<'a> PropertyInfoArea<'a> {
                     self.header().types_offset
                 ))
             })?;
-        let slice = self.u32_slice_from(type_array_offset);
+        let slice = self.u32_slice_from(type_array_offset, self.num_types())?;
         let value = slice.get(index).ok_or_else(|| {
             Error::FileValidation(format!(
                 "Type index {index} out of bounds: array length {} at offset {type_array_offset}",
@@ -436,7 +462,9 @@ impl<'a> PropertyInfoArea<'a> {
                     continue;
                 }
             };
-            if prefix.namelen > remaining_name_size as u32 {
+            // Widen the untrusted field instead of truncating the local
+            // length with `as u32`.
+            if prefix.namelen as usize > remaining_name_size {
                 continue;
             }
             let Some(prefix_name) = entry_name_str(prefix.name(self), "Prefix", i as usize) else {
@@ -489,7 +517,7 @@ impl<'a> PropertyInfoArea<'a> {
                     match trie_node.find_child_for_string(segment) {
                         Some(node) => {
                             remaining_name = &remaining_name[index + 1..];
-                            trie_node = TrieNode::new(self, node.trie_node_offset);
+                            trie_node = node;
                         }
                         None => {
                             break;
@@ -528,7 +556,9 @@ impl<'a> PropertyInfoArea<'a> {
                     return_type_index
                 };
 
-                info!(
+                // `trace!`, not `info!`: this fires on every successful
+                // lookup on the property-get hot path.
+                trace!(
                     "Property '{name}' resolved: context_index={context_index}, type_index={type_index}"
                 );
                 return (context_index, type_index);
@@ -575,9 +605,8 @@ impl<'a> PropertyInfoArea<'a> {
         // search) and surface the inability-to-trust-sort via `corrupted`.
         let mut corrupted = false;
         let idx = find(n, |i| {
-            match offset_at(i).and_then(|off| {
-                self.cstr(off)
-                    .to_str()
+            match offset_at(i).and_then(|off| self.cstr(off)).and_then(|s| {
+                s.to_str()
                     .map_err(|e| Error::FileValidation(format!("{kind} entry {i} not UTF-8: {e}")))
             }) {
                 Ok(s) => s.cmp(needle),
@@ -596,7 +625,7 @@ impl<'a> PropertyInfoArea<'a> {
     }
 }
 
-pub struct PropertyInfoAreaFile {
+pub(crate) struct PropertyInfoAreaFile {
     mmap: MemoryMap,
 }
 

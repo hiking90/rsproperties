@@ -5,7 +5,13 @@ use std::num::ParseIntError;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Crate-wide error type.
+///
+/// `#[non_exhaustive]` because this enum is re-exported from a published
+/// library: downstream `match`es must keep a wildcard arm so future
+/// variants are not semver-breaking.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -19,14 +25,43 @@ pub enum Error {
     #[error("Encoding error: {0}")]
     Encoding(String),
 
+    /// UTF-8 decode failure. A dedicated `#[from]` variant (rather than
+    /// stringifying into [`Error::Encoding`]) so `source()` still reaches
+    /// the original [`std::str::Utf8Error`].
+    #[error("UTF-8 conversion error: {0}")]
+    Utf8(#[from] std::str::Utf8Error),
+
     #[error("Parse error: {0}")]
     Parse(String),
+
+    /// Integer parse failure. `#[from]` for the same `source()`-chain
+    /// reason as [`Error::Utf8`].
+    #[error("Parse integer error: {0}")]
+    ParseInt(#[from] ParseIntError),
 
     #[error("File validation error: {0}")]
     FileValidation(String),
 
     #[error("Conversion error: {0}")]
     Conversion(String),
+
+    /// Caller-supplied argument violated an API contract (over-long
+    /// name/value, malformed input) — distinct from [`Error::FileValidation`],
+    /// which reports corrupt on-disk state.
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+
+    /// A first-write-wins global (properties/socket directory) was already
+    /// initialized — explicitly via `init()`/`try_init()` or implicitly by
+    /// the first property access latching the default.
+    #[error("Already initialized: {0}")]
+    AlreadyInitialized(String),
+
+    /// The property service accepted the connection but rejected the
+    /// request at the protocol level — the socket itself is healthy, so
+    /// this is deliberately not an [`Error::Io`].
+    #[error("Property service rejected \"{name}\": error code {code:#x}")]
+    ServiceError { name: String, code: i32 },
 
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
@@ -38,7 +73,7 @@ pub enum Error {
     FileOwnership(String),
 
     #[error("Lock error: {0}")]
-    LockError(String),
+    Lock(String),
 
     /// Cached global-initialization failure (see `try_system_properties`).
     /// Wraps the original in `Arc` because the `OnceLock` cache can only
@@ -68,24 +103,6 @@ pub enum Error {
         #[source]
         source: Box<Error>,
     },
-}
-
-impl From<std::str::Utf8Error> for Error {
-    fn from(source: std::str::Utf8Error) -> Self {
-        Error::Encoding(format!("UTF-8 conversion error: {source}"))
-    }
-}
-
-impl From<std::ffi::OsString> for Error {
-    fn from(source: std::ffi::OsString) -> Self {
-        Error::Conversion(format!("OsString conversion error: {source:?}"))
-    }
-}
-
-impl From<ParseIntError> for Error {
-    fn from(source: ParseIntError) -> Self {
-        Error::Parse(format!("Parse integer error: {source}"))
-    }
 }
 
 pub trait ContextWithLocation<T> {
@@ -129,7 +146,7 @@ where
 ///
 /// In test and debug modes, only checks file permissions and size.
 /// In production mode, also enforces that the file is owned by root (uid=0, gid=0).
-pub fn validate_file_metadata(
+pub(crate) fn validate_file_metadata(
     metadata: &std::fs::Metadata,
     path: &std::path::Path,
     min_size: u64,

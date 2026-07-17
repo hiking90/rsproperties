@@ -32,6 +32,10 @@ static SOCKET_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// Set the global socket directory for property services (internal use only).
 /// This function can only be called once. Subsequent calls will be ignored.
 ///
+/// Callers must hold `crate::GLOBAL_DIRS_LOCK` (see `lib::try_init`) so the
+/// pre-check + set sequence stays atomic against the implicit latch in
+/// [`socket_dir`].
+///
 /// # Arguments
 /// * `dir` - The directory path where property service sockets are located
 ///
@@ -59,6 +63,13 @@ pub(crate) fn socket_dir_is_set() -> bool {
 /// 2. `PROPERTY_SERVICE_SOCKET_DIR` environment variable
 /// 3. Default directory: `/dev/socket`
 pub fn socket_dir() -> &'static Path {
+    // Lock-free once initialized; the first call takes `GLOBAL_DIRS_LOCK` so
+    // the env/default latch cannot slip between `try_init`'s pre-check and
+    // its `set_socket_dir` commit.
+    if let Some(dir) = SOCKET_DIR.get() {
+        return dir.as_path();
+    }
+    let _guard = crate::lock_global_dirs();
     SOCKET_DIR
         .get_or_init(|| {
             let dir = env::var("PROPERTY_SERVICE_SOCKET_DIR")
@@ -81,6 +92,99 @@ fn get_property_service_for_system_socket() -> PathBuf {
     socket_dir().join(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME)
 }
 
+/// Bound on every socket operation against the property service —
+/// **including connect** (see `connect_with_timeout`). The V1 path
+/// additionally enforces its own (shorter) close-wait budget; this cap
+/// exists so a stalled server — one that stopped accepting, never
+/// responds, or stops draining our send — cannot block the caller's
+/// thread forever, the exact hazard the V1 arm defends against with
+/// `wait_for_socket_close`.
+const SERVICE_IO_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maps a read/write-timeout expiry to a clearly-labelled `TimedOut` error
+/// (preserving the original as text); passes every other error through.
+/// Shared by `recv_i32` and `ServiceWriter::send` so both directions of
+/// the protocol report timeouts the same way.
+fn map_timeout_err(e: std::io::Error, doing: &str) -> Error {
+    if matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ) {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("timed out {doing} ({SERVICE_IO_TIMEOUT:?}): {e}"),
+        ))
+    } else {
+        Error::Io(e)
+    }
+}
+
+/// Connects to a unix-domain socket with `timeout` as a hard bound on the
+/// connect itself.
+///
+/// `UnixStream::connect` can block indefinitely when the server's listen
+/// backlog is full (an AF_UNIX peculiarity: a listener that stopped
+/// calling `accept()` parks new clients inside `connect`, *before* any
+/// read/write timeout can apply). A non-blocking socket surfaces that
+/// state as `EAGAIN`, which is retried with a short sleep until the
+/// deadline; `EINPROGRESS` (possible per POSIX) is awaited with
+/// `poll(POLLOUT)` + `SO_ERROR`.
+fn connect_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
+    use rustix::event::{poll, PollFd, PollFlags};
+    use rustix::io::Errno;
+    use rustix::net as rnet;
+
+    let timed_out = || {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("timed out connecting to {path:?} ({timeout:?})"),
+        )
+    };
+
+    let addr = rnet::SocketAddrUnix::new(path)?;
+    let fd = rnet::socket(rnet::AddressFamily::UNIX, rnet::SocketType::STREAM, None)?;
+    rustix::io::ioctl_fionbio(&fd, true)?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match rnet::connect(&fd, &addr) {
+            Ok(()) => break,
+            // Backlog full: AF_UNIX reports EAGAIN with nothing to poll on
+            // (unlike TCP there is no in-flight handshake) — back off and
+            // retry until the deadline.
+            Err(Errno::AGAIN) => {
+                if Instant::now() >= deadline {
+                    return Err(timed_out());
+                }
+                std::thread::sleep(Duration::from_millis(10).min(timeout));
+            }
+            Err(Errno::INPROGRESS) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(timed_out());
+                }
+                let timespec = rustix::event::Timespec::try_from(remaining).unwrap_or(
+                    rustix::event::Timespec {
+                        tv_sec: i64::MAX,
+                        tv_nsec: 0,
+                    },
+                );
+                let mut fds = [PollFd::new(&fd, PollFlags::OUT)];
+                if poll(&mut fds, Some(&timespec))? == 0 {
+                    return Err(timed_out());
+                }
+                // Writable does not mean connected — fetch the final status.
+                rnet::sockopt::socket_error(&fd)??;
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    rustix::io::ioctl_fionbio(&fd, false)?;
+    Ok(UnixStream::from(fd))
+}
+
 struct ServiceConnection {
     stream: UnixStream,
 }
@@ -94,34 +198,57 @@ impl ServiceConnection {
         // the only authoritative check — `fs::metadata` would race the open.
         let stream = if name == "sys.powerctl" {
             let system_socket = get_property_service_for_system_socket();
-            UnixStream::connect(&system_socket)
+            connect_with_timeout(&system_socket, SERVICE_IO_TIMEOUT)
                 .or_else(|first_err| {
                     log::warn!(
                         "Connect to {system_socket:?} failed ({first_err}); falling back to {property_service_socket:?}"
                     );
-                    UnixStream::connect(&property_service_socket)
+                    connect_with_timeout(&property_service_socket, SERVICE_IO_TIMEOUT)
                 })?
         } else {
-            UnixStream::connect(&property_service_socket)?
+            connect_with_timeout(&property_service_socket, SERVICE_IO_TIMEOUT)?
         };
+
+        // Failure to arm the timeouts would silently drop the no-hang
+        // guarantee, so it is an error rather than a `let _ =`.
+        stream.set_read_timeout(Some(SERVICE_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(SERVICE_IO_TIMEOUT))?;
 
         Ok(Self { stream })
     }
 
     fn recv_i32(&mut self) -> Result<i32> {
         let mut buf = [0u8; 4];
-        self.stream.read_exact(&mut buf)?;
+        self.stream
+            .read_exact(&mut buf)
+            .map_err(|e| map_timeout_err(e, "waiting for property service response"))?;
         let value = i32::from_ne_bytes(buf);
         Ok(value)
     }
 }
 
+/// One wire fragment: caller-borrowed payload bytes, or a 4-byte word the
+/// writer materialised itself (command ids, length prefixes).
+enum WireBuf<'a> {
+    Borrowed(&'a [u8]),
+    Word([u8; 4]),
+}
+
+impl WireBuf<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            WireBuf::Borrowed(b) => b,
+            WireBuf::Word(w) => w,
+        }
+    }
+}
+
 struct ServiceWriter<'a> {
-    // Raw byte slices rather than `IoSlice`s: the short-write loop in
+    // Raw byte fragments rather than `IoSlice`s: the short-write loop in
     // `send` needs to re-slice past already-written bytes, and `IoSlice`
     // doesn't expose its inner slice on stable (`advance_slices` is
     // 1.81+, above this crate's MSRV).
-    buffers: Vec<&'a [u8]>,
+    buffers: Vec<WireBuf<'a>>,
 }
 
 impl<'a> ServiceWriter<'a> {
@@ -131,27 +258,25 @@ impl<'a> ServiceWriter<'a> {
         }
     }
 
-    fn write_str(self, value: &'a str, len: &'a u32) -> Self {
-        // The length prefix and payload arrive as separate arguments (the
-        // `&'a u32` needs to outlive the buffer list); a mismatched pair
-        // would silently desynchronise the length-prefixed frame.
-        debug_assert_eq!(
-            *len as usize,
-            value.len(),
-            "write_str: length prefix does not match payload"
-        );
-        let mut thiz = self.write_u32(len);
-        thiz.buffers.push(value.as_bytes());
-        thiz
+    /// Appends a length-prefixed string. The writer derives the prefix from
+    /// the payload itself, so a mismatched pair — which would silently
+    /// desynchronise the frame — is unrepresentable at this API.
+    fn write_str(mut self, value: &'a str) -> Result<Self> {
+        let len = u32::try_from(value.len()).map_err(|_| {
+            Error::InvalidArgument(format!("string too long for wire: {} bytes", value.len()))
+        })?;
+        self.buffers.push(WireBuf::Word(len.to_ne_bytes()));
+        self.buffers.push(WireBuf::Borrowed(value.as_bytes()));
+        Ok(self)
     }
 
-    fn write_u32(mut self, value: &'a u32) -> Self {
-        self.buffers.push(value.as_bytes());
+    fn write_u32(mut self, value: u32) -> Self {
+        self.buffers.push(WireBuf::Word(value.to_ne_bytes()));
         self
     }
 
     fn write_bytes(mut self, value: &'a [u8]) -> Self {
-        self.buffers.push(value);
+        self.buffers.push(WireBuf::Borrowed(value));
         self
     }
 
@@ -161,13 +286,14 @@ impl<'a> ServiceWriter<'a> {
         // every byte is on the wire — a short write would otherwise
         // desynchronise the length-prefixed protocol and leave the server
         // waiting for bytes that never arrive.
-        let total: usize = self.buffers.iter().map(|b| b.len()).sum();
+        let total: usize = self.buffers.iter().map(|b| b.as_slice().len()).sum();
         let mut written = 0usize;
         while written < total {
             // Rebuild the IoSlice list, skipping what already went out.
             let mut skip = written;
             let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(self.buffers.len());
             for buf in &self.buffers {
+                let buf = buf.as_slice();
                 if skip >= buf.len() {
                     skip -= buf.len();
                     continue;
@@ -184,7 +310,7 @@ impl<'a> ServiceWriter<'a> {
                 }
                 Ok(n) => written += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(Error::Io(e)),
+                Err(e) => return Err(map_timeout_err(e, "sending property service request")),
             }
         }
         conn.stream.flush()?;
@@ -222,14 +348,14 @@ impl PropertyMessage {
         // constructor to be the enforcement point it must be at least as
         // strict as the wire contract.
         if name_bytes.len() >= PROP_NAME_MAX {
-            return Err(Error::FileValidation(format!(
+            return Err(Error::InvalidArgument(format!(
                 "Property name length {} exceeds PROP_NAME_MAX - 1 = {}",
                 name_bytes.len(),
                 PROP_NAME_MAX - 1
             )));
         }
         if value_bytes.len() >= PROP_VALUE_MAX {
-            return Err(Error::FileValidation(format!(
+            return Err(Error::InvalidArgument(format!(
                 "Property value length {} exceeds PROP_VALUE_MAX - 1 = {}",
                 value_bytes.len(),
                 PROP_VALUE_MAX - 1
@@ -272,9 +398,10 @@ fn protocol_version() -> ProtocolVersion {
 /// shuts down its write side or until `timeout` elapses.
 fn wait_for_socket_close(stream: &mut UnixStream, timeout: Duration) -> Result<()> {
     // Half-close our write side so the server can finish; then drain.
+    // (No initial `set_read_timeout` here — the loop below re-arms the
+    // remaining budget before every read.)
     let _ = stream.shutdown(Shutdown::Write);
     let original_timeout = stream.read_timeout().ok().flatten();
-    let _ = stream.set_read_timeout(Some(timeout));
 
     let started = Instant::now();
     let mut buf = [0u8; 64];
@@ -288,7 +415,13 @@ fn wait_for_socket_close(stream: &mut UnixStream, timeout: Duration) -> Result<(
             log::warn!("wait_for_socket_close: timed out after {timeout:?}");
             break;
         }
-        let _ = stream.set_read_timeout(Some(remaining));
+        // If the timeout can't be armed, the next read could block without
+        // bound — the exact thing this loop exists to prevent. Give up on
+        // draining instead (the SET itself already went out).
+        if let Err(e) = stream.set_read_timeout(Some(remaining)) {
+            log::warn!("wait_for_socket_close: couldn't arm read timeout ({e}); skipping drain");
+            break;
+        }
         match stream.read(&mut buf) {
             Ok(0) => break, // EOF — server closed.
             Ok(_) => {}     // Discard any trailing bytes.
@@ -318,11 +451,11 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
     // `validate_value_len` rejects NUL in values explicitly.
     if let Err(e) = crate::wire::validate_property_name(name) {
         log::error!("setprop reject: {e}");
-        return Err(Error::FileValidation(e));
+        return Err(Error::InvalidArgument(e));
     }
     if let Err(e) = crate::wire::validate_value_len(name, value) {
         log::error!("setprop reject: {e}");
-        return Err(Error::FileValidation(e));
+        return Err(Error::InvalidArgument(e));
     }
 
     match protocol_version() {
@@ -333,7 +466,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
                     name.len(),
                     PROP_NAME_MAX
                 );
-                return Err(Error::FileValidation(format!(
+                return Err(Error::InvalidArgument(format!(
                     "Property name is too long: {}",
                     name.len()
                 )));
@@ -345,7 +478,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
                     value.len(),
                     PROP_VALUE_MAX
                 );
-                return Err(Error::FileValidation(format!(
+                return Err(Error::InvalidArgument(format!(
                     "Property value is too long: {}",
                     value.len()
                 )));
@@ -361,32 +494,21 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
             wait_for_socket_close(&mut conn.stream, Duration::from_millis(250))?;
         }
         ProtocolVersion::V2 => {
-            // `try_from`, not `as`: V2 names have no wire-level length cap
-            // and `ro.` values are unbounded, so a silent truncation here
-            // would emit a length prefix smaller than the payload pushed
-            // into the writer — exactly the frame desync this module's
-            // send loop exists to prevent.
-            let name_len = u32::try_from(name.len()).map_err(|_| {
-                Error::FileValidation(format!("Property name too long: {} bytes", name.len()))
-            })?;
-            let value_len = u32::try_from(value.len()).map_err(|_| {
-                Error::FileValidation(format!("Property value too long: {} bytes", value.len()))
-            })?;
-
             // (Name/value policy is validated at the top of `set` — shared
-            // with the V1 arm.)
+            // with the V1 arm. Length prefixes are derived inside
+            // `write_str`, so no separate truncation hazard here.)
             // Mirror the server's wire caps so an oversized frame fails
             // here with a clear message instead of the server's opaque
             // error status.
             if name.len() > crate::wire::MAX_WIRE_NAME_LEN {
-                return Err(Error::FileValidation(format!(
+                return Err(Error::InvalidArgument(format!(
                     "Property name exceeds the wire cap: {} > {}",
                     name.len(),
                     crate::wire::MAX_WIRE_NAME_LEN
                 )));
             }
             if value.len() > crate::wire::MAX_WIRE_VALUE_LEN {
-                return Err(Error::FileValidation(format!(
+                return Err(Error::InvalidArgument(format!(
                     "Property value exceeds the wire cap: {} > {}",
                     value.len(),
                     crate::wire::MAX_WIRE_VALUE_LEN
@@ -396,9 +518,9 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
             let mut conn = ServiceConnection::new(name)?;
 
             ServiceWriter::new()
-                .write_u32(&PROP_MSG_SETPROP2)
-                .write_str(name, &name_len)
-                .write_str(value, &value_len)
+                .write_u32(PROP_MSG_SETPROP2)
+                .write_str(name)?
+                .write_str(value)?
                 .send(&mut conn)?;
 
             let res = conn.recv_i32()?;
@@ -411,10 +533,14 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
                     "Property service returned error for '{name}' (<{} bytes>): 0x{res:X}",
                     value.len()
                 );
-                return Err(Error::Io(std::io::Error::other(format!(
-                    "Unable to set property \"{name}\" (<{} bytes>): error code: 0x{res:X}",
-                    value.len()
-                ))));
+                // A protocol-level rejection, not a transport failure — the
+                // socket round-trip succeeded. A dedicated variant so callers
+                // can tell a permanent policy denial from a retryable
+                // `Error::Io`.
+                return Err(Error::ServiceError {
+                    name: name.to_owned(),
+                    code: res,
+                });
             }
         }
     }

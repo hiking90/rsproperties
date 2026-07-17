@@ -79,14 +79,6 @@ impl From<&str> for PropertyConfig {
 }
 
 impl PropertyConfig {
-    /// Create config from optional PathBuf (for backward compatibility)
-    pub fn from_optional_path(path: Option<PathBuf>) -> Self {
-        match path {
-            Some(path) => Self::from(path),
-            None => Self::default(),
-        }
-    }
-
     /// Create config with only properties directory
     pub fn with_properties_dir<P: Into<PathBuf>>(dir: P) -> Self {
         Self {
@@ -120,7 +112,9 @@ impl PropertyConfig {
     }
 }
 
-/// Builder for PropertyConfig with validation
+/// Builder for [`PropertyConfig`]. Collects optional directories; `build()`
+/// is infallible — paths are validated when the configuration is applied
+/// (`try_init` / first property access), not here.
 #[derive(Debug, Clone, Default)]
 pub struct PropertyConfigBuilder {
     properties_dir: Option<PathBuf>,
@@ -174,7 +168,7 @@ mod trie_serializer;
 // Explicit re-export lists (not globs) so the public API surface is
 // visible here and additions to the modules don't silently become public.
 #[cfg(feature = "builder")]
-pub use build_property_parser::{check_permissions, load_properties_from_file};
+pub use build_property_parser::load_properties_from_file;
 #[cfg(feature = "builder")]
 pub use property_info_serializer::{build_trie, PropertyInfoEntry};
 pub use system_properties::SystemProperties;
@@ -184,11 +178,35 @@ pub use system_property_set::{
     PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME, PROPERTY_SERVICE_SOCKET_NAME,
 };
 
-pub const PROP_VALUE_MAX: usize = 92;
+// Re-export (not a second definition): `wire::PROP_VALUE_MAX` is the single
+// source of truth — an independent constant here could drift and desync the
+// seqlock read buffer size from the area's reserved slot size.
+pub use wire::PROP_VALUE_MAX;
 pub const PROP_DIRNAME: &str = "/dev/__properties__";
 
 // System properties directory.
 static SYSTEM_PROPERTIES_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Serializes every commit to the first-write-wins directory cells
+/// (`SYSTEM_PROPERTIES_DIR` here and `SOCKET_DIR` in `system_property_set`).
+/// `try_init` must make its pre-check + set atomic against both concurrent
+/// inits and the implicit env/default latch performed by the first call to
+/// `properties_dir()` / `socket_dir()` — otherwise a lost race after the
+/// pre-check leaves the globals half-applied with no way to roll back a
+/// committed `OnceLock`. Read fast paths (`OnceLock::get`) stay lock-free.
+///
+/// Private on purpose: all access goes through [`lock_global_dirs`] so no
+/// call site can bypass its poison recovery.
+static GLOBAL_DIRS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire `GLOBAL_DIRS_LOCK`, recovering from poison: the lock only guards
+/// the check-then-set ordering of `OnceLock` cells, each of which is
+/// internally consistent even if a holder panicked mid-sequence.
+pub(crate) fn lock_global_dirs() -> std::sync::MutexGuard<'static, ()> {
+    GLOBAL_DIRS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 // Global system properties. Stores Result so initialization failure does not
 // poison the OnceLock and callers can observe the error. The error side is
 // `Arc<Error>` because the cache can only hand out references while callers
@@ -201,17 +219,18 @@ static SYSTEM_PROPERTIES: OnceLock<
 /// Initialize system properties with flexible configuration options.
 ///
 /// # Arguments
-/// * `config` - Can be:
-///   - `None` - Use default directories
-///   - `Some(PathBuf)` - Set only properties directory (backward compatibility)
-///   - `Some(PropertyConfig)` - Full configuration
+/// * `config` - A [`PropertyConfig`]; only the directories present in it
+///   are applied:
+///   - `PropertyConfig::default()` - touch nothing (defaults latch on first use)
+///   - `PropertyConfig::from(PathBuf)` - set only the properties directory
+///   - a fully populated config - set both directories
 ///
 /// # Examples
 /// ```rust,no_run
 /// use rsproperties::{init, PropertyConfig};
 /// use std::path::PathBuf;
 ///
-/// // Set only properties directory (backward compatible)
+/// // Set only properties directory
 /// init(PropertyConfig::from(PathBuf::from("/custom/properties")));
 ///
 /// // Full configuration
@@ -242,34 +261,35 @@ pub fn try_init(config: PropertyConfig) -> Result<()> {
     // Both `SYSTEM_PROPERTIES_DIR` and the socket-dir cell are first-write-
     // wins. Pre-check everything this call intends to set *before*
     // committing anything, so a failed init never leaves the global state
-    // half-applied (e.g. properties_dir locked, socket_dir unset).
+    // half-applied (e.g. properties_dir locked, socket_dir unset). The lock
+    // makes pre-check + set atomic against concurrent `try_init`s and the
+    // implicit latches in `properties_dir()` / `socket_dir()`.
+    let _guard = lock_global_dirs();
     if config.properties_dir.is_some() && SYSTEM_PROPERTIES_DIR.get().is_some() {
-        return Err(Error::FileValidation(
-            "System properties directory already initialized \
+        return Err(Error::AlreadyInitialized(
+            "system properties directory \
              (explicitly via init() or implicitly by a prior property read)"
                 .into(),
         ));
     }
     if config.socket_dir.is_some() && system_property_set::socket_dir_is_set() {
-        return Err(Error::FileValidation(
-            "Socket directory already initialized".into(),
-        ));
+        return Err(Error::AlreadyInitialized("socket directory".into()));
     }
 
     if let Some(props_dir) = config.properties_dir {
         log::info!("Setting system properties directory to: {props_dir:?}");
-        SYSTEM_PROPERTIES_DIR.set(props_dir).map_err(|_| {
-            Error::FileValidation("System properties directory already initialized".into())
-        })?;
+        SYSTEM_PROPERTIES_DIR
+            .set(props_dir)
+            .map_err(|_| Error::AlreadyInitialized("system properties directory".into()))?;
     }
 
     if let Some(socket_dir) = config.socket_dir {
         if !system_property_set::set_socket_dir(&socket_dir) {
-            // Lost a race between the pre-check and the set; anything set
-            // above is already committed and a `OnceLock` cannot be un-set,
-            // so surface the inconsistency.
-            return Err(Error::FileValidation(
-                "Socket directory already initialized (race after pre-check)".into(),
+            // Unreachable while every committer honors `GLOBAL_DIRS_LOCK`
+            // (pre-check and set are atomic under the guard above); kept as
+            // defense in depth because a `OnceLock` cannot be un-set.
+            return Err(Error::AlreadyInitialized(
+                "socket directory (race after pre-check)".into(),
             ));
         }
         log::info!("Successfully set socket directory to: {socket_dir:?}");
@@ -281,6 +301,12 @@ pub fn try_init(config: PropertyConfig) -> Result<()> {
 /// Returns the configured directory if init() was called,
 /// otherwise returns the default PROP_DIRNAME (/dev/__properties__).
 pub fn properties_dir() -> &'static Path {
+    // Lock-free once initialized; the first call takes `GLOBAL_DIRS_LOCK` so
+    // the default-latch cannot slip between `try_init`'s pre-check and set.
+    if let Some(dir) = SYSTEM_PROPERTIES_DIR.get() {
+        return dir.as_path();
+    }
+    let _guard = lock_global_dirs();
     SYSTEM_PROPERTIES_DIR
         .get_or_init(|| {
             log::info!("Using default properties directory: {PROP_DIRNAME}");

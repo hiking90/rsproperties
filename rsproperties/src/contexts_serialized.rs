@@ -5,7 +5,7 @@ use std::ffi::CStr;
 use std::path::Path;
 
 use crate::errors::*;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use rustix::fs;
 
 #[cfg(feature = "builder")]
@@ -25,18 +25,42 @@ fn try_build_context_node(
     i: usize,
 ) -> Result<ContextNode> {
     let context_offset = area.context_offset(i)?;
-    let context_cstr = area.cstr(context_offset);
-    // `cstr()` swallows out-of-range offsets and missing NUL terminators by
-    // falling back to an empty string. Promote that to an error here:
-    // an empty context name would otherwise produce a plausible-looking
-    // node whose filename is the directory itself, failing `open()` far
-    // from the actual corruption instead of skipping this slot.
+    // `cstr()` reports out-of-range offsets and missing NUL terminators as
+    // errors; an *empty* name is still rejected here — it would produce a
+    // plausible-looking node whose filename is the directory itself,
+    // failing `open()` far from the actual corruption.
+    let context_cstr = area.cstr(context_offset)?;
     if context_cstr.is_empty() {
         return Err(Error::FileValidation(format!(
-            "context entry {i}: invalid or unterminated string at offset {context_offset}"
+            "context entry {i}: empty context name at offset {context_offset}"
         )));
     }
     let context_name = context_cstr.to_str()?;
+    // The context name comes from file content and becomes a filename via
+    // `dirname.join()` — which *replaces* `dirname` entirely when handed an
+    // absolute path, and descends on `/` or `..`. On the writable path the
+    // resulting file is later `remove_file`d by `PropertyAreaMap::new_rw`,
+    // so a corrupt or malicious property_info must not be able to point a
+    // node outside the properties directory. Legitimate SELinux context
+    // names (`u:object_r:...:s0`) never contain a path separator, so
+    // requiring a single normal component loses nothing.
+    {
+        use std::path::Component;
+        let mut components = Path::new(context_name).components();
+        // The explicit `contains('/')` check closes what `components()`
+        // normalizes away: `"a/"`, `"a//"`, and `"a/."` all yield a single
+        // `Normal("a")` component yet are not plain filenames.
+        if context_name.contains('/')
+            || !matches!(
+                (components.next(), components.next()),
+                (Some(Component::Normal(_)), None)
+            )
+        {
+            return Err(Error::FileValidation(format!(
+                "context entry {i}: context name {context_name:?} is not a plain filename"
+            )));
+        }
+    }
     // The owned context is only consumed by `open()` (writable path) for
     // SELinux labeling; read-only nodes skip the allocation.
     let context = writable.then(|| context_cstr.to_owned());
@@ -161,7 +185,7 @@ impl ContextsSerialized {
             .context_with_location(format!("Failed to open writer lock {lock_path:?}"))?;
         fs::flock(&lock_file, fs::FlockOperation::NonBlockingLockExclusive).map_err(|e| {
             error!("Another writer holds the property area lock {lock_path:?}: {e}");
-            Error::LockError(format!(
+            Error::Lock(format!(
                 "Writable property area already owned by another instance ({lock_path:?}): {e}"
             ))
         })?;
@@ -183,12 +207,51 @@ impl ContextsSerialized {
             PropertyAreaMap::new_ro(serial_filename)
         };
 
-        match &result {
-            Ok(_) => {}
-            Err(e) => error!("Failed to map serial property area {serial_filename:?}: {e}"),
-        }
-
         result
+            .inspect_err(|e| error!("Failed to map serial property area {serial_filename:?}: {e}"))
+    }
+
+    /// Shared slot lookup for the accessors below: one bounds check via
+    /// `.get()` (which also covers the parser's `u32::MAX` "no context"
+    /// sentinel, since `len <= u32::MAX`) plus the `None`-slot
+    /// (skipped-at-init) case.
+    ///
+    /// `miss_is_expected` picks the log level of the out-of-range case:
+    /// a name lookup missing is the normal fallback flow on the get hot
+    /// path (`debug!`), while an out-of-range *explicit* `context_index` —
+    /// which this crate itself produced earlier — signals internal
+    /// inconsistency or corruption (`warn!`). A `None` slot is always an
+    /// `error!`: the entry existed in property_info but was corrupt at
+    /// init.
+    fn context_node_at(
+        &self,
+        index: u32,
+        what: &dyn std::fmt::Display,
+        miss_is_expected: bool,
+    ) -> Result<&ContextNode> {
+        match self.context_nodes.get(index as usize) {
+            Some(Some(node)) => Ok(node),
+            Some(None) => {
+                error!("Context entry {index} for {what} was skipped during init");
+                Err(Error::NotFound(format!(
+                    "context entry {index} for {what} unavailable (corrupt at init)"
+                )))
+            }
+            None => {
+                if miss_is_expected {
+                    debug!(
+                        "No context for {what}: index={index}, max_contexts={}",
+                        self.context_nodes.len()
+                    );
+                } else {
+                    warn!(
+                        "Context index out of range for {what}: index={index}, max_contexts={}",
+                        self.context_nodes.len()
+                    );
+                }
+                Err(Error::NotFound(format!("no context for {what}")))
+            }
+        }
     }
 
     pub(crate) fn prop_area_for_name(&self, name: &str) -> Result<(PropertyAreaGuard<'_>, u32)> {
@@ -196,29 +259,11 @@ impl ContextsSerialized {
             .property_info_area_file
             .property_info_area()
             .get_property_info_indexes(name);
-
-        if index == u32::MAX || index >= self.context_nodes.len() as u32 {
-            warn!(
-                "Property {} not found: index={}, max_contexts={}",
-                name,
-                index,
-                self.context_nodes.len()
-            );
-            return Err(Error::NotFound(name.to_owned()));
-        }
-
-        let context_node = self.context_nodes[index as usize].as_ref().ok_or_else(|| {
-            error!("Context entry {index} for property {name} was skipped during init");
-            Error::NotFound(name.to_owned())
-        })?;
-
-        match context_node.property_area() {
-            Ok(area) => Ok((area, index)),
-            Err(e) => {
-                error!("Failed to get property area for {name}: {e}");
-                Err(e)
-            }
-        }
+        let node = self.context_node_at(index, &format_args!("property {name}"), true)?;
+        let area = node
+            .property_area()
+            .inspect_err(|e| error!("Failed to get property area for {name}: {e}"))?;
+        Ok((area, index))
     }
 
     #[cfg(feature = "builder")]
@@ -230,31 +275,11 @@ impl ContextsSerialized {
             .property_info_area_file
             .property_info_area()
             .get_property_info_indexes(name);
-
-        if index == u32::MAX || index >= self.context_nodes.len() as u32 {
-            error!(
-                "Could not find context for property {}: index={}, max_contexts={}",
-                name,
-                index,
-                self.context_nodes.len()
-            );
-            return Err(Error::NotFound(format!(
-                "Could not find context for property {name}"
-            )));
-        }
-
-        let context_node = self.context_nodes[index as usize].as_ref().ok_or_else(|| {
-            error!("Context entry {index} for property {name} was skipped during init");
-            Error::NotFound(format!("Could not find context for property {name}"))
-        })?;
-
-        match context_node.property_area_mut() {
-            Ok(area) => Ok((area, index)),
-            Err(e) => {
-                error!("Failed to get mutable property area for {name}: {e}");
-                Err(e)
-            }
-        }
+        let node = self.context_node_at(index, &format_args!("property {name}"), true)?;
+        let area = node
+            .property_area_mut()
+            .inspect_err(|e| error!("Failed to get mutable property area for {name}: {e}"))?;
+        Ok((area, index))
     }
 
     pub(crate) fn serial_prop_area(&self) -> &PropertyArea {
@@ -262,35 +287,15 @@ impl ContextsSerialized {
     }
 
     pub(crate) fn prop_area_with_index(&self, context_index: u32) -> Result<PropertyAreaGuard<'_>> {
-        if context_index >= self.context_nodes.len() as u32 {
-            error!(
-                "Invalid context index {}: max={}",
-                context_index,
-                self.context_nodes.len()
-            );
-            // A lookup failure, not a parse failure — consistent with
-            // `prop_area_for_name`.
-            return Err(Error::NotFound(format!(
-                "context index {context_index} out of range (len {})",
-                self.context_nodes.len()
-            )));
-        }
-
-        let context_node = self.context_nodes[context_index as usize]
-            .as_ref()
-            .ok_or_else(|| {
-                error!("Context entry {context_index} was skipped during init");
-                Error::NotFound(format!(
-                    "Context entry {context_index} is unavailable (corrupt at init)"
-                ))
-            })?;
-        match context_node.property_area() {
-            Ok(area) => Ok(area),
-            Err(e) => {
-                error!("Failed to get property area for context index {context_index}: {e}");
-                Err(e)
-            }
-        }
+        self.context_node_at(
+            context_index,
+            &format_args!("context index {context_index}"),
+            false,
+        )?
+        .property_area()
+        .inspect_err(|e| {
+            error!("Failed to get property area for context index {context_index}: {e}")
+        })
     }
 
     #[cfg(feature = "builder")]
@@ -298,35 +303,14 @@ impl ContextsSerialized {
         &self,
         context_index: u32,
     ) -> Result<PropertyAreaMutGuard<'_>> {
-        if context_index >= self.context_nodes.len() as u32 {
-            error!(
-                "Invalid context index {}: max={}",
-                context_index,
-                self.context_nodes.len()
-            );
-            // See `prop_area_with_index`: lookup failure → NotFound.
-            return Err(Error::NotFound(format!(
-                "context index {context_index} out of range (len {})",
-                self.context_nodes.len()
-            )));
-        }
-
-        let context_node = self.context_nodes[context_index as usize]
-            .as_ref()
-            .ok_or_else(|| {
-                error!("Context entry {context_index} was skipped during init");
-                Error::NotFound(format!(
-                    "Context entry {context_index} is unavailable (corrupt at init)"
-                ))
-            })?;
-        match context_node.property_area_mut() {
-            Ok(area) => Ok(area),
-            Err(e) => {
-                error!(
-                    "Failed to get mutable property area for context index {context_index}: {e}"
-                );
-                Err(e)
-            }
-        }
+        self.context_node_at(
+            context_index,
+            &format_args!("context index {context_index}"),
+            false,
+        )?
+        .property_area_mut()
+        .inspect_err(|e| {
+            error!("Failed to get mutable property area for context index {context_index}: {e}")
+        })
     }
 }

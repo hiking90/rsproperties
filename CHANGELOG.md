@@ -6,6 +6,65 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: minor bumps may include API changes).
 
+## [0.7.0] - 2026-07-17
+
+Correctness release from a second full-source review: seqlock writer
+fences, socket no-hang guarantees, error-type overhaul, and build.prop
+`import` support.
+
+### Fixed
+
+- **Seqlock writer fences**: `apply_write` now issues a `Release` fence
+  between publishing the dirty serial and storing value bytes (matching
+  bionic's `atomic_thread_fence`), and `set_dirty_backup_area` fences
+  before rewriting the shared backup slot. Without them, ARM readers
+  could accept a torn read that passed the serial re-check.
+- `SystemProperties::wait` no longer panics on huge `tv_sec` timeouts
+  (`Instant` overflow degrades to an infinite wait, matching bionic).
+- Property-service V2 socket I/O is bounded by a 2s timeout (connect,
+  read, and write) — a stalled server can no longer block the caller's
+  thread forever.
+- Context names from `property_info` are validated to be plain filenames,
+  closing a path-traversal window that could unlink files outside the
+  properties directory on the writable path.
+- `try_init` pre-check + commit is now atomic (a global init lock also
+  taken by the first-use latches), so a lost race can no longer leave the
+  directory globals half-applied.
+- Corrupt trie count fields now fail validation instead of silently
+  reinterpreting adjacent file data (`u32_slice_from` validates against
+  the declared element count via zerocopy).
+
+### Changed
+
+- **Breaking:** `Error` is `#[non_exhaustive]`; `LockError` renamed to
+  `Lock`; `From<OsString>` removed; `Utf8Error`/`ParseIntError` now
+  convert to new source-preserving `Utf8`/`ParseInt` variants instead of
+  stringifying into `Encoding`/`Parse`.
+- **Breaking:** public-API surface reduction — internal items are no
+  longer exported: `check_permissions` (no-op placeholder),
+  `errors::validate_file_metadata`, and the never-reachable parser
+  internals (`PropertyInfo`, `PropertyInfoArea`, `PropertyInfoAreaFile`,
+  `PropertyInfoAreaHeader`, `TrieNode`) are now `pub(crate)`;
+  `PropertyConfig::from_optional_path` (redundant with
+  `From<PathBuf>`/`Default`) is removed.
+- New `Error` variants: `InvalidArgument` (API misuse, previously
+  misfiled under `FileValidation`), `AlreadyInitialized`, and
+  `ServiceError { name, code }` (protocol-level rejection, previously a
+  fabricated `Error::Io`).
+- `load_properties_from_file` supports `import` statements (recursive,
+  depth-capped, `${property}` expansion, per-file dedup) instead of
+  failing the whole file; non-UTF-8 lines and empty keys are skipped
+  with a warning.
+- `PropertyInfoEntry::new` public constructor for programmatic trie
+  building.
+- Serialized tries are byte-for-byte deterministic (prefix ties broken
+  by name).
+- `PROP_VALUE_MAX` at the crate root is a re-export of
+  `wire::PROP_VALUE_MAX` (was an independent duplicate definition).
+- Property-miss logging on the get hot path downgraded to `debug!`
+  (was duplicated `warn!` + `error!` per miss); per-lookup success log
+  downgraded to `trace!`.
+
 ## [0.6.0] - 2026-07-17
 
 Soundness release: fixes from a full-source review spanning the seqlock

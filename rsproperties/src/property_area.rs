@@ -21,6 +21,53 @@ const PA_SIZE: u64 = 128 * 1024;
 const PROP_AREA_MAGIC: u32 = 0x504f5250;
 const PROP_AREA_VERSION: u32 = 0xfc6ed0ab;
 
+/// Marker for types that may be materialized in-place from property-area
+/// mmap bytes via [`MemoryMap::to_object`] / [`MemoryMap::to_object_mut`].
+///
+/// # Safety
+///
+/// Implementors must be valid for **every** bit pattern (no niches — no
+/// `bool`/enum/reference fields; `repr(C)` with primitive/atomic fields,
+/// or unions/`UnsafeCell` thereof), tolerate arbitrary padding-byte
+/// values, and follow this module's shared-mmap concurrency protocol when
+/// accessed through `&T` (fields that can be rewritten after publication
+/// are accessed exclusively through atomics + the seqlock serial). Without
+/// this bound `to_object` would let any safe caller conjure UB by picking
+/// a type with invalid-bit-pattern niches.
+pub(crate) unsafe trait MmapObject {}
+
+// SAFETY: u32/AtomicU32 fields only, `repr(C, align(4))`, every bit pattern
+// valid; mutable-after-publication fields (serial, links, prop) are atomics
+// driven by the module's seqlock/publish protocol.
+unsafe impl MmapObject for PropertyArea {}
+unsafe impl MmapObject for PropertyTrieNode {}
+// SAFETY: AtomicU32 serial + byte array value/long-offset union, every bit
+// pattern valid; value bytes are accessed byte-wise atomically under the
+// seqlock protocol (see property_info.rs).
+unsafe impl MmapObject for PropertyInfo {}
+
+// Byte-for-byte compatibility with bionic's on-disk layout: these structs
+// overlay files produced (and consumed) by native Android. A field added,
+// removed, or reordered must fail the build, not corrupt lookups at
+// runtime — hence per-field offsets, not just sizes (a size-only assert
+// would let two same-width fields swap silently). `PropertyInfo`'s size is
+// asserted next to its definition in property_info.rs.
+const _: () = {
+    assert!(mem::size_of::<PropertyTrieNode>() == 20);
+    assert!(mem::offset_of!(PropertyTrieNode, namelen) == 0);
+    assert!(mem::offset_of!(PropertyTrieNode, prop) == 4);
+    assert!(mem::offset_of!(PropertyTrieNode, left) == 8);
+    assert!(mem::offset_of!(PropertyTrieNode, right) == 12);
+    assert!(mem::offset_of!(PropertyTrieNode, children) == 16);
+
+    assert!(mem::size_of::<PropertyArea>() == 128);
+    assert!(mem::offset_of!(PropertyArea, bytes_used) == 0);
+    assert!(mem::offset_of!(PropertyArea, serial) == 4);
+    assert!(mem::offset_of!(PropertyArea, magic) == 8);
+    assert!(mem::offset_of!(PropertyArea, version) == 12);
+    assert!(mem::offset_of!(PropertyArea, reserved) == 16);
+};
+
 #[repr(C, align(4))]
 pub(crate) struct PropertyTrieNode {
     pub(crate) namelen: u32,
@@ -113,7 +160,12 @@ impl PropertyAreaMap {
         // for an arbitrary properties dir, so treat `new_rw` as "build a
         // fresh area" and remove any stale file first. O_EXCL still guards
         // the create itself (no symlink / pre-created-file substitution
-        // between the unlink and the open).
+        // between the unlink and the open). Note this is not mutual
+        // exclusion between two concurrent `new_rw` callers — each can
+        // unlink the other's file and succeed on a different inode, leaving
+        // earlier readers attached to the orphaned one; the system-level
+        // single-writer policy is a precondition, not something enforced
+        // here.
         match std::fs::remove_file(filename) {
             Ok(()) => debug!("Removed stale property area file: {filename:?}"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -342,10 +394,14 @@ impl PropertyAreaMap {
 
         if prop_offset == 0 {
             let offset = self.new_prop_info(name, value)?;
-            let current_node = self
-                .mmap
-                .to_object_mut::<PropertyTrieNode>(current, self.data_offset)?;
-            current_node
+            // Atomic store through a shared reference — same publish pattern
+            // as the `children` link above; no exclusive access needed.
+            // Writability is guaranteed non-locally: this line is reachable
+            // only after `new_prop_info` → `allocate_obj` →
+            // `property_area_mut` succeeded, which requires a writable
+            // mapping (`to_object`, unlike `to_object_mut`, does not check).
+            self.mmap
+                .to_object::<PropertyTrieNode>(current, self.data_offset)?
                 .prop
                 .store(offset, std::sync::atomic::Ordering::Release);
         }
@@ -367,7 +423,7 @@ impl PropertyAreaMap {
         // would return bytes of the first allocated object as "backup".
         let reserved = crate::bionic_align(crate::PROP_VALUE_MAX, mem::size_of::<u32>());
         if dst.len() >= reserved {
-            return Err(Error::FileValidation(format!(
+            return Err(Error::InvalidArgument(format!(
                 "Backup read too long: {} (max: {})",
                 dst.len(),
                 reserved - 1
@@ -399,7 +455,7 @@ impl PropertyAreaMap {
         // this function is `pub(crate)` and the rest of the module uses
         // `checked_*` throughout — keep the discipline.
         let total_len = value.len().checked_add(1).ok_or_else(|| {
-            Error::FileValidation(format!("Backup value too long: {}", value.len()))
+            Error::InvalidArgument(format!("Backup value too long: {}", value.len()))
         })?;
         // Bound against the *reserved* backup slot (see `PropertyArea::init`),
         // not the whole data region — a longer value would silently overwrite
@@ -407,13 +463,22 @@ impl PropertyAreaMap {
         let reserved = crate::bionic_align(crate::PROP_VALUE_MAX, mem::size_of::<u32>());
         if total_len > reserved {
             error!("Backup value overflows the reserved slot: {total_len} > {reserved}");
-            return Err(Error::FileValidation(format!(
+            return Err(Error::InvalidArgument(format!(
                 "Backup value too long: {} (max: {})",
                 value.len(),
                 reserved - 1
             )));
         }
 
+        // Seqlock writer fence: the backup slot is shared per-area and this
+        // rewrite happens *after* the previous update's clean serial store.
+        // Without a fence the relaxed byte stores below could be observed
+        // before that clean serial — a reader still parked on the previous
+        // update's dirty serial could snapshot *this* update's backup bytes
+        // and yet pass its serial re-check. Pairs with the reader's
+        // `fence(Acquire)`: observing any backup byte written after this
+        // fence implies observing the newer serial at the re-check → retry.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         // Byte-wise atomic stores — concurrent readers in other processes
         // may snapshot the slot while we rewrite it (their seqlock re-check
         // discards the torn copy, but the accesses themselves must be
@@ -550,8 +615,9 @@ impl PropertyAreaMap {
             ))
         })?;
 
-        // Bounds check
-        if new_offset > self.pa_data_size as u32 {
+        // Bounds check. Widen to u64 instead of truncating `pa_data_size`
+        // with `as u32` — the module's checked-arithmetic discipline.
+        if u64::from(new_offset) > self.pa_data_size as u64 {
             error!(
                 "Out of memory: new_offset={} > pa_data_size={}",
                 new_offset, self.pa_data_size
@@ -884,24 +950,31 @@ impl MemoryMap {
     // Convert the memory-mapped file to the object with the given offset.
     // base is the base offset of the object.
     // offset is calculated by adding the base offset and the given offset.
-    pub(crate) fn to_object<T>(&self, offset: usize, base: usize) -> Result<&T> {
+    pub(crate) fn to_object<T: MmapObject>(&self, offset: usize, base: usize) -> Result<&T> {
         let offset = self.checked_offset(offset, base)?;
         self.check_size(offset, mem::size_of::<T>())?;
         self.check_alignment::<T>(offset)?;
-        // SAFETY: bounds and alignment are both verified above. The resulting
+        // SAFETY: bounds and alignment are verified above; `T: MmapObject`
+        // guarantees every bit pattern is a valid `T` and that shared access
+        // follows the module's mmap concurrency protocol. The resulting
         // reference's lifetime is tied to `&self`, which owns the mmap.
         Ok(unsafe { &*(self.data.add(offset) as *const T) })
     }
 
     // Convert the memory-mapped file to the mutable object with the given offset.
-    pub(crate) fn to_object_mut<T>(&mut self, offset: usize, base: usize) -> Result<&mut T> {
+    pub(crate) fn to_object_mut<T: MmapObject>(
+        &mut self,
+        offset: usize,
+        base: usize,
+    ) -> Result<&mut T> {
         self.require_writable()?;
         let offset = self.checked_offset(offset, base)?;
         self.check_size(offset, mem::size_of::<T>())?;
         self.check_alignment::<T>(offset)?;
-        // SAFETY: bounds and alignment are both verified above. `&mut self`
-        // ensures exclusive access for the lifetime of the returned
-        // reference. The mapping is PROT_WRITE (checked above).
+        // SAFETY: bounds and alignment are verified above; `T: MmapObject`
+        // guarantees every bit pattern is a valid `T`. `&mut self` ensures
+        // exclusive access for the lifetime of the returned reference. The
+        // mapping is PROT_WRITE (checked above).
         Ok(unsafe { &mut *(self.data.add(offset) as *mut T) })
     }
 
@@ -923,6 +996,11 @@ impl MemoryMap {
     /// Byte-wise-atomic view of `size` bytes at `offset`. Used for the
     /// dirty backup slot, which — like the value slots — may be rewritten
     /// by another process's writer while a reader snapshots it.
+    ///
+    /// `AtomicU8::store` is a safe call but SIGSEGVs on a PROT_READ
+    /// mapping — callers that intend to *store* through the returned slice
+    /// must check [`Self::require_writable`] first (this accessor takes
+    /// `&self` because readers share it).
     pub(crate) fn atomic_data(
         &self,
         offset: usize,

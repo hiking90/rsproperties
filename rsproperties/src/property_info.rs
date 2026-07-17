@@ -45,6 +45,13 @@ const _: () = assert!(mem::size_of::<AtomicU32>() == mem::size_of::<u32>());
 const _: () = assert!(mem::align_of::<AtomicU32>() == mem::align_of::<u32>());
 const _: () = assert!(mem::size_of::<[AtomicU8; PROP_VALUE_MAX]>() == PROP_VALUE_MAX);
 
+// Whole-struct layout pin, like the `PropertyTrieNode`/`PropertyArea`
+// asserts in property_area.rs: `PropertyInfo` overlays bionic's `prop_info`
+// (serial u32 + PROP_VALUE_MAX-byte value/long union = 96 bytes).
+const _: () = assert!(mem::size_of::<PropertyInfo>() == 4 + PROP_VALUE_MAX);
+const _: () = assert!(mem::offset_of!(PropertyInfo, serial) == 0);
+const _: () = assert!(mem::offset_of!(PropertyInfo, data) == 4);
+
 #[repr(C)]
 struct LongProperty {
     error_message: [u8; LONG_LEGACY_ERROR_BUFFER_SIZE],
@@ -58,7 +65,7 @@ union Union {
 }
 
 #[repr(C, align(4))]
-pub struct PropertyInfo {
+pub(crate) struct PropertyInfo {
     pub(crate) serial: AtomicU32,
     data: UnsafeCell<Union>,
 }
@@ -109,7 +116,13 @@ impl PropertyInfo {
             "init_with_value: value of {} bytes must use the long variant",
             value.len()
         );
-        let serial_value = (value.len() as u32) << 24;
+        // Derive the serial's length field from the length that will
+        // actually be stored, so a release-build contract violation cannot
+        // desync the two: `init_value_bytes` clamps to the slot, and a
+        // len >= 256 would otherwise shift bits clean out of the length
+        // field. A bionic-compatible reader trusts `serial >> 24` verbatim.
+        let stored_len = value.len().min(PROP_VALUE_MAX - 1);
+        let serial_value = (stored_len as u32) << 24;
         self.serial.store(serial_value, Ordering::Relaxed);
 
         // SAFETY: `&mut self` grants exclusive access; we initialize the
@@ -151,7 +164,8 @@ impl PropertyInfo {
     /// set — the union would be reinterpreting value bytes as an offset.
     pub(crate) fn long_offset(&self) -> Result<u32> {
         if !self.is_long() {
-            return Err(Error::Encoding(
+            // API misuse by the caller, not a data-encoding failure.
+            return Err(Error::InvalidArgument(
                 "long_offset called on a short property entry".into(),
             ));
         }
@@ -207,15 +221,17 @@ impl PropertyInfoWriter<'_> {
     pub(crate) fn apply_write(self, value: &str) -> Result<u32> {
         let current = self.0.serial.load(Ordering::Relaxed);
         if current & LONG_FLAG != 0 {
-            return Err(Error::FileValidation(format!(
+            // A caller-contract violation (unsupported operation on this
+            // entry kind), not corrupt on-disk state.
+            return Err(Error::InvalidArgument(format!(
                 "in-place update of long property is not supported (serial={current:#x})"
             )));
         }
         let len_u32 = u32::try_from(value.len()).map_err(|_| {
-            Error::FileValidation(format!("Value length exceeds u32: {}", value.len()))
+            Error::InvalidArgument(format!("Value length exceeds u32: {}", value.len()))
         })?;
         if value.len() >= PROP_VALUE_MAX {
-            return Err(Error::FileValidation(format!(
+            return Err(Error::InvalidArgument(format!(
                 "Value too long: {} (max: {})",
                 value.len(),
                 PROP_VALUE_MAX
@@ -233,6 +249,15 @@ impl PropertyInfoWriter<'_> {
 
         // From here on no further early returns: each step is infallible.
         self.0.serial.store(dirty_serial, Ordering::Release);
+        // Seqlock writer fence (bionic: atomic_thread_fence(release) between
+        // the dirty store and strlcpy). A `Release` *store* only orders the
+        // writes before it — the relaxed value-byte stores below could still
+        // be observed *before* the dirty serial, letting a reader pass its
+        // serial re-check while holding torn bytes. The fence pairs with the
+        // reader's `fence(Acquire)`: a reader that observes any value byte
+        // written after this fence is guaranteed to observe the dirty serial
+        // at its re-check and retry.
+        std::sync::atomic::fence(Ordering::Release);
         // SAFETY: `&mut self` on the writer guarantees no concurrent writer
         // in this process; the LONG flag check above confirms the active
         // variant is `value`. Byte-wise atomic stores keep concurrent

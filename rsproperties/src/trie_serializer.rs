@@ -25,7 +25,7 @@ where
 {
     match name {
         Some(s) if !s.is_empty() => match lookup(s) {
-            // `>=` rather than a plain `try_from`: an index of exactly
+            // `filter` on top of `try_from`: an index of exactly
             // `u32::MAX` would collide with the "no context" sentinel and
             // silently demote a real context on the reader side.
             Some(i) => u32::try_from(i)
@@ -75,6 +75,12 @@ impl TrieSerializer {
             .types_offset = this.arena.size() as u32;
         this.serialize_strings(&trie_builder.types)?;
 
+        // AOSP parity: upstream stamps an intermediate `size` here because
+        // its Find*Offset helpers consult it during trie writing. This
+        // port's `find_context_index`/`find_type_index` never read
+        // `header.size`, and the value is unconditionally overwritten with
+        // the final size below — kept only to match the reference
+        // serializer's write sequence.
         this.arena
             .get_object::<PropertyInfoAreaHeader>(header_offset)?
             .size = this.arena.size() as u32;
@@ -140,9 +146,22 @@ impl TrieSerializer {
             .get_object::<TrieNodeData>(trie_offset)?
             .property_entry = property_entry;
 
-        // Sort prefixes by length (longest first)
+        // Sort prefixes by length (longest first), tie-breaking equal
+        // lengths by name: `prefixes` is a HashSet, so without the
+        // tie-breaker the serialized byte output would vary run to run,
+        // breaking reproducible builds. (AOSP's own tie order is likewise
+        // unspecified — it length-sorts with an unstable std::sort — so
+        // this makes *this* serializer deterministic rather than matching
+        // AOSP's ties byte-for-byte.) Lookup semantics are unaffected —
+        // two distinct equal-length prefixes can never both match one
+        // name.
         let mut sorted_prefix_matches: Vec<_> = builder_node.prefixes.iter().collect();
-        sorted_prefix_matches.sort_by_key(|b| std::cmp::Reverse(b.name.len()));
+        sorted_prefix_matches.sort_by(|a, b| {
+            b.name
+                .len()
+                .cmp(&a.name.len())
+                .then_with(|| a.name.cmp(&b.name))
+        });
 
         // Counts are bounded by trie input size (≤ a few thousand entries per
         // pixel build), well below u32::MAX.

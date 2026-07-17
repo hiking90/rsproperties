@@ -49,12 +49,17 @@ fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> 
         // `Timespec.tv_sec`/`tv_nsec` are signed (i64). Negative values are
         // not valid timeouts; treat them as immediate timeout to avoid
         // panicking in `Instant + Duration` from a `usize::MAX`-ish wrap.
+        // A *huge* positive `tv_sec` (e.g. i64::MAX, a reasonable "wait
+        // forever") is the opposite hazard: `Instant + Duration` panics on
+        // overflow, so an unrepresentable deadline degrades to an infinite
+        // wait instead — matching bionic, which passes the value through to
+        // the futex untouched.
         let deadline = match _timeout {
             None => None,
             Some(t) if t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec >= 1_000_000_000 => {
                 return None;
             }
-            Some(t) => Some(Instant::now() + Duration::new(t.tv_sec as u64, t.tv_nsec as u32)),
+            Some(t) => Instant::now().checked_add(Duration::new(t.tv_sec as u64, t.tv_nsec as u32)),
         };
         loop {
             let remaining_ts = match deadline {
@@ -227,13 +232,15 @@ impl SystemProperties {
             fence(Ordering::Acquire);
             let final_serial = prop_info.serial.load(Ordering::Acquire);
             if final_serial == serial {
-                let s = std::str::from_utf8(bytes).map_err(|e| {
-                    Error::Encoding(format!("property value is not valid UTF-8: {e}"))
-                })?;
+                // `Error::Utf8`, not `Encoding(String)`: keep every UTF-8
+                // decode failure on the same source-preserving variant.
+                let s = std::str::from_utf8(bytes).map_err(Error::Utf8)?;
                 return Ok(f.take().expect("callback consumed once on success")(s));
             }
             // serial changed → retry; spurious UTF-8 from a torn read is
-            // naturally absorbed here.
+            // naturally absorbed here. The loop is unbounded like bionic's,
+            // so at least tell the CPU it's a spin-wait (SMT/power hint).
+            std::hint::spin_loop();
         }
     }
 
@@ -252,6 +259,12 @@ impl SystemProperties {
     {
         let res = match self.contexts.prop_area_for_name(name) {
             Ok(res) => res,
+            // Don't add a second log line for NotFound: the layer below
+            // already reports it at the appropriate level (debug for an
+            // unknown context, error for a corrupt-at-init slot). Other
+            // errors (corrupt mapping, poisoned lock) get logged here with
+            // the property name for context.
+            Err(e @ Error::NotFound(_)) => return Err(e),
             Err(e) => {
                 log::error!("Failed to find property area for {name}: {e}");
                 return Err(e);
@@ -557,45 +570,54 @@ impl SystemProperties {
     ///
     /// On macOS there is no futex; this returns `None` immediately, so do
     /// not call it in a polling loop there.
+    ///
+    /// # Deadlock caution (builder feature, same process)
+    ///
+    /// This holds the context node's read lock for the whole wait (the
+    /// serial reference lives inside the mmap guard, which must outlive
+    /// the futex call). A thread in the *same process* that tries to set a
+    /// property in the same context via the builder path needs that
+    /// node's write lock — it will block on this reader, the property
+    /// never changes, the futex never wakes: deadlock. Cross-process
+    /// waiters (the normal Android arrangement, and this crate's service)
+    /// are unaffected — writers in other processes don't take this lock.
+    /// Do not combine `wait()` with a same-process builder writer on the
+    /// same context.
     pub fn wait(
         &self,
         index: Option<&PropertyIndex>,
         old_serial: Option<u32>,
         timeout: Option<&Timespec>,
     ) -> Option<u32> {
-        match index {
-            Some(idx) => match self.contexts.prop_area_with_index(idx.context_index).ok() {
-                Some(guard) => {
-                    let pa = guard.property_area();
-                    match pa.property_info(idx.property_index).ok() {
-                        Some(pi) => {
-                            let old =
-                                old_serial.unwrap_or_else(|| pi.serial.load(Ordering::Acquire));
-                            futex_wait(&pi.serial, old, timeout)
-                        }
-                        None => {
-                            log::error!(
-                                "Failed to get PropertyInfo for index: {}",
-                                idx.property_index
-                            );
-                            None
-                        }
-                    }
-                }
-                None => {
-                    log::error!(
-                        "Failed to get PropertyArea for index: {}",
-                        idx.context_index
-                    );
-                    None
-                }
-            },
-            None => {
-                let serial_pa = self.contexts.serial_prop_area().serial();
-                let old = old_serial.unwrap_or_else(|| serial_pa.load(Ordering::Acquire));
-                futex_wait(serial_pa, old, timeout)
-            }
-        }
+        // No index → wait on the global serial.
+        let Some(idx) = index else {
+            let serial_pa = self.contexts.serial_prop_area().serial();
+            let old = old_serial.unwrap_or_else(|| serial_pa.load(Ordering::Acquire));
+            return futex_wait(serial_pa, old, timeout);
+        };
+
+        let guard = self
+            .contexts
+            .prop_area_with_index(idx.context_index)
+            .inspect_err(|e| {
+                log::error!(
+                    "Failed to get PropertyArea for index {}: {e}",
+                    idx.context_index
+                )
+            })
+            .ok()?;
+        let pi = guard
+            .property_area()
+            .property_info(idx.property_index)
+            .inspect_err(|e| {
+                log::error!(
+                    "Failed to get PropertyInfo for index {}: {e}",
+                    idx.property_index
+                )
+            })
+            .ok()?;
+        let old = old_serial.unwrap_or_else(|| pi.serial.load(Ordering::Acquire));
+        futex_wait(&pi.serial, old, timeout)
     }
 }
 

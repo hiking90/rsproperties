@@ -1,7 +1,7 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use log::{error, info, warn};
+use log::{info, warn};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -18,6 +18,29 @@ pub struct PropertyInfoEntry {
 }
 
 impl PropertyInfoEntry {
+    /// Constructs an entry programmatically (the file-based path is
+    /// [`Self::parse_from_file`]). Validates `type_str` with the same rule
+    /// as the parser; AOSP's `PropertyInfoEntry` likewise exposes a public
+    /// constructor.
+    pub fn new(name: String, context: String, type_str: String, exact_match: bool) -> Result<Self> {
+        // Store the whitespace-normalized form (`join(" ")`), matching
+        // `parse_from_line` — otherwise the same logical type could
+        // serialize as different bytes depending on which constructor
+        // produced the entry.
+        let type_strings: Vec<&str> = type_str.split_whitespace().collect();
+        if !type_str.is_empty() && !Self::is_type_valid(&type_strings) {
+            return Err(Error::InvalidArgument(format!(
+                "Type '{type_str}' is not valid."
+            )));
+        }
+        Ok(Self {
+            name,
+            context,
+            type_str: type_strings.join(" "),
+            exact_match,
+        })
+    }
+
     /// Property name (e.g. `ro.build.host`).
     pub fn name(&self) -> &str {
         &self.name
@@ -86,15 +109,16 @@ impl PropertyInfoEntry {
         } else if match_operation != Some("prefix") && require_prefix_or_exact {
             // `unwrap_or` instead of `{:?}` so the user-facing parse error
             // doesn't leak Rust's `Some("...")`/`None` notation.
+            // No log here: the only caller (`parse_from_file`) already
+            // warns with line context — logging both duplicated every
+            // parse failure.
             let op = match_operation.unwrap_or("<missing>");
-            error!("Invalid match operation '{op}' - must be 'prefix' or 'exact'");
             return Err(Error::Parse(format!(
                 "Match operation '{op}' is not valid. Must be 'prefix' or 'exact'"
             )));
         }
 
         if !type_strings.is_empty() && !Self::is_type_valid(&type_strings) {
-            error!("Invalid type specification: '{}'", type_strings.join(" "));
             return Err(Error::Parse(format!(
                 "Type '{}' is not valid.",
                 type_strings.join(" ")
@@ -191,9 +215,7 @@ pub fn build_trie(
 
 #[cfg(test)]
 mod tests {
-    // use std::ffi::CString;
     use super::*;
-    // use crate::property_info_parser::*;
 
     #[test]
     fn test_parse_from_line() {
@@ -236,21 +258,28 @@ mod tests {
         assert!(entry.exact_match);
     }
 
-    // #[test]
-    // fn test_parse_from_file() {
-    //     let entries = PropertyInfoEntry::parse_from_file(Path::new("tests/android/plat_property_contexts"), false).unwrap();
-    //     assert_eq!(entries.1.len(), 0);
-    //     assert_eq!(entries.0[0].name, "net.rmnet");
-    //     assert_eq!(entries.0[entries.0.len() - 1].name, "ro.quick_start.device_id");
-
-    //     let data: Vec<u8> = build_trie(&entries.0, "u:object_r:build_prop:s0", "string").unwrap();
-
-    //     let property_info = PropertyInfoArea::new(&data);
-    //     let index = property_info.get_property_info("ro.unknown.unknown");
-    //     assert_eq!(index, (Some(CString::new("u:object_r:build_prop:s0").unwrap()).as_deref(), Some(CString::new("string").unwrap()).as_deref()));
-    //     let index = property_info.get_property_info("net.rmnet");
-    //     assert_eq!(index, (Some(CString::new("u:object_r:net_radio_prop:s0").unwrap()).as_deref(), Some(CString::new("string").unwrap()).as_deref()));
-    //     let index = property_info.get_property_info("ro.quick_start.device_id");
-    //     assert_eq!(index, (Some(CString::new("u:object_r:quick_start_prop:s0").unwrap()).as_deref(), Some(CString::new("string").unwrap()).as_deref()));
-    // }
+    #[test]
+    fn test_new_validates_type() {
+        assert!(PropertyInfoEntry::new(
+            "ro.a".into(),
+            "u:object_r:build_prop:s0".into(),
+            "string".into(),
+            true
+        )
+        .is_ok());
+        assert!(PropertyInfoEntry::new(
+            "ro.a".into(),
+            "u:object_r:build_prop:s0".into(),
+            "".into(),
+            false
+        )
+        .is_ok());
+        assert!(PropertyInfoEntry::new(
+            "ro.a".into(),
+            "u:object_r:build_prop:s0".into(),
+            "not_a_type".into(),
+            true
+        )
+        .is_err());
+    }
 }

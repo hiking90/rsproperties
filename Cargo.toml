@@ -6,7 +6,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 authors = ["Jeff Kim <hiking90@gmail.com>"]
 license = "Apache-2.0"
@@ -19,7 +19,7 @@ categories = ["os", "api-bindings"]
 
 [workspace.dependencies]
 # Common dependencies shared across workspace
-rustix = { version = "1.1", features = ["fs", "mm", "thread", "process", "net"] }
+rustix = { version = "1.1", features = ["fs", "mm", "thread", "process", "net", "event"] }
 log = "0.4"
 zerocopy = "0.8"
 zerocopy-derive = "0.8"

@@ -115,6 +115,13 @@ impl TrieNodeArena {
         // A plain byte copy needs no alignment at all, so the previous
         // unsafe pointer write (whose safety leaned on allocator behavior
         // the language doesn't guarantee) is unnecessary.
+        //
+        // `to_ne_bytes`: the serialized format is host-endian throughout
+        // (zerocopy struct writes here, `align_to::<u32>` reads in the
+        // parser) — the same property AOSP's format has, since it mmaps
+        // native structs verbatim. Files are NOT portable across
+        // endianness; a big-endian host cannot produce files for a
+        // little-endian device or vice versa.
         self.data[offset..offset + mem::size_of::<u32>()].copy_from_slice(&value.to_ne_bytes());
     }
 

@@ -84,22 +84,40 @@ impl ContextNode {
     }
 
     pub(crate) fn property_area(&self) -> Result<PropertyAreaGuard<'_>> {
+        // The read path recovers from lock poison instead of failing: a
+        // writer panicking under this RwLock cannot leave the protected
+        // `Option` half-updated (`Some` is assigned whole and never reverts
+        // to `None`), and mmap *content* consistency is the seqlock's job —
+        // cross-process readers don't take this lock at all. Propagating
+        // poison here would trade zero safety for permanently failing every
+        // in-process read on this node. The builder-side paths (`open`,
+        // `property_area_mut`) stay strict.
+        use std::sync::PoisonError;
         // Fast path: already initialized.
         {
-            let guard = self.property_area.read().map_err(lock_err("read"))?;
+            let guard = self
+                .property_area
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             if guard.is_some() {
                 return Ok(PropertyAreaGuard::from_initialized(guard));
             }
         }
         // Slow path: initialize under the write lock if still empty.
         {
-            let mut guard = self.property_area.write().map_err(lock_err("write"))?;
+            let mut guard = self
+                .property_area
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             if guard.is_none() {
                 *guard = Some(PropertyAreaMap::new_ro(self.filename.as_path())?);
             }
         }
         // Re-acquire read lock for the typed guard.
-        let guard = self.property_area.read().map_err(lock_err("read"))?;
+        let guard = self
+            .property_area
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         Ok(PropertyAreaGuard::from_initialized(guard))
     }
 
@@ -130,7 +148,7 @@ impl ContextNode {
 
 fn lock_err<T>(kind: &'static str) -> impl Fn(std::sync::PoisonError<T>) -> Error {
     move |e| {
-        Error::LockError(format!(
+        Error::Lock(format!(
             "Failed to acquire {kind} lock on property area: {e}"
         ))
     }
