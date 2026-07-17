@@ -16,10 +16,7 @@
 //!   `unsafe impl Sync` below documents the assumption.
 
 use std::cell::UnsafeCell;
-use std::ffi::CStr;
 use std::mem;
-#[cfg(feature = "builder")]
-use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use crate::errors::{Error, Result};
@@ -30,6 +27,13 @@ const LONG_LEGACY_ERROR: &str = "Must use __system_property_read_callback() to r
 
 const LONG_FLAG: u32 = 1 << 16;
 const LONG_LEGACY_ERROR_BUFFER_SIZE: usize = 56;
+
+// The legacy error message must fit the fixed buffer *with* its NUL
+// terminator — a longer message would be silently truncated by
+// `error_bytes_padded` and lose NUL termination, while the serial length
+// byte kept the untruncated length.
+#[cfg(feature = "builder")]
+const _: () = assert!(LONG_LEGACY_ERROR.len() < LONG_LEGACY_ERROR_BUFFER_SIZE);
 
 // `AtomicU8` / `AtomicU32` are guaranteed by `std::sync::atomic` to have the
 // same in-memory representation and alignment as `u8` / `u32`. Asserting it
@@ -68,9 +72,12 @@ pub struct PropertyInfo {
 unsafe impl Sync for PropertyInfo {}
 
 impl PropertyInfo {
+    /// Initializes the header for a long property. The trailing name bytes
+    /// are written separately by `PropertyAreaMap::new_prop_info` through
+    /// the mmap base pointer — writing them through `&mut self` would step
+    /// outside this reference's provenance.
     #[cfg(feature = "builder")]
-    pub(crate) fn init_with_long_offset(&mut self, name: &str, offset: u32) {
-        init_name_with_trailing_data(self, name);
+    pub(crate) fn init_with_long_offset(&mut self, offset: u32) {
         let error_bytes = LONG_LEGACY_ERROR.as_bytes();
         let serial_value = ((error_bytes.len() as u32) << 24) | LONG_FLAG;
 
@@ -88,9 +95,20 @@ impl PropertyInfo {
         }
     }
 
+    /// Initializes the header and short value. See `init_with_long_offset`
+    /// for why the trailing name is not written here.
+    ///
+    /// The caller must have routed values of `PROP_VALUE_MAX` bytes or more
+    /// to the long variant — a short slot needs room for the NUL, so
+    /// storing exactly `PROP_VALUE_MAX` bytes would truncate to
+    /// `PROP_VALUE_MAX - 1` while the serial recorded the full length.
     #[cfg(feature = "builder")]
-    pub(crate) fn init_with_value(&mut self, name: &str, value: &str) {
-        init_name_with_trailing_data(self, name);
+    pub(crate) fn init_with_value(&mut self, value: &str) {
+        debug_assert!(
+            value.len() < PROP_VALUE_MAX,
+            "init_with_value: value of {} bytes must use the long variant",
+            value.len()
+        );
         let serial_value = (value.len() as u32) << 24;
         self.serial.store(serial_value, Ordering::Relaxed);
 
@@ -102,74 +120,46 @@ impl PropertyInfo {
         }
     }
 
-    /// Reads the trailing name field.
+    /// Snapshots the short-variant value into `buf` (byte-wise atomic, no
+    /// UTF-8 validation) and returns the populated prefix. Raw bytes let
+    /// the seqlock read loop validate the serial *before* UTF-8 decoding,
+    /// so torn multi-byte sequences are absorbed by the retry instead of
+    /// aborting on `?`. The returned slice borrows `buf`, not `self` — it
+    /// is a copy, valid independent of later writes to the entry.
     ///
-    /// `bound` caps the NUL scan at the remaining mmap extent past `self`,
-    /// computed by the enclosing `PropertyAreaMap` via `max_value_bound`.
-    ///
-    /// Gated on `builder` because the only caller is `update`'s `ro.`
-    /// validation, which itself is builder-only. Without the gate this
-    /// would be dead code in default Android builds.
-    #[cfg(feature = "builder")]
-    pub(crate) fn name(&self, bound: usize) -> Result<&CStr> {
-        let header = mem::size_of::<PropertyInfo>();
-        // `name_from_trailing_data` reads `len + 1` bytes; bail out when the
-        // bound is too small to even hold the NUL terminator. Paired with
-        // `PropertyAreaMap::max_value_bound`, which already rejects entries
-        // whose trailing region is < 1 byte by returning 0.
-        if bound <= header {
-            return Err(Error::Encoding(
-                "PropertyInfo name has no room for terminator".into(),
-            ));
+    /// Contract: the caller must have checked `!self.is_long()` (the sole
+    /// callers, `PropertyAreaMap::property_value_bytes` and the seqlock
+    /// read loop, both do). On a LONG entry this would misread the
+    /// `LongProperty` header bytes as value bytes — not UB (the union is
+    /// all plain bytes, and long entries are write-once so there is no
+    /// race), but garbage; the `debug_assert!` documents the contract.
+    /// For long entries use `PropertyAreaMap::long_property_value`.
+    pub(crate) fn short_value_bytes<'a>(&self, buf: &'a mut [u8; PROP_VALUE_MAX]) -> &'a [u8] {
+        debug_assert!(!self.is_long(), "short_value_bytes on a LONG entry");
+        // SAFETY: reading the `value` union variant. Both union variants
+        // are plain (atomic) bytes with no validity requirement, the array
+        // lies entirely within `self` (provenance-safe), and all
+        // concurrent access to this range is byte-wise atomic.
+        unsafe {
+            let slot = &*(*self.data.get()).value;
+            read_value_atomic(slot, buf)
         }
-        let len = bound - header - 1;
-        name_from_trailing_data(self, Some(len))
     }
 
-    /// Reads the property value as raw bytes (no UTF-8 validation).
-    ///
-    /// Returning bytes lets the seqlock read loop validate the serial
-    /// *before* attempting UTF-8 decoding. With byte-wise atomic stores a
-    /// reader may observe partially-written multi-byte sequences that
-    /// would otherwise spuriously fail `String::from_utf8` and abort the
-    /// retry loop. Callers that need a `String` should validate the
-    /// serial first, then convert via `String::from_utf8`.
-    ///
-    /// `long_value_bound` is an upper bound on how far past `self` the
-    /// long variant may extend. For the short variant this argument is
-    /// ignored.
-    /// Reads short-variant bytes into `buf`; returns the populated prefix.
-    /// The long variant borrows bytes directly from the mmap — long
-    /// properties are write-once (`apply_write` rejects LONG entries), so
-    /// the out-of-line bytes are stable for the lifetime of the mapping.
-    ///
-    /// Lifetime invariant: both `self` and `buf` are bound to `'a`, so the
-    /// returned `Cow` is valid for whichever of the two ends first (the
-    /// shorter, in practice usually `buf`'s scope). Tying both to a single
-    /// lifetime is what lets the long path return `Cow::Borrowed` from the
-    /// mmap without leaking past `self`'s borrow.
-    pub(crate) fn value_bytes<'a>(
-        &'a self,
-        long_value_bound: usize,
-        buf: &'a mut [u8; PROP_VALUE_MAX],
-    ) -> Result<std::borrow::Cow<'a, [u8]>> {
-        if self.is_long() {
-            // SAFETY: when the LONG flag is set the union variant is
-            // `long_property`. The offset is read atomically; the
-            // out-of-line value is bounded by `long_value_bound`.
-            let bytes = unsafe {
-                let long_property = &*(*self.data.get()).long_property;
-                let offset = long_property.offset.load(Ordering::Relaxed) as usize;
-                long_value_bytes(self, offset, long_value_bound)?
-            };
-            Ok(std::borrow::Cow::Borrowed(bytes))
-        } else {
-            // SAFETY: when the LONG flag is clear the union variant is the
-            // byte-wise atomic `value` array of size `PROP_VALUE_MAX`.
-            unsafe {
-                let slot = &*(*self.data.get()).value;
-                Ok(std::borrow::Cow::Borrowed(read_value_atomic(slot, buf)))
-            }
+    /// Reads the long-variant relative offset (from the start of this entry
+    /// to the out-of-line value bytes). Errors when the LONG flag is not
+    /// set — the union would be reinterpreting value bytes as an offset.
+    pub(crate) fn long_offset(&self) -> Result<u32> {
+        if !self.is_long() {
+            return Err(Error::Encoding(
+                "long_offset called on a short property entry".into(),
+            ));
+        }
+        // SAFETY: LONG flag checked above, so the active union variant is
+        // `long_property`, which lies entirely within `self`.
+        unsafe {
+            let long_property = &*(*self.data.get()).long_property;
+            Ok(long_property.offset.load(Ordering::Relaxed))
         }
     }
 
@@ -310,80 +300,4 @@ fn init_value_bytes(slot: &mut [AtomicU8; PROP_VALUE_MAX], bytes: &[u8]) {
         *slot[i].get_mut() = b;
     }
     *slot[copy_len].get_mut() = 0;
-}
-
-/// Bounds-checked NUL scan for the long-property variant, returning the raw
-/// bytes (no UTF-8 validation) borrowed from the mmap.
-///
-/// Long properties are write-once: `apply_write` rejects entries with the
-/// LONG flag set, so once the entry is initialised the out-of-line bytes
-/// never change. That immutability is what lets the reader borrow the
-/// bytes directly instead of copying them into a `Vec<u8>`.
-///
-/// # Safety
-/// Caller must guarantee that `info + bound_from_info` does not exceed the
-/// mmap allocation containing `info`. This function further reduces the read
-/// span by `offset` so the scan stays within the allocation.
-unsafe fn long_value_bytes(
-    info: &PropertyInfo,
-    offset: usize,
-    bound_from_info: usize,
-) -> Result<&[u8]> {
-    let scan_len = bound_from_info.checked_sub(offset).ok_or_else(|| {
-        Error::Encoding(format!(
-            "Long property offset {offset} exceeds mmap bound {bound_from_info}"
-        ))
-    })?;
-    if scan_len == 0 {
-        return Err(Error::Encoding("Long property scan length is zero".into()));
-    }
-    let self_ptr = info as *const _ as *const u8;
-    // SAFETY: `value_ptr` stays within the mmap because `scan_len ==
-    // bound_from_info - offset` and the caller proved `info +
-    // bound_from_info` is in-bounds.
-    let value_ptr = unsafe { self_ptr.add(offset) };
-    // SAFETY: `value_ptr` is in-bounds for `scan_len` bytes by the same
-    // argument. `u8` has no alignment requirement. The borrow is tied to
-    // `'a` (the `&'a PropertyInfo`), so it can't outlive the mmap.
-    let bytes = unsafe { std::slice::from_raw_parts(value_ptr, scan_len) };
-    let cstr = CStr::from_bytes_until_nul(bytes).map_err(|e| {
-        Error::Encoding(format!("Long property value missing NUL within bound: {e}"))
-    })?;
-    Ok(cstr.to_bytes())
-}
-
-#[inline(always)]
-pub(crate) fn name_from_trailing_data<I: Sized>(thiz: &I, len: Option<usize>) -> Result<&CStr> {
-    // The unbounded variant (`len == None`) is intentionally disallowed: a
-    // missing terminator on a corrupted file would otherwise let the scan
-    // run past the mmap. Callers must supply an upper bound.
-    let len = len.ok_or_else(|| {
-        Error::Encoding("name_from_trailing_data requires a bounded length".into())
-    })?;
-    // SAFETY: `thiz` points into a memory-mapped property file laid out as a
-    // header (`I`) immediately followed by `len + 1` bytes of name data. The
-    // caller (a property area / trie helper) guarantees that the bytes from
-    // `thiz + size_of::<I>()` up to `+ len + 1` are within the mapping.
-    unsafe {
-        let thiz_ptr = thiz as *const _ as *const u8;
-        let name_ptr = thiz_ptr.add(mem::size_of::<I>());
-        CStr::from_bytes_until_nul(std::slice::from_raw_parts(name_ptr, len + 1))
-            .map_err(|e| Error::Encoding(format!("Failed to convert name to CStr: {e}")))
-    }
-}
-
-#[cfg(feature = "builder")]
-#[inline(always)]
-pub(crate) fn init_name_with_trailing_data<I: Sized>(thiz: &mut I, name: &str) {
-    // SAFETY: callers (the property area allocator) reserve
-    // `size_of::<I>() + name.len() + 1` bytes when constructing the trailing-
-    // name layout, so writing `name.len() + 1` bytes after `thiz` is in-bounds.
-    // `&mut thiz` guarantees exclusive access.
-    unsafe {
-        let thiz_ptr = thiz as *mut _ as *mut u8;
-        let name_ptr = thiz_ptr.add(mem::size_of::<I>());
-
-        ptr::copy_nonoverlapping(name.as_ptr(), name_ptr, name.len());
-        *name_ptr.add(name.len()) = 0; // Add null terminator
-    }
 }

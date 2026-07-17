@@ -13,7 +13,6 @@ use rustix::thread::futex;
 use crate::errors::*;
 
 use crate::contexts_serialized::ContextsSerialized;
-use crate::property_info::PropertyInfo;
 
 pub(crate) use crate::wire::PROP_VALUE_MAX;
 pub(crate) const PROP_TREE_FILE: &str = "/dev/__properties__/property_info";
@@ -118,6 +117,7 @@ fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> 
 }
 
 // To avoid lifetime issues, the property index is used to access the property value.
+#[derive(Clone, Copy, Debug)]
 pub struct PropertyIndex {
     pub(crate) context_index: u32,
     pub(crate) property_index: u32,
@@ -170,13 +170,22 @@ impl SystemProperties {
     fn read_with_callback<R, F>(
         &self,
         pa: &crate::property_area::PropertyAreaMap,
-        prop_info: &PropertyInfo,
+        pi_offset: u32,
         f: F,
     ) -> Result<R>
     where
         F: FnOnce(&str) -> R,
     {
-        let bound = pa.max_value_bound(prop_info);
+        let prop_info = pa.property_info(pi_offset)?;
+        // Long entries are write-once (their serial never changes after
+        // init), so resolve the out-of-line bytes once, outside the retry
+        // loop — re-validating the entry every iteration is pure overhead
+        // on this hot path. Short entries snapshot per iteration below.
+        let long_bytes: Option<&[u8]> = if prop_info.is_long() {
+            Some(pa.long_property_value(pi_offset)?)
+        } else {
+            None
+        };
         // Reused across retries — short-variant reads borrow from this
         // stack buffer so the seqlock loop allocates nothing.
         let mut buf = [0u8; PROP_VALUE_MAX];
@@ -194,32 +203,27 @@ impl SystemProperties {
             // *after* the serial re-check lets the retry loop absorb those
             // spurious decodes instead of bailing on `?`.
             let bytes: &[u8] = if serial_dirty(serial) {
-                let backup = pa.dirty_backup_area().map_err(|e| {
-                    log::error!("Failed to read dirty backup area: {e}");
-                    e
-                })?;
-                backup.to_bytes()
+                // The backup slot is shared per-area and may be rewritten by
+                // the *next* update the moment the current one completes, so
+                // it must be snapshotted into the stack buffer BEFORE the
+                // fence/serial re-check below — nothing may re-read the slot
+                // after validation (bionic memcpys before its fence for the
+                // same reason). While dirty, the top 8 bits of `serial`
+                // still hold the *old* value length, which is exactly the
+                // backup snapshot's length; clamp defends against a corrupt
+                // length field.
+                let len = ((serial >> 24) as usize).min(PROP_VALUE_MAX - 1);
+                pa.read_dirty_backup(&mut buf[..len])?;
+                &buf[..len]
+            } else if let Some(bytes) = long_bytes {
+                // Write-once long bytes, resolved before the loop —
+                // re-reading them after the re-check below is stable.
+                bytes
             } else {
-                // `value_bytes` returns Cow — short borrows `buf`, long
-                // borrows directly from the mmap. Either way no heap
-                // allocation. The borrow is alive across the serial
-                // re-check below so we can hand it to `f` on success.
-                let cow = prop_info.value_bytes(bound, &mut buf)?;
-                let serial_check = {
-                    fence(Ordering::Acquire);
-                    prop_info.serial.load(Ordering::Acquire)
-                };
-                if serial_check == serial {
-                    let s = std::str::from_utf8(&cow).map_err(|e| {
-                        Error::Encoding(format!("property value is not valid UTF-8: {e}"))
-                    })?;
-                    return Ok(f.take().expect("callback consumed once on success")(s));
-                }
-                continue;
+                // Short: byte-wise atomic snapshot into the stack buffer.
+                prop_info.short_value_bytes(&mut buf)
             };
 
-            // Dirty path: backup is a `&CStr` that doesn't borrow from `buf`,
-            // so the original fence/recheck pattern works as before.
             fence(Ordering::Acquire);
             let final_serial = prop_info.serial.load(Ordering::Acquire);
             if final_serial == serial {
@@ -256,7 +260,7 @@ impl SystemProperties {
         let pa = res.0.property_area();
 
         match pa.find(name) {
-            Ok(pi) => match self.read_with_callback(pa, pi.0, f) {
+            Ok((_, pi_offset)) => match self.read_with_callback(pa, pi_offset, f) {
                 Ok(r) => Ok(r),
                 Err(e) => {
                     log::error!("Failed to read property {name}: {e}");
@@ -296,7 +300,13 @@ impl SystemProperties {
                 };
                 Ok(Some(index))
             }
-            Err(_) => Ok(None),
+            // Only genuine absence maps to `None`. Lookup *failures* (bad
+            // name, corrupt mmap) must propagate — flattening them would
+            // send `set` down the `add` path, which is a silent no-op for
+            // existing names, turning a real error into a successful-looking
+            // write that never happened.
+            Err(Error::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -328,7 +338,7 @@ impl SystemProperties {
     }
 
     #[cfg(feature = "builder")]
-    pub fn update(&mut self, index: &PropertyIndex, value: &str) -> Result<bool> {
+    pub fn update(&mut self, index: &PropertyIndex, value: &str) -> Result<()> {
         // Pre-flight value-length check — `update` cannot promote to a long
         // property in-place (`PropertyInfoWriter::apply_write` rejects on
         // LONG_FLAG). Pass an empty name so the `ro.` exception in
@@ -358,6 +368,27 @@ impl SystemProperties {
         // it captured remain valid after `pi`/`cow` go out of scope.
         let mut backup_buf = [0u8; crate::wire::PROP_VALUE_MAX];
         let backup_len = {
+            let name = pa
+                .property_info_name(index.property_index)
+                .map_err(|e| {
+                    log::error!(
+                        "Failed to read property name for index {}: {e}",
+                        index.property_index
+                    );
+                    e
+                })?
+                .to_bytes();
+            if name.starts_with(b"ro.") {
+                let error_msg = format!(
+                    "Try to update the read-only property: {}",
+                    String::from_utf8_lossy(name)
+                );
+                log::error!("{error_msg}");
+                return Err(Error::PermissionDenied(error_msg));
+            }
+            // Pre-flight LONG check: if the entry was created long, we can't
+            // overwrite it in-place. Checking *before* writing the backup
+            // keeps backup_area aligned with the entry it shadows.
             let pi = pa.property_info(index.property_index).map_err(|e| {
                 log::error!(
                     "Failed to get property info for index {}: {e}",
@@ -365,27 +396,24 @@ impl SystemProperties {
                 );
                 e
             })?;
-            let bound = pa.max_value_bound(pi);
-            let name = pi.name(bound)?.to_bytes();
-            if name.starts_with(b"ro.") {
-                let error_msg = format!("Try to update the read-only property: {name:?}");
-                log::error!("{error_msg}");
-                return Err(Error::PermissionDenied(error_msg));
-            }
-            // Pre-flight LONG check: if the entry was created long, we can't
-            // overwrite it in-place. Checking *before* writing the backup
-            // keeps backup_area aligned with the entry it shadows.
             if pi.is_long() {
-                let error_msg =
-                    format!("in-place update of long property is not supported: {name:?}");
+                let error_msg = format!(
+                    "in-place update of long property is not supported: {}",
+                    String::from_utf8_lossy(name)
+                );
                 log::error!("{error_msg}");
                 return Err(Error::FileValidation(error_msg));
             }
-            // After the LONG check, `value_bytes` is guaranteed to return
-            // the short variant — a `Cow::Borrowed(&backup_buf[..len])`.
-            // Capturing only the length lets us drop the borrow without
-            // losing the bytes that already live in `backup_buf`.
-            pi.value_bytes(bound, &mut backup_buf)?.len()
+            // After the LONG check, `property_value_bytes` is guaranteed to
+            // take the short path — a snapshot into `backup_buf`. Capturing
+            // only the length lets us drop the borrow without losing the
+            // bytes that already live in `backup_buf`. This NUL-scanned
+            // length equals the length recorded in the entry's serial word
+            // because values are validated NUL-free on every write path
+            // (`wire::validate_value_len`) — dirty-path readers size their
+            // backup copy from that serial length.
+            pa.property_value_bytes(index.property_index, &mut backup_buf)?
+                .len()
         };
 
         // Back up the current value so concurrent readers can observe a
@@ -406,9 +434,14 @@ impl SystemProperties {
         })?;
         pi.writer().apply_write(value)?;
 
+        // The value is fully published at this point. A failed FUTEX_WAKE
+        // only delays waiters (they re-check the serial on their own), so
+        // erroring out here would misreport a completed update — and, worse,
+        // skip the global serial bump below, leaving `wait_any` observers
+        // permanently unaware of the change. bionic ignores the wake result
+        // entirely; log and continue.
         if let Err(e) = futex_wake(&pi.serial) {
-            log::error!("Failed to wake property futex: {e}");
-            return Err(e);
+            log::warn!("Failed to wake property futex: {e}");
         }
 
         let serial_pa = self.contexts.serial_prop_area();
@@ -417,11 +450,10 @@ impl SystemProperties {
         serial_pa.serial().fetch_add(1, Ordering::Release);
 
         if let Err(e) = futex_wake(serial_pa.serial()) {
-            log::error!("Failed to wake global serial futex: {e}");
-            return Err(e);
+            log::warn!("Failed to wake global serial futex: {e}");
         }
 
-        Ok(true)
+        Ok(())
     }
 
     /// Adds a new property.
@@ -460,12 +492,10 @@ impl SystemProperties {
         // Atomic RMW: see note in `update`.
         serial_pa.serial().fetch_add(1, Ordering::Release);
 
-        match futex_wake(serial_pa.serial()) {
-            Ok(_) => {}
-            Err(e) => {
-                log::error!("Failed to wake global serial futex after adding property: {e}");
-                return Err(e);
-            }
+        // See the wake-failure note in `update`: the property is already
+        // added and the serial bumped — report success.
+        if let Err(e) = futex_wake(serial_pa.serial()) {
+            log::warn!("Failed to wake global serial futex after adding property: {e}");
         }
 
         Ok(())

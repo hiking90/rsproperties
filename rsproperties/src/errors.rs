@@ -40,8 +40,27 @@ pub enum Error {
     #[error("Lock error: {0}")]
     LockError(String),
 
+    /// Cached global-initialization failure (see `try_system_properties`).
+    /// Wraps the original in `Arc` because the `OnceLock` cache can only
+    /// hand out references while callers need an owned value — the
+    /// original variant stays reachable via `source()`/`Arc` and its own
+    /// chain is preserved.
+    ///
+    /// Like `Context` below, the source appears in `Display` *and* via
+    /// `#[source]` (duplicated text under chain-walking reporters) so that
+    /// bare `{e}` log sites still show the root cause.
+    #[error("SystemProperties initialization failed: {0}")]
+    Init(#[source] std::sync::Arc<Error>),
+
     /// A wrapped error with caller-supplied context and the source error
     /// preserved for `Error::source()` chain traversal.
+    ///
+    /// Note: the source is deliberately included in `Display` *and*
+    /// exposed via `#[source]`, deviating from the thiserror convention of
+    /// one-or-the-other. This crate's log sites print bare `{e}`, so
+    /// dropping the source from `Display` would silence root causes at
+    /// every existing call site; the cost is a duplicated message when a
+    /// reporter walks the chain (anyhow-style "caused by" output).
     #[error("{msg} (at {location}): {source}")]
     Context {
         msg: String,
@@ -72,6 +91,13 @@ impl From<ParseIntError> for Error {
 pub trait ContextWithLocation<T> {
     #[track_caller]
     fn context_with_location(self, msg: impl Into<String>) -> Result<T>;
+
+    /// Lazy variant of [`Self::context_with_location`]: the message closure
+    /// runs only on the error path. Use this in loops / hot paths where an
+    /// eagerly-evaluated `format!` argument would allocate on every
+    /// success.
+    #[track_caller]
+    fn with_context_location(self, f: impl FnOnce() -> String) -> Result<T>;
 }
 
 impl<T, E> ContextWithLocation<T> for std::result::Result<T, E>
@@ -83,6 +109,16 @@ where
         let location = std::panic::Location::caller();
         self.map_err(|e| Error::Context {
             msg: msg.into(),
+            location,
+            source: Box::new(e.into()),
+        })
+    }
+
+    #[track_caller]
+    fn with_context_location(self, f: impl FnOnce() -> String) -> Result<T> {
+        let location = std::panic::Location::caller();
+        self.map_err(|e| Error::Context {
+            msg: f(),
             location,
             source: Box::new(e.into()),
         })
@@ -138,12 +174,15 @@ pub fn validate_file_metadata(
         return Err(Error::PermissionDenied(error_msg));
     }
 
-    // In production mode, also check ownership
-    // Skip ownership checks only in test/development environments:
-    // 1. When compiled with debug assertions (development builds)
-    // 2. When compiled in test configuration
-    // This is compile-time only and cannot be bypassed at runtime
-    let skip_ownership_check = cfg!(debug_assertions) || cfg!(test);
+    // In production (release) builds, also check ownership.
+    //
+    // `cfg!(test)` is intentionally NOT part of this condition: it is only
+    // true while compiling this crate's own `--test` harness, so it never
+    // covers integration tests, doctests, or downstream crates — relying
+    // on it made `cargo test` and `cargo test --release` behave
+    // differently for the same fixture files. `debug_assertions` alone
+    // draws the line uniformly at dev-vs-release.
+    let skip_ownership_check = cfg!(debug_assertions);
 
     if !skip_ownership_check && (metadata.st_uid() != 0 || metadata.st_gid() != 0) {
         let error_msg = format!(

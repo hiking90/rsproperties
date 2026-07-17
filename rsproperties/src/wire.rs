@@ -34,17 +34,43 @@ pub const PROP_SUCCESS: i32 = 0;
 /// V2 generic error response code.
 pub const PROP_ERROR: i32 = -1;
 
-/// Decides whether a property value's byte length is acceptable.
+/// Sanity cap on a V2 wire property-name length. The wire format is
+/// length-prefixed, so this only exists to bound the server's upfront
+/// allocation against a hostile peer; `validate_property_name` rejects
+/// anything actually malformed. Lives here (not in the server crate) so
+/// the client can pre-check the same limit — "client accepts, server
+/// rejects" drift is exactly what this module exists to prevent.
+pub const MAX_WIRE_NAME_LEN: usize = 1024;
+
+/// Sanity cap on a V2 wire property-value length. Long `ro.` values may
+/// legitimately exceed `PROP_VALUE_MAX`, so the cap is generous; see
+/// `MAX_WIRE_NAME_LEN` for why it lives in this module.
+pub const MAX_WIRE_VALUE_LEN: usize = 8192;
+
+/// Decides whether a property value is storable: length policy plus a
+/// NUL-byte check.
 ///
-/// Single policy used by both `system_property_set` (client) and the
-/// service handler. Pre-change those two sites disagreed on whether the
-/// comparison was `>` or `>=` — a value of exactly [`PROP_VALUE_MAX`]
-/// bytes could be sent by the client and then rejected by the server (or
-/// vice versa).
+/// Single policy used by both `system_property_set` (client), the service
+/// handler, and `SystemProperties::{add, update}`. Pre-change those sites
+/// disagreed on whether the comparison was `>` or `>=` — a value of
+/// exactly [`PROP_VALUE_MAX`] bytes could be sent by the client and then
+/// rejected by the server (or vice versa).
 ///
 /// Names starting with `ro.` are allowed to exceed the limit (the server
 /// stores them as long properties).
+///
+/// Interior NUL bytes are rejected because the storage format treats
+/// values as C strings: the length recorded in the entry's serial word is
+/// the full byte length, while every scan (value slot, dirty backup,
+/// long value) stops at the first NUL. A value like `"a\0bc"` would
+/// record length 4 but store/back-up only 1 byte — a seqlock reader on
+/// the dirty path would then copy `serial >> 24` = 4 bytes, including
+/// stale bytes from an earlier update of a *different* property. bionic
+/// cannot even express such a value (its API takes C strings).
 pub fn validate_value_len(name: &str, value: &str) -> Result<(), String> {
+    if value.as_bytes().contains(&0) {
+        return Err("value must not contain NUL bytes".into());
+    }
     if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
         return Err(format!(
             "value too long: {} bytes (max {} for non-'ro.' properties)",
@@ -55,10 +81,12 @@ pub fn validate_value_len(name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// AOSP `init/property_service.cpp::IsLegalPropertyName` parity (V2 path).
+/// AOSP `init/util.cpp::IsLegalPropertyName` parity (V2 path).
 ///
 /// - non-empty
-/// - first char is `_` or ASCII alphanumeric (rejects `-foo`, `@foo`, `:foo`)
+/// - cannot start with `.` (AOSP only rejects a leading dot — `-foo`,
+///   `@foo`, `:foo` are legal names for bionic clients, so rejecting them
+///   here would refuse writes that Android's own property service accepts)
 /// - cannot end with `.`
 /// - no consecutive `.`
 /// - allowed chars: ASCII alphanumeric, `_`, `.`, `-`, `@`, `:`
@@ -69,9 +97,8 @@ pub fn validate_property_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("name is empty".into());
     }
-    let first = name.chars().next().expect("non-empty");
-    if !(first.is_ascii_alphanumeric() || first == '_') {
-        return Err(format!("name must start with alphanumeric or '_': {name}"));
+    if name.starts_with('.') {
+        return Err(format!("name cannot start with '.': {name}"));
     }
     if name.ends_with('.') {
         return Err(format!("name cannot end with '.': {name}"));
@@ -110,6 +137,15 @@ mod tests {
     }
 
     #[test]
+    fn value_rejects_interior_nul() {
+        // Interior NUL would desync the serial length from the NUL-scanned
+        // storage length and leak stale backup bytes to seqlock readers.
+        assert!(validate_value_len("foo", "a\0bc").is_err());
+        assert!(validate_value_len("ro.foo", "a\0bc").is_err());
+        assert!(validate_value_len("foo", "\0").is_err());
+    }
+
+    #[test]
     fn name_basic_ok() {
         assert!(validate_property_name("ro.build.version.sdk").is_ok());
         assert!(validate_property_name("_internal.flag").is_ok());
@@ -122,11 +158,18 @@ mod tests {
     }
 
     #[test]
-    fn name_rejects_leading_non_alnum() {
+    fn name_rejects_leading_dot() {
         assert!(validate_property_name(".leading.dot").is_err());
-        assert!(validate_property_name("-leading.dash").is_err());
-        assert!(validate_property_name("@leading.at").is_err());
-        assert!(validate_property_name(":leading.colon").is_err());
+    }
+
+    #[test]
+    fn name_allows_leading_symbols_like_aosp() {
+        // AOSP `IsLegalPropertyName` only rejects a *leading dot*; these are
+        // all legal names for bionic clients and must stay accepted.
+        assert!(validate_property_name("-leading.dash").is_ok());
+        assert!(validate_property_name("@leading.at").is_ok());
+        assert!(validate_property_name(":leading.colon").is_ok());
+        assert!(validate_property_name("_internal").is_ok());
     }
 
     #[test]

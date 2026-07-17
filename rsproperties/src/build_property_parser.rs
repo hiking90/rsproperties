@@ -30,7 +30,11 @@ pub fn load_properties_from_file(
 
     for (line_count, line) in reader.lines().enumerate() {
         let line_count = line_count + 1;
-        let line = line.map_err(Error::from)?;
+        // Lazy context: unlike the open above, this runs per line — the
+        // closure only allocates on the error path.
+        let line = line.with_context_location(|| {
+            format!("Failed to read line {line_count} of {filename:?}")
+        })?;
         let line = line.trim();
 
         if line.is_empty() || line.starts_with('#') {

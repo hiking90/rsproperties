@@ -17,7 +17,7 @@ pub use socket_service::{SocketService, SocketServiceArgs};
 
 pub use properties_service::PropertiesService;
 
-pub(crate) struct ReadyMessage {}
+pub(crate) struct ReadyMessage;
 
 #[derive(Clone)]
 pub(crate) struct PropertyMessage {
@@ -49,6 +49,16 @@ pub struct ServiceContext<T: Actor> {
 /// # Requirements
 /// All folders specified in the PropertyConfig must be valid and accessible
 /// for the function to execute successfully.
+///
+/// # Failure semantics
+/// `rsproperties::try_init` commits process-global, first-write-wins
+/// state. If a later startup step fails, that state stays committed (a
+/// `OnceLock` cannot be un-set), so retrying `run` in the same process
+/// with a *different* config will fail with "already initialized" —
+/// treat a startup failure as fatal for the process.
+///
+/// The error type is `Send + Sync` so the returned future can be
+/// `tokio::spawn`ed and the error converted into `anyhow::Error`.
 pub async fn run(
     config: rsproperties::PropertyConfig,
     property_contexts_files: Vec<PathBuf>,
@@ -58,7 +68,7 @@ pub async fn run(
         ServiceContext<SocketService>,
         ServiceContext<PropertiesService>,
     ),
-    Box<dyn std::error::Error>,
+    Box<dyn std::error::Error + Send + Sync>,
 > {
     // Use `try_init` rather than `init`: if the global properties_dir /
     // socket_dir cells were already committed (e.g. earlier service
@@ -77,16 +87,22 @@ pub async fn run(
         properties_service: properties_service.actor_ref.clone(),
     });
 
-    socket_service
-        .actor_ref
-        .ask(ReadyMessage {})
-        .await
-        .map_err(|e| format!("Failed to start socket service: {e}"))?;
-    properties_service
-        .actor_ref
-        .ask(ReadyMessage {})
-        .await
-        .map_err(|e| format!("Failed to start properties service: {e}"))?;
+    // Sequential readiness checks (not an eagerly-evaluated pair): if the
+    // socket service already failed, waiting for the properties service's
+    // potentially slow init before reporting would only delay the failure.
+    // On failure, stop both actors explicitly instead of leaving them to
+    // the implicit drop of the returned contexts — the caller never sees
+    // the contexts on the error path.
+    if let Err(e) = socket_service.actor_ref.ask(ReadyMessage).await {
+        let _ = socket_service.actor_ref.stop().await;
+        let _ = properties_service.actor_ref.stop().await;
+        return Err(format!("Failed to start socket service: {e}").into());
+    }
+    if let Err(e) = properties_service.actor_ref.ask(ReadyMessage).await {
+        let _ = socket_service.actor_ref.stop().await;
+        let _ = properties_service.actor_ref.stop().await;
+        return Err(format!("Failed to start properties service: {e}").into());
+    }
 
     Ok((socket_service, properties_service))
 }

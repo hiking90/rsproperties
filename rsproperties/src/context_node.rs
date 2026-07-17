@@ -46,15 +46,32 @@ impl ContextNode {
                 "Attempted to open context node without write access: {:?}",
                 self.filename
             );
-            return Err(Error::LockError(format!(
+            // A usage-contract violation, not a lock failure.
+            return Err(Error::PermissionDenied(format!(
                 "open() requires access_rw == true: {:?}",
                 self.filename
             )));
         }
 
         let mut prop_area = self.property_area.write().map_err(lock_err("write"))?;
-        if prop_area.is_some() {
+        if prop_area.as_ref().is_some_and(|pa| pa.is_writable()) {
+            // Already opened read-write by a previous call.
             return Ok(());
+        }
+        if prop_area.is_some() {
+            // A map exists but is read-only: the *read* path (`property_area`)
+            // lazily creates RO maps regardless of `access_rw`, and if it ran
+            // before this open() the slot holds one. Returning Ok here would
+            // report "opened" while every subsequent write fails — surface
+            // the ordering violation instead.
+            error!(
+                "open() called after the read path mapped {:?} read-only",
+                self.filename
+            );
+            return Err(Error::PermissionDenied(format!(
+                "property area already mapped read-only: {:?}",
+                self.filename
+            )));
         }
 
         *prop_area = Some(PropertyAreaMap::new_rw(
@@ -88,9 +105,24 @@ impl ContextNode {
 
     #[cfg(feature = "builder")]
     pub(crate) fn property_area_mut(&self) -> Result<PropertyAreaMutGuard<'_>> {
-        let mut guard = self.property_area.write().map_err(lock_err("write"))?;
-        if guard.is_none() {
-            *guard = Some(PropertyAreaMap::new_ro(self.filename.as_path())?);
+        let guard = self.property_area.write().map_err(lock_err("write"))?;
+        // Never lazily initialize here: the only mapping this path could
+        // create is a read-only one (`new_ro`), and handing out a mut
+        // guard over a PROT_READ mapping would SIGSEGV on first write.
+        // Writable areas are opened eagerly by `ContextsSerialized::new`
+        // via `open()`. Also reject a map that exists but is read-only
+        // (e.g. lazily created by the *read* path before this call) — the
+        // borrow-level guard must never wrap a PROT_READ mapping.
+        let writable = guard.as_ref().is_some_and(|pa| pa.is_writable());
+        if !writable {
+            error!(
+                "property_area_mut on an unopened or read-only area: {:?}",
+                self.filename
+            );
+            return Err(Error::PermissionDenied(format!(
+                "property area not opened read-write: {:?}",
+                self.filename
+            )));
         }
         Ok(PropertyAreaMutGuard::from_initialized(guard))
     }

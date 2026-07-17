@@ -26,6 +26,16 @@ fn try_build_context_node(
 ) -> Result<ContextNode> {
     let context_offset = area.context_offset(i)?;
     let context_cstr = area.cstr(context_offset);
+    // `cstr()` swallows out-of-range offsets and missing NUL terminators by
+    // falling back to an empty string. Promote that to an error here:
+    // an empty context name would otherwise produce a plausible-looking
+    // node whose filename is the directory itself, failing `open()` far
+    // from the actual corruption instead of skipping this slot.
+    if context_cstr.is_empty() {
+        return Err(Error::FileValidation(format!(
+            "context entry {i}: invalid or unterminated string at offset {context_offset}"
+        )));
+    }
     let context_name = context_cstr.to_str()?;
     // The owned context is only consumed by `open()` (writable path) for
     // SELinux labeling; read-only nodes skip the allocation.
@@ -91,11 +101,20 @@ impl ContextsSerialized {
         let (writer_lock, serial_property_area_map) = if writable {
             if !dirname.is_dir() {
                 info!("Creating directory: {dirname:?}");
-                fs::mkdir(
+                match fs::mkdir(
                     dirname.as_path(),
                     fs::Mode::RWXU | fs::Mode::XGRP | fs::Mode::XOTH,
-                )
-                .map_err(Error::from)?;
+                ) {
+                    Ok(()) => {}
+                    // Lost a create race with a concurrent writer — the
+                    // flock below is the real single-writer arbiter, so an
+                    // already-existing *directory* is not an error here.
+                    // Re-check with is_dir(): EEXIST for a plain file at
+                    // this path is a real configuration error and deferring
+                    // it would surface later as a confusing ENOTDIR.
+                    Err(rustix::io::Errno::EXIST) if dirname.is_dir() => {}
+                    Err(e) => return Err(Error::from(e)),
+                }
             }
 
             // Must precede the `open()` calls below: they unlink and
@@ -249,8 +268,11 @@ impl ContextsSerialized {
                 context_index,
                 self.context_nodes.len()
             );
-            return Err(Error::Parse(format!(
-                "Invalid context index: {context_index}"
+            // A lookup failure, not a parse failure — consistent with
+            // `prop_area_for_name`.
+            return Err(Error::NotFound(format!(
+                "context index {context_index} out of range (len {})",
+                self.context_nodes.len()
             )));
         }
 
@@ -282,8 +304,10 @@ impl ContextsSerialized {
                 context_index,
                 self.context_nodes.len()
             );
-            return Err(Error::Parse(format!(
-                "Invalid context index: {context_index}"
+            // See `prop_area_with_index`: lookup failure → NotFound.
+            return Err(Error::NotFound(format!(
+                "context index {context_index} out of range (len {})",
+                self.context_nodes.len()
             )));
         }
 

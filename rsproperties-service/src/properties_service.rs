@@ -11,6 +11,18 @@ pub struct PropertiesServiceArgs {
     build_prop_files: Vec<PathBuf>,
 }
 
+impl PropertiesServiceArgs {
+    /// Public constructor: the type is exposed through `Actor::Args`, so
+    /// downstream users spawning the actor directly (instead of via
+    /// `run`) need a way to build it.
+    pub fn new(property_contexts_files: Vec<PathBuf>, build_prop_files: Vec<PathBuf>) -> Self {
+        Self {
+            property_contexts_files,
+            build_prop_files,
+        }
+    }
+}
+
 pub struct PropertiesService {
     system_properties: SystemProperties,
 }
@@ -34,10 +46,11 @@ where
 /// the loop body. Callers invoke this once via `spawn_blocking` so the
 /// tokio worker isn't held for the duration of init.
 ///
-/// Build-prop entries are collected into a `BTreeMap` so the apply order
-/// is deterministic across runs (`HashMap`'s seed-randomised iteration
-/// made the "which file wins on conflict" outcome irreproducible during
-/// debugging).
+/// Build-prop entries are collected into a `BTreeMap` so the order in
+/// which they are applied to the area (and thus the physical layout of
+/// the trie) is deterministic across runs. Which *file* wins a key
+/// conflict is already deterministic — `load_properties_from_file`
+/// overwrites in call order — the map only fixes the apply order.
 fn init_system_properties_sync(
     property_contexts_files: Vec<PathBuf>,
     build_prop_files: Vec<PathBuf>,
@@ -70,19 +83,15 @@ fn init_system_properties_sync(
     let properties: BTreeMap<String, String> = properties_unordered.into_iter().collect();
 
     let mut system_properties = SystemProperties::new_area(dir).map_err(io_other)?;
+    // `new_area` starts from a freshly-recreated, empty area and the
+    // BTreeMap keys are unique, so every key is new — `add` alone covers
+    // the loop. (The previous `find → update` branch was unreachable; had
+    // it ever been reached, `update` would have rejected the `ro.` keys
+    // that dominate build.prop files and killed the whole init.)
     for (key, value) in properties.iter() {
-        match system_properties.find(key.as_str()).map_err(io_other)? {
-            Some(prop_ref) => {
-                system_properties
-                    .update(&prop_ref, value.as_str())
-                    .map_err(io_other)?;
-            }
-            None => {
-                system_properties
-                    .add(key.as_str(), value.as_str())
-                    .map_err(io_other)?;
-            }
-        }
+        system_properties
+            .add(key.as_str(), value.as_str())
+            .map_err(io_other)?;
     }
     Ok(system_properties)
 }
@@ -118,22 +127,12 @@ impl Actor for PropertiesService {
         _actor_weak: &ActorWeak<Self>,
         killed: bool,
     ) -> std::result::Result<(), Self::Error> {
-        log::warn!("=====================================");
-        log::warn!("    PROPERTIES SERVICE SHUTDOWN     ");
-        log::warn!("=====================================");
-
+        // Routine shutdown logs at `info!`; only a kill is `warn!`-worthy.
         if killed {
-            log::error!("*** FORCED TERMINATION *** PropertiesService is being killed, cleaning up resources.");
+            log::warn!("PropertiesService killed — cleaning up resources");
         } else {
-            log::warn!("*** GRACEFUL SHUTDOWN *** PropertiesService is stopping gracefully.");
+            log::info!("PropertiesService stopping gracefully");
         }
-
-        // Perform any necessary cleanup here
-        // For example, you might want to save the current state or close any open files
-
-        log::warn!("PropertiesService cleanup completed - SERVICE TERMINATED");
-        log::warn!("=====================================");
-
         Ok(())
     }
 }
@@ -175,30 +174,20 @@ impl rsactor::Message<crate::PropertyMessage> for PropertiesService {
             return false;
         }
 
-        // Check if the property exists in the system properties
-        match self.system_properties.find(&name) {
-            Ok(Some(prop_ref)) => {
-                // Update the existing property
-                if let Err(e) = self.system_properties.update(&prop_ref, &value) {
-                    log::error!("Failed to update property '{name}': {e}");
-                    false
-                } else {
-                    log::info!("Updated property: {name} = {value}");
-                    true
-                }
-            }
-            Ok(None) => {
-                // Property does not exist, add it
-                if let Err(e) = self.system_properties.add(&name, &value) {
-                    log::error!("Failed to add property '{name}': {e}");
-                    false
-                } else {
-                    log::info!("Added property: {name} = {value}");
-                    true
-                }
+        // Delegate to `set`, which already encapsulates the find →
+        // update-or-add sequence (plus the `ro.` rejection) — duplicating
+        // that logic here invited policy drift between the two copies.
+        match self.system_properties.set(&name, &value) {
+            Ok(()) => {
+                // Mask the value (same policy as `PropertyMessage`'s Debug
+                // impl and the socket layer): values may carry sensitive
+                // payloads, and logging them here would defeat the masking
+                // everywhere upstream.
+                log::info!("Set property: {name} (<{} bytes>)", value.len());
+                true
             }
             Err(e) => {
-                log::error!("Failed to find property '{name}': {e}");
+                log::error!("Failed to set property '{name}': {e}");
                 false
             }
         }

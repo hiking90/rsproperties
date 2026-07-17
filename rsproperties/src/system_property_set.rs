@@ -58,24 +58,27 @@ pub(crate) fn socket_dir_is_set() -> bool {
 /// 1. Directory set via `set_socket_dir()`
 /// 2. `PROPERTY_SERVICE_SOCKET_DIR` environment variable
 /// 3. Default directory: `/dev/socket`
-pub fn socket_dir() -> &'static PathBuf {
-    SOCKET_DIR.get_or_init(|| {
-        let dir = env::var("PROPERTY_SERVICE_SOCKET_DIR")
-            .unwrap_or_else(|_| DEFAULT_SOCKET_DIR.to_string());
-        PathBuf::from(dir)
-    })
+pub fn socket_dir() -> &'static Path {
+    SOCKET_DIR
+        .get_or_init(|| {
+            let dir = env::var("PROPERTY_SERVICE_SOCKET_DIR")
+                .unwrap_or_else(|_| DEFAULT_SOCKET_DIR.to_string());
+            PathBuf::from(dir)
+        })
+        .as_path()
 }
 
-/// Get the full path to the property service socket
-fn get_property_service_socket() -> String {
-    let socket_path = socket_dir().join(PROPERTY_SERVICE_SOCKET_NAME);
-    socket_path.to_string_lossy().into_owned()
+/// Get the full path to the property service socket.
+/// Returns `PathBuf` (not `String`): a lossy string conversion would make
+/// the client connect to a *different* path when the configured directory
+/// is not valid UTF-8.
+fn get_property_service_socket() -> PathBuf {
+    socket_dir().join(PROPERTY_SERVICE_SOCKET_NAME)
 }
 
 /// Get the full path to the system property service socket
-fn get_property_service_for_system_socket() -> String {
-    let socket_path = socket_dir().join(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
-    socket_path.to_string_lossy().into_owned()
+fn get_property_service_for_system_socket() -> PathBuf {
+    socket_dir().join(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME)
 }
 
 struct ServiceConnection {
@@ -94,7 +97,7 @@ impl ServiceConnection {
             UnixStream::connect(&system_socket)
                 .or_else(|first_err| {
                     log::warn!(
-                        "Connect to {system_socket} failed ({first_err}); falling back to {property_service_socket}"
+                        "Connect to {system_socket:?} failed ({first_err}); falling back to {property_service_socket:?}"
                     );
                     UnixStream::connect(&property_service_socket)
                 })?
@@ -129,6 +132,14 @@ impl<'a> ServiceWriter<'a> {
     }
 
     fn write_str(self, value: &'a str, len: &'a u32) -> Self {
+        // The length prefix and payload arrive as separate arguments (the
+        // `&'a u32` needs to outlive the buffer list); a mismatched pair
+        // would silently desynchronise the length-prefixed frame.
+        debug_assert_eq!(
+            *len as usize,
+            value.len(),
+            "write_str: length prefix does not match payload"
+        );
         let mut thiz = self.write_u32(len);
         thiz.buffers.push(value.as_bytes());
         thiz
@@ -181,12 +192,14 @@ impl<'a> ServiceWriter<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
 enum ProtocolVersion {
     V1 = 1,
     V2 = 2,
 }
 
-#[derive(FromBytes, Immutable, IntoBytes, Debug)]
+// No `FromBytes`: the client only ever serializes this message.
+#[derive(Immutable, IntoBytes, Debug)]
 #[repr(C)]
 struct PropertyMessage {
     cmd: u32,
@@ -203,18 +216,23 @@ impl PropertyMessage {
         let name_bytes = name.as_bytes();
         let value_bytes = value.as_bytes();
 
-        if name_bytes.len() > PROP_NAME_MAX {
+        // `>=`, not `>`: the V1 wire format requires NUL-terminated fields
+        // (bionic rejects `strlen >= MAX`, and the server force-NULs the
+        // last byte, silently truncating an exactly-full field). For this
+        // constructor to be the enforcement point it must be at least as
+        // strict as the wire contract.
+        if name_bytes.len() >= PROP_NAME_MAX {
             return Err(Error::FileValidation(format!(
-                "Property name length {} exceeds PROP_NAME_MAX={}",
+                "Property name length {} exceeds PROP_NAME_MAX - 1 = {}",
                 name_bytes.len(),
-                PROP_NAME_MAX
+                PROP_NAME_MAX - 1
             )));
         }
-        if value_bytes.len() > PROP_VALUE_MAX {
+        if value_bytes.len() >= PROP_VALUE_MAX {
             return Err(Error::FileValidation(format!(
-                "Property value length {} exceeds PROP_VALUE_MAX={}",
+                "Property value length {} exceeds PROP_VALUE_MAX - 1 = {}",
                 value_bytes.len(),
-                PROP_VALUE_MAX
+                PROP_VALUE_MAX - 1
             )));
         }
 
@@ -231,10 +249,10 @@ impl PropertyMessage {
     }
 }
 
-fn protocol_version() -> &'static ProtocolVersion {
+fn protocol_version() -> ProtocolVersion {
     static PROTOCOL_VERSION: OnceLock<ProtocolVersion> = OnceLock::new();
 
-    PROTOCOL_VERSION.get_or_init(|| {
+    *PROTOCOL_VERSION.get_or_init(|| {
         // Try to get version from environment variable first
         let version = env::var("PROPERTY_SERVICE_VERSION")
             .ok()
@@ -261,15 +279,22 @@ fn wait_for_socket_close(stream: &mut UnixStream, timeout: Duration) -> Result<(
     let started = Instant::now();
     let mut buf = [0u8; 64];
     loop {
+        // Enforce `timeout` as a bound on the *total* wait, not per-read:
+        // a peer that keeps trickling bytes would otherwise hold this loop
+        // open indefinitely (each successful read restarts the read
+        // timeout). Recompute the remaining budget every iteration.
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            log::warn!("wait_for_socket_close: timed out after {timeout:?}");
+            break;
+        }
+        let _ = stream.set_read_timeout(Some(remaining));
         match stream.read(&mut buf) {
             Ok(0) => break, // EOF — server closed.
             Ok(_) => {}     // Discard any trailing bytes.
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if started.elapsed() >= timeout {
-                    log::warn!("wait_for_socket_close: timed out after {timeout:?}");
-                    break;
-                }
-            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => {
                 let _ = stream.set_read_timeout(original_timeout);
@@ -283,6 +308,23 @@ fn wait_for_socket_close(stream: &mut UnixStream, timeout: Duration) -> Result<(
 
 // Set a system property via local domain socket.
 pub(crate) fn set(name: &str, value: &str) -> Result<()> {
+    // Validate name and value up front, for BOTH protocol versions. This
+    // is load-bearing for interior NUL bytes in particular: the server
+    // decodes both wire formats as C strings, so a NUL-carrying `&str`
+    // (which Rust happily passes) would otherwise be silently truncated —
+    // `set("a\0b", v)` would target property "a", retargeting the write
+    // to a different key than the caller asked for.
+    // `validate_property_name` rejects NUL through its allowed-chars loop;
+    // `validate_value_len` rejects NUL in values explicitly.
+    if let Err(e) = crate::wire::validate_property_name(name) {
+        log::error!("setprop reject: {e}");
+        return Err(Error::FileValidation(e));
+    }
+    if let Err(e) = crate::wire::validate_value_len(name, value) {
+        log::error!("setprop reject: {e}");
+        return Err(Error::FileValidation(e));
+    }
+
     match protocol_version() {
         ProtocolVersion::V1 => {
             if name.len() >= PROP_NAME_MAX {
@@ -319,15 +361,36 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
             wait_for_socket_close(&mut conn.stream, Duration::from_millis(250))?;
         }
         ProtocolVersion::V2 => {
-            let value_len = value.len() as u32;
-            let name_len = name.len() as u32;
+            // `try_from`, not `as`: V2 names have no wire-level length cap
+            // and `ro.` values are unbounded, so a silent truncation here
+            // would emit a length prefix smaller than the payload pushed
+            // into the writer — exactly the frame desync this module's
+            // send loop exists to prevent.
+            let name_len = u32::try_from(name.len()).map_err(|_| {
+                Error::FileValidation(format!("Property name too long: {} bytes", name.len()))
+            })?;
+            let value_len = u32::try_from(value.len()).map_err(|_| {
+                Error::FileValidation(format!("Property value too long: {} bytes", value.len()))
+            })?;
 
-            // Shared client/server policy — pre-change V2 was `>= 92` here
-            // while the server validator used `> 92`. Single function avoids
-            // the drift.
-            if let Err(e) = crate::wire::validate_value_len(name, value) {
-                log::error!("V2 reject: {e}");
-                return Err(Error::FileValidation(e));
+            // (Name/value policy is validated at the top of `set` — shared
+            // with the V1 arm.)
+            // Mirror the server's wire caps so an oversized frame fails
+            // here with a clear message instead of the server's opaque
+            // error status.
+            if name.len() > crate::wire::MAX_WIRE_NAME_LEN {
+                return Err(Error::FileValidation(format!(
+                    "Property name exceeds the wire cap: {} > {}",
+                    name.len(),
+                    crate::wire::MAX_WIRE_NAME_LEN
+                )));
+            }
+            if value.len() > crate::wire::MAX_WIRE_VALUE_LEN {
+                return Err(Error::FileValidation(format!(
+                    "Property value exceeds the wire cap: {} > {}",
+                    value.len(),
+                    crate::wire::MAX_WIRE_VALUE_LEN
+                )));
             }
 
             let mut conn = ServiceConnection::new(name)?;
@@ -341,9 +404,16 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
             let res = conn.recv_i32()?;
 
             if res != PROP_SUCCESS {
-                log::error!("Property service returned error for '{name}' = '{value}': 0x{res:X}");
+                // Do not log/report the value: property values can carry
+                // sensitive data (tokens, identifiers) — same policy as the
+                // service side's masked logging.
+                log::error!(
+                    "Property service returned error for '{name}' (<{} bytes>): 0x{res:X}",
+                    value.len()
+                );
                 return Err(Error::Io(std::io::Error::other(format!(
-                    "Unable to set property \"{name}\" to \"{value}\": error code: 0x{res:X}"
+                    "Unable to set property \"{name}\" (<{} bytes>): error code: 0x{res:X}",
+                    value.len()
                 ))));
             }
         }

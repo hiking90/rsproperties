@@ -13,17 +13,34 @@ pub(crate) struct TrieSerializer {
     arena: TrieNodeArena,
 }
 
-/// Resolves an optional context/type name to a u32 index, returning the
-/// `u32::MAX` sentinel for absent or empty values, or when the lookup misses.
-fn resolve_index<F>(name: Option<&str>, mut lookup: F) -> u32
+/// Resolves an optional context/type name to a u32 index. Absent or empty
+/// values map to the `u32::MAX` "no context" sentinel; a *lookup miss* for a
+/// present name is an error — `TrieBuilder` inserts every context/type into
+/// the string tables before serialization, so a miss means the serializer's
+/// own invariant broke and folding it into the sentinel would silently
+/// write a corrupt file.
+fn resolve_index<F>(name: Option<&str>, mut lookup: F) -> Result<u32>
 where
     F: FnMut(&str) -> Option<usize>,
 {
     match name {
-        Some(s) if !s.is_empty() => lookup(s)
-            .and_then(|i| u32::try_from(i).ok())
-            .unwrap_or(u32::MAX),
-        _ => u32::MAX,
+        Some(s) if !s.is_empty() => match lookup(s) {
+            // `>=` rather than a plain `try_from`: an index of exactly
+            // `u32::MAX` would collide with the "no context" sentinel and
+            // silently demote a real context on the reader side.
+            Some(i) => u32::try_from(i)
+                .ok()
+                .filter(|&v| v != u32::MAX)
+                .ok_or_else(|| {
+                    Error::FileValidation(format!(
+                        "String table index {i} collides with the u32::MAX sentinel"
+                    ))
+                }),
+            None => Err(Error::FileValidation(format!(
+                "'{s}' missing from the serialized string table (serializer invariant violation)"
+            ))),
+        },
+        _ => Ok(u32::MAX),
     }
 }
 
@@ -43,12 +60,11 @@ impl TrieSerializer {
         }
 
         // `arena.size()` is the running write position of the in-memory
-        // `Vec<u8>` arena. The on-disk format stores offsets as `u32`, so
-        // an input that needed > 4 GiB of serialised data couldn't be
-        // expressed regardless — the silent `as u32` truncation here is
-        // bounded by the same format constraint. User-input lengths
-        // (e.g. `property_entry.name.len()` in `write_property_entry`)
-        // use `u32::try_from` so they fail loudly instead.
+        // `Vec<u8>` arena. The on-disk format stores offsets as `u32`;
+        // arena offsets grow monotonically, so the single `u32::try_from`
+        // on the *final* size below retroactively validates every
+        // intermediate `as u32` cast in this module — if the total fits,
+        // all earlier offsets did too.
         this.arena
             .get_object::<PropertyInfoAreaHeader>(header_offset)?
             .contexts_offset = this.arena.size() as u32;
@@ -63,27 +79,31 @@ impl TrieSerializer {
             .get_object::<PropertyInfoAreaHeader>(header_offset)?
             .size = this.arena.size() as u32;
 
-        let root_trie_offset = this.write_trie_node(&trie_builder.root)?;
+        let root_trie_offset = this.write_trie_node(&trie_builder.root, 0)?;
         this.arena
             .get_object::<PropertyInfoAreaHeader>(header_offset)?
             .root_offset = root_trie_offset;
 
         let final_size = this.arena.size();
+        let final_size_u32 = u32::try_from(final_size).map_err(|_| {
+            Error::FileValidation(format!(
+                "Serialized property info exceeds the u32 offset space: {final_size} bytes"
+            ))
+        })?;
         this.arena
             .get_object::<PropertyInfoAreaHeader>(header_offset)?
-            .size = final_size as u32;
+            .size = final_size_u32;
 
         Ok(this)
     }
 
     fn write_property_entry(&mut self, property_entry: &PropertyEntryBuilder) -> Result<u32> {
-        let context_index =
-            resolve_index(property_entry.context.as_ref().map(|s| s.as_str()), |s| {
-                self.arena.info().find_context_index(s)
-            });
-        let type_index = resolve_index(property_entry.rtype.as_ref().map(|s| s.as_str()), |s| {
+        let context_index = resolve_index(property_entry.context.as_deref(), |s| {
+            self.arena.info().find_context_index(s)
+        })?;
+        let type_index = resolve_index(property_entry.rtype.as_deref(), |s| {
             self.arena.info().find_type_index(s)
-        });
+        })?;
 
         let entry_offset = self.arena.allocate_object::<PropertyEntry>();
         let name_offset = self.arena.allocate_and_write_string(&property_entry.name) as u32;
@@ -103,7 +123,16 @@ impl TrieSerializer {
         Ok(entry_offset as u32)
     }
 
-    fn write_trie_node(&mut self, builder_node: &TrieBuilderNode) -> Result<u32> {
+    fn write_trie_node(&mut self, builder_node: &TrieBuilderNode, depth: usize) -> Result<u32> {
+        // Defense-in-depth alongside `MAX_NAME_SEGMENTS` in `TrieBuilder`:
+        // this function recurses once per trie level, so an unbounded
+        // depth would overflow the stack instead of returning an error.
+        const MAX_TRIE_DEPTH: usize = 512;
+        if depth > MAX_TRIE_DEPTH {
+            return Err(Error::FileValidation(format!(
+                "Trie deeper than {MAX_TRIE_DEPTH} levels — refusing to serialize"
+            )));
+        }
         let trie_offset = self.arena.allocate_object::<TrieNodeData>();
 
         let property_entry = self.write_property_entry(&builder_node.property_entry)?;
@@ -169,7 +198,7 @@ impl TrieSerializer {
 
         let children_count = sorted_children.len();
         for (i, child_node) in sorted_children.iter().enumerate() {
-            let child_offset = self.write_trie_node(child_node)?;
+            let child_offset = self.write_trie_node(child_node, depth + 1)?;
             self.arena
                 .uint32_array(children_offset_array_offset, children_count)?[i] = child_offset;
         }
@@ -177,7 +206,7 @@ impl TrieSerializer {
         Ok(trie_offset as u32)
     }
 
-    fn serialize_strings(&mut self, strings: &BTreeSet<Rc<String>>) -> Result<()> {
+    fn serialize_strings(&mut self, strings: &BTreeSet<Rc<str>>) -> Result<()> {
         self.arena.allocate_and_write_uint32(strings.len() as u32);
         let n = strings.len();
         let offset_array_offset = self.arena.allocate_uint32_array(n);

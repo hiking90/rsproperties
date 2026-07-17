@@ -171,10 +171,12 @@ mod trie_node_arena;
 #[cfg(feature = "builder")]
 mod trie_serializer;
 
+// Explicit re-export lists (not globs) so the public API surface is
+// visible here and additions to the modules don't silently become public.
 #[cfg(feature = "builder")]
-pub use build_property_parser::*;
+pub use build_property_parser::{check_permissions, load_properties_from_file};
 #[cfg(feature = "builder")]
-pub use property_info_serializer::*;
+pub use property_info_serializer::{build_trie, PropertyInfoEntry};
 pub use system_properties::SystemProperties;
 pub use system_property_set::socket_dir;
 
@@ -188,8 +190,13 @@ pub const PROP_DIRNAME: &str = "/dev/__properties__";
 // System properties directory.
 static SYSTEM_PROPERTIES_DIR: OnceLock<PathBuf> = OnceLock::new();
 // Global system properties. Stores Result so initialization failure does not
-// poison the OnceLock and callers can observe the error.
-static SYSTEM_PROPERTIES: OnceLock<Result<system_properties::SystemProperties>> = OnceLock::new();
+// poison the OnceLock and callers can observe the error. The error side is
+// `Arc<Error>` because the cache can only hand out references while callers
+// need an owned error — wrapping the shared original in `Error::Init`
+// preserves both the variant and the `source()` chain.
+static SYSTEM_PROPERTIES: OnceLock<
+    std::result::Result<system_properties::SystemProperties, std::sync::Arc<Error>>,
+> = OnceLock::new();
 
 /// Initialize system properties with flexible configuration options.
 ///
@@ -224,20 +231,23 @@ pub fn init(config: PropertyConfig) {
 }
 
 /// Initialize system properties, returning an error when an option cannot be
-/// applied (typically because it was already set on a previous call).
+/// applied — typically because it was already set, either explicitly by a
+/// previous `init()`/`try_init()` or implicitly by the first property read
+/// (`properties_dir()` latches the default directory on first use).
+///
+/// Only the options present in `config` are touched: a socket-only config
+/// leaves the properties directory unset (still overridable later), and
+/// vice versa.
 pub fn try_init(config: PropertyConfig) -> Result<()> {
-    let props_dir = config.properties_dir.unwrap_or_else(|| {
-        log::info!("Using default properties directory: {PROP_DIRNAME}");
-        PathBuf::from(PROP_DIRNAME)
-    });
-
     // Both `SYSTEM_PROPERTIES_DIR` and the socket-dir cell are first-write-
-    // wins. Pre-check both *before* committing either to avoid leaving the
-    // global state in a half-applied form (properties_dir locked, socket_dir
-    // unset) when the caller's intent was an atomic init.
-    if SYSTEM_PROPERTIES_DIR.get().is_some() {
+    // wins. Pre-check everything this call intends to set *before*
+    // committing anything, so a failed init never leaves the global state
+    // half-applied (e.g. properties_dir locked, socket_dir unset).
+    if config.properties_dir.is_some() && SYSTEM_PROPERTIES_DIR.get().is_some() {
         return Err(Error::FileValidation(
-            "System properties directory already initialized".into(),
+            "System properties directory already initialized \
+             (explicitly via init() or implicitly by a prior property read)"
+                .into(),
         ));
     }
     if config.socket_dir.is_some() && system_property_set::socket_dir_is_set() {
@@ -246,16 +256,18 @@ pub fn try_init(config: PropertyConfig) -> Result<()> {
         ));
     }
 
-    log::info!("Setting system properties directory to: {props_dir:?}");
-    SYSTEM_PROPERTIES_DIR.set(props_dir).map_err(|_| {
-        Error::FileValidation("System properties directory already initialized".into())
-    })?;
+    if let Some(props_dir) = config.properties_dir {
+        log::info!("Setting system properties directory to: {props_dir:?}");
+        SYSTEM_PROPERTIES_DIR.set(props_dir).map_err(|_| {
+            Error::FileValidation("System properties directory already initialized".into())
+        })?;
+    }
 
     if let Some(socket_dir) = config.socket_dir {
         if !system_property_set::set_socket_dir(&socket_dir) {
-            // Lost a race between the pre-check and the set; properties_dir
-            // is now committed but socket_dir is owned by another caller.
-            // Cannot un-set a `OnceLock`, so surface the inconsistency.
+            // Lost a race between the pre-check and the set; anything set
+            // above is already committed and a `OnceLock` cannot be un-set,
+            // so surface the inconsistency.
             return Err(Error::FileValidation(
                 "Socket directory already initialized (race after pre-check)".into(),
             ));
@@ -288,36 +300,17 @@ pub fn try_system_properties() -> Result<&'static system_properties::SystemPrope
             let dir = properties_dir();
             log::debug!("Initializing global SystemProperties instance from: {dir:?}");
 
-            system_properties::SystemProperties::new(dir).inspect_err(|e| {
-                log::error!("Failed to initialize SystemProperties from {dir:?}: {e}");
-            })
+            system_properties::SystemProperties::new(dir)
+                .inspect_err(|e| {
+                    log::error!("Failed to initialize SystemProperties from {dir:?}: {e}");
+                })
+                .map_err(std::sync::Arc::new)
         })
         .as_ref()
-        .map_err(|e| {
-            // We only have `&Error` from the cache, and `Error` isn't
-            // `Clone` (it transitively wraps `std::io::Error`). To avoid
-            // losing the failure context we walk `Error::source()` and
-            // flatten the chain into the Display string. Programmatic
-            // `source()` traversal is sacrificed here — preserving it
-            // would require caching `Arc<Error>` and changing the public
-            // return type.
-            Error::FileValidation(format_error_chain("SystemProperties init failed", e))
-        })
-}
-
-/// Formats `err` and its `source()` chain as `"<prefix>: <e0>: <e1>: ..."`.
-/// Used to surface root-cause info when we hold only `&Error` and can't
-/// build a `Error::Context` (which needs an owned source).
-fn format_error_chain(prefix: &str, err: &dyn std::error::Error) -> String {
-    use std::fmt::Write;
-    let mut out = format!("{prefix}: {err}");
-    let mut source = err.source();
-    while let Some(s) = source {
-        // ignore write! errors — String never fails to write
-        let _ = write!(&mut out, ": {s}");
-        source = s.source();
-    }
-    out
+        // `Error::Init` shares the cached original, so both the original
+        // variant (via `source()` downcast) and the full error chain stay
+        // reachable — flattening to a Display string would lose both.
+        .map_err(|e| Error::Init(std::sync::Arc::clone(e)))
 }
 
 /// Get the system properties.
@@ -327,28 +320,42 @@ fn format_error_chain(prefix: &str, err: &dyn std::error::Error) -> String {
 /// Prefer [`try_system_properties`] in code that must not panic.
 pub fn system_properties() -> &'static system_properties::SystemProperties {
     match try_system_properties() {
+        // `Error::Init`'s Display already starts with "SystemProperties
+        // initialization failed" — no extra prefix here.
         Ok(props) => props,
-        Err(e) => panic!("Failed to initialize SystemProperties: {e}"),
+        Err(e) => panic!("{e}"),
     }
 }
 
-/// Aligns size to the specified alignment (bionic style)
+/// Aligns `value` *up* to the given alignment (bionic style). The
+/// align-up contract — the result is never less than `value` — is
+/// load-bearing for allocation size computations, so overflow panics
+/// instead of saturating: a saturating add here would align *down* near
+/// `usize::MAX` and hand callers an under-sized allocation.
 ///
 /// # Panics
-/// Panics if alignment is not a power of 2
+/// - if `alignment` is not a power of 2
+/// - if `value + alignment - 1` overflows `usize`
 pub(crate) fn bionic_align(value: usize, alignment: usize) -> usize {
     assert!(
         alignment.is_power_of_two(),
         "Alignment must be a power of 2"
     );
 
-    // Use saturating_add to prevent overflow
     // (value + alignment - 1) & !(alignment - 1)
-    value.saturating_add(alignment - 1) & !(alignment - 1)
+    value
+        .checked_add(alignment - 1)
+        .expect("bionic_align: value + alignment overflows usize")
+        & !(alignment - 1)
 }
 
 /// Get a property value parsed to specified type
 /// Returns Err if property not found, system error, or parse error occurs
+///
+/// Note: unlike [`get_or`], an *empty* property value is not special-cased
+/// here — `get::<String>` returns `Ok("")` for a set-but-empty property,
+/// while `get_or` follows the Android convention (empty = unset) and
+/// falls back to the default.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -398,10 +405,10 @@ where
     let Ok(props) = try_system_properties() else {
         return default;
     };
-    // Two-stage closure: the inner `Result<T, T>` carries either the
-    // parsed value or the default back out of `read_with` without ever
-    // allocating a `String`. `Err(default)` is used to signal "use the
-    // default" because the callback can't capture-and-move it twice.
+    // Two-stage closure: the inner `Result<T, ()>` carries the parsed
+    // value back out of `read_with` without ever allocating a `String`.
+    // `Err(())` signals "use the default"; the default itself is returned
+    // at the match below, so the `FnOnce` callback never needs to own it.
     match props.read_with(name, |value| {
         if value.is_empty() {
             return Err(());
@@ -641,28 +648,36 @@ mod tests {
 
         let test_prop = "test.property";
 
-        let wait_any = || {
+        // Deterministic (no sleeps): sample the serial *before* spawning
+        // the waiter and pass it as `old_serial` — the documented contract
+        // closes the lost-wakeup window, so it does not matter whether the
+        // waiter enters futex_wait before or after the change lands. The
+        // old sleep-based sync hung forever (not failed) when the waiter
+        // lost the race.
+        let wait_any_from = |old: u32| {
             std::thread::spawn(move || {
                 let system_properties = system_properties();
-                system_properties.wait_any();
+                system_properties.wait(None, Some(old), None);
             })
         };
 
-        let handle = wait_any();
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        let old = system_properties().context_serial();
+        let handle = wait_any_from(old);
 
         system_properties_area.add(test_prop, "true").unwrap();
         handle.join().unwrap();
 
+        let index = system_properties()
+            .find(test_prop)
+            .unwrap()
+            .expect("just added");
+        let old_prop_serial = system_properties().serial(&index).expect("index valid");
         let handle = std::thread::spawn(move || {
             let system_properties = system_properties();
-            let index = system_properties.find(test_prop).unwrap();
-            // let serial = system_properties.serial(index.as_ref().unwrap());
-            system_properties.wait(index.as_ref(), None, None);
+            system_properties.wait(Some(&index), Some(old_prop_serial), None);
         });
 
-        let handle_any = wait_any();
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        let handle_any = wait_any_from(system_properties().context_serial());
 
         let index = system_properties_area.find(test_prop).unwrap();
         system_properties_area
@@ -691,15 +706,24 @@ mod tests {
     }
 
     #[test]
-    fn test_bionic_align_overflow_safety() {
-        // Test that bionic_align doesn't overflow with large values
-        let size = usize::MAX - 10;
-        let align = 16;
-        let result = bionic_align(size, align);
+    #[should_panic(expected = "bionic_align")]
+    fn test_bionic_align_overflow_panics() {
+        // Align-up cannot represent the result near usize::MAX; returning a
+        // value *smaller* than the input (the old saturating behavior)
+        // would under-size allocation computations, so overflow must panic.
+        bionic_align(usize::MAX - 10, 16);
+    }
 
-        // Should saturate and then align down
-        // Result should be aligned and not panic
-        assert_eq!(result % align, 0);
+    #[test]
+    fn test_bionic_align_upholds_align_up_contract() {
+        // The result is always >= the input and aligned.
+        for value in [0usize, 1, 3, 91, 92, 4095] {
+            for align in [1usize, 4, 16, 4096] {
+                let r = bionic_align(value, align);
+                assert!(r >= value);
+                assert_eq!(r % align, 0);
+            }
+        }
     }
 
     #[test]

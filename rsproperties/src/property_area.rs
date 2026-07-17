@@ -15,9 +15,7 @@ use crate::errors::*;
 use log::{debug, error, info, warn};
 use rustix::{fs, mm};
 
-#[cfg(feature = "builder")]
-use crate::property_info::init_name_with_trailing_data;
-use crate::property_info::{name_from_trailing_data, PropertyInfo};
+use crate::property_info::PropertyInfo;
 
 const PA_SIZE: u64 = 128 * 1024;
 const PROP_AREA_MAGIC: u32 = 0x504f5250;
@@ -33,37 +31,32 @@ pub(crate) struct PropertyTrieNode {
 }
 
 impl PropertyTrieNode {
+    /// Initializes the fixed-size header only. The trailing name bytes are
+    /// written by `PropertyAreaMap::new_prop_trie_node` through the mmap
+    /// base pointer — writing them through `&mut self` would step outside
+    /// this reference's provenance (it covers exactly
+    /// `size_of::<PropertyTrieNode>()` bytes).
     #[cfg(feature = "builder")]
-    fn init(&mut self, name: &str) {
+    fn init_header(&mut self, namelen: u32) {
         self.prop.store(0, std::sync::atomic::Ordering::Relaxed);
         self.left.store(0, std::sync::atomic::Ordering::Relaxed);
         self.right.store(0, std::sync::atomic::Ordering::Relaxed);
         self.children.store(0, std::sync::atomic::Ordering::Relaxed);
-
-        self.namelen = name.len() as _;
-        init_name_with_trailing_data(self, name);
-    }
-
-    pub(crate) fn name(&self) -> crate::errors::Result<&CStr> {
-        name_from_trailing_data(self, Some(self.namelen as _))
+        self.namelen = namelen;
     }
 }
 
 impl Debug for PropertyTrieNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The trailing name is not printed here: reading it requires the
+        // enclosing mmap (see `PropertyAreaMap::trie_node_name`), which a
+        // bare node reference cannot reach without leaving its provenance.
         f.debug_struct("PropertyTrieNode")
             .field("namelen", &self.namelen)
             .field("prop", &self.prop)
             .field("left", &self.left)
             .field("right", &self.right)
             .field("children", &self.children)
-            .field(
-                "name",
-                &self
-                    .name()
-                    .map(|n| n.to_str().unwrap_or("<invalid>"))
-                    .unwrap_or("<error>"),
-            )
             .finish()
     }
 }
@@ -101,7 +94,6 @@ impl PropertyArea {
 pub(crate) struct PropertyAreaMap {
     mmap: MemoryMap,
     data_offset: usize,
-    #[allow(dead_code)]
     pa_data_size: usize,
 }
 
@@ -165,7 +157,7 @@ impl PropertyAreaMap {
             pa_data_size,
         };
 
-        thiz.property_area_mut()
+        thiz.property_area_mut()?
             .init(PROP_AREA_MAGIC, PROP_AREA_VERSION);
 
         info!("Successfully created read-write property area map: {filename:?}");
@@ -193,7 +185,15 @@ impl PropertyAreaMap {
             mem::size_of::<PropertyArea>() as u64,
         )?;
 
-        let pa_size = metadata.len() as usize;
+        // See `PropertyInfoAreaFile::load_path`: `as usize` would truncate
+        // on 32-bit targets and desync the mapped size from the validated
+        // file size.
+        let pa_size = usize::try_from(metadata.len()).map_err(|_| {
+            Error::FileValidation(format!(
+                "File too large to map on this platform: {} bytes in {filename:?}",
+                metadata.len()
+            ))
+        })?;
         let pa_data_size = pa_size - std::mem::size_of::<PropertyArea>();
 
         let thiz = Self {
@@ -224,18 +224,22 @@ impl PropertyAreaMap {
             .expect("PropertyArea's offset is zero. So, it must be valid.")
     }
 
-    fn property_area_mut(&mut self) -> &mut PropertyArea {
-        self.mmap
-            .to_object_mut::<PropertyArea>(0, 0)
-            .expect("PropertyArea's offset is zero. So, it must be valid.")
+    /// Whether the underlying mapping was created read-write.
+    pub(crate) fn is_writable(&self) -> bool {
+        self.mmap.writable
+    }
+
+    // `Result`, not `expect`: offset 0 is always in-bounds/aligned, but
+    // `to_object_mut` also fails (by design) on a read-only mapping — that
+    // must surface as a typed error, not a panic.
+    fn property_area_mut(&mut self) -> Result<&mut PropertyArea> {
+        self.mmap.to_object_mut::<PropertyArea>(0, 0)
     }
 
     // Find the property information with the given name.
     pub(crate) fn find(&self, name: &str) -> Result<(&PropertyInfo, u32)> {
         let mut remaining_name = name;
-        let mut current = self
-            .mmap
-            .to_object::<PropertyTrieNode>(0, self.data_offset)?;
+        let mut current_offset = 0usize;
         loop {
             let sep = remaining_name.find('.');
             let substr_size = match sep {
@@ -250,15 +254,16 @@ impl PropertyAreaMap {
 
             let subname = &remaining_name[0..substr_size];
 
-            let children_offset = current.children.load(std::sync::atomic::Ordering::Acquire);
+            let children_offset = self
+                .mmap
+                .to_object::<PropertyTrieNode>(current_offset, self.data_offset)?
+                .children
+                .load(std::sync::atomic::Ordering::Acquire);
             if children_offset == 0 {
                 return Err(Error::NotFound(name.to_owned()));
             }
-            let root = self
-                .mmap
-                .to_object::<PropertyTrieNode>(children_offset as usize, self.data_offset)?;
 
-            current = self.find_prop_trie_node(root, subname)?;
+            current_offset = self.find_prop_trie_node(children_offset, subname)? as usize;
 
             if sep.is_none() {
                 break;
@@ -267,7 +272,11 @@ impl PropertyAreaMap {
             remaining_name = &remaining_name[substr_size + 1..];
         }
 
-        let prop_offset = current.prop.load(std::sync::atomic::Ordering::Acquire);
+        let prop_offset = self
+            .mmap
+            .to_object::<PropertyTrieNode>(current_offset, self.data_offset)?
+            .prop
+            .load(std::sync::atomic::Ordering::Acquire);
         if prop_offset != 0 {
             Ok((
                 self.mmap
@@ -344,15 +353,31 @@ impl PropertyAreaMap {
         Ok(())
     }
 
-    // Read the dirty backup area.
-    pub(crate) fn dirty_backup_area(&self) -> Result<&CStr> {
-        let result = self
-            .mmap
-            .to_cstr(mem::size_of::<PropertyTrieNode>(), self.data_offset);
-        if result.is_err() {
-            error!("Failed to read dirty backup area");
+    // Snapshot the dirty backup slot into `dst`, byte-wise atomic.
+    //
+    // The slot is shared per-area and may be concurrently rewritten by
+    // another process's writer starting its next update, so it follows the
+    // same byte-wise atomic discipline as the value slots (see the
+    // concurrency notes in `property_info.rs`). The caller (seqlock read
+    // loop) must copy *before* its fence/serial re-check and use only the
+    // snapshot afterwards.
+    pub(crate) fn read_dirty_backup(&self, dst: &mut [u8]) -> Result<()> {
+        let offset = mem::size_of::<PropertyTrieNode>();
+        // Mirror the write side's bound: reads past the reserved slot
+        // would return bytes of the first allocated object as "backup".
+        let reserved = crate::bionic_align(crate::PROP_VALUE_MAX, mem::size_of::<u32>());
+        if dst.len() >= reserved {
+            return Err(Error::FileValidation(format!(
+                "Backup read too long: {} (max: {})",
+                dst.len(),
+                reserved - 1
+            )));
         }
-        result
+        let src = self.mmap.atomic_data(offset, self.data_offset, dst.len())?;
+        for (d, s) in dst.iter_mut().zip(src) {
+            *d = s.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     // Set the dirty backup area.
@@ -365,6 +390,9 @@ impl PropertyAreaMap {
     // area itself stores raw bytes verbatim.
     #[cfg(feature = "builder")]
     pub(crate) fn set_dirty_backup_area(&mut self, value: &[u8]) -> Result<()> {
+        // The stores below go through `atomic_data` (a `&self` accessor), so
+        // check writability explicitly — a PROT_READ mapping would SIGSEGV.
+        self.mmap.require_writable()?;
         let offset = mem::size_of::<PropertyTrieNode>();
         // Checked arithmetic so a wrapping `usize` doesn't bypass the size
         // gate. Realistically `value.len()` is < PROP_VALUE_MAX (92), but
@@ -373,22 +401,28 @@ impl PropertyAreaMap {
         let total_len = value.len().checked_add(1).ok_or_else(|| {
             Error::FileValidation(format!("Backup value too long: {}", value.len()))
         })?;
-        let end = total_len.checked_add(offset).ok_or_else(|| {
-            Error::FileValidation(format!(
-                "Backup area offset overflow: {total_len} + {offset}"
-            ))
-        })?;
-        if end > self.pa_data_size {
-            error!(
-                "Backup area overflow: {total_len} + {offset} > {}",
-                self.pa_data_size
-            );
-            return Err(Error::FileValidation("Invalid offset".to_string()));
+        // Bound against the *reserved* backup slot (see `PropertyArea::init`),
+        // not the whole data region — a longer value would silently overwrite
+        // the first allocated object right after the slot.
+        let reserved = crate::bionic_align(crate::PROP_VALUE_MAX, mem::size_of::<u32>());
+        if total_len > reserved {
+            error!("Backup value overflows the reserved slot: {total_len} > {reserved}");
+            return Err(Error::FileValidation(format!(
+                "Backup value too long: {} (max: {})",
+                value.len(),
+                reserved - 1
+            )));
         }
 
-        let dst = self.mmap.data_mut(offset, self.data_offset, total_len)?;
-        dst[..value.len()].copy_from_slice(value);
-        dst[value.len()] = 0;
+        // Byte-wise atomic stores — concurrent readers in other processes
+        // may snapshot the slot while we rewrite it (their seqlock re-check
+        // discards the torn copy, but the accesses themselves must be
+        // atomic to be well-defined).
+        let dst = self.mmap.atomic_data(offset, self.data_offset, total_len)?;
+        for (slot, &b) in dst.iter().zip(value) {
+            slot.store(b, std::sync::atomic::Ordering::Relaxed);
+        }
+        dst[value.len()].store(0, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -398,12 +432,17 @@ impl PropertyAreaMap {
     fn add_prop_trie_node(&mut self, trie_offset: u32, name: &str) -> Result<u32> {
         let name_bytes = name.as_bytes();
         let mut current_offset = trie_offset;
-        loop {
+        // Same cycle bound as `find_prop_trie_node`: the builder normally
+        // walks only its own freshly-built file, but a corrupt link chain
+        // must fail instead of hanging the writer.
+        let max_steps = self.pa_data_size / mem::size_of::<PropertyTrieNode>();
+        for _ in 0..=max_steps {
             let current_node = self
                 .mmap
                 .to_object::<PropertyTrieNode>(current_offset as usize, self.data_offset)?;
-
-            let ordering = cmp_prop_name(name_bytes, current_node.name()?.to_bytes());
+            let node_name =
+                self.trie_node_name(current_offset as usize, current_node.namelen as usize)?;
+            let ordering = cmp_prop_name(name_bytes, node_name.to_bytes());
             let child_offset = match ordering {
                 std::cmp::Ordering::Less => {
                     current_node.left.load(std::sync::atomic::Ordering::Acquire)
@@ -411,14 +450,14 @@ impl PropertyAreaMap {
                 std::cmp::Ordering::Greater => current_node
                     .right
                     .load(std::sync::atomic::Ordering::Acquire),
-                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Equal => return Ok(current_offset),
             };
             if child_offset != 0 {
                 current_offset = child_offset;
                 continue;
             }
             // Empty slot — allocate the new node, then re-borrow to store the
-            // link (Release) before exiting the loop.
+            // link (Release) before returning.
             let offset = self.new_prop_trie_node(name)?;
             let current_node = self
                 .mmap
@@ -429,35 +468,68 @@ impl PropertyAreaMap {
                 std::cmp::Ordering::Equal => unreachable!(),
             };
             link.store(offset, std::sync::atomic::Ordering::Release);
-            current_offset = offset;
-            break;
+            return Ok(offset);
         }
-        Ok(current_offset)
+        Err(Error::FileValidation(
+            "Trie node cycle detected while adding (corrupt property area)".into(),
+        ))
     }
 
-    fn find_prop_trie_node<'a>(
-        &'a self,
-        trie: &'a PropertyTrieNode,
-        name: &str,
-    ) -> Result<&'a PropertyTrieNode> {
+    /// Reads the NUL-terminated name that trails the trie node at
+    /// `node_offset`. Both `namelen` (read from the already-validated node
+    /// header by the caller) and the node offset come from the mmap and
+    /// are untrusted: the trailing bytes are accessed through the mmap
+    /// base pointer (whole-mapping provenance, unlike a scan derived from
+    /// a `&PropertyTrieNode`), and `data()` rejects any length that would
+    /// leave the mapping, so a corrupt `namelen` fails with a typed error
+    /// instead of an out-of-bounds read.
+    fn trie_node_name(&self, node_offset: usize, namelen: usize) -> Result<&CStr> {
+        let name_offset = node_offset
+            .checked_add(mem::size_of::<PropertyTrieNode>())
+            .ok_or_else(|| {
+                Error::FileValidation(format!("Trie node name offset overflow: {node_offset}"))
+            })?;
+        let len_with_nul = namelen.checked_add(1).ok_or_else(|| {
+            Error::FileValidation(format!("Trie node namelen overflow: {namelen}"))
+        })?;
+        let bytes = self
+            .mmap
+            .data(name_offset, self.data_offset, len_with_nul)?;
+        CStr::from_bytes_until_nul(bytes).map_err(|e| {
+            Error::FileValidation(format!(
+                "Trie node name at offset {name_offset} missing NUL terminator: {e}"
+            ))
+        })
+    }
+
+    fn find_prop_trie_node(&self, trie_offset: u32, name: &str) -> Result<u32> {
         let name_bytes = name.as_bytes();
-        let mut current = trie;
-        loop {
-            let next_offset = match cmp_prop_name(name_bytes, current.name()?.to_bytes()) {
+        let mut current_offset = trie_offset;
+        // A corrupt file can link BST nodes into a cycle; a distinct-node
+        // walk can visit at most as many nodes as fit in the data region,
+        // so exceeding that proves a loop — fail instead of spinning.
+        let max_steps = self.pa_data_size / mem::size_of::<PropertyTrieNode>();
+        for _ in 0..=max_steps {
+            let current = self
+                .mmap
+                .to_object::<PropertyTrieNode>(current_offset as usize, self.data_offset)?;
+            let node_name =
+                self.trie_node_name(current_offset as usize, current.namelen as usize)?;
+            let next_offset = match cmp_prop_name(name_bytes, node_name.to_bytes()) {
                 std::cmp::Ordering::Less => current.left.load(std::sync::atomic::Ordering::Acquire),
                 std::cmp::Ordering::Greater => {
                     current.right.load(std::sync::atomic::Ordering::Acquire)
                 }
-                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Equal => return Ok(current_offset),
             };
             if next_offset == 0 {
                 return Err(Error::NotFound(name.to_owned()));
             }
-            current = self
-                .mmap
-                .to_object::<PropertyTrieNode>(next_offset as usize, self.data_offset)?;
+            current_offset = next_offset;
         }
-        Ok(current)
+        Err(Error::FileValidation(
+            "Trie node cycle detected (corrupt property area)".into(),
+        ))
     }
 
     #[cfg(feature = "builder")]
@@ -491,8 +563,30 @@ impl PropertyAreaMap {
         }
 
         // Update bytes_used
-        self.property_area_mut().bytes_used = new_offset;
+        self.property_area_mut()?.bytes_used = new_offset;
         Ok(offset)
+    }
+
+    /// Writes the NUL-terminated `name` into the `len + 1` bytes trailing
+    /// the object at `obj_offset` (of header size `header_size`). Goes
+    /// through the mmap base pointer so the write carries whole-mapping
+    /// provenance instead of escaping an object reference.
+    #[cfg(feature = "builder")]
+    fn write_trailing_name(
+        &mut self,
+        obj_offset: usize,
+        header_size: usize,
+        name: &str,
+    ) -> Result<()> {
+        let name_offset = obj_offset.checked_add(header_size).ok_or_else(|| {
+            Error::FileValidation(format!("Trailing name offset overflow: {obj_offset}"))
+        })?;
+        let dst = self
+            .mmap
+            .data_mut(name_offset, self.data_offset, name.len() + 1)?;
+        dst[..name.len()].copy_from_slice(name.as_bytes());
+        dst[name.len()] = 0;
+        Ok(())
     }
 
     #[cfg(feature = "builder")]
@@ -501,7 +595,12 @@ impl PropertyAreaMap {
         let node = self
             .mmap
             .to_object_mut::<PropertyTrieNode>(new_offset as usize, self.data_offset)?;
-        node.init(name);
+        node.init_header(name.len() as u32);
+        self.write_trailing_name(
+            new_offset as usize,
+            mem::size_of::<PropertyTrieNode>(),
+            name,
+        )?;
         Ok(new_offset)
     }
 
@@ -509,7 +608,12 @@ impl PropertyAreaMap {
     pub(crate) fn new_prop_info(&mut self, name: &str, value: &str) -> Result<u32> {
         let new_offset = self.allocate_obj(mem::size_of::<PropertyInfo>() + name.len() + 1)?;
 
-        if value.len() > crate::PROP_VALUE_MAX {
+        // `>=`, not `>`: the short slot needs room for the NUL terminator,
+        // so a value of exactly PROP_VALUE_MAX bytes must go out-of-line.
+        // bionic draws the same boundary (`valuelen >= PROP_VALUE_MAX` is
+        // long); with `>` the 92-byte case was silently truncated to 91
+        // bytes while the serial recorded a length of 92.
+        if value.len() >= crate::PROP_VALUE_MAX {
             let long_offset = self.allocate_obj(value.len() + 1)?;
 
             let target =
@@ -518,18 +622,26 @@ impl PropertyAreaMap {
             target[0..value.len()].copy_from_slice(value.as_bytes());
             target[value.len()] = 0; // Add null terminator
 
-            let relative_offset = long_offset - new_offset;
+            // `allocate_obj` offsets grow monotonically, so this cannot
+            // underflow — but the invariant lives in another function, so
+            // keep the module's checked-arithmetic discipline.
+            let relative_offset = long_offset.checked_sub(new_offset).ok_or_else(|| {
+                Error::FileValidation(format!(
+                    "Long allocation not after its entry: {long_offset} < {new_offset}"
+                ))
+            })?;
 
             let info = self
                 .mmap
                 .to_object_mut::<PropertyInfo>(new_offset as usize, self.data_offset)?;
-            info.init_with_long_offset(name, relative_offset as _);
+            info.init_with_long_offset(relative_offset as _);
         } else {
             let info = self
                 .mmap
                 .to_object_mut::<PropertyInfo>(new_offset as usize, self.data_offset)?;
-            info.init_with_value(name, value);
+            info.init_with_value(value);
         };
+        self.write_trailing_name(new_offset as usize, mem::size_of::<PropertyInfo>(), name)?;
 
         Ok(new_offset)
     }
@@ -547,22 +659,69 @@ impl PropertyAreaMap {
         self.mmap.to_object_mut(offset as usize, self.data_offset)
     }
 
-    /// Computes the maximum number of bytes that may be safely scanned past
-    /// `pi` without leaving this mmap. Returned to callers that need to read
-    /// long-property values whose length is not encoded in the header.
-    pub(crate) fn max_value_bound(&self, pi: &PropertyInfo) -> usize {
-        let pi_addr = pi as *const _ as usize;
-        let mmap_start = self.mmap.data as usize;
-        let mmap_end = mmap_start.saturating_add(self.mmap.size);
-        // Require room for the header AND at least one trailing byte (the
-        // NUL terminator slot). Without the `+ 1`, `pi_addr + header ==
-        // mmap_end` would return `header` and let `PropertyInfo::name` scan
-        // a single byte past the mapping.
-        let header = std::mem::size_of::<PropertyInfo>();
-        if pi_addr < mmap_start || pi_addr.saturating_add(header + 1) > mmap_end {
-            return 0;
+    /// Reads the NUL-terminated name trailing the `PropertyInfo` at
+    /// `offset`. The entry does not store its name length, so the scan is
+    /// bounded by the end of the mapping. Accessed through the mmap base
+    /// pointer, not the entry reference — see `trie_node_name`.
+    pub(crate) fn property_info_name(&self, offset: u32) -> Result<&CStr> {
+        // Validate the header first so a bogus offset fails with a typed
+        // error instead of an arbitrary scan.
+        let _ = self.property_info(offset)?;
+        let name_offset = (offset as usize)
+            .checked_add(mem::size_of::<PropertyInfo>())
+            .ok_or_else(|| {
+                Error::FileValidation(format!("PropertyInfo name offset overflow: {offset}"))
+            })?;
+        self.mmap.cstr_at(name_offset, self.data_offset)
+    }
+
+    /// Reads the value of the entry at `pi_offset` as raw bytes: the short
+    /// variant is snapshotted into `buf` (byte-wise atomic), the long
+    /// variant is borrowed from the mmap (long entries are write-once) via
+    /// [`Self::long_property_value`].
+    pub(crate) fn property_value_bytes<'a>(
+        &'a self,
+        pi_offset: u32,
+        buf: &'a mut [u8; crate::PROP_VALUE_MAX],
+    ) -> Result<&'a [u8]> {
+        let pi = self.property_info(pi_offset)?;
+        if pi.is_long() {
+            self.long_property_value(pi_offset)
+        } else {
+            Ok(pi.short_value_bytes(buf))
         }
-        mmap_end - pi_addr
+    }
+
+    /// Resolves the out-of-line bytes of a long entry. Long entries are
+    /// write-once, so the returned slice is stable for the mapping's
+    /// lifetime — callers may hoist it out of seqlock retry loops. The
+    /// offset is resolved through the mmap base pointer (whole-mapping
+    /// provenance) and validated against corrupt values.
+    pub(crate) fn long_property_value(&self, pi_offset: u32) -> Result<&[u8]> {
+        let pi = self.property_info(pi_offset)?;
+        let rel = pi.long_offset()? as usize;
+        // The out-of-line value must start past the entry header AND its
+        // trailing name — an offset into either would silently return the
+        // entry's own bytes as the value. The minimum legal offset is the
+        // next u32-aligned position after the name's NUL, exactly how
+        // `new_prop_info` lays the entry out.
+        let name_len = self.property_info_name(pi_offset)?.to_bytes().len();
+        let min_rel = crate::bionic_align(
+            mem::size_of::<PropertyInfo>() + name_len + 1,
+            mem::size_of::<u32>(),
+        );
+        if rel < min_rel {
+            return Err(Error::FileValidation(format!(
+                "Long property offset {rel} points inside the entry (min {min_rel})"
+            )));
+        }
+        let value_offset = (pi_offset as usize).checked_add(rel).ok_or_else(|| {
+            Error::FileValidation(format!("Long value offset overflow: {pi_offset} + {rel}"))
+        })?;
+        Ok(self
+            .mmap
+            .cstr_at(value_offset, self.data_offset)?
+            .to_bytes())
     }
 }
 
@@ -572,6 +731,10 @@ impl PropertyAreaMap {
 pub(crate) struct MemoryMap {
     data: *mut u8,
     size: usize,
+    /// Whether the mapping was created PROT_READ|PROT_WRITE. Mutable
+    /// accessors check this so a mut reference over a PROT_READ mapping
+    /// (which would SIGSEGV on first write) is a typed error instead.
+    writable: bool,
 }
 
 // SAFETY: The `data` pointer is owned by this MemoryMap and remains valid for
@@ -582,10 +745,20 @@ pub(crate) struct MemoryMap {
 // to complete before any readers attach.
 unsafe impl Send for MemoryMap {}
 
-// SAFETY: See `Send` above. Concurrent readers via `&self` only touch atomic
-// fields exposed through `to_object`. Mutations via `&mut self` are exclusive
-// by Rust's borrow rules. For mmaps shared across processes, the same
-// builder-phase precondition documented on `Send` applies.
+// SAFETY: See `Send` above. Within a process, mutation requires `&mut self`,
+// which the borrow checker makes exclusive; shared `&self` readers are
+// therefore never racing an in-process writer. Non-atomic fields read
+// through `&self` fall into two groups: (a) trie namelen/name bytes and
+// long values are written exactly once before their offset is published
+// via a Release store on the owning link/serial word, and readers reach
+// them only after the paired Acquire load — that happens-before edge makes
+// the reads race-free; (b) the header's magic/version have no publish
+// word — their safety rests on the builder-phase precondition documented
+// on `Send` (the header is fully written before any reader attaches).
+// Fields that *are* rewritten after publication (value slots, the dirty
+// backup slot) are accessed exclusively through byte-wise atomics plus the
+// seqlock serial protocol. Cross-process sharing relies on the same
+// protocol being followed by every mapping of the file.
 unsafe impl Sync for MemoryMap {}
 
 impl MemoryMap {
@@ -621,7 +794,20 @@ impl MemoryMap {
         Ok(Self {
             data: memory_area,
             size,
+            writable,
         })
+    }
+
+    /// Rejects mutable access to read-only mappings. Writing through a
+    /// PROT_READ mapping kills the process with SIGSEGV — fail with a
+    /// typed error at the accessor instead.
+    fn require_writable(&self) -> Result<()> {
+        if !self.writable {
+            return Err(Error::PermissionDenied(
+                "attempted mutable access to a read-only property mapping".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn size(&self) -> usize {
@@ -644,10 +830,12 @@ impl MemoryMap {
         base: usize,
         size: usize,
     ) -> Result<&mut [u8]> {
+        self.require_writable()?;
         let offset = self.checked_offset(offset, base)?;
         self.check_size(offset, size)?;
         // SAFETY: `offset + size <= self.size`. `&mut self` ensures exclusive
-        // access to the mmap region. `u8` has no alignment requirement.
+        // access to the mmap region. `u8` has no alignment requirement. The
+        // mapping is PROT_WRITE (checked above).
         Ok(unsafe { std::slice::from_raw_parts_mut(self.data.add(offset), size) })
     }
 
@@ -707,19 +895,21 @@ impl MemoryMap {
 
     // Convert the memory-mapped file to the mutable object with the given offset.
     pub(crate) fn to_object_mut<T>(&mut self, offset: usize, base: usize) -> Result<&mut T> {
+        self.require_writable()?;
         let offset = self.checked_offset(offset, base)?;
         self.check_size(offset, mem::size_of::<T>())?;
         self.check_alignment::<T>(offset)?;
         // SAFETY: bounds and alignment are both verified above. `&mut self`
-        // ensures exclusive access for the lifetime of the returned reference.
+        // ensures exclusive access for the lifetime of the returned
+        // reference. The mapping is PROT_WRITE (checked above).
         Ok(unsafe { &mut *(self.data.add(offset) as *mut T) })
     }
 
-    // Convert the memory-mapped file to the CStr with the given offset.
-    pub(crate) fn to_cstr(&self, offset: usize, base: usize) -> Result<&CStr> {
+    /// NUL-terminated string at `offset`; the scan is bounded by the end of
+    /// the mapping. The slice is derived from the mmap base pointer, so it
+    /// carries whole-mapping provenance.
+    pub(crate) fn cstr_at(&self, offset: usize, base: usize) -> Result<&CStr> {
         let offset = self.checked_offset(offset, base)?;
-        // Bound the NUL scan to the remaining mmap; `CStr::from_ptr` would
-        // otherwise read past the mapping if no terminator is present.
         let remaining = self.size.checked_sub(offset).ok_or_else(|| {
             Error::FileValidation(format!("Offset past mmap: {offset} > {}", self.size))
         })?;
@@ -727,6 +917,33 @@ impl MemoryMap {
         let bytes = unsafe { std::slice::from_raw_parts(self.data.add(offset), remaining) };
         CStr::from_bytes_until_nul(bytes).map_err(|e| {
             Error::FileValidation(format!("No NUL terminator at offset {offset}: {e}"))
+        })
+    }
+
+    /// Byte-wise-atomic view of `size` bytes at `offset`. Used for the
+    /// dirty backup slot, which — like the value slots — may be rewritten
+    /// by another process's writer while a reader snapshots it.
+    pub(crate) fn atomic_data(
+        &self,
+        offset: usize,
+        base: usize,
+        size: usize,
+    ) -> Result<&[std::sync::atomic::AtomicU8]> {
+        let offset = self.checked_offset(offset, base)?;
+        self.check_size(offset, size)?;
+        // SAFETY: `offset + size <= self.size`, so the slice lies within the
+        // mmap. `AtomicU8` has the same size/alignment as `u8` (asserted in
+        // property_info.rs). Callers pass only ranges whose every access is
+        // atomic under the module protocol (the dirty backup slot / value
+        // slots); a corrupt file could alias such a range with a non-atomic
+        // read elsewhere, but that requires corruption *and* a concurrent
+        // writer — outside the supported threat model, and bounded by the
+        // seqlock retry discarding torn data. Lifetime is tied to `&self`.
+        Ok(unsafe {
+            std::slice::from_raw_parts(
+                self.data.add(offset) as *const std::sync::atomic::AtomicU8,
+                size,
+            )
         })
     }
 }

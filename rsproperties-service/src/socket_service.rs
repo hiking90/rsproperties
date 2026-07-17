@@ -18,32 +18,26 @@ use rsactor::{Actor, ActorRef, ActorWeak};
 
 use rsproperties::errors::*;
 use rsproperties::wire::{
-    PROP_ERROR, PROP_MSG_SETPROP, PROP_MSG_SETPROP2, PROP_NAME_MAX, PROP_SUCCESS, PROP_VALUE_MAX,
+    MAX_WIRE_NAME_LEN, MAX_WIRE_VALUE_LEN, PROP_ERROR, PROP_MSG_SETPROP, PROP_MSG_SETPROP2,
+    PROP_NAME_MAX, PROP_SUCCESS, PROP_VALUE_MAX,
 };
 
-/// Upper bound on simultaneously serviced client connections. Each accepted
-/// connection takes one permit from the semaphore; further connections wait
-/// in the kernel's accept queue. Sized to allow comfortable concurrency
-/// without permitting an unbounded fan-out of spawned tasks.
+/// Upper bound on simultaneously *serviced* client connections. Each
+/// handler task holds one permit for the duration of the exchange.
 const MAX_CONCURRENT_CLIENTS: usize = 64;
+
+/// Upper bound on accepted connections *waiting* for a handler permit.
+/// Every waiting task holds an accepted `UnixStream` (one fd), so without
+/// this cap a connect flood while all handler permits are taken would
+/// accumulate fds until EMFILE and take the whole process down. Beyond
+/// `MAX_CONCURRENT_CLIENTS + MAX_WAITING_CLIENTS`, new connections are
+/// dropped immediately; well-behaved clients see ECONNRESET and retry.
+const MAX_WAITING_CLIENTS: usize = 256;
 
 /// Wall-clock timeout for an entire `handle_client` exchange. Trusted
 /// clients (init, system services) complete well under this; untrusted or
 /// stuck clients are torn down rather than tying up a task indefinitely.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Sanity upper bound on a V2 wire-protocol property name length. The real
-/// AOSP limit is `PROP_NAME_MAX = 32`, but the wire format is
-/// length-prefixed so we accept up to a much higher cap here and let
-/// `validate_property_name` reject anything actually malformed. The cap
-/// only exists to bound an upfront allocation against a hostile peer.
-const MAX_WIRE_NAME_LEN: u32 = 1024;
-
-/// Sanity upper bound on a V2 wire-protocol property value length.
-/// Long-value `ro.` properties can legitimately exceed `PROP_VALUE_MAX`,
-/// so the cap is generous; the actual length policy is enforced by
-/// `validate_value_len` after the bytes are read.
-const MAX_WIRE_VALUE_LEN: u32 = 8192;
 
 /// Permissions applied to the bound Unix socket files. `0o660`
 /// (rw-rw----) matches the AOSP init policy for property service sockets
@@ -51,6 +45,15 @@ const MAX_WIRE_VALUE_LEN: u32 = 8192;
 /// this explicit chmod the file would inherit the process umask, which
 /// is environment-dependent and frequently leaves the socket
 /// world-readable.
+///
+/// **Access model.** This file mode is the service's *entire* access
+/// control: any peer that can `connect()` (i.e. has write permission on
+/// the socket file — owner or group) may set any non-`ro.` property.
+/// Unlike AOSP init, no per-property SO_PEERCRED / property_contexts
+/// authorization is performed, and the "property" / "system" sockets
+/// share one handler; peer credentials are logged for auditability only.
+/// This is an intentional simplification for host-side deployments —
+/// restrict the socket directory / group membership accordingly.
 const SOCKET_FILE_MODE: u32 = 0o660;
 
 /// Backoff applied when `accept()` returns an error. Without it, a
@@ -66,6 +69,50 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// dependency.
 async fn chmod_socket(path: &Path) -> std::io::Result<()> {
     fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_FILE_MODE)).await
+}
+
+/// Binds a Unix socket so that it is never reachable at `path` with
+/// permissions wider than `SOCKET_FILE_MODE`: bind under a temporary name,
+/// chmod, then atomically rename into place (replacing any previous socket
+/// with no ENOENT window). A plain bind + chmod leaves a window with
+/// umask-derived permissions in which a connection can be established (and
+/// survive the later chmod). Deliberately NOT done by locking the process
+/// umask around the bind — umask is process-global and would race any
+/// concurrent file creation (e.g. the sibling PropertiesService writing
+/// `property_info` from `spawn_blocking`).
+///
+/// Note: the temp name is `.{name}.tmp-{pid}`, slightly longer than the
+/// final path — socket dirs near the `sun_path` limit (~104/108 bytes)
+/// need that much headroom. Stale temps from crashed runs (different pid)
+/// are swept by `on_start`.
+async fn bind_socket_with_mode(path: &Path) -> std::io::Result<UnixListener> {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::other(format!("invalid socket path: {path:?}")))?;
+    let tmp_path = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+
+    // Clear our own leftover temp (pid reuse / repeated on_start).
+    match fs::remove_file(&tmp_path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    let listener = UnixListener::bind(&tmp_path)?;
+    let finalize = async {
+        chmod_socket(&tmp_path).await?;
+        // `rename` atomically replaces any existing file at `path`, so the
+        // socket appears there already carrying 0o660.
+        fs::rename(&tmp_path, path).await
+    };
+    if let Err(e) = finalize.await {
+        // Tokio's UnixListener does not unlink on drop — clean up the temp
+        // so failed starts don't litter the socket directory.
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(e);
+    }
+    Ok(listener)
 }
 
 pub struct SocketServiceArgs {
@@ -99,6 +146,9 @@ pub struct SocketService {
     properties_service: ActorRef<crate::PropertiesService>,
     /// Limits concurrently in-flight client tasks.
     connection_sem: Arc<Semaphore>,
+    /// Limits accepted-but-not-yet-serviced connections (fd backpressure);
+    /// see `MAX_WAITING_CLIENTS`.
+    waiting_sem: Arc<Semaphore>,
 }
 
 impl Actor for SocketService {
@@ -129,39 +179,36 @@ impl Actor for SocketService {
         let system_socket_path = args
             .socket_dir
             .join(rsproperties::PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
-        // Remove existing socket files if they exist
-        if fs::try_exists(&property_socket_path).await? {
-            debug!(
-                "Removing existing property socket file: {}",
-                property_socket_path.display()
-            );
-            fs::remove_file(&property_socket_path).await?;
-        }
-        if fs::try_exists(&system_socket_path).await? {
-            debug!(
-                "Removing existing system socket file: {}",
-                system_socket_path.display()
-            );
-            fs::remove_file(&system_socket_path).await?;
+        // No pre-unlink of existing socket files: `bind_socket_with_mode`
+        // replaces them atomically via rename, so a restart never exposes
+        // an ENOENT window to connecting clients. Only sweep stale *temp*
+        // sockets left by crashed previous runs (their names embed another
+        // pid, so per-name cleanup can't catch them).
+        if let Ok(mut entries) = fs::read_dir(&args.socket_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with('.') && name.contains(".tmp-") {
+                        debug!("Removing stale temp socket: {:?}", entry.path());
+                        let _ = fs::remove_file(entry.path()).await;
+                    }
+                }
+            }
         }
         info!(
-            "Property socket services successfully created at: {} and {}",
+            "Property socket services will be created at: {} and {}",
             property_socket_path.display(),
             system_socket_path.display()
         );
-        // Bind both sockets
+        // Bind both sockets via the chmod-then-rename pattern so they are
+        // never connectable with permissions wider than SOCKET_FILE_MODE
+        // (see `bind_socket_with_mode`).
         trace!(
-            "Binding property service Unix domain socket: {}",
-            property_socket_path.display()
-        );
-        let property_listener = UnixListener::bind(&property_socket_path)?;
-        chmod_socket(&property_socket_path).await?;
-        trace!(
-            "Binding system property service Unix domain socket: {}",
+            "Binding property service Unix domain sockets: {} and {}",
+            property_socket_path.display(),
             system_socket_path.display()
         );
-        let system_listener = UnixListener::bind(&system_socket_path)?;
-        chmod_socket(&system_socket_path).await?;
+        let property_listener = bind_socket_with_mode(&property_socket_path).await?;
+        let system_listener = bind_socket_with_mode(&system_socket_path).await?;
         info!("AsyncPropertySocketService started successfully");
 
         // Model each listener as a `Stream` of accepted connections and hand
@@ -181,6 +228,7 @@ impl Actor for SocketService {
             socket_dir: args.socket_dir,
             properties_service: args.properties_service,
             connection_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS)),
+            waiting_sem: Arc::new(Semaphore::new(MAX_WAITING_CLIENTS)),
         })
     }
 
@@ -189,6 +237,10 @@ impl Actor for SocketService {
         event: Self::IdleEvent,
         _actor_weak: &ActorWeak<Self>,
     ) -> std::result::Result<(), Self::Error> {
+        // IMPORTANT: the actor runtime awaits `on_idle` inline in its
+        // single `select!` loop — any await that parks here stalls the
+        // mailbox (stop/ask) AND the other listener's accepts. Keep this
+        // body non-blocking except for the short, bounded error backoff.
         let (accepted, source) = event;
 
         let stream = match accepted {
@@ -197,31 +249,64 @@ impl Actor for SocketService {
                 // Permanent conditions (EMFILE, ENFILE, broken listener)
                 // would otherwise let the idle loop spin at full speed and
                 // saturate the log with the same error every microsecond. A
-                // small sleep both dampens the loop and gives the kernel time
-                // to recover the resource. `UnixListenerStream` keeps yielding
-                // after an error, so the listener is not lost.
+                // small sleep dampens the loop and gives the kernel time to
+                // recover; it does block the actor loop, but only for the
+                // fixed 100ms — unlike an unbounded permit wait.
+                // `UnixListenerStream` keeps yielding after an error, so the
+                // listener is not lost.
                 error!("Error accepting connection on {source} listener: {e}");
                 tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 return Ok(());
             }
         };
 
-        // Bound the number of concurrently in-flight client handlers. The old
-        // on_run acquired the permit *before* accepting; here the stream has
-        // already accepted one connection, so we acquire after. The idle loop
-        // is not polled again until this returns, so when all 64 permits are
-        // taken at most one extra connection is held here while the rest queue
-        // in the kernel's listen backlog — the same backpressure, off by one.
-        let permit = match self.connection_sem.clone().acquire_owned().await {
+        // Peer credentials: logged for auditability — see the access-model
+        // note on `SOCKET_FILE_MODE` (no per-property authorization).
+        if let Ok(cred) = stream.peer_cred() {
+            debug!(
+                "Client connected on {source} listener (uid={}, gid={})",
+                cred.uid(),
+                cred.gid()
+            );
+        }
+
+        // Bound the number of concurrently in-flight client handlers
+        // WITHOUT awaiting in the actor loop — the previous inline
+        // `acquire_owned().await` parked the whole loop (mailbox + the
+        // other listener) for up to CLIENT_TIMEOUT per saturated
+        // connection. Two-level backpressure, both non-blocking here:
+        // 1. a *waiting-room* permit is taken via try_acquire; if the room
+        //    is full the connection is dropped immediately, which caps the
+        //    total accepted fds at MAX_CONCURRENT_CLIENTS +
+        //    MAX_WAITING_CLIENTS instead of growing until EMFILE;
+        // 2. the spawned task then waits (deadline-bounded) for a handler
+        //    permit, holding its waiting-room slot until it gets one.
+        let waiting = match self.waiting_sem.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                error!("Connection semaphore closed");
-                return Ok(());
+                warn!("Waiting room full; dropping {source} connection");
+                return Ok(()); // `stream` dropped → connection closed
             }
         };
-
+        let sem = self.connection_sem.clone();
         let connection_sender = self.properties_service.clone();
         tokio::spawn(async move {
+            let permit = {
+                let _waiting = waiting; // released once a handler slot is ours
+                match tokio::time::timeout(CLIENT_TIMEOUT, sem.acquire_owned()).await {
+                    Ok(Ok(p)) => p,
+                    Ok(Err(_)) => {
+                        error!("Connection semaphore closed");
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        warn!(
+                            "No handler slot available within {CLIENT_TIMEOUT:?}, dropping {source} connection"
+                        );
+                        return;
+                    }
+                }
+            };
             let _permit = permit; // dropped when the task ends
             match tokio::time::timeout(
                 CLIENT_TIMEOUT,
@@ -244,21 +329,14 @@ impl Actor for SocketService {
         _actor_weak: &ActorWeak<Self>,
         killed: bool,
     ) -> std::result::Result<(), Self::Error> {
-        warn!("=====================================");
-        warn!("      SOCKET SERVICE SHUTDOWN       ");
-        warn!("=====================================");
-
+        // A graceful stop is normal operation — keep it at `info!` so log
+        // monitors don't alarm on routine shutdowns; only a kill warrants
+        // `warn!`.
         if killed {
-            error!(
-                "*** FORCED TERMINATION *** SocketService is being killed, cleaning up resources."
-            );
+            warn!("SocketService killed — cleaning up resources");
         } else {
-            warn!("*** GRACEFUL SHUTDOWN *** SocketService is stopping gracefully.");
+            info!("SocketService stopping gracefully");
         }
-
-        warn!("SocketService cleanup completed - SERVICE TERMINATED");
-        warn!("=====================================");
-
         Ok(())
     }
 }
@@ -284,7 +362,15 @@ impl SocketService {
 
         // Read the command (u32)
         let mut cmd_buf = [0u8; 4];
-        stream.read_exact(&mut cmd_buf).await?;
+        if let Err(e) = stream.read_exact(&mut cmd_buf).await {
+            // Connect-then-close without writing (port probes, health
+            // checks) is routine — not worth an `error!` in the caller.
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                debug!("Client closed the connection before sending a command");
+                return Ok(());
+            }
+            return Err(e.into());
+        }
         let cmd = u32::from_ne_bytes(cmd_buf);
 
         debug!("Received command: 0x{cmd:08X}");
@@ -350,6 +436,12 @@ impl SocketService {
     }
 
     /// Decodes a fixed-size NUL-padded V1 wire field into a `String`.
+    ///
+    /// Truncation at the first NUL is inherent to the V1 format — padding
+    /// and interior NULs are indistinguishable in a fixed buffer, and
+    /// bionic decodes identically (strlen). The rsproperties client
+    /// rejects NUL-carrying names/values before sending; a foreign V1
+    /// client sending them gets the same truncation AOSP would apply.
     fn string_from_fixed(buf: &[u8]) -> Result<String> {
         let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
         String::from_utf8(buf[..end].to_vec())
@@ -367,30 +459,58 @@ impl SocketService {
         let name_len = Self::read_u32(stream).await?;
         trace!("Name length: {name_len}");
 
-        if name_len > MAX_WIRE_NAME_LEN {
+        if name_len as usize > MAX_WIRE_NAME_LEN {
             error!("Name length too large: {name_len} (max {MAX_WIRE_NAME_LEN})");
-            Self::send_response(stream, PROP_ERROR).await?;
+            // Best-effort like every other V2 failure response: `?` here
+            // would replace the real error with a write failure when the
+            // peer is already gone.
+            let _ = Self::send_response(stream, PROP_ERROR).await;
             return Err(rsproperties::errors::Error::FileValidation(format!(
                 "Name length too large: {name_len}"
             )));
         }
 
-        let name = Self::read_string(stream, name_len as usize).await?;
+        // Protocol consistency: every V2 failure after the command word
+        // answers with a status code before closing, like the length-cap
+        // paths above — a bare connection close left the client's
+        // `recv_i32` to diagnose an EOF instead of a definite error.
+        // (`send_response` results are ignored: the peer may already be
+        // gone, which is fine — the response is best-effort.)
+        let name = match Self::read_string(stream, name_len as usize).await {
+            Ok(name) => name,
+            Err(e) => {
+                let _ = Self::send_response(stream, PROP_ERROR).await;
+                return Err(e);
+            }
+        };
         debug!("Property name: '{name}'");
 
         // Read value length and value
-        let value_len = Self::read_u32(stream).await?;
+        let value_len = match Self::read_u32(stream).await {
+            Ok(len) => len,
+            Err(e) => {
+                let _ = Self::send_response(stream, PROP_ERROR).await;
+                return Err(e);
+            }
+        };
         trace!("Value length: {value_len}");
 
-        if value_len > MAX_WIRE_VALUE_LEN {
+        if value_len as usize > MAX_WIRE_VALUE_LEN {
             error!("Value length too large: {value_len} (max {MAX_WIRE_VALUE_LEN})");
-            Self::send_response(stream, PROP_ERROR).await?;
+            // Best-effort — see the name-length branch above.
+            let _ = Self::send_response(stream, PROP_ERROR).await;
             return Err(rsproperties::errors::Error::FileValidation(format!(
                 "Value length too large: {value_len}"
             )));
         }
 
-        let value = Self::read_string(stream, value_len as usize).await?;
+        let value = match Self::read_string(stream, value_len as usize).await {
+            Ok(value) => value,
+            Err(e) => {
+                let _ = Self::send_response(stream, PROP_ERROR).await;
+                return Err(e);
+            }
+        };
         // Do NOT log the value; it may carry sensitive payloads. Names
         // are public on the wire (and surface in getprop output), but
         // values are not.
@@ -431,9 +551,17 @@ impl SocketService {
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf).await?;
 
-        // Remove null terminator if present
-        if let Some(null_pos) = buf.iter().position(|&x| x == 0) {
-            buf.truncate(null_pos);
+        // Reject NUL bytes instead of truncating at the first one: V2
+        // strings are length-prefixed and sent without a terminator
+        // (bionic does the same), so a NUL inside the declared length is a
+        // malformed frame. Truncating would silently retarget the write —
+        // a name "a\0b" would become property "a" and *pass* the
+        // downstream validators, which never see the NUL. AOSP init
+        // likewise rejects such names (IsLegalPropertyName).
+        if buf.contains(&0) {
+            return Err(rsproperties::errors::Error::Encoding(
+                "wire string contains an interior NUL byte".into(),
+            ));
         }
 
         String::from_utf8(buf).map_err(|e| rsproperties::errors::Error::Encoding(e.to_string()))
@@ -454,16 +582,23 @@ impl Drop for SocketService {
         debug!("Cleaning up async socket service");
 
         // Drop runs in sync context — keep blocking std::fs here (rare path).
+        //
+        // Note: this unlinks by *name* without verifying the file is the
+        // one this instance bound. If a new SocketService instance binds
+        // the same paths before an old instance drops, the old Drop would
+        // remove the new instance's live sockets — don't run two instances
+        // against one socket_dir (the design assumes a single service).
         for socket_name in [
             rsproperties::PROPERTY_SERVICE_SOCKET_NAME,
             rsproperties::PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME,
         ] {
             let path = self.socket_dir.join(socket_name);
-            if path.exists() {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => debug!("Socket file removed: {}", path.display()),
-                    Err(e) => warn!("Failed to remove socket file {}: {e}", path.display()),
-                }
+            // No `exists()` pre-check (TOCTOU): just remove and ignore
+            // NotFound.
+            match std::fs::remove_file(&path) {
+                Ok(()) => debug!("Socket file removed: {}", path.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!("Failed to remove socket file {}: {e}", path.display()),
             }
         }
     }

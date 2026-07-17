@@ -47,7 +47,7 @@ fn entry_name_str<'a>(name: &'a CStr, kind: &str, idx: usize) -> Option<&'a str>
     }
 }
 
-#[derive(FromBytes, KnownLayout, Immutable, Debug)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug)]
 #[repr(C, align(4))]
 pub(crate) struct PropertyEntry {
     pub(crate) name_offset: u32,
@@ -62,7 +62,7 @@ impl PropertyEntry {
     }
 }
 
-#[derive(FromBytes, KnownLayout, Debug, Immutable)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Debug, Immutable)]
 #[repr(C, align(4))]
 pub(crate) struct TrieNodeData {
     pub(crate) property_entry: u32,
@@ -74,7 +74,7 @@ pub(crate) struct TrieNodeData {
     pub(crate) exact_match_entries: u32,
 }
 
-#[derive(FromBytes, KnownLayout, Immutable, Debug)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug)]
 #[repr(C, align(4))]
 pub struct PropertyInfoAreaHeader {
     pub(crate) current_version: u32,
@@ -169,6 +169,17 @@ impl<'a> TrieNode<'a> {
         let node_index = find(self.num_child_nodes(), |i| match self.child_node(i) {
             Ok(child) => match child.name() {
                 Ok(name) => match name.to_str() {
+                    // `cstr()` swallows out-of-range offsets / missing NUL
+                    // by returning `c""` — an empty name is the corruption
+                    // fallback, not real data, and must disqualify the
+                    // search like the other corruption arms (otherwise
+                    // `"".cmp(input) == Less` silently steers the binary
+                    // search with a broken sort invariant).
+                    Ok("") => {
+                        warn!("child node {i} has empty (corruption-fallback) name");
+                        corrupted = true;
+                        Ordering::Equal
+                    }
                     Ok(s) => s.cmp(input),
                     Err(e) => {
                         warn!("child node {i} has non-UTF-8 name: {e}");
@@ -300,6 +311,13 @@ impl<'a> PropertyInfoArea<'a> {
         }
 
         let slice = &self.data_base[offset..];
+        // SAFETY: the sole obligation for `align_to::<u32>` is that the
+        // element reinterpretation be valid, and `u8 → u32` is valid for
+        // every bit pattern; the middle slice's alignment is guaranteed by
+        // `align_to` itself. The `prefix.is_empty()` check below is a
+        // *correctness* gate (the array must start exactly at `offset` —
+        // a non-empty prefix means the data there isn't 4-aligned and is
+        // treated as absent), not a safety requirement.
         let (prefix, u32_slice, _suffix) = unsafe { slice.align_to::<u32>() };
 
         // Ensure proper alignment - prefix should be empty for u32-aligned data
@@ -314,8 +332,14 @@ impl<'a> PropertyInfoArea<'a> {
 
     #[inline]
     pub(crate) fn header(&self) -> &PropertyInfoAreaHeader {
+        // Both construction paths guarantee room and alignment for the
+        // header at offset 0: the mmap path validates the file size on
+        // load (`load_path`), and the builder path (`TrieNodeArena::info`)
+        // allocates the header before anything else. `ref_from` re-checks
+        // both at runtime, so a violated invariant panics here rather
+        // than reading garbage.
         self.ref_from(0)
-            .expect("header at offset 0; file size validated on load")
+            .expect("header at offset 0; guaranteed by load-time validation / arena layout")
     }
 
     // #[inline]
@@ -355,7 +379,16 @@ impl<'a> PropertyInfoArea<'a> {
     }
 
     pub(crate) fn context_offset(&self, index: usize) -> Result<usize> {
-        let context_array_offset = self.header().contexts_offset as usize + size_of::<u32>();
+        // `contexts_offset` is untrusted file data — checked arithmetic so
+        // a corrupt value can't overflow (a debug-build panic on 32-bit).
+        let context_array_offset = (self.header().contexts_offset as usize)
+            .checked_add(size_of::<u32>())
+            .ok_or_else(|| {
+                Error::FileValidation(format!(
+                    "contexts_offset overflow: {}",
+                    self.header().contexts_offset
+                ))
+            })?;
         let slice = self.u32_slice_from(context_array_offset);
         let value = slice.get(index).ok_or_else(|| {
             Error::FileValidation(format!(
@@ -368,7 +401,15 @@ impl<'a> PropertyInfoArea<'a> {
 
     #[cfg(feature = "builder")]
     pub(crate) fn type_offset(&self, index: usize) -> Result<usize> {
-        let type_array_offset = self.header().types_offset as usize + size_of::<u32>();
+        // See `context_offset`: untrusted offset, checked arithmetic.
+        let type_array_offset = (self.header().types_offset as usize)
+            .checked_add(size_of::<u32>())
+            .ok_or_else(|| {
+                Error::FileValidation(format!(
+                    "types_offset overflow: {}",
+                    self.header().types_offset
+                ))
+            })?;
         let slice = self.u32_slice_from(type_array_offset);
         let value = slice.get(index).ok_or_else(|| {
             Error::FileValidation(format!(
@@ -420,12 +461,18 @@ impl<'a> PropertyInfoArea<'a> {
         let mut trie_node = self.root_node();
 
         loop {
-            if trie_node.context_index() != !0 {
-                return_context_index = trie_node.context_index();
+            // Cache each index: every accessor call re-validates the whole
+            // TrieNodeData → PropertyEntry chain (`ref_from` twice), so
+            // calling them twice per field doubled the per-level cost of
+            // this lookup hot path.
+            let context_index = trie_node.context_index();
+            if context_index != !0 {
+                return_context_index = context_index;
             }
 
-            if trie_node.type_index() != !0 {
-                return_type_index = trie_node.type_index();
+            let type_index = trie_node.type_index();
+            if type_index != !0 {
+                return_type_index = type_index;
             }
 
             self.check_prefix_match(
@@ -573,8 +620,19 @@ impl PropertyInfoAreaFile {
             size_of::<PropertyInfoAreaHeader>() as u64,
         )?;
 
+        // `metadata.len()` is u64; a plain `as usize` would truncate on
+        // 32-bit targets, letting a 2^32 + k byte file pass the minimum-
+        // size validation above but map only k bytes — turning `header()`'s
+        // validated-on-load invariant into a reachable panic.
+        let size = usize::try_from(metadata.len()).map_err(|_| {
+            Error::FileValidation(format!(
+                "File too large to map on this platform: {} bytes in {path:?}",
+                metadata.len()
+            ))
+        })?;
+
         Ok(Self {
-            mmap: MemoryMap::new(file, metadata.len() as usize, false)?,
+            mmap: MemoryMap::new(file, size, false)?,
         })
     }
 

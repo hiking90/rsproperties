@@ -18,7 +18,27 @@ pub struct PropertyInfoEntry {
 }
 
 impl PropertyInfoEntry {
-    fn is_type_valid(type_strings: &[String]) -> bool {
+    /// Property name (e.g. `ro.build.host`).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// SELinux context this property maps to.
+    pub fn context(&self) -> &str {
+        &self.context
+    }
+
+    /// Space-joined type specification (e.g. `"string"`, `"enum a b"`).
+    pub fn type_str(&self) -> &str {
+        &self.type_str
+    }
+
+    /// Whether the entry is an exact match (vs a prefix match).
+    pub fn exact_match(&self) -> bool {
+        self.exact_match
+    }
+
+    fn is_type_valid(type_strings: &[&str]) -> bool {
         if type_strings.is_empty() {
             return false;
         }
@@ -33,7 +53,7 @@ impl PropertyInfoEntry {
 
         const NO_PARAMETER_TYPES: &[&str] = &["string", "int", "bool", "uint", "double", "size"];
 
-        NO_PARAMETER_TYPES.contains(&type_strings[0].as_str())
+        NO_PARAMETER_TYPES.contains(&type_strings[0])
     }
 
     // Parse a line from the property info file.
@@ -56,16 +76,20 @@ impl PropertyInfoEntry {
 
         let match_operation = tokenizer.next();
 
-        let type_strings: Vec<String> = tokenizer.map(str::to_owned).collect();
+        // Borrow from `line` — the only owned copy is the final `join`.
+        let type_strings: Vec<&str> = tokenizer.collect();
 
         let mut exact_match = false;
 
         if match_operation == Some("exact") {
             exact_match = true;
         } else if match_operation != Some("prefix") && require_prefix_or_exact {
-            error!("Invalid match operation '{match_operation:?}' - must be 'prefix' or 'exact'");
+            // `unwrap_or` instead of `{:?}` so the user-facing parse error
+            // doesn't leak Rust's `Some("...")`/`None` notation.
+            let op = match_operation.unwrap_or("<missing>");
+            error!("Invalid match operation '{op}' - must be 'prefix' or 'exact'");
             return Err(Error::Parse(format!(
-                "Match operation '{match_operation:?}' is not valid. Must be 'prefix' or 'exact'"
+                "Match operation '{op}' is not valid. Must be 'prefix' or 'exact'"
             )));
         }
 
@@ -95,7 +119,8 @@ impl PropertyInfoEntry {
             "Parsing property info file: {filename:?} (require_prefix_or_exact={require_prefix_or_exact})"
         );
 
-        let file = File::open(filename)?;
+        let file = File::open(filename)
+            .context_with_location(format!("Failed to open property info file {filename:?}"))?;
         let reader = BufReader::new(file);
 
         let mut errors = Vec::new();
