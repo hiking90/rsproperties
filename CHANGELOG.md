@@ -6,6 +6,96 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: minor bumps may include API changes).
 
+## [0.6.0] - 2026-07-17
+
+Soundness release: fixes from a full-source review spanning the seqlock
+read protocol, the mmap access model, wire validation, and the service's
+socket handling.
+
+### Changed
+
+- **Breaking:** `socket_dir()` returns `&'static Path` instead of
+  `&'static PathBuf`.
+- **Breaking:** `SystemProperties::update` returns `Result<()>` — the
+  previous `Result<bool>` had no `false` path.
+- **Breaking:** new `Error::Init(Arc<Error>)` variant. Cached
+  initialization failures (`try_system_properties`) now preserve the
+  original error variant and `source()` chain instead of flattening to a
+  `FileValidation` string.
+- **Breaking:** `rsproperties_service::run`'s error type is now
+  `Box<dyn Error + Send + Sync>` (spawnable / `anyhow`-convertible), and
+  a failed startup stops both actors explicitly.
+- **Breaking:** the `ContextWithLocation` trait gained
+  `with_context_location` (lazy message closure — no allocation on the
+  success path of per-line loops).
+- `try_init` with a socket-only config no longer commits the default
+  properties directory, so a later properties-dir init still works.
+- `validate_property_name` now matches AOSP `IsLegalPropertyName`:
+  only a leading `.` is rejected — leading `-`, `@`, `:` are legal and
+  were previously refused, rejecting writes Android itself accepts.
+- `set()` validates name and value client-side for both protocol
+  versions before connecting; property values are masked as `<N bytes>`
+  in service and client error logs.
+
+### Added
+
+- `PropertyIndex` derives `Clone`, `Copy`, `Debug`.
+- `PropertyInfoEntry` getters (`name`, `context`, `type_str`,
+  `exact_match`) and `PropertiesServiceArgs::new`.
+- `wire::MAX_WIRE_NAME_LEN` / `wire::MAX_WIRE_VALUE_LEN` — V2 wire caps
+  shared by client and server (previously server-only, so the client
+  could build frames the server always rejected).
+
+### Fixed
+
+- Seqlock dirty-path reads re-read the shared backup slot *after* the
+  serial re-check, so a writer starting its next update could hand the
+  reader a torn value that still passed validation. The backup is now
+  snapshotted byte-wise atomically into a stack buffer *before* the
+  fence, sized from the serial's length bits — bionic's protocol.
+- Interior NUL bytes in names and values are rejected on every write
+  path (`validate_value_len`, client `set`, server V2 decoder). The
+  storage format is C strings: a NUL-carrying value desynced the serial
+  length from the stored length (leaking stale backup bytes to dirty
+  readers), and a NUL-carrying name was silently truncated into a
+  *different* property key.
+- All trailing-name and long-value access now goes through the mmap base
+  pointer (offset-based) instead of pointers derived from `&T`
+  references — removing provenance-escaping arithmetic (Stacked/Tree
+  Borrows UB) and, with it, the unsound-by-contract helper functions.
+- Untrusted trie `namelen`/offsets are bounds-checked (a corrupt file
+  could previously trigger an out-of-bounds scan past the mapping), BST
+  walks carry cycle bounds instead of hanging, and long-value offsets
+  are validated against the entry layout.
+- `MemoryMap` tracks writability and rejects mutable access to
+  read-only mappings; `ContextNode` no longer lazily maps read-only
+  areas on the writer path (a write would have raised SIGSEGV).
+- `TrieNodeArena` unsafe casts replaced with runtime-validated zerocopy
+  views; bounds are checked against the allocated extent; the serialized
+  size is validated to fit the u32 offset space.
+- The 92-byte short/long boundary used `>` instead of bionic's `>=`,
+  silently truncating an exactly-92-byte value while recording length 92
+  in the serial word.
+- `SystemProperties::find` flattened every lookup error to "not found",
+  which could turn a corrupt-file error into a silently-successful
+  no-op `set`. Only genuine absence maps to `None` now.
+- futex wake failures after a completed publish no longer return `Err`
+  (the value was already visible; bionic ignores the wake result), and
+  the global serial bump is no longer skipped.
+- `metadata.len() as usize` truncation on 32-bit targets could map fewer
+  bytes than the validated file size and turn a load-time invariant into
+  a reachable panic.
+- Service sockets are bound via bind-to-temp → chmod → rename, so they
+  are never connectable with umask-derived permissions (the previous
+  bind-then-chmod window let early connections survive the chmod).
+- The socket service's actor loop no longer awaits connection permits
+  inline (64 slow clients could stall both listeners and graceful
+  shutdown for 10 s each); accepted-but-waiting connections are capped
+  so a connect flood can no longer exhaust file descriptors.
+- Property-name trie construction rejects empty segments (`a..b`),
+  which were indistinguishable from the parser's corruption fallback
+  and silently degraded lookups.
+
 ## [0.5.0] - 2026-06-12
 
 Android-parity release: futex wait correctness, SELinux labeling, service
