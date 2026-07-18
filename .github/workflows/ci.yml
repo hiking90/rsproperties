@@ -47,14 +47,19 @@ jobs:
     - name: Build
       run: cargo build --verbose --all-features
 
+    # `--features builder`, not `--all-features`: the strict-file-validation
+    # feature enforces the root-ownership check on property files even in
+    # debug builds, so test fixtures created by the non-root CI user would
+    # be rejected. The Build/clippy/docs jobs still compile with
+    # --all-features, so the strict feature keeps compile coverage.
     - name: Run tests
-      run: cargo test --verbose --all-features
+      run: cargo test --verbose --features builder
 
     # Note: Release mode tests are skipped in CI because they enforce
     # strict file ownership validation (root ownership) which fails
     # in GitHub Actions environment. This is intentional security behavior.
     # - name: Run tests (release mode)
-    #   run: cargo test --verbose --all-features --release
+    #   run: cargo test --verbose --features builder --release
 
     - name: Test workspace examples
       run: |
@@ -88,8 +93,10 @@ jobs:
           ${{ runner.os }}-cargo-coverage-
           ${{ runner.os }}-cargo-
 
+    # --features builder, not --all-features: strict-file-validation would
+    # make area-creating tests fail as non-root (see the Test job note).
     - name: Generate coverage report
-      run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+      run: cargo llvm-cov --features builder --workspace --lcov --output-path lcov.info
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v7

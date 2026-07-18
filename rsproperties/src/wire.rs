@@ -63,7 +63,7 @@ pub const MAX_WIRE_VALUE_LEN: usize = 8192;
 /// Names starting with `ro.` are allowed to exceed the limit (the server
 /// stores them as long properties). In-place update paths, which cannot
 /// promote a value to the out-of-line long-property representation, must
-/// use [`validate_short_value_len`] instead — the exemption is selected
+/// use `validate_short_value_len` instead — the exemption is selected
 /// by *which function* is called, not by an in-band sentinel name.
 ///
 /// Interior NUL bytes are rejected because the storage format treats
