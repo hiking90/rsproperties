@@ -35,8 +35,8 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 rsproperties = "0.6"
-# For Linux property service daemon
-rsproperties-service = "0.6"
+# For the Linux property service daemon (not published on crates.io):
+rsproperties-service = { git = "https://github.com/hiking90/rsproperties" }
 
 # Optional features
 [features]

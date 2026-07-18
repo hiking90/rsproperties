@@ -11,6 +11,8 @@ documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Service implementation for Android system properties"
+# Not released to crates.io — consumed via git/path only.
+publish = false
 
 [features]
 builder = ["rsproperties/builder"]

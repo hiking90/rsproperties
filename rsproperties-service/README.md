@@ -40,18 +40,18 @@ The service consists of two main components running as separate actors:
 
 ## Installation
 
-Add this to your `Cargo.toml`:
+This crate is not published on crates.io; depend on it via git:
 
 ```toml
 [dependencies]
-rsproperties-service = "0.6"
+rsproperties-service = { git = "https://github.com/hiking90/rsproperties" }
 ```
 
 Or add it with the builder feature:
 
 ```toml
 [dependencies]
-rsproperties-service = { version = "0.6", features = ["builder"] }
+rsproperties-service = { git = "https://github.com/hiking90/rsproperties", features = ["builder"] }
 ```
 
 ## Quick Start
