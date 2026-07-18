@@ -44,14 +44,14 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rsproperties-service = "0.4"
+rsproperties-service = "0.6"
 ```
 
 Or add it with the builder feature:
 
 ```toml
 [dependencies]
-rsproperties-service = { version = "0.4", features = ["builder"] }
+rsproperties-service = { version = "0.6", features = ["builder"] }
 ```
 
 ## Quick Start

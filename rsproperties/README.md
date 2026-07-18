@@ -27,7 +27,7 @@ Add `rsproperties` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rsproperties = "0.4"
+rsproperties = "0.6"
 
 # Optional features
 [features]
