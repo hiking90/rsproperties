@@ -6,7 +6,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.0"
+version = "0.6.0"
 edition = "2021"
 authors = ["Jeff Kim <hiking90@gmail.com>"]
 license = "Apache-2.0"
@@ -47,3 +47,10 @@ lto = true
 panic = 'abort'
 codegen-units = 1
 rpath = false
+
+# Benchmarks build their fixture files as the invoking user, and the
+# root-ownership check on property files is gated on debug-assertions —
+# enable them so `cargo bench` runs without root. (Also enables overflow
+# checks; A/B comparisons stay fair as long as both sides use this.)
+[profile.bench]
+debug-assertions = true

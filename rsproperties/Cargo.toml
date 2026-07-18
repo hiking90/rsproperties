@@ -29,4 +29,10 @@ android_system_properties.workspace = true
 env_logger.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+criterion = "0.5"
+
+[[bench]]
+name = "props_bench"
+harness = false
+required-features = ["builder"]
 

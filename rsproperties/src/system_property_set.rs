@@ -693,3 +693,65 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(all(test, not(target_os = "android")))]
+mod tests {
+    use super::*;
+
+    /// SO_RCVTIMEO re-arms per *syscall*, so a peer trickling one byte per
+    /// window under the static timeout would stretch "2 seconds" well past
+    /// the budget (~3.6s for this schedule). `recv_i32` must enforce
+    /// `SERVICE_IO_TIMEOUT` as a total budget instead.
+    #[test]
+    fn test_recv_i32_total_timeout_budget() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+
+        let feeder = std::thread::spawn(move || {
+            for _ in 0..3 {
+                if server.write_all(&[0u8]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(800));
+            }
+            // Never send the 4th byte, and keep the socket open past the
+            // client's budget so an early EOF can't end the wait for us.
+            std::thread::sleep(Duration::from_millis(1500));
+        });
+
+        let mut conn = ServiceConnection { stream: client };
+        let start = Instant::now();
+        let err = conn
+            .recv_i32()
+            .expect_err("3/4 bytes must not satisfy recv_i32");
+        let elapsed = start.elapsed();
+
+        let msg = format!("{err}");
+        assert!(msg.contains("timed out"), "unexpected error: {msg}");
+        assert!(
+            elapsed >= Duration::from_millis(1800),
+            "budget expired early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(3200),
+            "total budget not enforced (per-syscall re-arm?): {elapsed:?}"
+        );
+
+        drop(conn);
+        let _ = feeder.join();
+    }
+
+    /// A server that closes before a full 4-byte status is a protocol
+    /// error, reported as EOF — not a hang, not a success.
+    #[test]
+    fn test_recv_i32_early_close_is_eof_error() {
+        let (client, server) = UnixStream::pair().unwrap();
+        drop(server);
+
+        let mut conn = ServiceConnection { stream: client };
+        let err = conn.recv_i32().expect_err("closed socket must error");
+        assert!(
+            format!("{err}").contains("closed before"),
+            "unexpected error: {err}"
+        );
+    }
+}

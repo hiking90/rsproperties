@@ -49,15 +49,6 @@ pub enum Error {
     #[error("File validation error: {0}")]
     FileValidation(String),
 
-    /// Never constructed by this crate; retained only because removing a
-    /// public variant is semver-breaking.
-    #[deprecated(
-        note = "never produced by rsproperties; match it with a wildcard arm — \
-                it will be removed in the next major release"
-    )]
-    #[error("Conversion error: {0}")]
-    Conversion(String),
-
     /// Caller-supplied argument violated an API contract (over-long
     /// name/value, malformed input) — distinct from [`Error::FileValidation`],
     /// which reports corrupt on-disk state.

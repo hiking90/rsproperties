@@ -351,6 +351,35 @@ mod tests {
         assert_eq!(properties.get("after.import"), Some(&"2".to_string()));
     }
 
+    /// AOSP's `LoadProperties` has no import dedup: a file imported twice
+    /// legitimately re-applies with last-wins semantics. An earlier
+    /// load-once visited set silently changed final values for real-world
+    /// override patterns — this pins the re-apply behavior.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_duplicate_import_reapplies_last_wins() {
+        use std::io::Write;
+        let tmp = TempDir::new("rsprops_lastwins_test");
+        let dir = &tmp.0;
+
+        let overlay = dir.join("overlay.prop");
+        writeln!(File::create(&overlay).unwrap(), "key=from_overlay").unwrap();
+
+        let root = dir.join("root.prop");
+        {
+            let mut f = File::create(&root).unwrap();
+            writeln!(f, "import {}", overlay.display()).unwrap();
+            writeln!(f, "key=local").unwrap();
+            // The second import must re-apply the overlay (last wins), not
+            // be skipped as "already loaded".
+            writeln!(f, "import {}", overlay.display()).unwrap();
+        }
+
+        let mut properties = HashMap::new();
+        load_properties_from_file(&root, None, "u:r:init:s0", &mut properties).unwrap();
+        assert_eq!(properties.get("key"), Some(&"from_overlay".to_string()));
+    }
+
     #[cfg(not(target_os = "android"))]
     #[test]
     fn test_import_cycle_is_cut() {
