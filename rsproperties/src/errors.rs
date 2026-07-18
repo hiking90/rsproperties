@@ -66,9 +66,21 @@ pub enum Error {
 
     /// A first-write-wins global (properties/socket directory) was already
     /// initialized — explicitly via `init()`/`try_init()` or implicitly by
-    /// the first property access latching the default.
+    /// the first property access latching the default. Also used for
+    /// initialization-order conflicts of the same shape, e.g. a property
+    /// area already mapped read-only when a writable mapping is requested.
     #[error("Already initialized: {0}")]
     AlreadyInitialized(String),
+
+    /// A global resource budget was exhausted (e.g. the build.prop import
+    /// loader's total-file-loads budget). Deliberately NOT used for the
+    /// per-import recursion-depth cap, which is logged and skipped rather
+    /// than aborting. A dedicated variant — not [`Error::Parse`] — so
+    /// callers can distinguish "abort the whole load" limits from ordinary
+    /// per-item failures with `matches!` instead of re-inspecting counters
+    /// or message text.
+    #[error("Limit exceeded: {0}")]
+    LimitExceeded(String),
 
     /// The property service accepted the connection but rejected the
     /// request at the protocol level — the socket itself is healthy, so

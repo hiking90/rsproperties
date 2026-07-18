@@ -40,19 +40,20 @@ fn check_permissions(_key: &str, _value: &str, _context: &str) {
 /// Mirrors AOSP init's `LoadProperties`: when `filter` is `None`/empty,
 /// `import <path>` lines are loaded recursively (with `${property}`
 /// expansion against the entries collected so far), and an import that
-/// cannot be resolved or read is logged and skipped rather than aborting
-/// the rest of the file. Import *cycles* are cut by a canonicalized-path
+/// cannot be resolved or read — including one nested deeper than
+/// `MAX_IMPORT_DEPTH` — is logged and skipped rather than aborting the
+/// rest of the file. Import *cycles* are cut by a canonicalized-path
 /// recursion stack; a file legitimately imported twice (shared base, or
 /// re-imported after overrides) is re-applied each time, exactly as AOSP's
-/// last-wins semantics require — `MAX_IMPORT_DEPTH` bounds pathological
+/// last-wins semantics require — `MAX_TOTAL_LOADS` bounds pathological
 /// re-import fan-out. Non-UTF-8 lines are skipped with a warning — prop
 /// files on real devices are byte streams and may carry stray non-UTF-8
 /// comment bytes.
 ///
-/// On error (I/O failure mid-file, import nesting deeper than
-/// `MAX_IMPORT_DEPTH`, more than `MAX_TOTAL_LOADS` file loads), entries
-/// parsed before the failure remain in `properties` — the map is an
-/// accumulator, not a transaction.
+/// On error (I/O failure reading the root file, or more than
+/// `MAX_TOTAL_LOADS` file loads across the whole pass), entries parsed
+/// before the failure remain in `properties` — the map is an accumulator,
+/// not a transaction.
 pub fn load_properties_from_file(
     filename: &Path,
     filter: Option<&str>,
@@ -90,6 +91,9 @@ fn expand_import_path(raw: &str, properties: &HashMap<String, String>) -> Option
     Some(out)
 }
 
+// Recursion state (depth/visited/loads) travels with every call; a params
+// struct would be re-destructured at each of the three call sites for no
+// clarity gain.
 #[allow(clippy::too_many_arguments)]
 fn load_properties_impl(
     filename: &Path,
@@ -101,15 +105,20 @@ fn load_properties_impl(
     loads: &mut u32,
 ) -> Result<()> {
     if depth > MAX_IMPORT_DEPTH {
+        // `Parse`, not `LimitExceeded`: the import call site swallows this
+        // (log + skip, AOSP parity) — only the *global* loads budget below
+        // aborts the pass.
         return Err(Error::Parse(format!(
             "import nesting deeper than {MAX_IMPORT_DEPTH} levels at {filename:?}"
         )));
     }
     // The stack-based cycle cut permits duplicate loads by design; this
     // budget is what keeps that from amplifying exponentially.
+    // `LimitExceeded` is load-bearing: the import call site uses the
+    // variant to tell "abort the whole pass" from per-import failures.
     *loads += 1;
     if *loads > MAX_TOTAL_LOADS {
-        return Err(Error::Parse(format!(
+        return Err(Error::LimitExceeded(format!(
             "more than {MAX_TOTAL_LOADS} file loads in one pass (import amplification) at {filename:?}"
         )));
     }
@@ -132,14 +141,18 @@ fn load_properties_impl(
     }
     // From here on every exit must pop the stack entry; wrap the body so
     // one removal covers all paths.
-    let result = load_properties_body(filename, filter, context, properties, depth, visited, loads);
+    let result = load_properties_body(
+        filename, &canonical, filter, context, properties, depth, visited, loads,
+    );
     visited.remove(&canonical);
     result
 }
 
+// See `load_properties_impl` for the arguments-count rationale.
 #[allow(clippy::too_many_arguments)]
 fn load_properties_body(
     filename: &Path,
+    canonical: &Path,
     filter: Option<&str>,
     context: &str,
     properties: &mut HashMap<String, String>,
@@ -147,8 +160,18 @@ fn load_properties_body(
     visited: &mut HashSet<PathBuf>,
     loads: &mut u32,
 ) -> Result<()> {
+    // Open the *canonicalized* path — the cycle-detection key above. This
+    // narrows (best-effort, does not close) the symlink-swap window between
+    // canonicalize and open: a component of the canonical path could still
+    // be replaced by a symlink in between, since `File::open` follows
+    // symlinks. Fully closing it would need openat2(RESOLVE_NO_SYMLINKS)
+    // or an open-then-fstat comparison; the depth/loads caps already keep
+    // any confusion bounded, so the narrowing is judged sufficient.
+    // Error messages still name the caller's path: on canonicalization
+    // failure `canonical` falls back to `filename`, so `File::open` reports
+    // the name the user wrote.
     let file =
-        File::open(filename).context_with_location(format!("Failed to open {filename:?}"))?;
+        File::open(canonical).context_with_location(format!("Failed to open {filename:?}"))?;
     let mut reader = BufReader::new(file);
     let filter = filter.filter(|s| !s.is_empty());
 
@@ -201,7 +224,11 @@ fn load_properties_body(
                             // rest of the tree with cheap per-import
                             // failures and report overall success on a
                             // truncated load. Abort the pass loudly.
-                            if *loads > MAX_TOTAL_LOADS {
+                            // Branch on the error variant itself, not on
+                            // re-inspecting the counter: post-state
+                            // inference would silently misclassify errors
+                            // if the increment ever moved.
+                            if matches!(e, Error::LimitExceeded(_)) {
                                 return Err(e);
                             }
                             warn!(

@@ -3,38 +3,60 @@
 
 use std::mem;
 
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::errors::{Error, Result};
 use crate::property_info_parser::*;
 
 #[derive(Debug)]
 pub(crate) struct TrieNodeArena {
-    pub(crate) data: Vec<u8>,
+    /// `Vec<u32>`, not `Vec<u8>`: the parser side (`PropertyInfoArea`)
+    /// reinterprets the buffer as 4-byte-aligned structs, and a `Vec<u8>`
+    /// base address is only guaranteed 1-aligned by the language — every
+    /// real allocator hands back more, but that is an observation, not a
+    /// contract. A `u32` backing makes the 4-alignment a language-level
+    /// guarantee, so `PropertyInfoArea::new`'s alignment assert can never
+    /// fire on the builder path. Offsets and `current_data_pointer` remain
+    /// in **bytes**; byte views are derived via zerocopy (`as_bytes`).
+    data: Vec<u32>,
     current_data_pointer: usize,
 }
 
 impl TrieNodeArena {
     pub(crate) fn new() -> Self {
         Self {
-            data: Vec::with_capacity(16 * 1024),
+            data: Vec::with_capacity(16 * 1024 / mem::size_of::<u32>()),
             current_data_pointer: 0,
         }
+    }
+
+    /// Whole-buffer byte view (including growth slack). Callers slice it
+    /// with byte offsets; bounds against the allocated extent are the
+    /// responsibility of the checked accessors below.
+    #[inline(always)]
+    fn bytes(&self) -> &[u8] {
+        self.data.as_bytes()
+    }
+
+    #[inline(always)]
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        self.data.as_mut_bytes()
     }
 
     /// Reinterprets `size_of::<T>()` bytes at `offset` as `&mut T`.
     ///
     /// No `unsafe`: `mut_from_bytes` validates the size and the *actual
-    /// pointer* alignment at runtime (including the `Vec` base address,
-    /// which the language only guarantees to be 1-aligned), and the
-    /// `FromBytes + IntoBytes` bounds guarantee every bit pattern of the
-    /// zero-filled arena is a valid `T` — instantiating with e.g. `bool`
-    /// or an enum fails to compile instead of being invalid-value UB.
+    /// pointer* alignment at runtime (the `u32` backing guarantees 4-byte
+    /// base alignment; types with a larger alignment still get caught
+    /// here), and the `FromBytes + IntoBytes` bounds guarantee every bit
+    /// pattern of the zero-filled arena is a valid `T` — instantiating
+    /// with e.g. `bool` or an enum fails to compile instead of being
+    /// invalid-value UB.
     ///
     /// Bounds are checked against `current_data_pointer` (the allocated
-    /// extent), not `data.len()` — `allocate_data`'s growth `resize` leaves
-    /// slack that would otherwise let a miscomputed offset silently read
-    /// or write unallocated zero bytes.
+    /// extent), not the buffer length — `allocate_data`'s growth `resize`
+    /// leaves slack that would otherwise let a miscomputed offset silently
+    /// read or write unallocated zero bytes.
     #[inline(always)]
     pub(crate) fn get_object<T>(&mut self, offset: usize) -> Result<&mut T>
     where
@@ -49,7 +71,7 @@ impl TrieNodeArena {
             )));
         }
 
-        T::mut_from_bytes(&mut self.data[offset..end]).map_err(|e| {
+        T::mut_from_bytes(&mut self.bytes_mut()[offset..end]).map_err(|e| {
             Error::FileValidation(format!(
                 "Object at offset {} is not properly aligned for type {}: {e}",
                 offset,
@@ -93,7 +115,7 @@ impl TrieNodeArena {
             )));
         }
 
-        <[u32]>::mut_from_bytes(&mut self.data[offset..end]).map_err(|e| {
+        <[u32]>::mut_from_bytes(&mut self.bytes_mut()[offset..end]).map_err(|e| {
             Error::FileValidation(format!(
                 "Array at offset {offset} is not properly aligned for u32: {e}"
             ))
@@ -101,11 +123,12 @@ impl TrieNodeArena {
     }
 
     pub(crate) fn allocate_and_write_string(&mut self, string: &str) -> usize {
-        let bytes = string.as_bytes();
-        let offset = self.allocate_data(bytes.len() + 1);
+        let len = string.len();
+        let offset = self.allocate_data(len + 1);
 
-        self.data[offset..offset + bytes.len()].copy_from_slice(bytes);
-        self.data[offset + bytes.len()] = 0; // null terminator
+        let dst = self.bytes_mut();
+        dst[offset..offset + len].copy_from_slice(string.as_bytes());
+        dst[offset + len] = 0; // null terminator
         offset
     }
 
@@ -121,7 +144,8 @@ impl TrieNodeArena {
         // native structs verbatim. Files are NOT portable across
         // endianness; a big-endian host cannot produce files for a
         // little-endian device or vice versa.
-        self.data[offset..offset + mem::size_of::<u32>()].copy_from_slice(&value.to_ne_bytes());
+        self.bytes_mut()[offset..offset + mem::size_of::<u32>()]
+            .copy_from_slice(&value.to_ne_bytes());
     }
 
     /// Reserves `size` bytes, rounded up to a multiple of `size_of::<u32>()`,
@@ -140,11 +164,14 @@ impl TrieNodeArena {
             .current_data_pointer
             .checked_add(aligned_size)
             .expect("arena allocation overflows usize");
-        if needed > self.data.len() {
+        let byte_len = self.data.len() * mem::size_of::<u32>();
+        if needed > byte_len {
             // Standard doubling growth, but never less than what this
-            // allocation needs.
+            // allocation needs. `aligned_size` is a multiple of 4, so
+            // `needed` always divides into whole u32 words.
+            let target_bytes = needed.max(byte_len.saturating_mul(2));
             self.data
-                .resize(needed.max(self.data.len().saturating_mul(2)), 0);
+                .resize(target_bytes.div_ceil(mem::size_of::<u32>()), 0);
         }
 
         let offset = self.current_data_pointer;
@@ -157,13 +184,20 @@ impl TrieNodeArena {
         self.current_data_pointer
     }
 
+    /// Parser view of the arena. Sliced to the allocated extent — handing
+    /// out the growth slack too would bypass the `current_data_pointer`
+    /// bounds discipline the checked accessors above enforce: the parser's
+    /// own bounds checks run against `data_base.len()`, so a miscomputed
+    /// offset into zero-filled slack would read 0 instead of erroring.
     pub(crate) fn info(&self) -> PropertyInfoArea<'_> {
-        PropertyInfoArea::new(&self.data)
+        PropertyInfoArea::new(&self.bytes()[..self.current_data_pointer])
     }
 
-    pub(crate) fn into_data(mut self) -> Vec<u8> {
-        self.data.truncate(self.current_data_pointer);
-        self.data
+    /// Consumes the arena into the serialized byte image. One copy — the
+    /// price of the `u32` backing that guarantees alignment during the
+    /// build; callers receive a plain `Vec<u8>` as before.
+    pub(crate) fn into_data(self) -> Vec<u8> {
+        self.bytes()[..self.current_data_pointer].to_vec()
     }
 }
 
@@ -200,7 +234,7 @@ mod arena_tests {
         // resize to 200), leaving zeroed slack past the allocated extent.
         arena.allocate_data(4);
 
-        assert!(arena.data.len() > 108);
+        assert!(arena.data.len() * mem::size_of::<u32>() > 108);
         // Access inside the slack must fail even though `data.len()`
         // covers it.
         let result = arena.get_object::<u32>(108);

@@ -113,8 +113,10 @@ impl PropertyConfig {
 }
 
 /// Builder for [`PropertyConfig`]. Collects optional directories; `build()`
-/// is infallible — paths are validated when the configuration is applied
-/// (`try_init` / first property access), not here.
+/// is infallible — and `try_init` only claims the first-write-wins slots.
+/// Paths are actually validated at first *use* (first property access /
+/// first socket connection), so a nonexistent directory is not reported
+/// until then.
 #[derive(Debug, Clone, Default)]
 pub struct PropertyConfigBuilder {
     properties_dir: Option<PathBuf>,
@@ -547,14 +549,20 @@ pub fn set<T: std::fmt::Display + ?Sized>(name: &str, value: &T) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(unused_imports)]
     use super::*;
     #[cfg(target_os = "android")]
     use android_system_properties::AndroidSystemProperties;
+    // Used only by the builder-only host tests below; cfg-scope them
+    // instead of blanket-allowing unused_imports for every configuration.
+    #[cfg(all(feature = "builder", not(target_os = "android")))]
     use std::collections::HashMap;
+    #[cfg(all(feature = "builder", not(target_os = "android")))]
     use std::fs::{create_dir, remove_dir_all, File};
+    #[cfg(all(feature = "builder", not(target_os = "android")))]
     use std::io::Write;
+    #[cfg(all(feature = "builder", not(target_os = "android")))]
     use std::path::Path;
+    #[cfg(all(feature = "builder", not(target_os = "android")))]
     use std::sync::{Mutex, MutexGuard};
 
     #[cfg(all(feature = "builder", not(target_os = "android")))]
@@ -657,6 +665,15 @@ mod tests {
     #[cfg(all(feature = "builder", not(target_os = "android")))]
     fn build_property_dir(dir: &str) -> SystemProperties {
         crate::init(PropertyConfig::from(PathBuf::from(dir)));
+        // `init` is first-write-wins and swallows AlreadyInitialized with a
+        // warn — if some other test in this binary latched a *different*
+        // directory first, the `properties_dir()` cleanup below would
+        // delete that directory instead of ours. Fail loudly instead.
+        assert_eq!(
+            properties_dir(),
+            Path::new(dir),
+            "another test latched a different properties dir before this one"
+        );
 
         let property_contexts_files = vec![
             "tests/android/plat_property_contexts",
@@ -678,8 +695,13 @@ mod tests {
             build_trie(&property_infos, "u:object_r:build_prop:s0", "string").unwrap();
 
         let dir = properties_dir();
-        remove_dir_all(dir).unwrap_or_default();
-        create_dir(dir).unwrap_or_default();
+        // Missing dir is fine on first run; any other failure (permissions)
+        // surfaces at `create_dir` below.
+        let _ = remove_dir_all(dir);
+        // `unwrap`, not `unwrap_or_default`: swallowing a create failure
+        // here only defers the crash to `File::create` with a less
+        // accurate message.
+        create_dir(dir).unwrap();
         File::create(dir.join("property_info"))
             .unwrap()
             .write_all(&data)

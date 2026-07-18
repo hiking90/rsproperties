@@ -18,6 +18,9 @@ pub(crate) struct PropertyEntryBuilder {
     pub(crate) rtype: Option<Rc<str>>,
 }
 
+// Eq/Hash key on `name` only — the prefix/exact sets deduplicate by
+// property name, so two entries differing only in context/type compare
+// equal on purpose (that *is* the duplicate being detected).
 impl PartialEq for PropertyEntryBuilder {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
@@ -61,14 +64,20 @@ impl TrieBuilderNode {
         self.property_entry.rtype = Some(rtype);
     }
 
+    /// `name` is the trie-level key (the last segment); `full_name` is the
+    /// caller's complete property name, used for diagnostics — an error
+    /// naming only the segment ("already exists for 'b'") is useless for
+    /// locating the offending `a.b` line. AOSP reports the full name here
+    /// too.
     fn add_exact_match_context(
         &mut self,
         name: Rc<str>,
         context: Rc<str>,
         rtype: Rc<str>,
+        full_name: &str,
     ) -> Result<()> {
         let entry = PropertyEntryBuilder {
-            name: Rc::clone(&name),
+            name,
             context: Some(context),
             rtype: Some(rtype),
         };
@@ -76,21 +85,23 @@ impl TrieBuilderNode {
         if self.exact_matches.insert(entry) {
             Ok(())
         } else {
-            error!("Exact match already exists for '{name}'");
+            error!("Exact match already exists for '{full_name}'");
             Err(Error::FileValidation(format!(
-                "Exact match already exists for '{name}'"
+                "Exact match already exists for '{full_name}'"
             )))
         }
     }
 
+    /// See [`Self::add_exact_match_context`] for the `full_name` contract.
     fn add_prefix_context(
         &mut self,
         name: Rc<str>,
         context: Rc<str>,
         rtype: Rc<str>,
+        full_name: &str,
     ) -> Result<()> {
         let entry = PropertyEntryBuilder {
-            name: Rc::clone(&name),
+            name,
             context: Some(context),
             rtype: Some(rtype),
         };
@@ -98,9 +109,9 @@ impl TrieBuilderNode {
         if self.prefixes.insert(entry) {
             Ok(())
         } else {
-            error!("Prefix already exists for '{name}'");
+            error!("Prefix already exists for '{full_name}'");
             Err(Error::FileValidation(format!(
-                "Prefix already exists for '{name}'"
+                "Prefix already exists for '{full_name}'"
             )))
         }
     }
@@ -170,6 +181,17 @@ impl TrieBuilder {
         rtype: &str,
         exact: bool,
     ) -> Result<()> {
+        // The serialized string table and the trailing node names are C
+        // strings; an interior NUL desyncs the recorded lengths from what
+        // NUL-scanning readers see (exact-match lookups of the truncated
+        // prefix would resolve to this entry's context). This gate covers
+        // every per-entry string; the defaults, which bypass `add_to_trie`
+        // (interned directly by `TrieBuilder::new`), get the same check at
+        // `build_trie`'s entry.
+        crate::wire::validate_no_interior_nul("property name", name)?;
+        crate::wire::validate_no_interior_nul("context", context)?;
+        crate::wire::validate_no_interior_nul("type", rtype)?;
+
         let mut name_parts = name.split('.').collect::<Vec<&str>>();
 
         let ends_with_dot = if name_parts.last() == Some(&"") {
@@ -238,9 +260,9 @@ impl TrieBuilder {
         // The three branches are mutually exclusive, so each can consume
         // `context`/`rtype` directly — no refcount traffic needed.
         if exact {
-            current_node.add_exact_match_context(last_name, context, rtype)?;
+            current_node.add_exact_match_context(last_name, context, rtype, name)?;
         } else if !ends_with_dot {
-            current_node.add_prefix_context(last_name, context, rtype)?;
+            current_node.add_prefix_context(last_name, context, rtype, name)?;
         } else {
             let child = current_node
                 .children

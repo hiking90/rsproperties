@@ -8,6 +8,8 @@
 //! and the server (`rsproperties-service`) must agree on these — duplicating
 //! them in each crate would let "client rejects, server accepts" drift sneak in.
 
+use crate::errors::{Error, Result};
+
 /// Size of the in-memory property-value buffer **including** the trailing
 /// NUL — matches the historical bionic `PROP_VALUE_MAX = 92` definition.
 /// User content is therefore capped at `PROP_VALUE_MAX - 1 = 91` bytes,
@@ -59,6 +61,12 @@ pub const MAX_WIRE_VALUE_LEN: usize = 8192;
 /// Names starting with `ro.` are allowed to exceed the limit (the server
 /// stores them as long properties).
 ///
+/// Passing an **empty `name`** deliberately disables the `ro.` exemption:
+/// in-place update paths (`SystemProperties::update`) cannot promote a
+/// value to the out-of-line long-property representation, so they pass
+/// `""` to enforce the short-value cap regardless of the real name. Every
+/// other caller must pass the actual property name.
+///
 /// Interior NUL bytes are rejected because the storage format treats
 /// values as C strings: the length recorded in the entry's serial word is
 /// the full byte length, while every scan (value slot, dirty backup,
@@ -67,16 +75,41 @@ pub const MAX_WIRE_VALUE_LEN: usize = 8192;
 /// the dirty path would then copy `serial >> 24` = 4 bytes, including
 /// stale bytes from an earlier update of a *different* property. bionic
 /// cannot even express such a value (its API takes C strings).
-pub fn validate_value_len(name: &str, value: &str) -> Result<(), String> {
+pub fn validate_value_len(name: &str, value: &str) -> Result<()> {
     if value.as_bytes().contains(&0) {
-        return Err("value must not contain NUL bytes".into());
+        return Err(Error::InvalidArgument(
+            "value must not contain NUL bytes".into(),
+        ));
     }
     if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
-        return Err(format!(
+        return Err(Error::InvalidArgument(format!(
             "value too long: {} bytes (max {} for non-'ro.' properties)",
             value.len(),
-            PROP_VALUE_MAX
-        ));
+            PROP_VALUE_MAX - 1
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects interior NUL bytes in a property-metadata string (name, SELinux
+/// context, or type). Everything downstream — the shared-memory trie, the
+/// serialized `property_info` string table — stores these as C strings, so
+/// an interior NUL desyncs the recorded byte length from what NUL-scanning
+/// readers see: truncated ghost names, unreachable entries, and misleading
+/// "string table" build errors. `kind` names the field for the error
+/// message (e.g. `"property name"`).
+///
+/// `pub(crate)`: this guards internal storage invariants (trie/string
+/// table), not the wire protocol — exporting it would freeze an
+/// implementation detail into the public API. Builder-gated because every
+/// caller (trie builder, serializer, `PropertyArea::add`) is.
+#[cfg(feature = "builder")]
+pub(crate) fn validate_no_interior_nul(kind: &str, s: &str) -> Result<()> {
+    if s.as_bytes().contains(&0) {
+        return Err(Error::InvalidArgument(format!(
+            "{kind} must not contain NUL bytes: \"{}\"",
+            s.escape_default()
+        )));
     }
     Ok(())
 }
@@ -93,24 +126,32 @@ pub fn validate_value_len(name: &str, value: &str) -> Result<(), String> {
 ///
 /// The V1 wire protocol additionally enforces `name.len() <= PROP_NAME_MAX`
 /// at the message-encoding layer; V2 has no length cap here.
-pub fn validate_property_name(name: &str) -> Result<(), String> {
+pub fn validate_property_name(name: &str) -> Result<()> {
     if name.is_empty() {
-        return Err("name is empty".into());
+        return Err(Error::InvalidArgument("name is empty".into()));
     }
     if name.starts_with('.') {
-        return Err(format!("name cannot start with '.': {name}"));
+        return Err(Error::InvalidArgument(format!(
+            "name cannot start with '.': {name}"
+        )));
     }
     if name.ends_with('.') {
-        return Err(format!("name cannot end with '.': {name}"));
+        return Err(Error::InvalidArgument(format!(
+            "name cannot end with '.': {name}"
+        )));
     }
     let mut prev_dot = false;
     for c in name.chars() {
         let ok = c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '@' | ':');
         if !ok {
-            return Err(format!("invalid char {c:?} in name: {name}"));
+            return Err(Error::InvalidArgument(format!(
+                "invalid char {c:?} in name: {name}"
+            )));
         }
         if c == '.' && prev_dot {
-            return Err(format!("consecutive '.' in name: {name}"));
+            return Err(Error::InvalidArgument(format!(
+                "consecutive '.' in name: {name}"
+            )));
         }
         prev_dot = c == '.';
     }

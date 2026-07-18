@@ -14,6 +14,22 @@ use crate::context_node::{ContextNode, PropertyAreaGuard};
 use crate::property_area::{PropertyArea, PropertyAreaMap};
 use crate::property_info_parser::{PropertyInfoArea, PropertyInfoAreaFile};
 
+/// Filenames the property directory reserves for its own bookkeeping. A
+/// context named after one of these would make `ContextNode::open()` (which
+/// unlinks and recreates its file via `PropertyAreaMap::new_rw`) destroy
+/// that bookkeeping: `.writer_lock` → the flock the writer just acquired
+/// keeps guarding an orphan inode, so a second writer can "win" the lock
+/// and both writers unlink each other's areas; `properties_serial` → the
+/// serial mapping created right after the node loop re-unlinks the node's
+/// file, leaving the node on an orphan inode invisible to readers;
+/// `property_info` → the trie file itself is destroyed.
+///
+/// Compared (like the duplicate check) on the ASCII-case-folded name: on a
+/// case-insensitive filesystem (macOS APFS default, where this crate's
+/// tests run writable) `"PROPERTY_INFO"` would otherwise pass the exact
+/// match yet unlink the real `property_info`.
+const RESERVED_FILENAMES: &[&str] = &[".writer_lock", "properties_serial", "property_info"];
+
 /// Decodes one `ContextNode` entry from the property-info area. Returns
 /// `Err` on corrupt offset, missing NUL terminator, or non-UTF-8 name —
 /// callers tag the slot as `None` so the surrounding `Vec<Option<_>>`
@@ -23,6 +39,7 @@ fn try_build_context_node(
     dirname: &Path,
     writable: bool,
     i: usize,
+    seen_names: &mut std::collections::HashSet<String>,
 ) -> Result<ContextNode> {
     let context_offset = area.context_offset(i)?;
     // `cstr()` reports out-of-range offsets and missing NUL terminators as
@@ -60,6 +77,26 @@ fn try_build_context_node(
                 "context entry {i}: context name {context_name:?} is not a plain filename"
             )));
         }
+    }
+    // Same-directory collisions are as destructive as directory escape —
+    // see `RESERVED_FILENAMES`. Both checks compare the ASCII-case-folded
+    // name so a case-insensitive filesystem cannot be used to alias two
+    // "different" names onto one file (the fold is also why the seen-set
+    // key is an owned `String` rather than a borrow of the mmap'd name).
+    let folded_name = context_name.to_ascii_lowercase();
+    if RESERVED_FILENAMES.contains(&folded_name.as_str()) {
+        return Err(Error::FileValidation(format!(
+            "context entry {i}: context name {context_name:?} collides with a reserved filename"
+        )));
+    }
+    // Two entries with the same name would share one file: the later
+    // node's `open()` unlinks the earlier node's area, silently losing its
+    // properties within the same instance. First entry wins; later
+    // duplicates are skipped like any other corrupt entry.
+    if !seen_names.insert(folded_name) {
+        return Err(Error::FileValidation(format!(
+            "context entry {i}: duplicate context name {context_name:?}"
+        )));
     }
     // The owned context is only consumed by `open()` (writable path) for
     // SELinux labeling; read-only nodes skip the allocation.
@@ -131,8 +168,10 @@ impl ContextsSerialized {
         }
         let mut context_nodes: Vec<Option<ContextNode>> = Vec::with_capacity(num_context_nodes);
 
+        let mut seen_names = std::collections::HashSet::new();
         for i in 0..num_context_nodes {
-            match try_build_context_node(&property_info_area, dirname, writable, i) {
+            match try_build_context_node(&property_info_area, dirname, writable, i, &mut seen_names)
+            {
                 Ok(n) => context_nodes.push(Some(n)),
                 Err(e) => {
                     warn!("context entry {i} skipped: {e}");
@@ -162,7 +201,9 @@ impl ContextsSerialized {
             // out *before* touching anything the winner owns.
             let lock = Self::acquire_writer_lock(dirname)?;
 
-            for node in context_nodes.iter_mut().flatten() {
+            // `open()` takes `&self` (interior mutability via its RwLock) —
+            // a `&mut` walk here would misread as structural mutation.
+            for node in context_nodes.iter().flatten() {
                 node.open()?;
             }
 

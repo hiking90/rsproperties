@@ -360,6 +360,14 @@ impl PropertyAreaMap {
     pub(crate) fn add(&mut self, name: &str, value: &str) -> Result<()> {
         debug!("Adding property: '{name}' = '{value}'");
 
+        // An interior NUL would desync `namelen` from the NUL-scanned
+        // trailing name: the entry becomes unreachable under its real name
+        // while every retry re-allocates fresh trie nodes (leaking area
+        // space until AreaFull) and enumeration shows a truncated ghost
+        // name. Reject here — the single choke point every caller
+        // (`SystemProperties::add`, the build.prop load path) goes through.
+        crate::wire::validate_no_interior_nul("property name", name)?;
+
         let mut remaining_name = name;
         let mut current = 0;
         loop {
@@ -451,6 +459,37 @@ impl PropertyAreaMap {
         Ok(())
     }
 
+    /// Backs up the entry's current value into the area's dirty backup
+    /// slot, then runs the entry-side seqlock write (`apply_write`) — the
+    /// only way to reach a `PropertyInfoWriter` from outside this module.
+    ///
+    /// The two steps are deliberately fused: readers that observe the dirty
+    /// serial read the *backup slot*, not the entry, so publishing the
+    /// dirty bit without a fresh backup would serve a previous update's
+    /// backup bytes as this property's value. Keeping `set_dirty_backup_area`
+    /// and `property_info_mut` private makes that ordering violation
+    /// unrepresentable rather than merely documented.
+    ///
+    /// `backup` must hold the entry's current value bytes (snapshotted by
+    /// the caller before taking `&mut self`).
+    #[cfg(feature = "builder")]
+    pub(crate) fn backup_and_apply_write(
+        &mut self,
+        pi_offset: u32,
+        backup: &[u8],
+        value: &str,
+    ) -> Result<()> {
+        self.set_dirty_backup_area(backup)?;
+        // The published serial is deliberately not returned — the sole
+        // caller has no use for it, and an unused `u32` invites callers to
+        // treat it as something it isn't (futex waits need the serial
+        // *address*, not its value).
+        self.property_info_mut(pi_offset)?
+            .writer()
+            .apply_write(value)?;
+        Ok(())
+    }
+
     // Set the dirty backup area.
     // It is used to store the backup of the property area.
     //
@@ -460,7 +499,7 @@ impl PropertyAreaMap {
     // already validates UTF-8 after the seqlock re-check, so the backup
     // area itself stores raw bytes verbatim.
     #[cfg(feature = "builder")]
-    pub(crate) fn set_dirty_backup_area(&mut self, value: &[u8]) -> Result<()> {
+    fn set_dirty_backup_area(&mut self, value: &[u8]) -> Result<()> {
         // The stores below go through `atomic_data` (a `&self` accessor), so
         // check writability explicitly — a PROT_READ mapping would SIGSEGV.
         self.mmap.require_writable()?;
@@ -734,12 +773,13 @@ impl PropertyAreaMap {
         self.mmap.to_object(offset as usize, self.data_offset)
     }
 
-    /// Returns a `&mut PropertyInfo` for the entry at `offset`. Exposed only
-    /// to the builder feature because the in-place update path is the only
-    /// caller; together with `&mut PropertyAreaMap` it enforces single-writer
-    /// inside one process via the borrow checker.
+    /// Returns a `&mut PropertyInfo` for the entry at `offset`. Private —
+    /// the only legitimate route to a writer is `backup_and_apply_write`,
+    /// which guarantees the dirty backup slot is written first. Together
+    /// with `&mut PropertyAreaMap` it enforces single-writer inside one
+    /// process via the borrow checker.
     #[cfg(feature = "builder")]
-    pub(crate) fn property_info_mut(&mut self, offset: u32) -> Result<&mut PropertyInfo> {
+    fn property_info_mut(&mut self, offset: u32) -> Result<&mut PropertyInfo> {
         self.mmap.to_object_mut(offset as usize, self.data_offset)
     }
 
@@ -762,7 +802,10 @@ impl PropertyAreaMap {
     /// Reads the value of the entry at `pi_offset` as raw bytes: the short
     /// variant is snapshotted into `buf` (byte-wise atomic), the long
     /// variant is borrowed from the mmap (long entries are write-once) via
-    /// [`Self::long_property_value`].
+    /// [`Self::long_property_value`]. Builder-gated: the only caller is the
+    /// update path's backup snapshot (readers use the seqlock loop's own
+    /// accessors instead).
+    #[cfg(feature = "builder")]
     pub(crate) fn property_value_bytes<'a>(
         &'a self,
         pi_offset: u32,
@@ -937,9 +980,11 @@ impl MemoryMap {
             .checked_add(size)
             .ok_or_else(|| Error::FileValidation(format!("Size overflow: {offset} + {size}")))?;
         if end > self.size {
+            // Deliberately no base-pointer in the message: an ASLR address
+            // in logs has no diagnostic value here.
             error!(
-                "Memory access out of bounds: {} + {} > {} (ptr={:p})",
-                offset, size, self.size, self.data
+                "Memory access out of bounds: {} + {} > {}",
+                offset, size, self.size
             );
             return Err(Error::FileValidation(format!(
                 "Invalid offset: {end} > {}",
@@ -999,16 +1044,43 @@ impl MemoryMap {
     /// NUL-terminated string at `offset`; the scan is bounded by the end of
     /// the mapping. The slice is derived from the mmap base pointer, so it
     /// carries whole-mapping provenance.
+    ///
+    /// The NUL search runs over the byte-wise-atomic view and stops AT the
+    /// first NUL — it never reads past it. A plain `&[u8]` scan
+    /// (`CStr::from_bytes_until_nul` → word-sized memchr) would over-read
+    /// up to 7 bytes past the NUL, and with 4-byte allocation alignment
+    /// those bytes can belong to the next allocated object — e.g. a
+    /// `PropertyInfo` serial word being atomically rewritten by another
+    /// process's writer, a formal data race under the byte-wise atomics
+    /// discipline documented on `Sync` above. The returned `&CStr` (and the
+    /// non-atomic re-read constructing it) covers only `[offset, nul]`,
+    /// which the module protocol publishes write-once.
+    ///
+    /// Residual formal gap, accepted: if a *corrupt* file makes this range
+    /// alias a mutable slot (e.g. a bogus long-property offset pointing
+    /// into another entry's value), the non-atomic re-read can still race a
+    /// concurrent writer. Sealing that would require returning an owned
+    /// copy assembled from atomic loads — an allocation on the lookup hot
+    /// path to defend a corruption+concurrent-writer combination that the
+    /// module's threat-model notes already exclude.
     pub(crate) fn cstr_at(&self, offset: usize, base: usize) -> Result<&CStr> {
         let offset = self.checked_offset(offset, base)?;
         let remaining = self.size.checked_sub(offset).ok_or_else(|| {
             Error::FileValidation(format!("Offset past mmap: {offset} > {}", self.size))
         })?;
-        // SAFETY: bounds checked above; `u8` has no alignment requirement.
-        let bytes = unsafe { std::slice::from_raw_parts(self.data.add(offset), remaining) };
-        CStr::from_bytes_until_nul(bytes).map_err(|e| {
-            Error::FileValidation(format!("No NUL terminator at offset {offset}: {e}"))
-        })
+        let cells = self.atomic_data(offset, 0, remaining)?;
+        let nul = cells
+            .iter()
+            .position(|c| c.load(std::sync::atomic::Ordering::Relaxed) == 0)
+            .ok_or_else(|| {
+                Error::FileValidation(format!("No NUL terminator at offset {offset}"))
+            })?;
+        let bytes = self.data(offset, 0, nul + 1)?;
+        // Checked (not `_unchecked`) construction: the prefix is write-once
+        // under the module protocol, but a corrupt file breaking that
+        // invariant should surface as a typed error, not UB.
+        CStr::from_bytes_with_nul(bytes)
+            .map_err(|e| Error::FileValidation(format!("Invalid C string at offset {offset}: {e}")))
     }
 
     /// Byte-wise-atomic view of `size` bytes at `offset`. Used for the
@@ -1029,10 +1101,14 @@ impl MemoryMap {
         self.check_size(offset, size)?;
         // SAFETY: `offset + size <= self.size`, so the slice lies within the
         // mmap. `AtomicU8` has the same size/alignment as `u8` (asserted in
-        // property_info.rs). Callers pass only ranges whose every access is
-        // atomic under the module protocol (the dirty backup slot / value
-        // slots); a corrupt file could alias such a range with a non-atomic
-        // read elsewhere, but that requires corruption *and* a concurrent
+        // property_info.rs). Callers fall into two groups, both race-free:
+        // (a) ranges under the byte-wise-atomic protocol (the dirty backup
+        // slot / value slots), where every concurrent access is atomic; or
+        // (b) read-only atomic scans over write-once-published bytes
+        // (`cstr_at`'s NUL search), where the only concurrent accesses are
+        // other *reads* — mixing atomic and non-atomic reads is not a data
+        // race. A corrupt file could alias such a range with a non-atomic
+        // access elsewhere, but that requires corruption *and* a concurrent
         // writer — outside the supported threat model, and bounded by the
         // seqlock retry discarding torn data. Lifetime is tied to `&self`.
         Ok(unsafe {

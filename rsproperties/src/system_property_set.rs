@@ -19,8 +19,6 @@ use crate::errors::*;
 const DEFAULT_SOCKET_DIR: &str = "/dev/socket";
 pub const PROPERTY_SERVICE_SOCKET_NAME: &str = "property_service";
 pub const PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME: &str = "property_service_for_system";
-const PROP_SERVICE_NAME: &str = "property_service";
-// const PROP_SERVICE_FOR_SYSTEM_NAME: &str = "property_service_for_system";
 
 use crate::wire::{
     PROP_MSG_SETPROP, PROP_MSG_SETPROP2, PROP_NAME_MAX, PROP_SUCCESS, PROP_VALUE_MAX,
@@ -72,9 +70,14 @@ pub fn socket_dir() -> &'static Path {
     let _guard = crate::lock_global_dirs();
     SOCKET_DIR
         .get_or_init(|| {
-            let dir = env::var("PROPERTY_SERVICE_SOCKET_DIR")
-                .unwrap_or_else(|_| DEFAULT_SOCKET_DIR.to_string());
-            PathBuf::from(dir)
+            // `var_os`, not `var`: Unix paths are arbitrary bytes, and a
+            // non-UTF-8 configured directory must be *used*, not silently
+            // swapped for the default — the same
+            // different-path-on-lossy-conversion hazard
+            // `get_property_service_socket` documents.
+            env::var_os("PROPERTY_SERVICE_SOCKET_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET_DIR))
         })
         .as_path()
 }
@@ -247,12 +250,51 @@ impl ServiceConnection {
     }
 
     fn recv_i32(&mut self) -> Result<i32> {
+        // SO_RCVTIMEO re-arms per *syscall*: a plain `read_exact` against a
+        // server trickling one byte per window would stretch "2 seconds"
+        // into 4×. Enforce SERVICE_IO_TIMEOUT as a total budget — the same
+        // deadline pattern as `send` and `wait_for_socket_close`.
+        let deadline = Instant::now() + SERVICE_IO_TIMEOUT;
         let mut buf = [0u8; 4];
-        self.stream
-            .read_exact(&mut buf)
-            .map_err(|e| map_timeout_err(e, "waiting for property service response"))?;
-        let value = i32::from_ne_bytes(buf);
-        Ok(value)
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "timed out waiting for property service response \
+                         ({SERVICE_IO_TIMEOUT:?} total, {filled}/4 bytes received)"
+                    ),
+                )));
+            }
+            // Best-effort re-arm: on macOS `setsockopt` fails with EINVAL
+            // once the peer's FIN has been processed ("the socket has been
+            // shut down"), even though the buffered response bytes are
+            // still readable. Failing here would drop a response the
+            // server already sent; the connect-time static timeout remains
+            // armed as the per-syscall bound, and the deadline check above
+            // still bounds the total.
+            let _ = self.stream.set_read_timeout(Some(remaining));
+            match self.stream.read(&mut buf[filled..]) {
+                Ok(0) => {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "property service closed before sending a full response",
+                    )))
+                }
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(map_timeout_err(e, "waiting for property service response")),
+            }
+        }
+        // Deliberately NO timeout-restore here: connections are one-shot
+        // (a fresh `ServiceConnection` per request), so the small
+        // remaining-budget left armed is never observed — and the server
+        // may have already closed its end after responding, where a
+        // `setsockopt` would fail with EINVAL on macOS ("the socket has
+        // been shut down") depending on FIN arrival timing.
+        Ok(i32::from_ne_bytes(buf))
     }
 }
 
@@ -373,7 +415,11 @@ enum ProtocolVersion {
 }
 
 // No `FromBytes`: the client only ever serializes this message.
-#[derive(Immutable, IntoBytes, Debug)]
+// No `Debug`: a derived impl would print the raw `value` bytes, and
+// property values may carry sensitive payloads — the same don't-log-values
+// policy as the service crate's masked manual impl. Nothing needs it today;
+// if one is ever required, write a manual impl that masks `value`.
+#[derive(Immutable, IntoBytes)]
 #[repr(C)]
 struct PropertyMessage {
     cmd: u32,
@@ -549,14 +595,10 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
     // to a different key than the caller asked for.
     // `validate_property_name` rejects NUL through its allowed-chars loop;
     // `validate_value_len` rejects NUL in values explicitly.
-    if let Err(e) = crate::wire::validate_property_name(name) {
-        log::error!("setprop reject: {e}");
-        return Err(Error::InvalidArgument(e));
-    }
-    if let Err(e) = crate::wire::validate_value_len(name, value) {
-        log::error!("setprop reject: {e}");
-        return Err(Error::InvalidArgument(e));
-    }
+    crate::wire::validate_property_name(name)
+        .inspect_err(|e| log::error!("setprop reject: {e}"))?;
+    crate::wire::validate_value_len(name, value)
+        .inspect_err(|e| log::error!("setprop reject: {e}"))?;
 
     match protocol_version() {
         ProtocolVersion::V1 => {
@@ -584,7 +626,11 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
                 )));
             }
 
-            let mut conn = ServiceConnection::new(PROP_SERVICE_NAME)?;
+            // Pass the *property name* — `ServiceConnection::new` routes
+            // `sys.powerctl` to the for_system socket by name, on V1 as
+            // well as V2 (bionic's `send_prop_msg` constructs its V1
+            // connection from `msg->name` the same way).
+            let mut conn = ServiceConnection::new(name)?;
             let prop_msg = PropertyMessage::new(PROP_MSG_SETPROP, name, value)?;
 
             ServiceWriter::new()

@@ -326,6 +326,19 @@ impl SystemProperties {
     pub fn find(&self, name: &str) -> Result<Option<PropertyIndex>> {
         let res = match self.contexts.prop_area_for_name(name) {
             Ok(res) => res,
+            // A name that maps to no context cannot have a property — the
+            // same "genuine absence" contract as the in-area miss below.
+            // (Unlike a flattened in-area lookup *failure*, sending `set`
+            // down the `add` path here is harmless: `add` hits the same
+            // context miss and fails loudly.) The lower layer already
+            // logged the miss at the appropriate level.
+            //
+            // Caveat: `context_node_at` reports a corrupt-at-init context
+            // slot with the same `NotFound` variant, so that case is also
+            // folded into absence here — the current error shape cannot
+            // tell the two apart. (`read_with` propagates it as `Err`
+            // instead; `set` still fails loudly via `add`.)
+            Err(Error::NotFound(_)) => return Ok(None),
             Err(e) => {
                 log::error!("Failed to find property area for {name}: {e}");
                 return Err(e);
@@ -379,18 +392,6 @@ impl SystemProperties {
 
     #[cfg(feature = "builder")]
     pub fn update(&mut self, index: &PropertyIndex, value: &str) -> Result<()> {
-        // Pre-flight value-length check — `update` cannot promote to a long
-        // property in-place (`PropertyInfoWriter::apply_write` rejects on
-        // LONG_FLAG). Pass an empty name so the `ro.` exception in
-        // `validate_value_len` doesn't apply here.
-        // `InvalidArgument`, matching `apply_write`'s classification of the
-        // same condition — this is a caller-argument problem, not corrupt
-        // on-disk state.
-        if let Err(e) = crate::wire::validate_value_len("", value) {
-            log::error!("{e}");
-            return Err(Error::InvalidArgument(e));
-        }
-
         let mut res = match self.contexts.prop_area_mut_with_index(index.context_index) {
             Ok(res) => res,
             Err(e) => {
@@ -406,7 +407,7 @@ impl SystemProperties {
 
         // Inspect through `&pi` first: validate ro., snapshot backup into a
         // stack buffer. `pi` borrow is dropped at the end of this block so
-        // we can take `&mut pa` for `set_dirty_backup_area` immediately
+        // we can take `&mut pa` for `backup_and_apply_write` immediately
         // after. The buffer outlives the inner borrow scope, so the bytes
         // it captured remain valid after `pi`/`cow` go out of scope.
         let mut backup_buf = [0u8; crate::wire::PROP_VALUE_MAX];
@@ -429,6 +430,15 @@ impl SystemProperties {
                 log::error!("{error_msg}");
                 return Err(Error::PermissionDenied(error_msg));
             }
+            // Value-length check — `update` cannot promote to a long
+            // property in-place (`apply_write` rejects on LONG_FLAG). Pass
+            // an empty name so the `ro.` exception in `validate_value_len`
+            // doesn't apply here. Deliberately *after* the `ro.` check
+            // above: for a read-only property the dominant refusal reason
+            // is read-only-ness, and reporting "value too long" instead
+            // would misdirect the caller. Still before the backup snapshot,
+            // preserving "every failure path occurs before set_dirty".
+            crate::wire::validate_value_len("", value).inspect_err(|e| log::error!("{e}"))?;
             // Pre-flight LONG check: if the entry was created long, we can't
             // overwrite it in-place. Checking *before* writing the backup
             // keeps backup_area aligned with the entry it shadows.
@@ -462,32 +472,32 @@ impl SystemProperties {
                 .len()
         };
 
-        // Back up the current value so concurrent readers can observe a
-        // consistent snapshot via the dirty bit. No standalone fence needed:
-        // the Release stores inside `apply_write` synchronize this write
-        // with readers.
-        pa.set_dirty_backup_area(&backup_buf[..backup_len])
+        // Backup-then-publish as a single fused operation: readers that
+        // observe the dirty serial read the backup slot, so the backup must
+        // land before the dirty bit — `backup_and_apply_write` makes that
+        // ordering structural (the entry writer is unreachable otherwise).
+        pa.backup_and_apply_write(index.property_index, &backup_buf[..backup_len], value)
             .map_err(|e| {
-                log::error!("Failed to set backup area: {e}");
+                log::error!("Failed to update property value: {e}");
                 e
             })?;
 
-        // Single-transaction publish: set_dirty → write → publish_serial.
-        // Encapsulated in writer so a half-published state is impossible.
-        let pi = pa.property_info_mut(index.property_index).map_err(|e| {
-            log::error!("Failed to get mutable property info after backup: {e}");
-            e
-        })?;
-        pi.writer().apply_write(value)?;
-
-        // The value is fully published at this point. A failed FUTEX_WAKE
-        // only delays waiters (they re-check the serial on their own), so
-        // erroring out here would misreport a completed update — and, worse,
-        // skip the global serial bump below, leaving `wait_any` observers
-        // permanently unaware of the change. bionic ignores the wake result
-        // entirely; log and continue.
-        if let Err(e) = futex_wake(&pi.serial) {
-            log::warn!("Failed to wake property futex: {e}");
+        // The value is fully published at this point — from here on NOTHING
+        // may early-return. A failure would misreport a completed update
+        // and, worse, skip the global serial bump below, leaving `wait_any`
+        // observers permanently unaware of the change. That is why the
+        // re-fetch for the futex wake is non-fatal too (it re-runs checks
+        // the offset just passed inside `backup_and_apply_write`, so a
+        // failure here is theoretical): a missed FUTEX_WAKE only delays
+        // waiters — they re-check the serial on their own; bionic ignores
+        // the wake result entirely. Log and continue.
+        match pa.property_info(index.property_index) {
+            Ok(pi) => {
+                if let Err(e) = futex_wake(&pi.serial) {
+                    log::warn!("Failed to wake property futex: {e}");
+                }
+            }
+            Err(e) => log::warn!("Failed to re-fetch property info for futex wake: {e}"),
         }
 
         let serial_pa = self.contexts.serial_prop_area();
@@ -511,12 +521,8 @@ impl SystemProperties {
     #[cfg(feature = "builder")]
     pub fn add(&mut self, name: &str, value: &str) -> Result<()> {
         // Shared policy across client/server: only `ro.` names may exceed
-        // PROP_VALUE_MAX (stored as long properties). `InvalidArgument`
-        // for the same reason as in `update`.
-        if let Err(e) = crate::wire::validate_value_len(name, value) {
-            log::error!("{e}");
-            return Err(Error::InvalidArgument(e));
-        }
+        // PROP_VALUE_MAX (stored as long properties).
+        crate::wire::validate_value_len(name, value).inspect_err(|e| log::error!("{e}"))?;
 
         let mut res = match self.contexts.prop_area_mut_for_name(name) {
             Ok(res) => res,
@@ -616,8 +622,11 @@ impl SystemProperties {
                     return Some(serial);
                 }
                 let slice = remaining.min(DIRTY_SLICE);
+                // Derive both fields from the Duration (like `wait`) —
+                // hardcoding `tv_sec: 0` would silently truncate whole
+                // seconds if `DIRTY_SLICE` ever grew past 1s.
                 let slice_ts = Timespec {
-                    tv_sec: 0,
+                    tv_sec: slice.as_secs() as _,
                     tv_nsec: slice.subsec_nanos() as _,
                 };
                 match futex_wait(&pi.serial, serial, Some(&slice_ts)) {
@@ -670,7 +679,12 @@ impl SystemProperties {
 
     /// Waits until the property at `index` (or, with `index == None`, the
     /// global serial — i.e. any property) changes, returning the new serial.
-    /// Returns `None` on timeout or lookup failure.
+    /// Returns `None` on timeout, lookup failure, **or a futex syscall
+    /// failure** — the three are indistinguishable through this signature.
+    /// Consequence: do not tight-poll this method with a zero/short timeout
+    /// and treat every `None` as "timed out, retry" — a persistent futex
+    /// error would turn that loop into a busy-spin. Without a timeout, a
+    /// `None` always means an error.
     ///
     /// `old_serial` should be the serial observed when the caller last read
     /// the value (via [`Self::serial`] / [`Self::context_serial`]). Passing
@@ -802,7 +816,9 @@ impl SystemProperties {
 
 #[cfg(test)]
 mod tests {
-    #![allow(unused_imports)]
+    // Everything in this module is android-only; scope the imports the same
+    // way instead of blanket-allowing unused_imports.
+    #[cfg(target_os = "android")]
     use super::*;
 
     #[cfg(target_os = "android")]

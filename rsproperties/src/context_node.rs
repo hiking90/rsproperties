@@ -68,7 +68,10 @@ impl ContextNode {
                 "open() called after the read path mapped {:?} read-only",
                 self.filename
             );
-            return Err(Error::PermissionDenied(format!(
+            // An initialization-order conflict, not an OS permission
+            // failure — `PermissionDenied` here sent users chasing file
+            // modes.
+            return Err(Error::AlreadyInitialized(format!(
                 "property area already mapped read-only: {:?}",
                 self.filename
             )));

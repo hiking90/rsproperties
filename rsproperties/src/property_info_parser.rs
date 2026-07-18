@@ -11,15 +11,15 @@ use zerocopy_derive::*;
 use crate::errors::*;
 use crate::property_area::MemoryMap;
 
-/// Binary search returning the matching index or `None` for miss. Internal
-/// indexing uses `usize` to avoid `u32 → i32` truncation when
-/// `array_length > i32::MAX`. The callback is `FnMut` so it can record
-/// out-of-band signals (e.g. a corrupted entry) for the caller to inspect.
-fn find<F>(array_length: u32, mut f: F) -> Option<usize>
+/// Binary search returning the matching index or `None` for miss. Takes
+/// `usize` directly — callers hold `usize` lengths, and round-tripping
+/// through `u32` would add a silent truncation point if a count's type
+/// ever widened. The callback is `FnMut` so it can record out-of-band
+/// signals (e.g. a corrupted entry) for the caller to inspect.
+fn find<F>(len: usize, mut f: F) -> Option<usize>
 where
     F: FnMut(usize) -> Ordering,
 {
-    let len = array_length as usize;
     let (mut lo, mut hi) = (0usize, len);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
@@ -71,7 +71,11 @@ pub(crate) struct PropertyEntry {
 }
 
 impl PropertyEntry {
-    pub(crate) fn name<'a>(&'a self, property_info_area: &'a PropertyInfoArea) -> Result<&'a CStr> {
+    // `&'d CStr` tied to the *data* lifetime, not `&self` — same convention
+    // as `TrieNode::name` / `cstr` / `ref_from` throughout this file: the
+    // name borrows the underlying buffer, so callers may return it up the
+    // stack past this entry reference.
+    pub(crate) fn name<'d>(&self, property_info_area: &PropertyInfoArea<'d>) -> Result<&'d CStr> {
         property_info_area.cstr(self.name_offset as usize)
     }
 }
@@ -148,82 +152,56 @@ impl<'a> TrieNode<'a> {
             })
     }
 
-    pub(crate) fn num_child_nodes(&self) -> u32 {
-        self.data().map(|d| d.num_child_nodes).unwrap_or_else(|e| {
-            warn!(
-                "Failed to read TrieNodeData at offset {}: {e}",
-                self.trie_node_offset
-            );
-            0
-        })
-    }
-
-    fn child_node(&self, n: usize) -> Result<TrieNode<'a>> {
+    /// Validated offset array of this node's children — one node-data
+    /// validation + one array slice for the whole binary search, mirroring
+    /// `prefix_offsets` / `exact_match_offsets`. Bounds are validated
+    /// against the *declared* count, so a corrupt count field fails loudly
+    /// instead of silently reinterpreting adjacent data as entries.
+    fn child_offsets(&self) -> Result<&'a [u32]> {
         let data = self.data()?;
-        let offset =
-            self.entry_offset_at(data.child_nodes, data.num_child_nodes, n, "Child node")?;
-        Ok(TrieNode::new(self.property_info_area, offset))
-    }
-
-    /// Reads the `n`-th offset out of a `count`-sized u32 offset array at
-    /// `array_offset` — used by `child_node` (the prefix/exact-match loops
-    /// slice their whole arrays up front via `prefix_offsets` /
-    /// `exact_match_offsets` instead). Bounds are validated against the
-    /// *declared* count, so a corrupt count field fails loudly instead of
-    /// silently reinterpreting adjacent data as entries.
-    fn entry_offset_at(
-        &self,
-        array_offset: u32,
-        count: u32,
-        n: usize,
-        kind: &str,
-    ) -> Result<usize> {
-        let slice = self
-            .property_info_area
-            .u32_slice_from(array_offset as usize, count as usize)?;
-        let offset = slice.get(n).ok_or_else(|| {
-            Error::FileValidation(format!(
-                "{kind} index {n} out of bounds: array length {}",
-                slice.len()
-            ))
-        })?;
-        Ok(*offset as usize)
+        self.property_info_area
+            .u32_slice_from(data.child_nodes as usize, data.num_child_nodes as usize)
     }
 
     fn find_child_for_string(&self, input: &str) -> Option<TrieNode<'a>> {
+        // Hoisted once for the whole search: the previous per-probe
+        // `child_node(i)` re-validated the node data and re-sliced the
+        // offset array on every iteration of this lookup hot path.
+        let offsets = match self.child_offsets() {
+            Ok(o) => o,
+            Err(e) => {
+                warn!("Failed to read child node offsets: {e}");
+                return None;
+            }
+        };
+        let child_at = |i: usize| TrieNode::new(self.property_info_area, offsets[i] as usize);
+
         // On corruption we return `Ordering::Equal`; `find` exits the binary
         // search immediately so the closure runs at most once after the flag
         // is set. `corrupted` then disqualifies the index because the
         // sorted-invariant can no longer be trusted.
         let mut corrupted = false;
-        let node_index = find(self.num_child_nodes(), |i| match self.child_node(i) {
-            Ok(child) => match child.name() {
-                Ok(name) => match name.to_str() {
-                    // No valid trie node has an empty name — treat it as
-                    // corruption and disqualify the search like the other
-                    // corruption arms (otherwise `"".cmp(input) == Less`
-                    // silently steers the binary search with a broken sort
-                    // invariant).
-                    Ok("") => {
-                        warn!("child node {i} has empty (corruption-fallback) name");
-                        corrupted = true;
-                        Ordering::Equal
-                    }
-                    Ok(s) => s.cmp(input),
-                    Err(e) => {
-                        warn!("child node {i} has non-UTF-8 name: {e}");
-                        corrupted = true;
-                        Ordering::Equal
-                    }
-                },
+        let node_index = find(offsets.len(), |i| match child_at(i).name() {
+            Ok(name) => match name.to_str() {
+                // No valid trie node has an empty name — treat it as
+                // corruption and disqualify the search like the other
+                // corruption arms (otherwise `"".cmp(input) == Less`
+                // silently steers the binary search with a broken sort
+                // invariant).
+                Ok("") => {
+                    warn!("child node {i} has empty (corruption-fallback) name");
+                    corrupted = true;
+                    Ordering::Equal
+                }
+                Ok(s) => s.cmp(input),
                 Err(e) => {
-                    warn!("child node {i} name read failed: {e}");
+                    warn!("child node {i} has non-UTF-8 name: {e}");
                     corrupted = true;
                     Ordering::Equal
                 }
             },
             Err(e) => {
-                warn!("child node {i} read failed: {e}");
+                warn!("child node {i} name read failed: {e}");
                 corrupted = true;
                 Ordering::Equal
             }
@@ -232,7 +210,7 @@ impl<'a> TrieNode<'a> {
         if corrupted {
             return None;
         }
-        node_index.and_then(|i| self.child_node(i).ok())
+        node_index.map(child_at)
     }
 
     /// Validated offset array of this node's prefix entries. Fetched once
@@ -267,13 +245,19 @@ pub(crate) struct PropertyInfoArea<'a> {
 
 impl<'a> PropertyInfoArea<'a> {
     pub(crate) fn new(data_base: &'a [u8]) -> Self {
-        // `header()` relies on this holding for both construction paths
-        // (mmap: validated by `load_path`; builder: header pre-allocated by
-        // `TrieNodeArena`) — assert it locally so a future third path can't
-        // silently violate it.
+        // `header()` relies on both properties holding for every
+        // construction path (mmap: page-aligned base, size validated by
+        // `load_path`; builder: 4-aligned `Vec<u32>` backing, header
+        // pre-allocated by `TrieNodeArena`) — assert them locally so a
+        // future third path can't silently violate either.
         debug_assert!(
             data_base.len() >= size_of::<PropertyInfoAreaHeader>(),
             "property_info area smaller than its header"
+        );
+        debug_assert_eq!(
+            data_base.as_ptr().align_offset(size_of::<u32>()),
+            0,
+            "property_info base not 4-byte aligned"
         );
         Self { data_base }
     }
@@ -354,17 +338,17 @@ impl<'a> PropertyInfoArea<'a> {
 
     #[inline]
     pub(crate) fn header(&self) -> &PropertyInfoAreaHeader {
-        // Both construction paths guarantee room for the header at offset
-        // 0: the mmap path validates the file size on load (`load_path`),
-        // and the builder path (`TrieNodeArena::info`) allocates the header
-        // before anything else (asserted in `new`). Alignment differs by
-        // path: the mmap base is page-aligned, while the arena's `Vec<u8>`
-        // base is only 1-aligned *by the language* — in practice every real
-        // allocator hands back ≥8-byte-aligned blocks. `ref_from` re-checks
-        // both properties on the actual pointer at runtime, so a violated
-        // assumption panics here rather than reading garbage.
+        // Both construction paths guarantee room for the header at offset 0
+        // AND a 4-aligned base (asserted in `new`): the mmap path validates
+        // the file size on load (`load_path`) and mmap bases are
+        // page-aligned; the builder path allocates the header before
+        // anything else out of `TrieNodeArena`'s `Vec<u32>` backing, whose
+        // base alignment is a language-level guarantee — not an allocator
+        // observation. `ref_from` re-checks both properties on the actual
+        // pointer at runtime, so a violated assumption panics here rather
+        // than reading garbage.
         self.ref_from(0)
-            .expect("header at offset 0; size guaranteed by load-time validation / arena layout")
+            .expect("header at offset 0; size/alignment guaranteed by construction paths")
     }
 
     /// Element count stored at the head of the u32 table at `table_offset`
@@ -583,16 +567,14 @@ impl<'a> PropertyInfoArea<'a> {
 
     #[cfg(feature = "builder")]
     pub(crate) fn find_context_index(&self, context: &str) -> Option<usize> {
-        self.find_string_index(self.num_contexts() as u32, context, "context", |i| {
+        self.find_string_index(self.num_contexts(), context, "context", |i| {
             self.context_offset(i)
         })
     }
 
     #[cfg(feature = "builder")]
     pub(crate) fn find_type_index(&self, rtype: &str) -> Option<usize> {
-        self.find_string_index(self.num_types() as u32, rtype, "type", |i| {
-            self.type_offset(i)
-        })
+        self.find_string_index(self.num_types(), rtype, "type", |i| self.type_offset(i))
     }
 
     /// Shared binary search for context/type tables. Treats any entry that
@@ -602,7 +584,7 @@ impl<'a> PropertyInfoArea<'a> {
     #[cfg(feature = "builder")]
     fn find_string_index(
         &self,
-        n: u32,
+        n: usize,
         needle: &str,
         kind: &str,
         offset_at: impl Fn(usize) -> Result<usize>,

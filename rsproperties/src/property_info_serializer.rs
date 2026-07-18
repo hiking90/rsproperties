@@ -10,6 +10,7 @@ use crate::errors::*;
 use crate::trie_builder::*;
 use crate::trie_serializer::*;
 
+#[derive(Debug, Clone)]
 pub struct PropertyInfoEntry {
     name: String,
     context: String,
@@ -22,13 +23,22 @@ impl PropertyInfoEntry {
     /// [`Self::parse_from_file`]). Validates `type_str` with the same rule
     /// as the parser; AOSP's `PropertyInfoEntry` likewise exposes a public
     /// constructor.
-    pub fn new(name: String, context: String, type_str: String, exact_match: bool) -> Result<Self> {
+    ///
+    /// `type_str` is borrowed: only its whitespace-normalized copy is
+    /// stored, so taking ownership would force callers to allocate a
+    /// `String` that is immediately discarded.
+    pub fn new(name: String, context: String, type_str: &str, exact_match: bool) -> Result<Self> {
         // Store the whitespace-normalized form (`join(" ")`), matching
         // `parse_from_line` — otherwise the same logical type could
         // serialize as different bytes depending on which constructor
         // produced the entry.
+        //
+        // The guard checks the *token list*, not `type_str.is_empty()`:
+        // a whitespace-only `type_str` normalizes to the same empty type
+        // as `""` and must pass identically (`parse_from_line` already
+        // treats them alike).
         let type_strings: Vec<&str> = type_str.split_whitespace().collect();
-        if !type_str.is_empty() && !Self::is_type_valid(&type_strings) {
+        if !type_strings.is_empty() && !Self::is_type_valid(&type_strings) {
             return Err(Error::InvalidArgument(format!(
                 "Type '{type_str}' is not valid."
             )));
@@ -196,7 +206,19 @@ impl PropertyInfoEntry {
                 }
                 Err(err) => {
                     warn!("Line {line_count}: Failed to parse line '{line}': {err}");
-                    errors.push(err);
+                    // Same self-describing contract as the UTF-8 arm above:
+                    // callers consume the returned Vec, so the position
+                    // must live in the error itself, not only in the warn.
+                    // Unwrap the inner `Parse` payload — re-wrapping the
+                    // whole error would render as "Parse error: line N …:
+                    // Parse error: …".
+                    let msg = match err {
+                        Error::Parse(m) => m,
+                        other => other.to_string(),
+                    };
+                    errors.push(Error::Parse(format!(
+                        "line {line_count} of {filename:?}: {msg}"
+                    )));
                 }
             }
         }
@@ -219,6 +241,14 @@ pub fn build_trie(
         default_context,
         default_type
     );
+
+    // The defaults bypass `add_to_trie` (they are interned directly by
+    // `TrieBuilder::new`), so they need the same interior-NUL gate the
+    // per-entry path applies — without it a NUL default reaches the string
+    // table and later fails as a misleading "serializer invariant
+    // violation" instead of an input error.
+    crate::wire::validate_no_interior_nul("default context", default_context)?;
+    crate::wire::validate_no_interior_nul("default type", default_type)?;
 
     let mut trie = TrieBuilder::new(default_context, default_type);
 
@@ -291,21 +321,30 @@ mod tests {
         assert!(PropertyInfoEntry::new(
             "ro.a".into(),
             "u:object_r:build_prop:s0".into(),
-            "string".into(),
+            "string",
             true
         )
         .is_ok());
         assert!(PropertyInfoEntry::new(
             "ro.a".into(),
             "u:object_r:build_prop:s0".into(),
-            "".into(),
+            "",
+            false
+        )
+        .is_ok());
+        // Whitespace-only normalizes to the same empty type as "" and must
+        // behave identically.
+        assert!(PropertyInfoEntry::new(
+            "ro.a".into(),
+            "u:object_r:build_prop:s0".into(),
+            "   ",
             false
         )
         .is_ok());
         assert!(PropertyInfoEntry::new(
             "ro.a".into(),
             "u:object_r:build_prop:s0".into(),
-            "not_a_type".into(),
+            "not_a_type",
             true
         )
         .is_err());

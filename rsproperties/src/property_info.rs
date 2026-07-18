@@ -185,7 +185,13 @@ impl PropertyInfo {
     /// Returns a writer that has exclusive update rights to this entry.
     ///
     /// `&mut self` ensures only one writer exists within a process; the
-    /// returned writer enforces the seqlock + LONG-flag invariants.
+    /// returned writer enforces the entry-side seqlock + LONG-flag
+    /// invariants. It does NOT cover the area-side precondition: readers
+    /// that observe the dirty serial read the per-area dirty backup slot,
+    /// which must hold this entry's current value *before* `apply_write`
+    /// publishes the dirty bit. That ordering is enforced structurally by
+    /// `PropertyAreaMap::backup_and_apply_write` — the only path from
+    /// outside `property_area.rs` to this writer.
     /// Cross-process invariants are documented at the module level.
     #[cfg(feature = "builder")]
     pub(crate) fn writer(&mut self) -> PropertyInfoWriter<'_> {
@@ -210,11 +216,20 @@ impl PropertyInfoWriter<'_> {
     /// Atomic short-value update: validate → set dirty → write bytes →
     /// publish new serial. Returns the published serial.
     ///
-    /// The entire seqlock protocol is encapsulated here so callers cannot
-    /// leave the entry in a half-published state: every failure path occurs
-    /// *before* `set_dirty`, and once the dirty bit is published the
+    /// The *entry-side* seqlock steps are encapsulated here so callers
+    /// cannot leave the entry in a half-published state: every failure path
+    /// occurs *before* `set_dirty`, and once the dirty bit is published the
     /// remaining steps are infallible (byte-wise atomic stores + atomic
     /// serial publish).
+    ///
+    /// # Precondition
+    ///
+    /// The area's dirty backup slot must already hold this entry's current
+    /// value: readers that observe the dirty serial read the backup slot,
+    /// not the entry, so publishing the dirty bit without a fresh backup
+    /// serves a previous update's backup bytes as this value. The ordering
+    /// is enforced by `PropertyAreaMap::backup_and_apply_write` — keep it
+    /// the only external route to this method.
     ///
     /// Rejects when the LONG flag is set — switching the union variant
     /// in-place would leak the out-of-line long-property buffer.
@@ -228,10 +243,12 @@ impl PropertyInfoWriter<'_> {
             )));
         }
         if value.len() >= PROP_VALUE_MAX {
+            // `PROP_VALUE_MAX - 1`: the slot reserves one byte for the NUL,
+            // so 92 bytes is rejected and the honest maximum is 91.
             return Err(Error::InvalidArgument(format!(
                 "Value too long: {} (max: {})",
                 value.len(),
-                PROP_VALUE_MAX
+                PROP_VALUE_MAX - 1
             )));
         }
         // Infallible after the check above: len < PROP_VALUE_MAX (92), far
