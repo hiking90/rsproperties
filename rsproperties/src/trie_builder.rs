@@ -225,7 +225,7 @@ impl TrieBuilder {
 
         let last_name: &str = name_parts
             .pop()
-            .ok_or(Error::Parse(format!("No name parts for '{name}'")))?;
+            .ok_or_else(|| Error::Parse(format!("No name parts for '{name}'")))?;
 
         // Intern only after the name has passed validation so rejected
         // lines don't leave their context/type behind in the string

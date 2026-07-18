@@ -6,6 +6,83 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: minor bumps may include API changes).
 
+## [Unreleased]
+
+Fourth full-source review pass: platform contracts (macOS), AOSP parity
+deviations, and error/type-boundary tightening.
+
+### Fixed
+
+- **macOS `SO_NOSIGPIPE`**: the rustix-created client socket now sets
+  `SO_NOSIGPIPE` like std does on Apple platforms — writing to a
+  peer-closed property-service socket delivers `EPIPE` instead of killing
+  hosts that don't ignore `SIGPIPE` (e.g. a cdylib embedded in a C
+  process).
+- **Corruption no longer masquerades as absence**: a context slot that
+  was corrupt at init is reported as `Error::FileValidation` instead of
+  `NotFound`, so `SystemProperties::find` propagates it as an error
+  rather than folding it into `Ok(None)`.
+- **AOSP parity — legacy two-token property_contexts lines**: a *missing*
+  match operation is accepted (defaults to prefix match) even with
+  `require_prefix_or_exact`, matching `ParsePropertyInfoLine`; only a
+  present-but-invalid token is an error.
+- **AOSP parity — import path expansion**: `expand_import_path` now
+  supports `$$` escapes and `${name:-default}` fallbacks (also taken for
+  *empty* values), and rejects a bare `$x`, matching `ExpandProps`.
+- **macOS `wait` stale-serial fast path**: the documented "already
+  changed → return immediately" contract of `old_serial` now holds on
+  macOS too (it is a plain atomic load, no futex needed); previously the
+  macOS paths returned `None` unconditionally.
+- `PROPERTY_SERVICE_VERSION` env values that are set but unparseable now
+  select **V1** with a warning (same policy as the
+  `ro.property_service.version` property) instead of silently defaulting
+  to V2.
+- The send loop no longer propagates macOS's spurious
+  `set_write_timeout` `EINVAL` (peer FIN processed) — the next write
+  surfaces the real `EPIPE`/`WriteZero` instead, mirroring the receive
+  path.
+- `PropertyArea::add` validates empty name segments *before* walking the
+  trie, so an invalid name (`"a."`, `"a..b"`) no longer leaves
+  freshly-allocated (unreferenced-but-reusable) trie nodes behind.
+- Serializer arena offsets are bounded to `u32` **at allocation time**;
+  the old "final `try_from` retroactively validates every intermediate
+  `as u32`" argument is gone, along with the casts it excused. A
+  compile-time guard also rejects arena types with alignment > 4, whose
+  runtime pointer-based check was allocator-dependent.
+- `.writer_lock` permissions are re-asserted with `fchmod` on open — a
+  leftover lock file with wider modes (pre-0.6 versions) no longer
+  defeats the anti-squat rationale of mode 0600.
+- Non-ASCII context names are rejected: APFS also aliases Unicode case
+  and NFC/NFD normalization variants onto one file, which the
+  ASCII-case-fold duplicate check could not catch.
+- Prop-file line length is bounded (64 KiB, skip-with-warn): a crafted
+  newline-less file can no longer grow a single read buffer without
+  bound.
+- V1 name-length documentation in `wire` was off by one (`<`, not `<=` —
+  the fixed buffer needs its NUL terminator).
+
+### Changed
+
+- `Error::ParseInt` removed — it was never constructed; `Error::Parse`
+  is the single documented parse-failure variant of the public API.
+- `PropertyConfig` is now `#[non_exhaustive]`: construct via the
+  builder, `with_*` constructors, or `From` impls.
+- `wire::validate_value_len` no longer honors an empty-name sentinel to
+  disable the `ro.` long-value exemption; the in-place update path uses
+  a dedicated internal `validate_short_value_len`.
+- The root-ownership file check can be enforced in
+  `debug-assertions`-enabled builds via the new opt-in
+  `strict-file-validation` feature (profiles enabling debug-assertions
+  for overflow checks no longer silently relax validation with no
+  recourse).
+- `get`/`get_or`/`get_or_else` document that the `FromStr` parse runs
+  under the property area's read lock (must not block or re-enter the
+  property API); crate-level doc example is no longer compiled out on
+  host (`cfg(android)` removed), and misleading `set("ro.…")` examples
+  replaced.
+- `MemoryMap`'s `Debug` no longer prints the raw mapping pointer (ASLR
+  address), matching the module's no-address-in-logs policy.
+
 ## [0.6.0] - 2026-07-18
 
 Consolidated correctness and hardening release from three successive

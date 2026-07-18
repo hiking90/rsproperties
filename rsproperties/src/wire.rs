@@ -19,10 +19,12 @@ use crate::errors::{Error, Result};
 /// path in `property_info`.
 pub const PROP_VALUE_MAX: usize = 92;
 
-/// Hard cap on property-name byte length in the **V1 wire protocol** only
-/// (V1's message buffer is a fixed `[u8; PROP_NAME_MAX]`). The V2 protocol
-/// is length-prefixed and does not impose this limit at the wire layer —
-/// AOSP `init/property_service.cpp::IsLegalPropertyName` likewise doesn't
+/// Size of the **V1 wire protocol**'s fixed name buffer
+/// (`[u8; PROP_NAME_MAX]`), *including* the NUL terminator — usable name
+/// bytes are capped at `PROP_NAME_MAX - 1 = 31` (bionic rejects
+/// `strlen(name) >= PROP_NAME_MAX`). The V2 protocol is length-prefixed
+/// and does not impose this limit at the wire layer — AOSP
+/// `init/property_service.cpp::IsLegalPropertyName` likewise doesn't
 /// enforce a length on V2.
 pub const PROP_NAME_MAX: usize = 32;
 
@@ -59,13 +61,10 @@ pub const MAX_WIRE_VALUE_LEN: usize = 8192;
 /// rejected by the server (or vice versa).
 ///
 /// Names starting with `ro.` are allowed to exceed the limit (the server
-/// stores them as long properties).
-///
-/// Passing an **empty `name`** deliberately disables the `ro.` exemption:
-/// in-place update paths (`SystemProperties::update`) cannot promote a
-/// value to the out-of-line long-property representation, so they pass
-/// `""` to enforce the short-value cap regardless of the real name. Every
-/// other caller must pass the actual property name.
+/// stores them as long properties). In-place update paths, which cannot
+/// promote a value to the out-of-line long-property representation, must
+/// use [`validate_short_value_len`] instead — the exemption is selected
+/// by *which function* is called, not by an in-band sentinel name.
 ///
 /// Interior NUL bytes are rejected because the storage format treats
 /// values as C strings: the length recorded in the entry's serial word is
@@ -76,17 +75,40 @@ pub const MAX_WIRE_VALUE_LEN: usize = 8192;
 /// stale bytes from an earlier update of a *different* property. bionic
 /// cannot even express such a value (its API takes C strings).
 pub fn validate_value_len(name: &str, value: &str) -> Result<()> {
-    if value.as_bytes().contains(&0) {
-        return Err(Error::InvalidArgument(
-            "value must not contain NUL bytes".into(),
-        ));
-    }
+    reject_value_nul(value)?;
     if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
         return Err(Error::InvalidArgument(format!(
             "value too long: {} bytes (max {} for non-'ro.' properties)",
             value.len(),
             PROP_VALUE_MAX - 1
         )));
+    }
+    Ok(())
+}
+
+/// [`validate_value_len`] with the `ro.` long-property exemption
+/// unconditionally disabled. For in-place update paths
+/// (`SystemProperties::update`) that cannot promote a value to the
+/// out-of-line long representation, so the short-value cap applies
+/// regardless of the property's real name.
+#[cfg(feature = "builder")]
+pub(crate) fn validate_short_value_len(value: &str) -> Result<()> {
+    reject_value_nul(value)?;
+    if value.len() >= PROP_VALUE_MAX {
+        return Err(Error::InvalidArgument(format!(
+            "value too long: {} bytes (max {} for an in-place update)",
+            value.len(),
+            PROP_VALUE_MAX - 1
+        )));
+    }
+    Ok(())
+}
+
+fn reject_value_nul(value: &str) -> Result<()> {
+    if value.as_bytes().contains(&0) {
+        return Err(Error::InvalidArgument(
+            "value must not contain NUL bytes".into(),
+        ));
     }
     Ok(())
 }
@@ -124,8 +146,9 @@ pub(crate) fn validate_no_interior_nul(kind: &str, s: &str) -> Result<()> {
 /// - no consecutive `.`
 /// - allowed chars: ASCII alphanumeric, `_`, `.`, `-`, `@`, `:`
 ///
-/// The V1 wire protocol additionally enforces `name.len() <= PROP_NAME_MAX`
-/// at the message-encoding layer; V2 has no length cap here.
+/// The V1 wire protocol additionally enforces `name.len() < PROP_NAME_MAX`
+/// at the message-encoding layer (the fixed buffer must keep room for the
+/// NUL terminator); V2 has no length cap here.
 pub fn validate_property_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::InvalidArgument("name is empty".into()));
@@ -175,6 +198,16 @@ mod tests {
     #[test]
     fn value_len_at_cap_ok_for_ro() {
         assert!(validate_value_len("ro.foo", "x".repeat(PROP_VALUE_MAX * 10).as_str()).is_ok());
+    }
+
+    #[cfg(feature = "builder")]
+    #[test]
+    fn short_value_len_ignores_ro_exemption() {
+        // The in-place-update variant enforces the cap even for `ro.`
+        // names — there is no name argument to smuggle an exemption in.
+        assert!(validate_short_value_len("x".repeat(PROP_VALUE_MAX - 1).as_str()).is_ok());
+        assert!(validate_short_value_len("x".repeat(PROP_VALUE_MAX).as_str()).is_err());
+        assert!(validate_short_value_len("a\0bc").is_err());
     }
 
     #[test]

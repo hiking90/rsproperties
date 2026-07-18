@@ -11,6 +11,12 @@ use zerocopy_derive::*;
 use crate::errors::*;
 use crate::property_area::MemoryMap;
 
+/// In-band "no context/type" sentinel used by the serialized format
+/// (bionic uses `~0u` the same way). A `context_index`/`type_index` of
+/// this value means "not set at this node — inherit from the walk so
+/// far". Named so the `!0` magic doesn't scatter across comparisons.
+pub(crate) const NO_INDEX: u32 = !0;
+
 /// Binary search returning the matching index or `None` for miss. Takes
 /// `usize` directly — callers hold `usize` lengths, and round-tripping
 /// through `u32` would add a silent truncation point if a count's type
@@ -148,7 +154,7 @@ impl<'a> TrieNode<'a> {
             .map(|pe| (pe.context_index, pe.type_index))
             .unwrap_or_else(|e| {
                 warn!("Failed to read PropertyEntry: {e}");
-                (!0, !0)
+                (NO_INDEX, NO_INDEX)
             })
     }
 
@@ -423,6 +429,16 @@ impl<'a> PropertyInfoArea<'a> {
         Ok(*value as _)
     }
 
+    /// Applies the first (longest, by serialization order) prefix entry
+    /// matching `remaining_name`.
+    ///
+    /// Deliberately stricter than AOSP on inconsistent files: AOSP
+    /// compares only `namelen` bytes (`strncmp`), trusting the field,
+    /// while this port length-gates on `namelen` but matches against the
+    /// full NUL-terminated name — so a corrupt `namelen < strlen(name)`
+    /// *misses* here instead of matching on a silently truncated prefix.
+    /// Consistent files (the builder always writes `namelen ==
+    /// strlen(name)`) behave identically.
     fn check_prefix_match(
         &self,
         remaining_name: &str,
@@ -457,10 +473,10 @@ impl<'a> PropertyInfoArea<'a> {
                 continue;
             };
             if remaining_name.starts_with(prefix_name) {
-                if prefix.context_index != !0 {
+                if prefix.context_index != NO_INDEX {
                     *context_index = prefix.context_index;
                 }
-                if prefix.type_index != !0 {
+                if prefix.type_index != NO_INDEX {
                     *type_index = prefix.type_index;
                 }
                 return;
@@ -469,8 +485,8 @@ impl<'a> PropertyInfoArea<'a> {
     }
 
     pub(crate) fn get_property_info_indexes(&self, name: &str) -> (u32, u32) {
-        let mut return_context_index: u32 = !0;
-        let mut return_type_index: u32 = !0;
+        let mut return_context_index: u32 = NO_INDEX;
+        let mut return_type_index: u32 = NO_INDEX;
         let mut remaining_name = name;
         let mut trie_node = self.root_node();
 
@@ -479,10 +495,10 @@ impl<'a> PropertyInfoArea<'a> {
             // both indexes — separate accessors would double the per-level
             // cost of this lookup hot path.
             let (context_index, type_index) = trie_node.context_and_type_indexes();
-            if context_index != !0 {
+            if context_index != NO_INDEX {
                 return_context_index = context_index;
             }
-            if type_index != !0 {
+            if type_index != NO_INDEX {
                 return_type_index = type_index;
             }
 
@@ -535,13 +551,13 @@ impl<'a> PropertyInfoArea<'a> {
                 continue;
             };
             if exact_match_name == remaining_name {
-                let context_index = if exact_match.context_index != !0 {
+                let context_index = if exact_match.context_index != NO_INDEX {
                     exact_match.context_index
                 } else {
                     return_context_index
                 };
 
-                let type_index = if exact_match.type_index != !0 {
+                let type_index = if exact_match.type_index != NO_INDEX {
                     exact_match.type_index
                 } else {
                     return_type_index
@@ -556,6 +572,11 @@ impl<'a> PropertyInfoArea<'a> {
             }
         }
 
+        // AOSP parity: upstream re-runs the prefix scan here even though
+        // the loop's final iteration already covered this node with the
+        // same arguments (same first match, same overwrite) — kept for
+        // behavioral parity with the reference walk, not because it can
+        // change the result.
         self.check_prefix_match(
             remaining_name,
             &trie_node,

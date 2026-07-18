@@ -49,15 +49,17 @@ fn main() {
     // Parse command line arguments
     let args = Args::parse();
 
-    // Create configuration
-    let config = PropertyConfig {
-        properties_dir: args.properties_dir,
-        socket_dir: args.socket_dir,
-    };
-
     // Initialize rsproperties only if custom directories are specified
-    if config.properties_dir.is_some() || config.socket_dir.is_some() {
-        rsproperties::init(config);
+    // (PropertyConfig is #[non_exhaustive] — build it through the builder).
+    if args.properties_dir.is_some() || args.socket_dir.is_some() {
+        let mut builder = PropertyConfig::builder();
+        if let Some(dir) = args.properties_dir {
+            builder = builder.properties_dir(dir);
+        }
+        if let Some(dir) = args.socket_dir {
+            builder = builder.socket_dir(dir);
+        }
+        rsproperties::init(builder.build());
     }
 
     // Validate property name and value

@@ -22,6 +22,21 @@ pub(crate) struct TrieNodeArena {
     current_data_pointer: usize,
 }
 
+/// Compile-time guard for arena-stored types: alignment must not exceed
+/// the 4 bytes the `Vec<u32>` backing guarantees. The runtime check in
+/// `get_object` validates the *runtime pointer*, which for `align > 4`
+/// would pass or fail depending on where the allocator happened to place
+/// the buffer — while the parser's mmap side re-checks the *file offset*
+/// and would reject the file. A stricter-aligned type must fail the
+/// build, not produce files the builder blesses and the parser rejects.
+struct AlignFitsArena<T>(std::marker::PhantomData<T>);
+impl<T> AlignFitsArena<T> {
+    const OK: () = assert!(
+        mem::align_of::<T>() <= mem::size_of::<u32>(),
+        "arena-stored types must have alignment <= 4 (the Vec<u32> backing guarantee)"
+    );
+}
+
 impl TrieNodeArena {
     pub(crate) fn new() -> Self {
         Self {
@@ -62,6 +77,7 @@ impl TrieNodeArena {
     where
         T: FromBytes + zerocopy::IntoBytes + zerocopy::KnownLayout,
     {
+        let () = AlignFitsArena::<T>::OK;
         let size = mem::size_of::<T>();
         let end = offset.saturating_add(size);
         if end > self.current_data_pointer {
@@ -81,16 +97,18 @@ impl TrieNodeArena {
     }
 
     #[inline(always)]
-    pub(crate) fn allocate_object<T>(&mut self) -> usize {
-        let size = mem::size_of::<T>();
-
-        self.allocate_data(size)
+    pub(crate) fn allocate_object<T>(&mut self) -> Result<u32> {
+        // Guarded at allocation too — this is where a stricter-aligned
+        // type would first break the offset discipline.
+        let () = AlignFitsArena::<T>::OK;
+        self.allocate_data(mem::size_of::<T>())
     }
 
     #[inline(always)]
-    pub(crate) fn allocate_uint32_array(&mut self, length: usize) -> usize {
-        let size = mem::size_of::<u32>() * length;
-
+    pub(crate) fn allocate_uint32_array(&mut self, length: usize) -> Result<u32> {
+        let size = length
+            .checked_mul(mem::size_of::<u32>())
+            .ok_or_else(|| Error::FileValidation(format!("Array len overflow: {length}")))?;
         self.allocate_data(size)
     }
 
@@ -122,18 +140,19 @@ impl TrieNodeArena {
         })
     }
 
-    pub(crate) fn allocate_and_write_string(&mut self, string: &str) -> usize {
+    pub(crate) fn allocate_and_write_string(&mut self, string: &str) -> Result<u32> {
         let len = string.len();
-        let offset = self.allocate_data(len + 1);
+        let offset = self.allocate_data(len + 1)?;
+        let start = offset as usize;
 
         let dst = self.bytes_mut();
-        dst[offset..offset + len].copy_from_slice(string.as_bytes());
-        dst[offset + len] = 0; // null terminator
-        offset
+        dst[start..start + len].copy_from_slice(string.as_bytes());
+        dst[start + len] = 0; // null terminator
+        Ok(offset)
     }
 
-    pub(crate) fn allocate_and_write_uint32(&mut self, value: u32) {
-        let offset = self.allocate_data(mem::size_of::<u32>());
+    pub(crate) fn allocate_and_write_uint32(&mut self, value: u32) -> Result<()> {
+        let offset = self.allocate_data(mem::size_of::<u32>())? as usize;
         // A plain byte copy needs no alignment at all, so the previous
         // unsafe pointer write (whose safety leaned on allocator behavior
         // the language doesn't guarantee) is unnecessary.
@@ -146,6 +165,7 @@ impl TrieNodeArena {
         // little-endian device or vice versa.
         self.bytes_mut()[offset..offset + mem::size_of::<u32>()]
             .copy_from_slice(&value.to_ne_bytes());
+        Ok(())
     }
 
     /// Reserves `size` bytes, rounded up to a multiple of `size_of::<u32>()`,
@@ -153,17 +173,26 @@ impl TrieNodeArena {
     /// allocation, which is guaranteed to be `u32`-aligned (the pointer
     /// starts at 0 and every allocation is u32-aligned in length, so the
     /// invariant is preserved across calls).
-    fn allocate_data(&mut self, size: usize) -> usize {
+    ///
+    /// The on-disk format stores offsets as `u32`, and the bound is
+    /// enforced HERE, at allocation time: every offset this arena ever
+    /// returns fits `u32` by construction, so the serializer needs no
+    /// retroactive "if the final size fits, all earlier casts did"
+    /// argument — over-large input fails with a typed error at the
+    /// allocation that crossed the line.
+    fn allocate_data(&mut self, size: usize) -> Result<u32> {
         let aligned_size = crate::bionic_align(size, mem::size_of::<u32>());
 
-        // Checked/saturating arithmetic per the crate discipline; both
-        // expressions can only overflow after an allocation of half the
-        // address space, but wrapping in release mode would silently
-        // corrupt offsets rather than fail.
         let needed = self
             .current_data_pointer
             .checked_add(aligned_size)
-            .expect("arena allocation overflows usize");
+            .filter(|&n| u32::try_from(n).is_ok())
+            .ok_or_else(|| {
+                Error::FileValidation(format!(
+                    "Serialized property info exceeds the u32 offset space: {} + {aligned_size} bytes",
+                    self.current_data_pointer
+                ))
+            })?;
         let byte_len = self.data.len() * mem::size_of::<u32>();
         if needed > byte_len {
             // Standard doubling growth, but never less than what this
@@ -174,10 +203,11 @@ impl TrieNodeArena {
                 .resize(target_bytes.div_ceil(mem::size_of::<u32>()), 0);
         }
 
-        let offset = self.current_data_pointer;
+        // Fits by the `needed` gate above (`offset <= needed <= u32::MAX`).
+        let offset = self.current_data_pointer as u32;
         self.current_data_pointer += aligned_size;
 
-        offset
+        Ok(offset)
     }
 
     pub(crate) fn size(&self) -> usize {
@@ -210,7 +240,7 @@ mod arena_tests {
     /// resize slack) behave as in production.
     fn arena_with(size: usize) -> TrieNodeArena {
         let mut arena = TrieNodeArena::new();
-        arena.allocate_data(size);
+        arena.allocate_data(size).unwrap();
         arena
     }
 
@@ -218,8 +248,9 @@ mod arena_tests {
     fn test_get_object_out_of_bounds() {
         let mut arena = arena_with(100);
 
-        // offset + size > allocated extent
-        let result = arena.get_object::<u64>(96);
+        // offset + size > allocated extent. `[u32; 2]` (size 8, align 4) —
+        // an align-8 type like u64 no longer compiles against the arena.
+        let result = arena.get_object::<[u32; 2]>(96);
         assert!(result.is_err());
 
         if let Err(e) = result {
@@ -232,7 +263,7 @@ mod arena_tests {
         let mut arena = arena_with(100);
         // The second allocation triggers doubling growth (needed=104 →
         // resize to 200), leaving zeroed slack past the allocated extent.
-        arena.allocate_data(4);
+        arena.allocate_data(4).unwrap();
 
         assert!(arena.data.len() * mem::size_of::<u32>() > 108);
         // Access inside the slack must fail even though `data.len()`

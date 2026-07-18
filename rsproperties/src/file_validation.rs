@@ -15,15 +15,10 @@ pub(crate) fn validate_file_metadata(
     path: &std::path::Path,
     min_size: u64,
 ) -> Result<()> {
-    // Platform-specific MetadataExt imports
-    #[cfg(target_os = "android")]
-    use std::os::android::fs::MetadataExt;
-    #[cfg(target_os = "linux")]
-    use std::os::linux::fs::MetadataExt;
-    #[cfg(target_os = "macos")]
-    use std::os::macos::fs::MetadataExt;
-
-    use rustix::fs;
+    // The portable-across-unix trait (uniform `u32`/`u64` accessors), not
+    // the per-OS `st_*` variants — those needed three cfg'd imports plus a
+    // macOS-only integer cast, and broke the build on every other unix.
+    use std::os::unix::fs::MetadataExt;
 
     // Only regular files are acceptable mmap targets. The metadata comes
     // from an already-open fd (fstat), so this check is race-free; without
@@ -37,10 +32,10 @@ pub(crate) fn validate_file_metadata(
     }
 
     // Check file size first (applies to all modes)
-    if metadata.st_size() < min_size {
+    if metadata.size() < min_size {
         let error_msg = format!(
             "File too small: size={}, min_size={} for {:?}",
-            metadata.st_size(),
+            metadata.size(),
             min_size,
             path
         );
@@ -48,18 +43,13 @@ pub(crate) fn validate_file_metadata(
         return Err(Error::FileSize(error_msg));
     }
 
-    #[cfg(any(target_os = "android", target_os = "linux"))]
-    let check_permissions = metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits());
-
-    #[cfg(target_os = "macos")]
-    let check_permissions =
-        metadata.st_mode() & (fs::Mode::WGRP.bits() | fs::Mode::WOTH.bits()) as u32;
-
-    // Check write permissions (applies to all modes)
-    if check_permissions != 0 {
+    // Check write permissions (applies to all modes). 0o022 = the
+    // group-write | other-write bits (S_IWGRP | S_IWOTH).
+    let writable_by_others = metadata.mode() & 0o022;
+    if writable_by_others != 0 {
         let error_msg = format!(
             "File has group or other write permissions: mode={:#o} for {:?}",
-            metadata.st_mode(),
+            metadata.mode(),
             path
         );
         log::error!("{error_msg}");
@@ -75,11 +65,15 @@ pub(crate) fn validate_file_metadata(
     // differently for the same fixture files. `debug_assertions` alone
     // draws the line uniformly at dev-vs-release.
     //
-    // Caveat: `debug-assertions` is not a security switch — a release
+    // `debug-assertions` is not a security switch, though: a release
     // profile with `debug-assertions = true` (commonly enabled for
-    // overflow checks) silently disables this check. Make the skip
-    // observable so such deployments can notice.
-    let skip_ownership_check = cfg!(debug_assertions);
+    // overflow checks — this workspace's bench profile does exactly that)
+    // would silently disable the check as a side effect. Deployments in
+    // that situation opt back in explicitly with the
+    // `strict-file-validation` feature, which enforces ownership
+    // regardless of the profile. The remaining skip is logged so it is
+    // observable either way.
+    let skip_ownership_check = cfg!(debug_assertions) && !cfg!(feature = "strict-file-validation");
 
     if skip_ownership_check {
         // AtomicBool, not `Once`: a logger backed by property reads would
@@ -95,11 +89,11 @@ pub(crate) fn validate_file_metadata(
         }
     }
 
-    if !skip_ownership_check && (metadata.st_uid() != 0 || metadata.st_gid() != 0) {
+    if !skip_ownership_check && (metadata.uid() != 0 || metadata.gid() != 0) {
         let error_msg = format!(
             "File not owned by root: uid={}, gid={} for {:?}",
-            metadata.st_uid(),
-            metadata.st_gid(),
+            metadata.uid(),
+            metadata.gid(),
             path
         );
         log::error!("{error_msg}");

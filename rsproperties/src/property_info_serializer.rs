@@ -3,7 +3,7 @@
 
 use log::{info, warn};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::Path;
 
 use crate::errors::*;
@@ -116,16 +116,20 @@ impl PropertyInfoEntry {
 
         if match_operation == Some("exact") {
             exact_match = true;
-        } else if match_operation != Some("prefix") && require_prefix_or_exact {
-            // `unwrap_or` instead of `{:?}` so the user-facing parse error
-            // doesn't leak Rust's `Some("...")`/`None` notation.
+        } else if let Some(op) = match_operation.filter(|&op| op != "prefix") {
+            // AOSP parity (`ParsePropertyInfoLine`): a *missing* operation
+            // is legal even with `require_prefix_or_exact` — legacy
+            // two-token `<property> <context>` lines default to prefix
+            // match. Only a token that is present but neither
+            // 'prefix'/'exact' is an error.
             // No log here: the only caller (`parse_from_file`) already
             // warns with line context — logging both duplicated every
             // parse failure.
-            let op = match_operation.unwrap_or("<missing>");
-            return Err(Error::Parse(format!(
-                "Match operation '{op}' is not valid. Must be 'prefix' or 'exact'"
-            )));
+            if require_prefix_or_exact {
+                return Err(Error::Parse(format!(
+                    "Match operation '{op}' is not valid. Must be 'prefix' or 'exact'"
+                )));
+            }
         }
 
         if !type_strings.is_empty() && !Self::is_type_valid(&type_strings) {
@@ -170,16 +174,25 @@ impl PropertyInfoEntry {
         // `build_property_parser`).
         let mut raw_line = Vec::new();
         loop {
-            raw_line.clear();
-            let read = reader
-                .read_until(b'\n', &mut raw_line)
-                .with_context_location(|| {
-                    format!("Failed to read line {} of {filename:?}", line_count + 1)
-                })?;
+            // Bounded like `build_property_parser`'s loop: same crafted-
+            // input threat model, same fix.
+            let (read, truncated) =
+                crate::build_property_parser::read_bounded_line(&mut reader, &mut raw_line)
+                    .with_context_location(|| {
+                        format!("Failed to read line {} of {filename:?}", line_count + 1)
+                    })?;
             if read == 0 {
                 break;
             }
             line_count += 1;
+            if truncated {
+                warn!("Line {line_count}: skipping over-long line");
+                errors.push(Error::Parse(format!(
+                    "line {line_count} of {filename:?}: line longer than {} bytes",
+                    crate::build_property_parser::MAX_LINE_LEN
+                )));
+                continue;
+            }
 
             let line = match std::str::from_utf8(&raw_line) {
                 Ok(line) => line.trim(),
@@ -304,6 +317,19 @@ mod tests {
         assert_eq!(entry.context, "u:object_r:build_prop:s0");
         assert_eq!(entry.type_str, "");
         assert!(!entry.exact_match);
+
+        // AOSP parity: a legacy two-token line is legal even when
+        // require_prefix_or_exact is true — a MISSING operation defaults
+        // to prefix match; only a present-but-invalid one is an error.
+        let entry =
+            PropertyInfoEntry::parse_from_line("ro.build.host u:object_r:build_prop:s0", true)
+                .unwrap();
+        assert!(!entry.exact_match);
+        assert!(PropertyInfoEntry::parse_from_line(
+            "ro.build.host u:object_r:build_prop:s0 bogus string",
+            true
+        )
+        .is_err());
 
         let entry = PropertyInfoEntry::parse_from_line(
             "ro.build.host u:object_r:build_prop:s0 exact enum string int",

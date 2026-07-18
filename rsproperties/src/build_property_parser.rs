@@ -4,7 +4,7 @@
 use log::{error, warn};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use crate::errors::*;
@@ -32,6 +32,55 @@ const MAX_TOTAL_LOADS: u32 = 1_000;
 /// Currently a no-op; see TODO in caller.
 fn check_permissions(_key: &str, _value: &str, _context: &str) {
     // TODO: Implement proper permission checking
+}
+
+/// Bound on one line's in-memory size. Real prop-file lines are a few
+/// hundred bytes; the cap exists so a crafted newline-less file cannot
+/// grow a single `read_until` buffer without bound — the same threat
+/// model as [`MAX_IMPORT_DEPTH`] / [`MAX_TOTAL_LOADS`].
+pub(crate) const MAX_LINE_LEN: usize = 64 * 1024;
+
+/// `read_until(b'\n')` with `MAX_LINE_LEN` as a hard memory bound.
+/// Returns `(bytes_read_this_line, truncated)`; `(0, false)` is EOF. An
+/// over-long line is drained (in bounded chunks) to its newline and
+/// reported as `truncated = true` with only the first `MAX_LINE_LEN`
+/// bytes in `buf` — callers warn and skip it.
+pub(crate) fn read_bounded_line(
+    reader: &mut impl BufRead,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<(usize, bool)> {
+    buf.clear();
+    // `+ 1`: reading one byte past the cap distinguishes "line of exactly
+    // MAX_LINE_LEN bytes" (fine) from "line longer than the cap".
+    // UFCS on a reborrow: plain `reader.take(...)` resolves to `take`
+    // *by value* on the opaque `impl BufRead` and fails to move out of
+    // the `&mut`.
+    let read = Read::take(&mut *reader, MAX_LINE_LEN as u64 + 1).read_until(b'\n', buf)?;
+    if buf.len() <= MAX_LINE_LEN || buf.ends_with(b"\n") {
+        return Ok((read, false));
+    }
+    // Over-long line: keep only the bounded prefix and drain the rest up
+    // to (and including) its newline through the reader's own buffer —
+    // memory stays bounded no matter the line length.
+    buf.truncate(MAX_LINE_LEN);
+    let mut total = read;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok((total, true)); // EOF inside the over-long line
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(nl) => {
+                reader.consume(nl + 1);
+                return Ok((total + nl + 1, true));
+            }
+            None => {
+                let n = available.len();
+                reader.consume(n);
+                total += n;
+            }
+        }
+    }
 }
 
 /// Loads `key=value` pairs from an Android build.prop-style file into
@@ -73,19 +122,44 @@ pub fn load_properties_from_file(
     )
 }
 
-/// Expands `${property}` references in an import path against the entries
+/// Expands property references in an import path against the entries
 /// loaded so far (AOSP expands against the live property store; during a
-/// bulk load the accumulator map is the equivalent source). Returns `None`
-/// when a reference is unterminated or names an unknown property.
+/// bulk load the accumulator map is the equivalent source).
+///
+/// AOSP `init/util.cpp::ExpandProps` parity:
+/// - `$$` is an escape for a literal `$`;
+/// - `${name}` substitutes the property's value;
+/// - `${name:-default}` falls back to `default` when the property is
+///   missing **or empty** (AOSP's `GetProperty(name, "")` cannot tell the
+///   two apart);
+/// - a `$` not followed by `{` or `$`, an unterminated `${`, or a
+///   missing/empty property without a default is an error → `None`
+///   (AOSP returns `Error()` for each; the caller logs and skips the
+///   import).
 fn expand_import_path(raw: &str, properties: &HashMap<String, String>) -> Option<String> {
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let end = after.find('}')?;
-        out.push_str(properties.get(&after[..end])?);
-        rest = &after[end + 1..];
+    while let Some(dollar) = rest.find('$') {
+        out.push_str(&rest[..dollar]);
+        let after = &rest[dollar + 1..];
+        if let Some(tail) = after.strip_prefix('$') {
+            out.push('$');
+            rest = tail;
+            continue;
+        }
+        let body = after.strip_prefix('{')?;
+        let end = body.find('}')?;
+        let reference = &body[..end];
+        let (name, default) = match reference.split_once(":-") {
+            Some((name, default)) => (name, Some(default)),
+            None => (reference, None),
+        };
+        match properties.get(name).map(String::as_str) {
+            Some(value) if !value.is_empty() => out.push_str(value),
+            // Missing and empty collapse to the default, like AOSP.
+            _ => out.push_str(default?),
+        }
+        rest = &body[end + 1..];
     }
     out.push_str(rest);
     Some(out)
@@ -181,11 +255,9 @@ fn load_properties_body(
     let mut raw_line = Vec::new();
     let mut line_count = 0usize;
     loop {
-        raw_line.clear();
         // Lazy context: this runs per line — the closure only allocates on
         // the error path.
-        let read = reader
-            .read_until(b'\n', &mut raw_line)
+        let (read, truncated) = read_bounded_line(&mut reader, &mut raw_line)
             .with_context_location(|| {
                 format!("Failed to read line {} of {filename:?}", line_count + 1)
             })?;
@@ -193,6 +265,12 @@ fn load_properties_body(
             break;
         }
         line_count += 1;
+        if truncated {
+            warn!(
+                "Line {line_count} of {filename:?}: skipping line longer than {MAX_LINE_LEN} bytes"
+            );
+            continue;
+        }
 
         let Ok(line) = std::str::from_utf8(&raw_line) else {
             warn!("Line {line_count} of {filename:?}: skipping non-UTF-8 line");
@@ -267,14 +345,14 @@ fn load_properties_body(
         }
 
         if key.starts_with("ctl.") || key == "sys.powerctl" || key == RESTORECON_PROPERTY {
-            error!("Line {line_count}: Ignoring disallowed property '{key}' with special meaning in prop file '{filename:?}'");
+            error!("Line {line_count} of {filename:?}: Ignoring disallowed property '{key}' with special meaning");
             continue;
         }
 
         check_permissions(key, value, context);
         if let Some(old_value) = properties.insert(key.to_string(), value.to_string()) {
             warn!(
-                "Line {line_count}: Overriding previous property '{key}':'{old_value}' with new value '{value}'"
+                "Line {line_count} of {filename:?}: Overriding previous property '{key}':'{old_value}' with new value '{value}'"
             );
         }
     }
@@ -378,6 +456,59 @@ mod tests {
         let mut properties = HashMap::new();
         load_properties_from_file(&root, None, "u:r:init:s0", &mut properties).unwrap();
         assert_eq!(properties.get("key"), Some(&"from_overlay".to_string()));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_expand_props_aosp_parity() {
+        let mut props = HashMap::new();
+        props.insert("a".to_string(), "va".to_string());
+        props.insert("empty".to_string(), String::new());
+        // `$$` escapes a literal dollar.
+        assert_eq!(expand_import_path("x$$y", &props).as_deref(), Some("x$y"));
+        assert_eq!(
+            expand_import_path("/${a}/f", &props).as_deref(),
+            Some("/va/f")
+        );
+        // `${name:-default}` falls back on missing AND empty values.
+        assert_eq!(
+            expand_import_path("${miss:-d}", &props).as_deref(),
+            Some("d")
+        );
+        assert_eq!(
+            expand_import_path("${empty:-d}", &props).as_deref(),
+            Some("d")
+        );
+        // Missing/empty without a default is an error.
+        assert_eq!(expand_import_path("${miss}", &props), None);
+        assert_eq!(expand_import_path("${empty}", &props), None);
+        // AOSP requires `{` after `$`.
+        assert_eq!(expand_import_path("a$b", &props), None);
+        // Unterminated reference.
+        assert_eq!(expand_import_path("${a", &props), None);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_read_bounded_line_truncates_giant_line() {
+        let mut data = vec![b'x'; MAX_LINE_LEN + 100];
+        data.push(b'\n');
+        data.extend_from_slice(b"next=1\n");
+        let mut reader = BufReader::new(std::io::Cursor::new(data));
+        let mut buf = Vec::new();
+
+        let (read, truncated) = read_bounded_line(&mut reader, &mut buf).unwrap();
+        assert!(truncated);
+        assert_eq!(buf.len(), MAX_LINE_LEN);
+        assert_eq!(read, MAX_LINE_LEN + 101); // whole line consumed, incl. newline
+
+        // The next line must start cleanly after the drained newline.
+        let (_, truncated) = read_bounded_line(&mut reader, &mut buf).unwrap();
+        assert!(!truncated);
+        assert_eq!(&buf[..], b"next=1\n");
+
+        let (read, _) = read_bounded_line(&mut reader, &mut buf).unwrap();
+        assert_eq!(read, 0); // EOF
     }
 
     #[cfg(not(target_os = "android"))]

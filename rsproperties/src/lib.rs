@@ -10,24 +10,19 @@
 //! - Get system properties.
 //! - Set system properties.
 //! - Wait for system properties.
-//! - Serialize system properties.
-//! - Deserialize system properties.
+//! - Serialize/deserialize the property-info trie (requires the `builder`
+//!   feature).
 //!
 //! ## Usage
 //!
 //! ```rust,no_run
-//! #[cfg(target_os = "android")]
-//! {
-//!     // Get a value of the property.
-//!     let value: String = rsproperties::get_or("ro.build.version.sdk", "0".to_owned());
-//!     println!("ro.build.version.sdk: {}", value);
+//! // Get a value of the property.
+//! let value: String = rsproperties::get_or("ro.build.version.sdk", "0".to_owned());
+//! println!("ro.build.version.sdk: {}", value);
 //!
-//!     // Set a value of the property - use string literals for compatibility
-//!     rsproperties::set("test.property", "test.value").unwrap();
-//!
-//!     // For Android system properties, prefer string format used by the system
-//!     rsproperties::set("ro.debuggable", "1").unwrap();  // Not &true
-//! }
+//! // Set a value of the property - use string literals for compatibility
+//! // with values other Android components write (e.g. "1", not "true").
+//! rsproperties::set("test.property", "test.value").unwrap();
 //! ```
 
 // Forward-compat with Rust 2024 edition: `unsafe fn` bodies must wrap
@@ -42,7 +37,13 @@ use std::{
 };
 
 /// Configuration for initializing the property system
+///
+/// `#[non_exhaustive]`: construct via [`PropertyConfig::builder`],
+/// [`PropertyConfig::with_both_dirs`], `From`, or `..Default::default()`
+/// struct update — never an exhaustive literal — so adding a field is not
+/// semver-breaking (which is the reason the builder exists at all).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct PropertyConfig {
     /// Directory for reading system properties (default: "/dev/__properties__")
     pub properties_dir: Option<PathBuf>,
@@ -242,10 +243,7 @@ static SYSTEM_PROPERTIES: OnceLock<
 /// init(PropertyConfig::from(PathBuf::from("/custom/properties")));
 ///
 /// // Full configuration
-/// let config = PropertyConfig {
-///     properties_dir: Some(PathBuf::from("/custom/properties")),
-///     socket_dir: Some(PathBuf::from("/custom/socket")),
-/// };
+/// let config = PropertyConfig::with_both_dirs("/custom/properties", "/custom/socket");
 /// init(config);
 /// ```
 pub fn init(config: PropertyConfig) {
@@ -414,6 +412,12 @@ pub(crate) fn bionic_align(value: usize, alignment: usize) -> usize {
 /// while `get_or` follows the Android convention (empty = unset) and
 /// falls back to the default.
 ///
+/// The `FromStr` parse runs while the property area's internal read lock
+/// is held (see [`SystemProperties::read_with`]): a `FromStr` impl that
+/// blocks, or re-enters this crate's property API, can deadlock against a
+/// same-process `builder` writer. Keep parsing cheap and non-reentrant —
+/// every ordinary `FromStr` (ints, floats, `String`) is fine.
+///
 /// # Examples
 /// ```rust,no_run
 /// use rsproperties::get;
@@ -454,6 +458,9 @@ where
 /// (e.g. an allocated `String`), prefer [`get_or_else`], which only
 /// constructs it on the fallback path.
 ///
+/// The `FromStr` parse runs under the property area's read lock — see the
+/// caution on [`get`].
+///
 /// # Examples
 /// ```rust,no_run
 /// use rsproperties::get_or;
@@ -479,6 +486,10 @@ where
 /// property store failed to initialize (see [`try_system_properties`]:
 /// failure is latched), so the found-and-parsed hot path never pays for
 /// constructing it.
+///
+/// The `FromStr` parse runs under the property area's read lock — see the
+/// caution on [`get`]. (The `default` closure runs after the lock is
+/// released.)
 ///
 /// # Examples
 /// ```rust,no_run
@@ -534,8 +545,10 @@ where
 /// set("test.float.property", &3.14).unwrap();       // Stored as "3.14"
 /// set("test.string.property", &"hello").unwrap();   // Stored as "hello"
 ///
-/// // For Android system properties, prefer string literals for compatibility
-/// set("ro.debuggable", "1").unwrap();               // Better than set("ro.debuggable", &1)
+/// // For well-known system properties, prefer string literals so the
+/// // stored form matches what other Android components expect ("1", not
+/// // "true"). Note `ro.*` properties are write-once: the property service
+/// // rejects setting one that already has a value.
 /// set("persist.sys.timezone", "Asia/Seoul").unwrap();
 /// ```
 ///

@@ -15,6 +15,11 @@ description = "Pure Rust implementation of Android's property system with cross-
 [features]
 default = []
 builder = []
+# Enforce the root-ownership check on property files even in builds with
+# debug-assertions enabled (which normally relax it for dev/test). For
+# release profiles that turn `debug-assertions = true` back on (e.g. for
+# overflow checks) without intending to relax file validation.
+strict-file-validation = []
 
 [dependencies]
 rustix.workspace = true

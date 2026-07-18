@@ -53,6 +53,17 @@ fn try_build_context_node(
         )));
     }
     let context_name = context_cstr.to_str()?;
+    // Legitimate SELinux context names are pure ASCII. Rejecting anything
+    // else closes what the ASCII case-fold below cannot: macOS APFS also
+    // aliases Unicode case variants and NFC/NFD normalization forms onto
+    // one file, so two "different" non-ASCII names could pass the
+    // duplicate check yet unlink each other's area files — exactly the
+    // destructive collision these checks exist to prevent.
+    if !context_name.is_ascii() {
+        return Err(Error::FileValidation(format!(
+            "context entry {i}: context name {context_name:?} contains non-ASCII characters"
+        )));
+    }
     // The context name comes from file content and becomes a filename via
     // `dirname.join()` — which *replaces* `dirname` entirely when handed an
     // absolute path, and descends on `/` or `..`. On the writable path the
@@ -250,6 +261,14 @@ impl ContextsSerialized {
             .mode(0o600)
             .open(&lock_path)
             .context_with_location(format!("Failed to open writer lock {lock_path:?}"))?;
+        // `.mode(0o600)` above only applies when the file is *created*; a
+        // leftover lock file with wider permissions (e.g. 0644 from an
+        // older version) would keep them and defeat the anti-squat
+        // rationale. Re-assert the mode on the open fd before taking the
+        // lock. (An attacker who already holds an open fd is not stopped —
+        // this closes the window for every open that comes after.)
+        fs::fchmod(&lock_file, fs::Mode::RUSR | fs::Mode::WUSR)
+            .context_with_location(format!("Failed to restrict mode of {lock_path:?}"))?;
         fs::flock(&lock_file, fs::FlockOperation::NonBlockingLockExclusive).map_err(|e| {
             error!("Another writer holds the property area lock {lock_path:?}: {e}");
             Error::Lock(format!(
@@ -301,7 +320,12 @@ impl ContextsSerialized {
                 // affected property. The returned error still carries the
                 // full context.
                 debug!("Context entry {index} for {what} was skipped during init");
-                Err(Error::NotFound(format!(
+                // `FileValidation`, NOT `NotFound`: callers fold `NotFound`
+                // into "property absent" (`SystemProperties::find` returns
+                // `Ok(None)`), and a context that *exists* in property_info
+                // but was corrupt at init must not masquerade as absence —
+                // it has to propagate as an error.
+                Err(Error::FileValidation(format!(
                     "context entry {index} for {what} unavailable (corrupt at init)"
                 )))
             }

@@ -1,8 +1,6 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::num::ParseIntError;
-
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Crate-wide error type.
@@ -38,13 +36,15 @@ pub enum Error {
     #[error("UTF-8 conversion error: {0}")]
     Utf8(#[from] std::str::Utf8Error),
 
+    /// Text that could not be parsed: malformed property names, bad
+    /// property-info lines, and — via `get<T>` — values whose `FromStr`
+    /// failed. This is the **single** parse-failure variant of the public
+    /// API: `get<T>`'s `T::Err` is only bound by `Display`, so the cause
+    /// is flattened into the message rather than carried as `source()`.
+    /// (A `ParseInt(ParseIntError)` sibling variant used to exist but was
+    /// never constructed — one variant, one contract.)
     #[error("Parse error: {0}")]
     Parse(String),
-
-    /// Integer parse failure. `#[from]` for the same `source()`-chain
-    /// reason as [`Error::Utf8`].
-    #[error("Parse integer error: {0}")]
-    ParseInt(#[from] ParseIntError),
 
     #[error("File validation error: {0}")]
     FileValidation(String),

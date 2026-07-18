@@ -307,7 +307,14 @@ impl SystemProperties {
                     Err(e)
                 }
             },
-            Err(e) => Err(e),
+            // Absence is the caller's normal fallback flow — no log. Every
+            // other failure (corrupt trie, bad name) is logged with the
+            // property name, same policy as the arms above.
+            Err(e @ Error::NotFound(_)) => Err(e),
+            Err(e) => {
+                log::error!("Failed to find {name} in property area: {e}");
+                Err(e)
+            }
         }
     }
 
@@ -331,13 +338,10 @@ impl SystemProperties {
             // (Unlike a flattened in-area lookup *failure*, sending `set`
             // down the `add` path here is harmless: `add` hits the same
             // context miss and fails loudly.) The lower layer already
-            // logged the miss at the appropriate level.
-            //
-            // Caveat: `context_node_at` reports a corrupt-at-init context
-            // slot with the same `NotFound` variant, so that case is also
-            // folded into absence here — the current error shape cannot
-            // tell the two apart. (`read_with` propagates it as `Err`
-            // instead; `set` still fails loudly via `add`.)
+            // logged the miss at the appropriate level. A corrupt-at-init
+            // context slot is NOT folded in here: `context_node_at` reports
+            // it as `FileValidation`, which propagates through the arm
+            // below — corruption must stay distinguishable from absence.
             Err(Error::NotFound(_)) => return Ok(None),
             Err(e) => {
                 log::error!("Failed to find property area for {name}: {e}");
@@ -370,24 +374,13 @@ impl SystemProperties {
     /// If the property is updated successfully, it returns Ok(()).
     #[cfg(feature = "builder")]
     pub fn set(&mut self, name: &str, value: &str) -> Result<()> {
+        // No extra logging here: every failure path inside `update`/`add`
+        // already logs with full context — a second line per failure only
+        // duplicated the noise.
         match self.find(name)? {
-            Some(prop_ref) => match self.update(&prop_ref, value) {
-                Ok(_) => {}
-                Err(e) => {
-                    log::error!("Failed to update property {name}: {e}");
-                    return Err(e);
-                }
-            },
-            None => match self.add(name, value) {
-                Ok(_) => {}
-                Err(e) => {
-                    log::error!("Failed to create property {name}: {e}");
-                    return Err(e);
-                }
-            },
+            Some(prop_ref) => self.update(&prop_ref, value),
+            None => self.add(name, value),
         }
-
-        Ok(())
     }
 
     #[cfg(feature = "builder")]
@@ -431,14 +424,14 @@ impl SystemProperties {
                 return Err(Error::PermissionDenied(error_msg));
             }
             // Value-length check — `update` cannot promote to a long
-            // property in-place (`apply_write` rejects on LONG_FLAG). Pass
-            // an empty name so the `ro.` exception in `validate_value_len`
-            // doesn't apply here. Deliberately *after* the `ro.` check
-            // above: for a read-only property the dominant refusal reason
-            // is read-only-ness, and reporting "value too long" instead
-            // would misdirect the caller. Still before the backup snapshot,
-            // preserving "every failure path occurs before set_dirty".
-            crate::wire::validate_value_len("", value).inspect_err(|e| log::error!("{e}"))?;
+            // property in-place (`apply_write` rejects on LONG_FLAG), so
+            // use the short-value variant, which has no `ro.` exemption.
+            // Deliberately *after* the `ro.` check above: for a read-only
+            // property the dominant refusal reason is read-only-ness, and
+            // reporting "value too long" instead would misdirect the
+            // caller. Still before the backup snapshot, preserving "every
+            // failure path occurs before set_dirty".
+            crate::wire::validate_short_value_len(value).inspect_err(|e| log::error!("{e}"))?;
             // Pre-flight LONG check: if the entry was created long, we can't
             // overwrite it in-place. Checking *before* writing the backup
             // keeps backup_area aligned with the entry it shadows.
@@ -695,8 +688,11 @@ impl SystemProperties {
     /// With `None`, the current serial is sampled at entry, so a change
     /// that lands before this call is only observed at the *next* change.
     ///
-    /// On macOS there is no futex; this returns `None` immediately, so do
-    /// not call it in a polling loop there.
+    /// On macOS there is no futex, so this cannot *block*: the
+    /// `old_serial` fast path still works (a serial that already differs
+    /// returns `Some` immediately — that part is a plain atomic load),
+    /// but once the serial has to be waited on, `None` is returned
+    /// immediately. Do not call it in a polling loop there.
     ///
     /// # Same-process builder writers
     ///
@@ -720,7 +716,16 @@ impl SystemProperties {
         // No index → wait on the global serial (lock-free, no slicing).
         let Some(idx) = index else {
             let serial_pa = self.contexts.serial_prop_area().serial();
-            let old = old_serial.unwrap_or_else(|| serial_pa.load(Ordering::Acquire));
+            // Documented already-changed fast path, checked BEFORE the
+            // futex: on Linux it merely pre-empts the syscall's EAGAIN,
+            // but on macOS (no futex — `futex_wait` fails immediately)
+            // it is the only thing keeping the `old_serial` contract.
+            let current = serial_pa.load(Ordering::Acquire);
+            let old = match old_serial {
+                Some(old) if old != current => return Some(current),
+                Some(old) => old,
+                None => current,
+            };
             return match futex_wait(serial_pa, old, timeout) {
                 FutexWaitOutcome::Changed(s) => Some(s),
                 FutexWaitOutcome::TimedOut | FutexWaitOutcome::Failed => None,
@@ -807,8 +812,15 @@ impl SystemProperties {
         }
         #[cfg(target_os = "macos")]
         {
-            // No futex: immediate None, as documented above.
-            let _ = (idx, old_serial, timeout);
+            // No futex, so blocking is impossible — but the documented
+            // `old_serial` fast path is a plain load and must still hold:
+            // a serial that already moved past `old_serial` returns
+            // immediately instead of being misreported as a failure.
+            let _ = timeout;
+            let current = self.serial(idx)?;
+            if old_serial.is_some_and(|old| old != current) {
+                return Some(current);
+            }
             None
         }
     }
@@ -830,7 +842,7 @@ mod tests {
     #[cfg(target_os = "android")]
     #[test]
     fn test_system_properties() -> Result<()> {
-        let system_properties = SystemProperties::new(&Path::new(crate::PROP_DIRNAME)).unwrap();
+        let system_properties = SystemProperties::new(Path::new(crate::PROP_DIRNAME))?;
 
         let handle = std::thread::spawn(move || {
             let version1 = system_properties

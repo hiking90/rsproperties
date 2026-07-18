@@ -367,6 +367,15 @@ impl PropertyAreaMap {
         // name. Reject here — the single choke point every caller
         // (`SystemProperties::add`, the build.prop load path) goes through.
         crate::wire::validate_no_interior_nul("property name", name)?;
+        // Empty segments ("a.", "a..b", "") are validated BEFORE the trie
+        // walk for the same allocation-hygiene reason as the NUL check: a
+        // mid-walk rejection would leave freshly-allocated nodes for the
+        // leading segments behind on every retry. (`find` keeps its
+        // in-loop check instead — it allocates nothing.)
+        if name.is_empty() || name.split('.').any(str::is_empty) {
+            error!("Invalid property name (empty segment): '{name}'");
+            return Err(Error::Parse(format!("Invalid property name: {name}")));
+        }
 
         let mut remaining_name = name;
         let mut current = 0;
@@ -376,11 +385,6 @@ impl PropertyAreaMap {
                 Some(pos) => pos,
                 None => remaining_name.len(),
             };
-
-            if substr_size == 0 {
-                error!("Invalid property name (empty segment): '{name}'");
-                return Err(Error::Parse(format!("Invalid property name: {name}")));
-            }
 
             let subname = &remaining_name[0..substr_size];
 
@@ -712,8 +716,12 @@ impl PropertyAreaMap {
         Ok(())
     }
 
+    /// Allocates an *unlinked* trie node. Private like `property_info_mut`:
+    /// the only legitimate consumer is `add`, whose publish protocol
+    /// (write name bytes, then Release-store the link) must not be
+    /// bypassable from elsewhere in the crate.
     #[cfg(feature = "builder")]
-    pub(crate) fn new_prop_trie_node(&mut self, name: &str) -> Result<u32> {
+    fn new_prop_trie_node(&mut self, name: &str) -> Result<u32> {
         let new_offset = self.allocate_obj(mem::size_of::<PropertyTrieNode>() + name.len() + 1)?;
         let node = self
             .mmap
@@ -727,8 +735,10 @@ impl PropertyAreaMap {
         Ok(new_offset)
     }
 
+    /// Allocates an *unlinked* property entry — private for the same
+    /// publish-protocol reason as [`Self::new_prop_trie_node`].
     #[cfg(feature = "builder")]
-    pub(crate) fn new_prop_info(&mut self, name: &str, value: &str) -> Result<u32> {
+    fn new_prop_info(&mut self, name: &str, value: &str) -> Result<u32> {
         let new_offset = self.allocate_obj(mem::size_of::<PropertyInfo>() + name.len() + 1)?;
 
         // `>=`, not `>`: the short slot needs room for the NUL terminator,
@@ -854,7 +864,6 @@ impl PropertyAreaMap {
 
 // MemoryMap is a wrapper for the memory-mapped file.
 // It provides the safe access to the memory-mapped file.
-#[derive(Debug)]
 pub(crate) struct MemoryMap {
     data: *mut u8,
     size: usize,
@@ -862,6 +871,19 @@ pub(crate) struct MemoryMap {
     /// accessors check this so a mut reference over a PROT_READ mapping
     /// (which would SIGSEGV on first write) is a typed error instead.
     writable: bool,
+}
+
+// Manual impl so `data` is never printed: an ASLR base address in logs has
+// no diagnostic value (same policy as `check_size`'s error message), and a
+// derived impl would leak it through every `{:?}` of the containing
+// structs (`PropertyAreaMap` derives Debug).
+impl Debug for MemoryMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryMap")
+            .field("size", &self.size)
+            .field("writable", &self.writable)
+            .finish_non_exhaustive()
+    }
 }
 
 // SAFETY: The `data` pointer is owned by this MemoryMap and remains valid for
@@ -999,9 +1021,11 @@ impl MemoryMap {
     /// reduces to a check on `offset % align_of::<T>()`.
     fn check_alignment<T>(&self, offset: usize) -> Result<()> {
         let align = mem::align_of::<T>();
-        // SAFETY: `add(offset)` is only used to compute the address, not
-        // dereferenced here. `offset <= self.size` is verified by the caller.
-        let ptr_addr = unsafe { self.data.add(offset) } as usize;
+        // Plain address arithmetic — no pointer is formed or dereferenced,
+        // so no `unsafe` surface. (`wrapping_add`: the caller has already
+        // bounds-checked `offset`, and an alignment check doesn't care
+        // about wraparound.)
+        let ptr_addr = (self.data as usize).wrapping_add(offset);
         if ptr_addr % align != 0 {
             return Err(Error::FileValidation(format!(
                 "Misaligned object at offset {offset}: required align={align}, addr={ptr_addr:#x}"

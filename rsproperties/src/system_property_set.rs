@@ -163,6 +163,13 @@ fn connect_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<UnixS
     let fd = {
         let fd = rnet::socket(rnet::AddressFamily::UNIX, rnet::SocketType::STREAM, None)?;
         rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
+        // SO_NOSIGPIPE: std sets this on every socket it creates on Apple
+        // platforms — same drop-a-std-guarantee hazard as CLOEXEC above.
+        // Without it, writing to a peer-closed socket delivers SIGPIPE
+        // instead of EPIPE, killing hosts that don't ignore the signal
+        // (Rust binaries do at startup; a cdylib embedded in a C process
+        // does not).
+        rnet::sockopt::set_socket_nosigpipe(&fd, true)?;
         fd
     };
     rustix::io::ioctl_fionbio(&fd, true)?;
@@ -378,7 +385,14 @@ impl<'a> ServiceWriter<'a> {
                     ),
                 )));
             }
-            conn.stream.set_write_timeout(Some(remaining))?;
+            // Best-effort re-arm, mirroring `recv_i32`: on macOS this
+            // `setsockopt` fails with EINVAL once the peer's FIN has been
+            // processed — propagating that would report "Invalid argument"
+            // where the *next write's* EPIPE/WriteZero is the real story.
+            // The connect-time static timeout stays armed as the
+            // per-syscall bound, and the deadline check above still bounds
+            // the total.
+            let _ = conn.stream.set_write_timeout(Some(remaining));
             // Rebuild the IoSlice list, skipping what already went out.
             let mut skip = written;
             let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(self.buffers.len());
@@ -479,7 +493,10 @@ impl PropertyMessage {
 ///    that would latch the default properties directory as a side effect
 ///    of a `set()` call). A present but unparseable value means an old or
 ///    odd init → **V1**, like bionic.
-/// 2. the `PROPERTY_SERVICE_VERSION` environment variable;
+/// 2. the `PROPERTY_SERVICE_VERSION` environment variable. Present but
+///    unparseable → **V1** with a warning, the same policy as the
+///    property above — a typo like `v1` must not silently select the
+///    *newer* protocol against an init that only speaks V1;
 /// 3. default: **V2**, a deliberate deviation from bionic's v1 default
 ///    for the *unset* case. V1 frames cannot carry names of
 ///    `PROP_NAME_MAX` (32) bytes or more — which modern property names
@@ -500,16 +517,20 @@ fn protocol_version() -> ProtocolVersion {
         return *v;
     }
 
-    let env_or_default = || {
-        let version = env::var("PROPERTY_SERVICE_VERSION")
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .unwrap_or(2);
-        if version >= 2 {
-            ProtocolVersion::V2
-        } else {
-            ProtocolVersion::V1
-        }
+    let env_or_default = || match env::var("PROPERTY_SERVICE_VERSION") {
+        Ok(v) => match v.trim().parse::<u32>() {
+            Ok(n) if n >= 2 => ProtocolVersion::V2,
+            Ok(_) => ProtocolVersion::V1,
+            // Present but not a number: same policy as the property path
+            // (old/odd configuration → V1), and loud — silently defaulting
+            // to V2 would send V2 frames to an init that may only
+            // understand V1.
+            Err(_) => {
+                log::warn!("PROPERTY_SERVICE_VERSION={v:?} is not a number; assuming V1");
+                ProtocolVersion::V1
+            }
+        },
+        Err(_) => ProtocolVersion::V2,
     };
 
     match crate::system_properties_if_initialized() {
