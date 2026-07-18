@@ -34,7 +34,7 @@ android_system_properties.workspace = true
 env_logger.workspace = true
 anyhow.workspace = true
 clap.workspace = true
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "props_bench"
