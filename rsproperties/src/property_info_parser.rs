@@ -9,7 +9,7 @@ use zerocopy::FromBytes;
 use zerocopy_derive::*;
 
 use crate::errors::*;
-use crate::property_area::MemoryMap;
+use crate::property_area::ImmutableFileMap;
 
 /// In-band "no context/type" sentinel used by the serialized format
 /// (bionic uses `~0u` the same way). A `context_index`/`type_index` of
@@ -38,11 +38,13 @@ where
     None
 }
 
-/// Decodes a trie entry name into a non-empty UTF-8 string.
+/// Decodes a trie entry name into a UTF-8 string.
 ///
 /// Returns `None` and logs a warning for corrupt names (out-of-range
 /// offset, missing NUL, non-UTF-8) so damaged entries are observable in
-/// logs; an empty name is skipped as well — no valid trie entry has one.
+/// logs. An empty name is returned as is: AOSP `AddToTrie` writes an empty
+/// exact entry for an exact `a..` line (shapes: `add_to_trie` in
+/// trie_builder.rs). The prefix loop rejects an empty name itself.
 fn entry_name_str<'a>(name: Result<&'a CStr>, kind: &str, idx: usize) -> Option<&'a str> {
     let name = match name {
         Ok(name) => name,
@@ -52,14 +54,7 @@ fn entry_name_str<'a>(name: Result<&'a CStr>, kind: &str, idx: usize) -> Option<
         }
     };
     match name.to_str() {
-        Ok(s) if !s.is_empty() => Some(s),
-        Ok(_) => {
-            // Warn like the other corruption arms — the doc promises damaged
-            // entries are observable in logs, and an empty name only occurs
-            // in a damaged file (the builder rejects empty segments).
-            warn!("{kind} entry {idx} has an empty name");
-            None
-        }
+        Ok(s) => Some(s),
         Err(e) => {
             warn!("{kind} entry {idx} has non-UTF-8 name: {e}");
             None
@@ -189,13 +184,18 @@ impl<'a> TrieNode<'a> {
         let mut corrupted = false;
         let node_index = find(offsets.len(), |i| match child_at(i).name() {
             Ok(name) => match name.to_str() {
-                // No valid trie node has an empty name — treat it as
-                // corruption and disqualify the search like the other
-                // corruption arms (otherwise `"".cmp(input) == Less`
-                // silently steers the binary search with a broken sort
-                // invariant).
-                Ok("") => {
-                    warn!("child node {i} has empty (corruption-fallback) name");
+                // AOSP `AddToTrie` writes an empty-named child for a `.a`,
+                // `a..b` or prefix `a..` line (shapes: `add_to_trie` in
+                // trie_builder.rs), and its serializer sorts children by
+                // name, so that child is child 0. There the empty name is
+                // compared like any other, as in AOSP
+                // `FindChildForString`: it sorts before every non-empty
+                // segment, and only an empty segment descends into it. An
+                // empty name at any other index means the children are out
+                // of order; disqualify the search like the other
+                // corruption arms.
+                Ok("") if i != 0 => {
+                    warn!("child node {i} has an empty name but is not child 0 (children out of order)");
                     corrupted = true;
                     Ordering::Equal
                 }
@@ -472,6 +472,15 @@ impl<'a> PropertyInfoArea<'a> {
             let Some(prefix_name) = entry_name_str(prefix.name(self), "Prefix", i) else {
                 continue;
             };
+            // AOSP `AddToTrie` never writes an empty prefix entry (a prefix
+            // line without a trailing dot keeps its non-empty last piece),
+            // so only a damaged file has one. AOSP `CheckPrefixMatch` would
+            // match every name with it (`strncmp` of 0 bytes); skip it, as
+            // 0.6.0 did.
+            if prefix_name.is_empty() {
+                warn!("Prefix entry {i} has an empty name");
+                continue;
+            }
             if remaining_name.starts_with(prefix_name) {
                 if prefix.context_index != NO_INDEX {
                     *context_index = prefix.context_index;
@@ -550,6 +559,10 @@ impl<'a> PropertyInfoArea<'a> {
             else {
                 continue;
             };
+            // An empty name (AOSP: an exact `a..` line, entry 0 of node
+            // `a`) is compared like any other, as AOSP
+            // `GetPropertyInfoIndexes` does with `strcmp`: it matches only
+            // an empty `remaining_name`, i.e. a name ending in `.`.
             if exact_match_name == remaining_name {
                 let context_index = if exact_match.context_index != NO_INDEX {
                     exact_match.context_index
@@ -566,7 +579,7 @@ impl<'a> PropertyInfoArea<'a> {
                 // `trace!`, not `info!`: this fires on every successful
                 // lookup on the property-get hot path.
                 trace!(
-                    "Property '{name}' resolved: context_index={context_index}, type_index={type_index}"
+                    "Property {name:?} resolved: context_index={context_index}, type_index={type_index}"
                 );
                 return (context_index, type_index);
             }
@@ -635,8 +648,10 @@ impl<'a> PropertyInfoArea<'a> {
     }
 }
 
+/// `property_info`, mapped read-only and shared on every target, like
+/// bionic. Sound only while writers follow \[IMM\] (property_area.rs).
 pub(crate) struct PropertyInfoAreaFile {
-    mmap: MemoryMap,
+    mmap: ImmutableFileMap,
 }
 
 impl PropertyInfoAreaFile {
@@ -645,8 +660,15 @@ impl PropertyInfoAreaFile {
     }
 
     pub(crate) fn load_path(path: &Path) -> Result<Self> {
-        let file: File =
-            File::open(path).context_with_location(format!("File open is failed in: {path:?}"))?;
+        // `O_NOFOLLOW` like AOSP `PropertyInfoAreaFile::LoadPath`: a
+        // symlink as the last path component fails with `ELOOP` instead of
+        // mapping the file it points to. std adds `O_CLOEXEC`.
+        use std::os::unix::fs::OpenOptionsExt;
+        let file: File = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as _)
+            .open(path)
+            .context_with_location(format!("File open is failed in: {path:?}"))?;
 
         let metadata = file
             .metadata()
@@ -657,6 +679,13 @@ impl PropertyInfoAreaFile {
             &metadata,
             path,
             size_of::<PropertyInfoAreaHeader>() as u64,
+        )?;
+        // [IMM]: a file its producer left owner-writable may be rewritten
+        // in place while mapped.
+        crate::file_validation::check_owner_write(
+            &metadata,
+            path,
+            cfg!(feature = "strict-file-validation"),
         )?;
 
         // `metadata.len()` is u64; a plain `as usize` would truncate on
@@ -671,7 +700,7 @@ impl PropertyInfoAreaFile {
         })?;
 
         let this = Self {
-            mmap: MemoryMap::new(file, size, false)?,
+            mmap: ImmutableFileMap::open(file, size)?,
         };
 
         // AOSP parity (`PropertyInfoAreaFile::LoadPath`): reject files this
@@ -698,10 +727,143 @@ impl PropertyInfoAreaFile {
     }
 
     pub(crate) fn property_info_area(&'_ self) -> PropertyInfoArea<'_> {
-        PropertyInfoArea::new(
-            self.mmap
-                .data(0, 0, self.mmap.size())
-                .expect("offset is 0. So, it must be valid."),
+        PropertyInfoArea::new(self.mmap.bytes())
+    }
+}
+
+#[cfg(all(test, feature = "builder", not(target_os = "android")))]
+mod tests {
+    use super::*;
+    use crate::property_info_serializer::{build_trie, PropertyInfoEntry};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    /// Removes the dir on drop; made before the dir is created, so a
+    /// failing assert still removes it.
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// AOSP opens `property_info` with `O_NOFOLLOW`: a symlink as the last
+    /// path component is refused even when it points to a valid file.
+    #[test]
+    fn load_path_refuses_symlinked_property_info() {
+        let guard = TempDir(
+            std::env::temp_dir().join(format!("rsprops_pinfo_link_{}", std::process::id())),
+        );
+        let dir = &guard.0;
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+
+        let entries = vec![PropertyInfoEntry::new(
+            "test.".to_owned(),
+            "u:object_r:test_prop:s0".to_owned(),
+            "string",
+            false,
         )
+        .unwrap()];
+        let trie = build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap();
+        let target = dir.join("property_info.real");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o444)
+            .open(&target)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, &trie))
+            .unwrap();
+        let link = dir.join("property_info");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        PropertyInfoAreaFile::load_path(&target).expect("the target itself loads");
+        let err = match PropertyInfoAreaFile::load_path(&link) {
+            Ok(_) => panic!("symlinked property_info must not be opened"),
+            Err(e) => e,
+        };
+        let Error::Context { source, .. } = &err else {
+            panic!("expected Context, got {err:?}");
+        };
+        match &**source {
+            Error::Io(io) => assert_eq!(
+                io.raw_os_error(),
+                Some(rustix::io::Errno::LOOP.raw_os_error()),
+                "{err}"
+            ),
+            other => panic!("expected Io(ELOOP), got {other:?}"),
+        }
+    }
+
+    /// AOSP `AddToTrie` shapes that `add_to_trie` rejects: an empty-named
+    /// child of `a` (prefix `a..`) and an empty exact entry in `a` (exact
+    /// `a..`). Lookups resolve them like AOSP `GetPropertyInfoIndexes`; an
+    /// empty name that is not child 0 disqualifies the child search.
+    #[test]
+    fn empty_names_resolve_like_aosp() {
+        use crate::trie_builder::{PropertyEntryBuilder, TrieBuilder, TrieBuilderNode};
+        use crate::trie_serializer::TrieSerializer;
+        use std::collections::{HashMap, HashSet};
+        use std::rc::Rc;
+        use zerocopy::IntoBytes;
+
+        const A: &str = "u:object_r:a_prop:s0";
+        const Z: &str = "u:object_r:z_prop:s0";
+        const EMPTY_CHILD: &str = "u:object_r:empty_child_prop:s0";
+        const EMPTY_EXACT: &str = "u:object_r:empty_exact_prop:s0";
+
+        fn context_of<'a>(area: &PropertyInfoArea<'a>, name: &str) -> &'a str {
+            let (index, _) = area.get_property_info_indexes(name);
+            let offset = area.context_offset(index as usize).unwrap();
+            area.cstr(offset).unwrap().to_str().unwrap()
+        }
+
+        let mut trie = TrieBuilder::new("u:object_r:default_prop:s0", "string");
+        trie.add_to_trie("a.", A, "string", false).unwrap();
+        trie.add_to_trie("a.m.", A, "string", false).unwrap();
+        trie.add_to_trie("a.z.", Z, "string", false).unwrap();
+        for context in [EMPTY_CHILD, EMPTY_EXACT] {
+            trie.contexts.insert(Rc::from(context));
+        }
+        let entry = |name: &str, context: &str| PropertyEntryBuilder {
+            name: Rc::from(name),
+            context: Some(Rc::from(context)),
+            rtype: Some(Rc::from("string")),
+        };
+        let a = trie.root.children.get_mut("a").unwrap();
+        a.children.insert(
+            Rc::from(""),
+            TrieBuilderNode {
+                property_entry: entry("", EMPTY_CHILD),
+                prefixes: HashSet::new(),
+                exact_matches: HashSet::new(),
+                children: HashMap::new(),
+            },
+        );
+        a.exact_matches.insert(entry("", EMPTY_EXACT));
+
+        let bytes = TrieSerializer::new(&trie).unwrap().into_data();
+        let mut words = vec![0u32; bytes.len() / 4];
+        words.as_mut_bytes().copy_from_slice(&bytes);
+
+        let children_of_a = {
+            let area = PropertyInfoArea::new(words.as_bytes());
+            // Only an empty segment descends into the empty-named child.
+            assert_eq!(context_of(&area, "a..b"), EMPTY_CHILD);
+            // Only a name ending in `.` matches the empty exact entry.
+            assert_eq!(context_of(&area, "a."), EMPTY_EXACT);
+            // Legal names: `b` probes the empty-named child 0 and misses.
+            assert_eq!(context_of(&area, "a.b"), A);
+            assert_eq!(context_of(&area, "a.b.c"), A);
+            assert_eq!(context_of(&area, "a.z.q"), Z);
+            let a = area.root_node().find_child_for_string("a").unwrap();
+            a.data().unwrap().child_nodes as usize / 4
+        };
+
+        // Children of `a` reordered to `m`, ``, `z`: the search for `z`
+        // probes child 1 first and stops there (AOSP would go on to `z`).
+        words.swap(children_of_a, children_of_a + 1);
+        let area = PropertyInfoArea::new(words.as_bytes());
+        assert_eq!(context_of(&area, "a.z.q"), A);
     }
 }

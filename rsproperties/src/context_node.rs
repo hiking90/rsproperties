@@ -40,6 +40,8 @@ impl ContextNode {
         }
     }
 
+    // Only `ContextsSerialized::new_rw` (builder) calls this.
+    #[cfg_attr(not(feature = "builder"), allow(dead_code))]
     pub(crate) fn open(&self) -> Result<()> {
         if !self.access_rw {
             error!(

@@ -1,14 +1,17 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use log::{debug, error, info, trace, warn};
-use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::io::Errno;
+use rustix::net::{AddressFamily, SendFlags, SocketAddrUnix, SocketFlags, SocketType};
+use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -21,6 +24,7 @@ use rsproperties::wire::{
     MAX_WIRE_NAME_LEN, MAX_WIRE_VALUE_LEN, PROP_ERROR, PROP_MSG_SETPROP, PROP_MSG_SETPROP2,
     PROP_NAME_MAX, PROP_SUCCESS, PROP_VALUE_MAX,
 };
+use rsproperties::{PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME, PROPERTY_SERVICE_SOCKET_NAME};
 
 /// Upper bound on simultaneously *serviced* client connections. Each
 /// handler task holds one permit for the duration of the exchange.
@@ -39,21 +43,24 @@ const MAX_WAITING_CLIENTS: usize = 256;
 /// stuck clients are torn down rather than tying up a task indefinitely.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Permissions applied to the bound Unix socket files. `0o660`
-/// (rw-rw----) matches the AOSP init policy for property service sockets
-/// — readable/writable by owner and group, denied to others. Without
-/// this explicit chmod the file would inherit the process umask, which
-/// is environment-dependent and frequently leaves the socket
-/// world-readable.
+/// Mode of both socket files: `0o660` (rw-rw----) — owner and group may
+/// connect, others may not. Stricter than AOSP init, which creates
+/// `property_service` 0666 (relying on SELinux) and only
+/// `property_service_for_system` 0660. The mode is set on the socket fd
+/// before `bind` and, if the umask cleared bits, raised to exactly this
+/// value before `listen` (see `bind_service_sockets`), so it does not
+/// depend on the process umask.
 ///
 /// **Access model.** This file mode is the service's *entire* access
 /// control: any peer that can `connect()` (i.e. has write permission on
-/// the socket file — owner or group) may set any non-`ro.` property.
+/// the socket file — owner or group) may set any non-`ro.` property, and
+/// any `ro.` property that has no value yet (the first writer fixes it).
 /// Unlike AOSP init, no per-property SO_PEERCRED / property_contexts
 /// authorization is performed, and the "property" / "system" sockets
 /// share one handler; peer credentials are logged for auditability only.
 /// This is an intentional simplification for host-side deployments —
-/// restrict the socket directory / group membership accordingly.
+/// restrict group membership and the socket dir as described on
+/// [`SocketService`].
 const SOCKET_FILE_MODE: u32 = 0o660;
 
 /// Backoff applied when `accept()` returns an error. Without it, a
@@ -63,56 +70,321 @@ const SOCKET_FILE_MODE: u32 = 0o660;
 /// clears, long enough to dampen the loop.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Applies `SOCKET_FILE_MODE` to a freshly-bound Unix socket file.
-/// `UnixListener::bind` creates the socket with permissions derived from
-/// the process umask; an explicit chmod removes that environmental
-/// dependency.
-async fn chmod_socket(path: &Path) -> std::io::Result<()> {
-    fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_FILE_MODE)).await
+/// Creates `dir` and any missing parent with mode 0755 minus the umask's
+/// bits. `create_dir_all` would use 0777 minus the umask's bits, which is
+/// world-writable under umask 0000. An existing directory keeps its mode;
+/// under a narrow umask (e.g. 077 → 0700) the group cannot reach the
+/// sockets, so a deployment that needs group access creates the socket
+/// dir beforehand with the mode it wants.
+fn ensure_socket_dir(dir: &Path) -> Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(dir)
+        .with_context_location(|| format!("create socket dir {dir:?}"))
 }
 
-/// Binds a Unix socket so that it is never reachable at `path` with
-/// permissions wider than `SOCKET_FILE_MODE`: bind under a temporary name,
-/// chmod, then atomically rename into place (replacing any previous socket
-/// with no ENOENT window). A plain bind + chmod leaves a window with
-/// umask-derived permissions in which a connection can be established (and
-/// survive the later chmod). Deliberately NOT done by locking the process
-/// umask around the bind — umask is process-global and would race any
-/// concurrent file creation (e.g. the sibling PropertiesService writing
-/// `property_info` from `spawn_blocking`).
-///
-/// Note: the temp name is `.{name}.tmp-{pid}`, slightly longer than the
-/// final path — socket dirs near the `sun_path` limit (~104/108 bytes)
-/// need that much headroom. Stale temps from crashed runs (different pid)
-/// are swept by `on_start`.
-async fn bind_socket_with_mode(path: &Path) -> std::io::Result<UnixListener> {
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| std::io::Error::other(format!("invalid socket path: {path:?}")))?;
-    let tmp_path = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+/// Opens the socket dir once. Every later unlink, rename and chmod is
+/// made relative to this descriptor, so a symlink at `dir` itself is
+/// followed here and nowhere else.
+fn open_socket_dir(dir: &Path) -> Result<OwnedFd> {
+    rustix::fs::open(
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context_location(|| format!("open socket dir {dir:?}"))
+}
 
-    // Clear our own leftover temp (pid reuse / repeated on_start).
-    match fs::remove_file(&tmp_path).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
+/// Startup warning for a socket dir that any local user can write to and
+/// that has no sticky bit: such a user can rename or unlink the service's
+/// sockets and put its own in their place. Only that case is checked —
+/// ancestors, group write and ACLs are not inspected — so `None` is not an
+/// access check. A sticky world-writable dir (`/tmp`) is not reported:
+/// other uids cannot rename or unlink entries the service owns there.
+fn socket_dir_warning(mode: Mode) -> Option<&'static str> {
+    (mode.contains(Mode::WOTH) && !mode.contains(Mode::SVTX)).then_some(
+        "socket dir is world-writable without the sticky bit; any local user can replace the sockets",
+    )
+}
 
-    let listener = UnixListener::bind(&tmp_path)?;
-    let finalize = async {
-        chmod_socket(&tmp_path).await?;
-        // `rename` atomically replaces any existing file at `path`, so the
-        // socket appears there already carrying 0o660.
-        fs::rename(&tmp_path, path).await
+/// Temp name of a socket while it is set up: `.<name>.tmp-<pid>`, the
+/// name 0.6.0 used, so the startup sweep also removes temps a crashed
+/// 0.6.0 left behind.
+fn temp_name(name: &str) -> String {
+    format!(".{name}.tmp-{}", std::process::id())
+}
+
+/// Removes temp sockets of crashed earlier runs (their names embed another
+/// pid). Only entries named `.property_service.tmp-*` or
+/// `.property_service_for_system.tmp-*` that are sockets are removed: the
+/// socket dir may be shared with other programs (e.g. `/dev/socket`).
+/// Errors are ignored; a temp that stays only takes up a name.
+fn sweep_stale_temps(dirfd: &OwnedFd) {
+    let prefixes = [
+        format!(".{PROPERTY_SERVICE_SOCKET_NAME}.tmp-"),
+        format!(".{PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME}.tmp-"),
+    ];
+    // `Dir::read_from` opens "." relative to `dirfd`: it lists the opened
+    // directory, not whatever the socket dir's path names now.
+    let Ok(entries) = rustix::fs::Dir::read_from(dirfd) else {
+        return;
     };
-    if let Err(e) = finalize.await {
-        // Tokio's UnixListener does not unlink on drop — clean up the temp
-        // so failed starts don't litter the socket directory.
-        let _ = fs::remove_file(&tmp_path).await;
-        return Err(e);
+    for entry in entries.map_while(std::result::Result::ok) {
+        let name = entry.file_name();
+        if !prefixes
+            .iter()
+            .any(|p| name.to_bytes().starts_with(p.as_bytes()))
+        {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            // `d_type` is not filled in by every filesystem.
+            FileType::Unknown => match rustix::fs::statat(dirfd, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(st) => FileType::from_raw_mode(st.st_mode),
+                Err(_) => continue,
+            },
+            file_type => file_type,
+        };
+        if file_type == FileType::Socket {
+            debug!("Removing stale temp socket: {name:?}");
+            let _ = rustix::fs::unlinkat(dirfd, name, AtFlags::empty());
+        }
     }
-    Ok(listener)
+}
+
+/// Entries this instance created directly in the socket dir, unlinked
+/// relative to `dirfd` on drop.
+///
+/// During startup it holds each temp name once its `bind` succeeded and,
+/// after each rename, the final name in place of the temp, so a failure, a
+/// panic, or a cancelled start (the `spawn_blocking` result is dropped)
+/// removes exactly what startup created. After a successful start it holds
+/// the two final names and lives in [`SocketService`], so dropping the
+/// service unlinks them. Unlinking is by name: an instance that bound the
+/// same names in between loses its sockets — hence one instance per
+/// socket dir.
+struct SocketDirEntries {
+    dirfd: OwnedFd,
+    names: Vec<String>,
+}
+
+impl SocketDirEntries {
+    fn rename(&mut self, dir: &Path, from: &str, to: &str) -> Result<()> {
+        rustix::fs::renameat(&self.dirfd, from, &self.dirfd, to).with_context_location(|| {
+            format!("rename {:?} to {:?}", dir.join(from), dir.join(to))
+        })?;
+        for name in &mut self.names {
+            if name == from {
+                *name = to.to_owned();
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SocketDirEntries {
+    fn drop(&mut self) {
+        for name in self.names.drain(..) {
+            match rustix::fs::unlinkat(&self.dirfd, name.as_str(), AtFlags::empty()) {
+                Ok(()) => debug!("Socket file removed: {name}"),
+                Err(e) if e == Errno::NOENT => {}
+                Err(e) => warn!("Failed to remove socket file {name}: {e}"),
+            }
+        }
+    }
+}
+
+/// Creates the socket for `tmp_name` and binds it at `dir/tmp_name`
+/// without listening.
+fn bind_temp(dir: &Path, dirfd: &OwnedFd, tmp_name: &str) -> Result<OwnedFd> {
+    let path = dir.join(tmp_name);
+    // Our own leftover (pid reuse, or a repeated start in this process).
+    match rustix::fs::unlinkat(dirfd, tmp_name, AtFlags::empty()) {
+        Ok(()) => {}
+        Err(e) if e == Errno::NOENT => {}
+        Err(e) => return Err(e).with_context_location(|| format!("unlink {path:?}")),
+    }
+    // Same flags as tokio's `UnixListener::bind` (mio 1.2.2
+    // `sys/unix/uds/listener.rs:35`): `from_std` requires a non-blocking
+    // socket, and CLOEXEC keeps the listener out of exec'd children.
+    let fd = rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        None,
+    )
+    .context_with_location("create unix socket")?;
+    // Linux creates the socket file with the socket inode's mode minus the
+    // umask (`unix_bind_bsd`; implementation behavior, not documented in
+    // unix(7)), so from the moment the path exists its mode is a subset of
+    // 0660. Without this the file starts at 0777 minus the umask.
+    rustix::fs::fchmod(&fd, Mode::from_raw_mode(SOCKET_FILE_MODE))
+        .context_with_location("fchmod unix socket")?;
+    // `sun_path` limit: rustix `SocketAddrUnix::new` accepts 108 bytes
+    // (0.6.0's std path: 107).
+    let addr = SocketAddrUnix::new(path.as_path())
+        .with_context_location(|| format!("socket address {path:?}"))?;
+    rustix::net::bind(&fd, &addr).with_context_location(|| format!("bind {path:?}"))?;
+    Ok(fd)
+}
+
+/// Raises the mode of the socket at `dir/tmp_name` to exactly
+/// `SOCKET_FILE_MODE` when the umask cleared bits at `bind`.
+///
+/// The entry is opened `O_PATH|O_NOFOLLOW` relative to the socket dir and
+/// checked with `fstat` to be a socket owned by this process's euid; the
+/// chmod then goes through `/proc/thread-self/fd/N`, which resolves to the
+/// opened inode without walking the path again. This is how bionic's
+/// `fchmodat(AT_SYMLINK_NOFOLLOW)` works: `fchmod` on an `O_PATH` fd fails
+/// with EBADF, and `fchmodat2` needs Linux 6.6. `thread-self` rather than
+/// `self`: `/proc/self` names the thread-group leader, and in a host
+/// process whose leader thread has exited its `fd/` may be gone
+/// (unverified); the calling thread is alive. `/proc/thread-self` exists
+/// since Linux 3.17; on older kernels the chmod falls back to
+/// `/proc/self/fd/N` (see [`chmod_opened`]). Needs `/proc` — only when
+/// the umask cleared bits of 0660.
+///
+/// If the socket dir's path was swapped after it was opened, `bind`
+/// created the socket elsewhere and this `openat` fails with ENOENT.
+fn widen_to_socket_mode(dir: &Path, dirfd: &OwnedFd, tmp_name: &str) -> Result<()> {
+    let path = dir.join(tmp_name);
+    let pfd = rustix::fs::openat(
+        dirfd,
+        tmp_name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context_location(|| format!("open {path:?}"))?;
+    let st = rustix::fs::fstat(&pfd).with_context_location(|| format!("fstat {path:?}"))?;
+    let euid = rustix::process::geteuid().as_raw();
+    if FileType::from_raw_mode(st.st_mode) != FileType::Socket || st.st_uid != euid {
+        return Err(Error::FileValidation(format!(
+            "not a socket owned by euid {euid}; mode left unchanged"
+        )))
+        .with_context_location(|| format!("raise mode of {path:?}"));
+    }
+    if Mode::from_raw_mode(st.st_mode).bits() == SOCKET_FILE_MODE {
+        return Ok(());
+    }
+    chmod_opened(
+        &pfd,
+        &st,
+        Mode::from_raw_mode(SOCKET_FILE_MODE),
+        &PROC_FD_DIRS,
+    )
+    .with_context_location(|| {
+        format!(
+            "raising {path:?} to 0660 via /proc/thread-self/fd or /proc/self/fd failed \
+                 (is /proc mounted? or run with a umask that keeps group rw, e.g. 007)"
+        )
+    })
+}
+
+/// `fd/` directories tried by [`chmod_opened`], in order.
+const PROC_FD_DIRS: [&str; 2] = ["/proc/thread-self/fd", "/proc/self/fd"];
+
+/// `chmod`s the inode `pfd` refers to (`st` is its `fstat`) through the
+/// first `<fd_dir>/N` that exists; ENOENT moves to the next directory
+/// (`/proc/thread-self` is absent before Linux 3.17, everything is absent
+/// without `/proc`).
+///
+/// `/proc/self/fd/N` is entry N of the thread-group leader's fd table. That
+/// is the calling thread's table for every thread created with
+/// `CLONE_FILES` (std, pthread and tokio threads); a thread that ran
+/// `unshare(CLONE_FILES)` has its own table, and the leader's entry N can
+/// be an unrelated file. So the link is `stat`ed first and used only when
+/// it resolves to `st`'s device and inode; otherwise nothing is changed.
+/// In the shared-table case entry N is `pfd`, which this call holds open,
+/// so it cannot change between the `stat` and the `chmod`.
+fn chmod_opened(pfd: &OwnedFd, st: &rustix::fs::Stat, mode: Mode, fd_dirs: &[&str]) -> Result<()> {
+    for fd_dir in fd_dirs {
+        let link = format!("{fd_dir}/{}", pfd.as_raw_fd());
+        match rustix::fs::stat(link.as_str()) {
+            Ok(target) if target.st_dev == st.st_dev && target.st_ino == st.st_ino => {
+                return rustix::fs::chmod(link.as_str(), mode)
+                    .with_context_location(|| format!("chmod {link}"));
+            }
+            Ok(_) => {
+                return Err(Error::FileValidation(format!(
+                    "{link} is another file (separate fd table); mode left unchanged"
+                )))
+            }
+            Err(Errno::NOENT) => continue,
+            Err(e) => return Err(e).with_context_location(|| format!("stat {link}")),
+        }
+    }
+    Err(Errno::NOENT).with_context_location(|| format!("none of {fd_dirs:?} exists"))
+}
+
+/// One socket up to the point where only the rename is left: bind at its
+/// temp name, mode raised, listening. The temp name is registered in
+/// `entries` as soon as `bind` created it.
+fn prepare_temp_socket(
+    dir: &Path,
+    entries: &mut SocketDirEntries,
+    tmp_name: &str,
+) -> Result<OwnedFd> {
+    let fd = bind_temp(dir, &entries.dirfd, tmp_name)?;
+    entries.names.push(tmp_name.to_owned());
+    widen_to_socket_mode(dir, &entries.dirfd, tmp_name)?;
+    // `listen` only after the mode is final (AOSP `CreateSocket` order:
+    // bind → fchmodat → listen): until then a `connect` fails with
+    // ECONNREFUSED, so no connection is made under an intermediate mode.
+    // Backlog -1 (SOMAXCONN) as tokio/mio on Linux.
+    let path = dir.join(tmp_name);
+    rustix::net::listen(&fd, -1).with_context_location(|| format!("listen {path:?}"))?;
+    Ok(fd)
+}
+
+/// Both listeners, already at their final names.
+struct BoundSockets {
+    property: std::os::unix::net::UnixListener,
+    system: std::os::unix::net::UnixListener,
+    /// Holds the two final names; dropping it unlinks them.
+    entries: SocketDirEntries,
+}
+
+/// Creates the socket dir if missing, then [`bind_service_sockets_at`].
+/// The sequence and its limits are documented on [`SocketService`].
+fn bind_service_sockets(dir: &Path) -> Result<BoundSockets> {
+    ensure_socket_dir(dir)?;
+    let dirfd = open_socket_dir(dir)?;
+    bind_service_sockets_at(dir, dirfd)
+}
+
+/// Binds both sockets in the directory `dirfd` refers to. `dir` is used
+/// for `bind` and for messages; every other operation goes through
+/// `dirfd`. Both temp sockets are set up before either is renamed, so a
+/// failure on the second leaves the existing final names untouched.
+fn bind_service_sockets_at(dir: &Path, dirfd: OwnedFd) -> Result<BoundSockets> {
+    let mut entries = SocketDirEntries {
+        dirfd,
+        names: Vec::with_capacity(2),
+    };
+    let st = rustix::fs::fstat(&entries.dirfd)
+        .with_context_location(|| format!("fstat socket dir {dir:?}"))?;
+    if let Some(warning) = socket_dir_warning(Mode::from_raw_mode(st.st_mode)) {
+        warn!("{warning}: {dir:?}");
+    }
+    sweep_stale_temps(&entries.dirfd);
+
+    let property_tmp = temp_name(PROPERTY_SERVICE_SOCKET_NAME);
+    let system_tmp = temp_name(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
+    let property = prepare_temp_socket(dir, &mut entries, &property_tmp)?;
+    let system = prepare_temp_socket(dir, &mut entries, &system_tmp)?;
+    // `renameat` replaces a socket left by a crashed earlier run without a
+    // window in which the name is missing. A failure on the second rename
+    // unlinks the first final name (via `entries`): the name belonged to
+    // no live service, since the caller holds the properties dir's writer
+    // lock and one instance serves one socket dir.
+    entries.rename(dir, &property_tmp, PROPERTY_SERVICE_SOCKET_NAME)?;
+    entries.rename(dir, &system_tmp, PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME)?;
+    Ok(BoundSockets {
+        property: property.into(),
+        system: system.into(),
+        entries,
+    })
 }
 
 pub struct SocketServiceArgs {
@@ -122,6 +394,13 @@ pub struct SocketServiceArgs {
 
 // Run the service in a separate task
 /// This function runs the socket service by spawning a new actor with the provided arguments.
+///
+/// Spawn this only while the properties dir's writer lock
+/// (`rsproperties::AreaWriterLock`) is held — `rsproperties_service::run`
+/// takes it before spawning either actor. Spawned without it, a second
+/// instance can replace and then unlink the running instance's sockets.
+/// The socket files and the socket dir contract are described on
+/// [`SocketService`].
 ///
 /// # Returns
 /// A reference to the spawned actor that can be used to interact with the socket service.
@@ -140,15 +419,62 @@ pub fn run(args: SocketServiceArgs) -> crate::ServiceContext<SocketService> {
     }
 }
 
-/// Tokio-based property socket service
+/// Tokio-based property socket service.
+///
+/// Spawn this only while the properties dir's writer lock
+/// (`rsproperties::AreaWriterLock`) is held — `rsproperties_service::run`
+/// takes it before spawning either actor. Spawned without it, a second
+/// instance can replace and then unlink the running instance's sockets.
+///
+/// # Socket files
+///
+/// A missing socket dir, and any missing parent directory, is created
+/// with mode 0755 minus the umask's bits.
+///
+/// Socket files are created as `socket(SOCK_CLOEXEC|SOCK_NONBLOCK)`,
+/// `fchmod(fd, 0660)`, `bind` at `<socket_dir>/.<name>.tmp-<pid>`. The
+/// kernel creates the file with the socket's mode minus the umask, so from
+/// the moment the path exists its mode is a subset of 0660. If the umask
+/// removed any of those bits (e.g. group write under umask 022), the mode
+/// is raised to exactly 0660 through an
+/// `O_PATH|O_NOFOLLOW` descriptor opened relative to the socket dir
+/// (`chmod("/proc/thread-self/fd/N")`, or `/proc/self/fd/N` on kernels
+/// before 3.17; both need `/proc`) after `fstat`
+/// confirms a socket owned by the service's euid. Only then does the
+/// socket `listen`; before that a `connect` fails with `ECONNREFUSED`.
+/// Both temp sockets are renamed onto their final names only after both
+/// are listening, and a failed start unlinks what it created, final names
+/// included. Dropping the service unlinks both final names.
+///
+/// The socket dir is opened once at startup; every unlink, rename and
+/// chmod is made relative to that descriptor or to a descriptor whose
+/// inode was checked with `fstat`, so the service changes no existing
+/// inode outside that directory. It changes only entries named
+/// `property_service`, `property_service_for_system`, or
+/// `.<either name>.tmp-<pid>` there (the startup sweep removes only
+/// sockets with those prefixes), and never follows a symlink at those
+/// names. `bind` itself takes a path: if the socket dir's path is swapped
+/// after startup opened it, the temp socket is created at the new
+/// location, startup fails, and that socket is left there.
+///
+/// Out of scope: any uid other than the service's euid and root that can
+/// write to the socket dir or any of its ancestors can replace the sockets
+/// with its own and so impersonate the service; nothing in the service can
+/// prevent that. Keep the socket dir and its ancestors writable only by
+/// the service's user and root. A world-writable socket dir without the
+/// sticky bit is reported with a warning at startup; this is not an access
+/// check. A default ACL on the socket dir gives its named users and groups
+/// access beyond the 0660 mode bits; the service does not inspect or
+/// remove ACLs. One service instance per socket dir.
 pub struct SocketService {
-    socket_dir: PathBuf,
     properties_service: ActorRef<crate::PropertiesService>,
     /// Limits concurrently in-flight client tasks.
     connection_sem: Arc<Semaphore>,
     /// Limits accepted-but-not-yet-serviced connections (fd backpressure);
     /// see `MAX_WAITING_CLIENTS`.
     waiting_sem: Arc<Semaphore>,
+    /// The two final socket names; unlinked when the service is dropped.
+    _socket_files: SocketDirEntries,
 }
 
 impl Actor for SocketService {
@@ -164,51 +490,31 @@ impl Actor for SocketService {
         args: Self::Args,
         actor_ref: &ActorRef<Self>,
     ) -> std::result::Result<Self, Self::Error> {
-        // Create parent directory if it doesn't exist. `try_exists`
-        // distinguishes "doesn't exist" (Ok(false)) from "couldn't ask"
-        // (Err) — propagate the latter so permission/ENOTDIR errors don't
-        // silently degrade to `create_dir_all` racing the same error.
-        if !fs::try_exists(&args.socket_dir).await? {
-            debug!("Creating parent directory: {:?}", args.socket_dir);
-            fs::create_dir_all(&args.socket_dir).await?;
-        }
-
-        let property_socket_path = args
-            .socket_dir
-            .join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
-        let system_socket_path = args
-            .socket_dir
-            .join(rsproperties::PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
-        // No pre-unlink of existing socket files: `bind_socket_with_mode`
-        // replaces them atomically via rename, so a restart never exposes
-        // an ENOENT window to connecting clients. Only sweep stale *temp*
-        // sockets left by crashed previous runs (their names embed another
-        // pid, so per-name cleanup can't catch them).
-        if let Ok(mut entries) = fs::read_dir(&args.socket_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with('.') && name.contains(".tmp-") {
-                        debug!("Removing stale temp socket: {:?}", entry.path());
-                        let _ = fs::remove_file(entry.path()).await;
-                    }
-                }
-            }
-        }
         info!(
             "Property socket services will be created at: {} and {}",
-            property_socket_path.display(),
-            system_socket_path.display()
+            args.socket_dir.join(PROPERTY_SERVICE_SOCKET_NAME).display(),
+            args.socket_dir
+                .join(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME)
+                .display()
         );
-        // Bind both sockets via the chmod-then-rename pattern so they are
-        // never connectable with permissions wider than SOCKET_FILE_MODE
-        // (see `bind_socket_with_mode`).
-        trace!(
-            "Binding property service Unix domain sockets: {} and {}",
-            property_socket_path.display(),
-            system_socket_path.display()
-        );
-        let property_listener = bind_socket_with_mode(&property_socket_path).await?;
-        let system_listener = bind_socket_with_mode(&system_socket_path).await?;
+        // All filesystem work is blocking syscalls; one `spawn_blocking`
+        // runs it off the runtime threads.
+        let dir = args.socket_dir.clone();
+        let bound = tokio::task::spawn_blocking(move || bind_service_sockets(&dir))
+            .await
+            .map_err(|e| std::io::Error::other(format!("socket bind task failed: {e}")))??;
+        // From here to `Ok(Self)`, any early return drops `entries`, which
+        // unlinks both final names, so a failed start does not leave them
+        // pointing at closed listeners.
+        let BoundSockets {
+            property,
+            system,
+            entries,
+        } = bound;
+        let property_listener = UnixListener::from_std(property)
+            .context_with_location("register property_service listener")?;
+        let system_listener = UnixListener::from_std(system)
+            .context_with_location("register property_service_for_system listener")?;
         info!("AsyncPropertySocketService started successfully");
 
         // Model each listener as a `Stream` of accepted connections and hand
@@ -225,10 +531,10 @@ impl Actor for SocketService {
             .map_err(|e| std::io::Error::other(format!("subscribe system listener: {e}")))?;
 
         Ok(Self {
-            socket_dir: args.socket_dir,
             properties_service: args.properties_service,
             connection_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS)),
             waiting_sem: Arc::new(Semaphore::new(MAX_WAITING_CLIENTS)),
+            _socket_files: entries,
         })
     }
 
@@ -293,6 +599,16 @@ impl Actor for SocketService {
         tokio::spawn(async move {
             let permit = {
                 let _waiting = waiting; // released once a handler slot is ours
+                                        // Bounded by `CLIENT_TIMEOUT`, not by the rsproperties
+                                        // client's 2 s reply budget. The timer only limits how long
+                                        // a waiting-room slot is held; it is not meant to drop
+                                        // requests the client may have given up on. A queued
+                                        // connection's request is usually already in the socket
+                                        // buffer, and AOSP init keeps pending connections in its
+                                        // listen backlog without a timer and applies every request
+                                        // it receives in full. Dropping at the client's budget
+                                        // would also discard V1 requests whose clients (bionic:
+                                        // success after a 250 ms poll) already reported them set.
                 match tokio::time::timeout(CLIENT_TIMEOUT, sem.acquire_owned()).await {
                     Ok(Ok(p)) => p,
                     Ok(Err(_)) => {
@@ -353,11 +669,13 @@ impl rsactor::Message<crate::ReadyMessage> for SocketService {
 }
 
 impl SocketService {
-    /// Handles a client connection
-    async fn handle_client(
-        mut stream: UnixStream,
-        service: ActorRef<crate::PropertiesService>,
-    ) -> Result<()> {
+    /// Handles a client connection. Generic over the receiving actor so
+    /// tests can record forwarded requests; production passes
+    /// `PropertiesService`.
+    async fn handle_client<A>(mut stream: UnixStream, service: ActorRef<A>) -> Result<()>
+    where
+        A: rsactor::Message<crate::PropertyMessage, Reply = bool>,
+    {
         trace!("Handling new client connection");
 
         // Read the command (u32)
@@ -402,10 +720,10 @@ impl SocketService {
     /// connection is the implicit ack — so failures are logged and the
     /// connection is closed without a response. Validation still happens in
     /// `PropertiesService::handle`, identical to the V2 path.
-    async fn handle_setprop_v1(
-        stream: &mut UnixStream,
-        service: ActorRef<crate::PropertiesService>,
-    ) -> Result<()> {
+    async fn handle_setprop_v1<A>(stream: &mut UnixStream, service: ActorRef<A>) -> Result<()>
+    where
+        A: rsactor::Message<crate::PropertyMessage, Reply = bool>,
+    {
         trace!("Handling SETPROP (V1) request");
 
         let mut name_buf = [0u8; PROP_NAME_MAX];
@@ -421,7 +739,7 @@ impl SocketService {
 
         let name = Self::string_from_fixed(&name_buf)?;
         let value = Self::string_from_fixed(&value_buf)?;
-        info!("Forwarding V1 property: '{name}' ({} bytes)", value.len());
+        info!("Forwarding V1 property: {name:?} ({} bytes)", value.len());
 
         let property_msg = crate::PropertyMessage { name, value };
         match service.ask(property_msg).await {
@@ -454,33 +772,36 @@ impl SocketService {
     }
 
     /// Handles SETPROP2 command
-    async fn handle_setprop2(
-        stream: &mut UnixStream,
-        service: ActorRef<crate::PropertiesService>,
-    ) -> Result<()> {
+    async fn handle_setprop2<A>(stream: &mut UnixStream, service: ActorRef<A>) -> Result<()>
+    where
+        A: rsactor::Message<crate::PropertyMessage, Reply = bool>,
+    {
         trace!("Handling SETPROP2 request");
 
-        // Read name length and name
-        let name_len = Self::read_u32(stream).await?;
+        // Protocol consistency: every V2 failure after the command word
+        // answers with a status code before closing — a bare connection
+        // close left the client's `recv_i32` to diagnose an EOF instead of
+        // a definite error. (`send_response` results are ignored: the peer
+        // may already be gone, which is fine — the response is
+        // best-effort, and `?` would replace the real error with a write
+        // failure.)
+        let name_len = match Self::read_u32(stream).await {
+            Ok(len) => len,
+            Err(e) => {
+                let _ = Self::send_response(stream, PROP_ERROR).await;
+                return Err(e);
+            }
+        };
         trace!("Name length: {name_len}");
 
         if name_len as usize > MAX_WIRE_NAME_LEN {
             error!("Name length too large: {name_len} (max {MAX_WIRE_NAME_LEN})");
-            // Best-effort like every other V2 failure response: `?` here
-            // would replace the real error with a write failure when the
-            // peer is already gone.
             let _ = Self::send_response(stream, PROP_ERROR).await;
             return Err(rsproperties::errors::Error::FileValidation(format!(
                 "Name length too large: {name_len}"
             )));
         }
 
-        // Protocol consistency: every V2 failure after the command word
-        // answers with a status code before closing, like the length-cap
-        // paths above — a bare connection close left the client's
-        // `recv_i32` to diagnose an EOF instead of a definite error.
-        // (`send_response` results are ignored: the peer may already be
-        // gone, which is fine — the response is best-effort.)
         let name = match Self::read_string(stream, name_len as usize).await {
             Ok(name) => name,
             Err(e) => {
@@ -488,7 +809,7 @@ impl SocketService {
                 return Err(e);
             }
         };
-        debug!("Property name: '{name}'");
+        debug!("Property name: {name:?}");
 
         // Read value length and value
         let value_len = match Self::read_u32(stream).await {
@@ -521,10 +842,15 @@ impl SocketService {
         // values are not.
         debug!("Property value length: {} bytes", value.len());
 
-        info!("Forwarding property: '{name}' ({} bytes)", value.len());
+        info!("Forwarding property: {name:?} ({} bytes)", value.len());
 
         let property_msg = crate::PropertyMessage { name, value };
 
+        // Forwarded whether or not the client is still connected, as AOSP
+        // init applies every request it received in full and ignores the
+        // result of sending the reply. A client that gave up waiting
+        // (`TimedOut`) may therefore find its set applied; checking the
+        // peer here would narrow that window, not close it.
         match service.ask(property_msg).await {
             Ok(true) => Self::send_response(stream, PROP_SUCCESS).await?,
             Ok(false) => {
@@ -574,39 +900,505 @@ impl SocketService {
         String::from_utf8(buf).map_err(|e| rsproperties::errors::Error::Utf8(e.utf8_error()))
     }
 
-    /// Sends a response to the client
+    /// Sends a status reply with `send(MSG_NOSIGNAL)`, so a peer that
+    /// already closed yields `EPIPE` instead of `SIGPIPE`.
+    ///
+    /// tokio's `write_all` ends in std's `write`, which on Rust 1.77–1.86
+    /// is a plain `write(2)`: a host process that leaves `SIGPIPE` at its
+    /// default (a C or JNI host embedding this service) was killed by the
+    /// signal. Same rule as the client's `ServiceWriter::send` in
+    /// `rsproperties/src/system_property_set.rs`; here it is a readiness
+    /// loop, and `CLIENT_TIMEOUT` around the handler bounds the wait. This
+    /// crate is Linux-only (see the `compile_error!` in lib.rs), so
+    /// `MSG_NOSIGNAL` needs no fallback.
     async fn send_response(stream: &mut UnixStream, response: i32) -> Result<()> {
         trace!("Sending response: {response}");
-        stream.write_all(&response.to_ne_bytes()).await?;
-        stream.flush().await?;
+        let bytes = response.to_ne_bytes();
+        let mut written = 0;
+        while written < bytes.len() {
+            stream.writable().await?;
+            match stream.try_io(tokio::io::Interest::WRITABLE, || {
+                rustix::net::send(stream.as_fd(), &bytes[written..], SendFlags::NOSIGNAL)
+                    .map_err(std::io::Error::from)
+            }) {
+                Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
+                Ok(n) => written += n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         trace!("Response sent successfully");
         Ok(())
     }
 }
 
-impl Drop for SocketService {
-    fn drop(&mut self) {
-        debug!("Cleaning up async socket service");
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
 
-        // Drop runs in sync context — keep blocking std::fs here (rare path).
-        //
-        // Note: this unlinks by *name* without verifying the file is the
-        // one this instance bound. If a new SocketService instance binds
-        // the same paths before an old instance drops, the old Drop would
-        // remove the new instance's live sockets — don't run two instances
-        // against one socket_dir (the design assumes a single service).
-        for socket_name in [
-            rsproperties::PROPERTY_SERVICE_SOCKET_NAME,
-            rsproperties::PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME,
-        ] {
-            let path = self.socket_dir.join(socket_name);
-            // No `exists()` pre-check (TOCTOU): just remove and ignore
-            // NotFound.
-            match std::fs::remove_file(&path) {
-                Ok(()) => debug!("Socket file removed: {}", path.display()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => warn!("Failed to remove socket file {}: {e}", path.display()),
-            }
+    const PROPERTY: &str = PROPERTY_SERVICE_SOCKET_NAME;
+    const SYSTEM: &str = PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME;
+
+    /// Bytes a fixture adds below its dir for its longest socket path:
+    /// `/<subdir>/` and the system temp name (the longer of the two).
+    pub(crate) fn socket_suffix_len(subdir: &str) -> usize {
+        subdir.len() + 2 + temp_name(SYSTEM).len()
+    }
+
+    /// Path `<base>/<label>_<pid>` for a socket test fixture whose longest
+    /// path adds `suffix_len` bytes. std's `UnixStream::connect` and
+    /// `UnixListener::bind` need room for the NUL in the 108-byte
+    /// `sun_path`, so the full path must stay under 108 bytes. `base` is
+    /// `temp_dir()` when that fits; otherwise `/tmp`, used only if the dir
+    /// can be created there (it is removed again; the caller creates it).
+    /// Panics with the reason when neither works.
+    pub(crate) fn socket_test_dir(label: &str, suffix_len: usize) -> PathBuf {
+        const SUN_PATH_LEN: usize = 108;
+        let name = format!("{label}_{}", std::process::id());
+        let fits = |dir: &Path| dir.as_os_str().len() + suffix_len < SUN_PATH_LEN;
+        let preferred = std::env::temp_dir().join(&name);
+        if fits(&preferred) {
+            return preferred;
         }
+        let fallback = Path::new("/tmp").join(&name);
+        let reason = if fits(&fallback) {
+            let _ = std::fs::remove_dir_all(&fallback);
+            match std::fs::create_dir(&fallback) {
+                Ok(()) => {
+                    std::fs::remove_dir(&fallback).unwrap();
+                    return fallback;
+                }
+                Err(e) => format!("creating {} failed: {e}", fallback.display()),
+            }
+        } else {
+            format!("{} is too long as well", fallback.display())
+        };
+        panic!(
+            "socket fixture {} plus {suffix_len} bytes reaches the {SUN_PATH_LEN}-byte \
+             sun_path limit (shorten TMPDIR); /tmp fallback: {reason}",
+            preferred.display()
+        );
+    }
+
+    /// Per-test socket dir with mode 0755, removed on drop.
+    struct SocketDir(PathBuf);
+
+    impl SocketDir {
+        fn new(label: &str) -> Self {
+            Self::at(socket_test_dir(label, socket_suffix_len("sockets")))
+        }
+
+        fn at(dir: PathBuf) -> Self {
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for SocketDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Leaves a socket file at `path` with no listener behind it.
+    fn plant_socket(path: &Path) {
+        drop(std::os::unix::net::UnixListener::bind(path).unwrap());
+    }
+
+    const CHILD_ENV: &str = "RSPROPERTIES_SERVICE_TEST_CHILD";
+
+    fn in_child() -> bool {
+        std::env::var_os(CHILD_ENV).is_some()
+    }
+
+    /// Re-runs `test_path` alone in a child process, for tests that change
+    /// process-global state (umask, SIGPIPE disposition); a regression
+    /// fails or kills only the child.
+    fn run_in_child(test_path: &str) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test_path, "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed ({:?}): {stdout}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Guard against a filter that matched nothing (vacuous pass).
+        assert!(
+            stdout.contains("1 passed"),
+            "child did not run the test: {stdout}"
+        );
+    }
+
+    /// Socket and directory modes come from the code, not the umask:
+    /// under umask 000 created dirs are 0755 and the temp socket is 0660
+    /// at `bind`; under umask 077 the socket is 0600 at `bind` and 0660 at
+    /// its final name.
+    #[test]
+    fn modes_do_not_depend_on_umask() {
+        if !in_child() {
+            run_in_child("socket_service::tests::modes_do_not_depend_on_umask");
+            return;
+        }
+        let dir = SocketDir::new("rsprops_svc_umask");
+
+        rustix::process::umask(Mode::empty());
+        let nested = dir.0.join("a").join("b");
+        ensure_socket_dir(&nested).unwrap();
+        assert_eq!(mode_of(&dir.0.join("a")), 0o755);
+        assert_eq!(mode_of(&nested), 0o755);
+        let dirfd = open_socket_dir(&dir.0).unwrap();
+        let _open = bind_temp(&dir.0, &dirfd, "umask000").unwrap();
+        assert_eq!(mode_of(&dir.0.join("umask000")), SOCKET_FILE_MODE);
+
+        rustix::process::umask(Mode::from_raw_mode(0o077));
+        let _narrow = bind_temp(&dir.0, &dirfd, "umask077").unwrap();
+        assert_eq!(mode_of(&dir.0.join("umask077")), 0o600);
+        let sockets = SocketDir::new("rsprops_svc_umask_sockets");
+        let _bound = bind_service_sockets(&sockets.0).unwrap();
+        assert_eq!(mode_of(&sockets.0.join(PROPERTY)), SOCKET_FILE_MODE);
+        assert_eq!(mode_of(&sockets.0.join(SYSTEM)), SOCKET_FILE_MODE);
+    }
+
+    /// The mode is raised only on a socket reached without following a
+    /// symlink. The euid half of the check cannot be tested: removing it
+    /// changes nothing unless the socket belongs to another uid, which a
+    /// test without a second uid cannot create.
+    #[test]
+    fn widen_refuses_symlink_and_non_socket() {
+        let dir = SocketDir::new("rsprops_svc_widen");
+        let victim = dir.0.join("victim");
+        std::fs::write(&victim, b"").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.0.join("link")).unwrap();
+        let dirfd = open_socket_dir(&dir.0).unwrap();
+
+        assert!(widen_to_socket_mode(&dir.0, &dirfd, "link").is_err());
+        assert!(widen_to_socket_mode(&dir.0, &dirfd, "victim").is_err());
+        assert_eq!(mode_of(&victim), 0o600);
+    }
+
+    /// Kernels before 3.17 have no `/proc/thread-self`: an absent first
+    /// `fd/` directory falls through to the next one (`/proc/self/fd`).
+    #[test]
+    fn chmod_opened_falls_back_when_thread_self_is_absent() {
+        let dir = SocketDir::new("rsprops_svc_procfb");
+        let sock = dir.0.join("s");
+        plant_socket(&sock);
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let pfd = rustix::fs::open(
+            &sock,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let st = rustix::fs::fstat(&pfd).unwrap();
+
+        let fd_dirs = ["/proc/rsprops-absent-thread-self/fd", "/proc/self/fd"];
+        chmod_opened(&pfd, &st, Mode::from_raw_mode(SOCKET_FILE_MODE), &fd_dirs).unwrap();
+        assert_eq!(mode_of(&sock), SOCKET_FILE_MODE);
+
+        // No `fd/` directory at all (no `/proc`): an error, mode unchanged.
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(chmod_opened(
+            &pfd,
+            &st,
+            Mode::from_raw_mode(SOCKET_FILE_MODE),
+            &fd_dirs[..1]
+        )
+        .is_err());
+        assert_eq!(mode_of(&sock), 0o600);
+    }
+
+    /// A temp socket refuses connections until it listens, so nobody
+    /// connects while its mode may still be raised.
+    #[test]
+    fn temp_socket_refuses_connections_until_listen() {
+        let dir = SocketDir::new("rsprops_svc_listen");
+        let dirfd = open_socket_dir(&dir.0).unwrap();
+        let tmp = temp_name(PROPERTY);
+        let fd = bind_temp(&dir.0, &dirfd, &tmp).unwrap();
+
+        let err = std::os::unix::net::UnixStream::connect(dir.0.join(&tmp)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+        rustix::net::listen(&fd, -1).unwrap();
+        std::os::unix::net::UnixStream::connect(dir.0.join(&tmp)).unwrap();
+    }
+
+    /// When the second socket cannot be bound (its temp path exceeds
+    /// `sun_path`), the first is not renamed over an existing socket and
+    /// no temp is left behind.
+    #[test]
+    fn second_bind_failure_leaves_no_partial_state() {
+        // rustix `SocketAddrUnix::new` accepts up to 108 path bytes. Pick
+        // the dir length so the property temp path is 103 bytes (5 below
+        // the limit); the system temp name is 11 bytes longer (114).
+        const SUN_PATH_LIMIT: usize = 108;
+        let dir_len = SUN_PATH_LIMIT - 5 - 1 - temp_name(PROPERTY).len();
+        // The suffix makes `<base>_` shorter than `dir_len`.
+        let base = socket_test_dir("rsprops_svc_len", SUN_PATH_LIMIT + 1 - dir_len);
+        let base = format!("{}_", base.to_str().unwrap());
+        assert!(base.len() < dir_len, "temp dir path too long: {base}");
+        let dir = SocketDir::at(PathBuf::from(format!(
+            "{base}{}",
+            "x".repeat(dir_len - base.len())
+        )));
+        assert_eq!(dir.0.join(temp_name(PROPERTY)).as_os_str().len(), 103);
+        assert_eq!(dir.0.join(temp_name(SYSTEM)).as_os_str().len(), 114);
+
+        let existing = dir.0.join(PROPERTY);
+        plant_socket(&existing);
+        let ino = std::fs::symlink_metadata(&existing).unwrap().ino();
+
+        assert!(bind_service_sockets(&dir.0).is_err());
+        assert_eq!(std::fs::symlink_metadata(&existing).unwrap().ino(), ino);
+        assert_eq!(names_in(&dir.0), [PROPERTY]);
+    }
+
+    /// Both final names carry `SOCKET_FILE_MODE`, nothing else is left in
+    /// the dir, and the listeners accept connections through tokio.
+    #[tokio::test]
+    async fn bound_sockets_have_final_mode_and_no_leftover() {
+        let dir = SocketDir::new("rsprops_svc_bind_final");
+        let path = dir.0.clone();
+        let bound = tokio::task::spawn_blocking(move || bind_service_sockets(&path))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(mode_of(&dir.0.join(PROPERTY)), SOCKET_FILE_MODE);
+        assert_eq!(mode_of(&dir.0.join(SYSTEM)), SOCKET_FILE_MODE);
+        assert_eq!(names_in(&dir.0), [PROPERTY, SYSTEM]);
+
+        let property = UnixListener::from_std(bound.property).unwrap();
+        let system = UnixListener::from_std(bound.system).unwrap();
+        let _client = UnixStream::connect(dir.0.join(PROPERTY)).await.unwrap();
+        property.accept().await.unwrap();
+        let _client = UnixStream::connect(dir.0.join(SYSTEM)).await.unwrap();
+        system.accept().await.unwrap();
+    }
+
+    /// The sweep removes only sockets with this service's temp prefixes.
+    #[test]
+    fn sweep_removes_only_own_temp_sockets() {
+        let dir = SocketDir::new("rsprops_svc_sweep");
+        plant_socket(&dir.0.join(".property_service.tmp-4294967295"));
+        plant_socket(&dir.0.join(".property_service_for_system.tmp-1"));
+        std::fs::write(dir.0.join(".property_service.tmp-2"), b"").unwrap();
+        plant_socket(&dir.0.join(".other.tmp-3"));
+
+        sweep_stale_temps(&open_socket_dir(&dir.0).unwrap());
+
+        assert_eq!(
+            names_in(&dir.0),
+            [".other.tmp-3", ".property_service.tmp-2"]
+        );
+    }
+
+    /// After the socket dir's path is swapped for another directory, no
+    /// unlink, rename or chmod reaches the new directory: startup fails, a
+    /// file there named like a final socket keeps its inode and content,
+    /// and the opened directory gets no final names. The temp socket
+    /// `bind` created through the path is left in the new directory.
+    #[test]
+    fn operations_stay_in_opened_socket_dir() {
+        let base = SocketDir::new("rsprops_svc_swap");
+        let opened = base.0.join("sockets");
+        let moved = base.0.join("moved");
+        std::fs::create_dir(&opened).unwrap();
+        let dirfd = open_socket_dir(&opened).unwrap();
+        std::fs::rename(&opened, &moved).unwrap();
+        std::fs::create_dir(&opened).unwrap();
+        let decoy = opened.join(PROPERTY);
+        std::fs::write(&decoy, b"decoy").unwrap();
+        let ino = std::fs::symlink_metadata(&decoy).unwrap().ino();
+
+        assert!(bind_service_sockets_at(&opened, dirfd).is_err());
+
+        assert_eq!(std::fs::symlink_metadata(&decoy).unwrap().ino(), ino);
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"decoy");
+        assert!(names_in(&moved).is_empty(), "{:?}", names_in(&moved));
+        assert_eq!(
+            names_in(&opened),
+            [temp_name(PROPERTY), PROPERTY.to_owned()]
+        );
+    }
+
+    /// Dropping the result of a start that never reached `SocketService`
+    /// (failed registration, panic, cancellation) unlinks the final names.
+    #[test]
+    fn bound_sockets_guard_unlinks_on_drop() {
+        let dir = SocketDir::new("rsprops_svc_guard");
+        let bound = bind_service_sockets(&dir.0).unwrap();
+        assert_eq!(names_in(&dir.0), [PROPERTY, SYSTEM]);
+        drop(bound);
+        assert!(names_in(&dir.0).is_empty(), "{:?}", names_in(&dir.0));
+    }
+
+    #[test]
+    fn socket_dir_warning_modes() {
+        let warn_for = |mode| socket_dir_warning(Mode::from_raw_mode(mode));
+        assert!(warn_for(0o777).is_some());
+        assert!(warn_for(0o1777).is_none());
+        assert!(warn_for(0o775).is_none());
+        assert!(warn_for(0o755).is_none());
+    }
+
+    /// A reply to a peer that already closed is `EPIPE`, not `SIGPIPE`,
+    /// even with `SIGPIPE` at `SIG_DFL` (C/JNI hosts). libtest ignores
+    /// `SIGPIPE`, so the check runs in a child that restores the default.
+    #[test]
+    fn send_response_to_closed_peer_is_epipe_not_sigpipe() {
+        if !in_child() {
+            run_in_child(
+                "socket_service::tests::send_response_to_closed_peer_is_epipe_not_sigpipe",
+            );
+            return;
+        }
+        // SAFETY: `libc::signal` is the libc crate's declaration of C
+        // `signal` for this target. `SIG_DFL` installs no handler, so no
+        // Rust code runs in signal context. The disposition is
+        // process-wide; this child process runs only this test (`--exact`).
+        let prev = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        assert_ne!(prev, libc::SIG_ERR, "signal(SIGPIPE, SIG_DFL) failed");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (mut server, client) = UnixStream::pair().unwrap();
+            drop(client);
+            let err = SocketService::send_response(&mut server, PROP_ERROR)
+                .await
+                .expect_err("peer-closed socket must error");
+            assert!(
+                matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::BrokenPipe),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    /// Counts forwarded requests in place of `PropertiesService`.
+    struct Recorder(Arc<AtomicUsize>);
+
+    impl Actor for Recorder {
+        type Args = Arc<AtomicUsize>;
+        type Error = std::convert::Infallible;
+        type IdleEvent = ();
+
+        async fn on_start(
+            count: Self::Args,
+            _actor_ref: &ActorRef<Self>,
+        ) -> std::result::Result<Self, Self::Error> {
+            Ok(Self(count))
+        }
+    }
+
+    impl rsactor::Message<crate::PropertyMessage> for Recorder {
+        type Reply = bool;
+
+        async fn handle(
+            &mut self,
+            _message: crate::PropertyMessage,
+            _actor_ref: &ActorRef<Self>,
+        ) -> bool {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+
+    fn recorder() -> (ActorRef<Recorder>, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let (actor_ref, _join) = rsactor::spawn::<Recorder>(count.clone());
+        (actor_ref, count)
+    }
+
+    fn v2_frame(name: &str, value: &str) -> Vec<u8> {
+        let mut frame = PROP_MSG_SETPROP2.to_ne_bytes().to_vec();
+        frame.extend_from_slice(&(name.len() as u32).to_ne_bytes());
+        frame.extend_from_slice(name.as_bytes());
+        frame.extend_from_slice(&(value.len() as u32).to_ne_bytes());
+        frame.extend_from_slice(value.as_bytes());
+        frame
+    }
+
+    /// A fully received V2 request is applied even though its client
+    /// closed the connection first (AOSP init parity).
+    #[tokio::test]
+    async fn v2_request_from_closed_client_is_applied() {
+        let (service, count) = recorder();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .write_all(&v2_frame("test.k3.closed", "1"))
+            .await
+            .unwrap();
+        drop(client);
+
+        // The reply then fails with EPIPE; only the forwarding matters.
+        let _ = SocketService::handle_client(server, service).await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn v2_request_from_live_client_gets_success_reply() {
+        let (service, count) = recorder();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .write_all(&v2_frame("test.k3.live", "1"))
+            .await
+            .unwrap();
+
+        SocketService::handle_client(server, service).await.unwrap();
+        let mut reply = [0u8; 4];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(i32::from_ne_bytes(reply), PROP_SUCCESS);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    /// A V2 frame that ends inside the name-length field gets a
+    /// `PROP_ERROR` reply, like other malformed frames.
+    #[tokio::test]
+    async fn v2_truncated_name_len_gets_error_reply() {
+        let (service, count) = recorder();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .write_all(&PROP_MSG_SETPROP2.to_ne_bytes())
+            .await
+            .unwrap();
+        client.write_all(&[0u8; 2]).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        assert!(SocketService::handle_client(server, service).await.is_err());
+        let mut reply = [0u8; 4];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(i32::from_ne_bytes(reply), PROP_ERROR);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 }

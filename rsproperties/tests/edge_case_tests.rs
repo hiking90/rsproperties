@@ -6,11 +6,15 @@
 //! These tests verify edge cases, error conditions, and API stability
 //! to ensure robust behavior under unusual conditions.
 
+#[cfg(any(feature = "builder", target_os = "android"))]
+use rsproperties::Error;
 use rsproperties::{self, PROP_DIRNAME, PROP_VALUE_MAX};
 
 mod common;
+#[cfg(any(feature = "builder", target_os = "android"))]
 use common::init_test;
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 fn setup_edge_test_env() {
     let _ = env_logger::builder().is_test(true).try_init();
     init_test();
@@ -31,13 +35,17 @@ fn test_api_constants() {
 }
 
 /// Test empty and whitespace property names
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_empty_property_names() {
     setup_edge_test_env();
 
     // Test empty property name
     let result: Result<String, _> = rsproperties::get("");
-    assert!(result.is_err(), "Getting empty property name should fail");
+    assert!(
+        matches!(result, Err(Error::NotFound(_))),
+        "Getting empty property name should be NotFound: {result:?}"
+    );
 
     let default_result = rsproperties::get_or("", "default".to_string());
     assert_eq!(
@@ -59,6 +67,7 @@ fn test_empty_property_names() {
 }
 
 /// Test property names with special characters
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_special_character_property_names() {
     setup_edge_test_env();
@@ -83,6 +92,7 @@ fn test_special_character_property_names() {
 }
 
 /// Test property names with invalid characters (if any restrictions exist)
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_invalid_property_names() {
     setup_edge_test_env();
@@ -125,6 +135,7 @@ fn test_invalid_property_names() {
 }
 
 /// Test very long property names
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_long_property_names() {
     setup_edge_test_env();
@@ -144,121 +155,29 @@ fn test_long_property_names() {
     }
 }
 
-/// Test edge cases with property values
-#[test]
-fn test_property_value_edge_cases() {
-    setup_edge_test_env();
+// `set` cases that should succeed (empty, whitespace, control and UTF-8
+// values, values up to `PROP_VALUE_MAX - 1` bytes) are checked frame by
+// frame against a fake service in `set_frame_tests.rs`. The cases below
+// are rejected before `set` connects, so they need no service.
 
-    let test_values = vec![
-        ("", "empty value"),
-        (" ", "single space"),
-        ("  ", "multiple spaces"),
-        ("\t", "tab character"),
-        ("\n", "newline character"),
-        ("\r", "carriage return"),
-        ("\r\n", "CRLF"),
-        ("value with spaces", "spaces in value"),
-        ("value\twith\ttabs", "tabs in value"),
-        ("\"quoted value\"", "quoted value"),
-        ("'single quoted'", "single quoted"),
-        ("value=with=equals", "equals in value"),
-        ("value:with:colons", "colons in value"),
-        ("value;with;semicolons", "semicolons in value"),
-        ("value/with/slashes", "slashes in value"),
-        ("value\\with\\backslashes", "backslashes in value"),
-        ("value with unicode: 🚀🌟⭐", "unicode characters"),
-        ("0", "zero"),
-        ("false", "false string"),
-        ("true", "true string"),
-        ("-1", "negative number"),
-        ("3.14159", "decimal number"),
-        ("1e10", "scientific notation"),
-    ];
-
-    for (i, (value, description)) in test_values.iter().enumerate() {
-        let prop_name = format!("edge.value.test.{i}");
-
-        match rsproperties::set(&prop_name, value) {
-            Ok(_) => {
-                let retrieved: Result<String, _> = rsproperties::get(&prop_name);
-                assert_eq!(
-                    retrieved.unwrap(),
-                    *value,
-                    "Failed for {}: {}",
-                    description,
-                    value.escape_debug()
-                );
-                println!("✓ {}: '{}'", description, value.escape_debug());
-            }
-            Err(e) => {
-                println!(
-                    "✗ Failed to set {}: {} - Error: {}",
-                    description,
-                    value.escape_debug(),
-                    e
-                );
-            }
-        }
-    }
-}
-
-/// Test maximum length property values
+/// Values of `PROP_VALUE_MAX` bytes or more are rejected for non-`ro.`
+/// names.
 #[test]
 #[cfg(feature = "builder")]
 fn test_maximum_length_values() {
     setup_edge_test_env();
 
-    // Test values at and around PROP_VALUE_MAX
-    let test_lengths = vec![
-        PROP_VALUE_MAX - 10,
-        PROP_VALUE_MAX - 5,
-        PROP_VALUE_MAX - 1,
-        PROP_VALUE_MAX,
-    ];
-
-    for length in test_lengths {
-        let prop_name = format!("edge.maxlen.{length}");
-        let value = "x".repeat(length);
-
-        match rsproperties::set(&prop_name, &value) {
-            Ok(_) => {
-                let retrieved: Result<String, _> = rsproperties::get(&prop_name);
-                let retrieved_value = retrieved.unwrap();
-                assert_eq!(retrieved_value.len(), length);
-                assert_eq!(retrieved_value, value);
-                println!("✓ Successfully set/get property with {length} byte value");
-            }
-            Err(e) => {
-                println!("✗ Failed to set property with {length} byte value: {e}");
-            }
-        }
-    }
-
-    // Test value that exceeds PROP_VALUE_MAX
-    let oversized_value = "x".repeat(PROP_VALUE_MAX + 10);
-    let result = rsproperties::set("edge.oversized", &oversized_value);
-    match result {
-        Ok(_) => {
-            // If it succeeds, check if value was truncated
-            let retrieved: Result<String, _> = rsproperties::get("edge.oversized");
-            let retrieved_value = retrieved.unwrap();
-            println!(
-                "Oversized value handling: set {} bytes, retrieved {} bytes",
-                oversized_value.len(),
-                retrieved_value.len()
-            );
-            assert!(
-                retrieved_value.len() <= PROP_VALUE_MAX,
-                "Retrieved value should not exceed PROP_VALUE_MAX"
-            );
-        }
-        Err(e) => {
-            println!("Oversized value correctly rejected: {e}");
-        }
+    for length in [PROP_VALUE_MAX, PROP_VALUE_MAX + 10] {
+        let result = rsproperties::set("edge.oversized", &"x".repeat(length));
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(_))),
+            "{length} byte value: {result:?}"
+        );
     }
 }
 
 /// Test error propagation and handling
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_error_handling() {
     setup_edge_test_env();
@@ -266,8 +185,8 @@ fn test_error_handling() {
     // Test get on non-existent property
     let result: Result<String, _> = rsproperties::get("definitely.does.not.exist.anywhere");
     assert!(
-        result.is_err(),
-        "Should return error for non-existent property"
+        matches!(result, Err(Error::NotFound(_))),
+        "Should return NotFound for non-existent property: {result:?}"
     );
 
     // Test that error contains useful information
@@ -277,62 +196,28 @@ fn test_error_handling() {
         println!("Error message for non-existent property: {error_msg}");
     }
 
-    #[cfg(feature = "builder")]
-    {
-        // Test set with invalid inputs
-        let invalid_cases = vec![("", "some_value", "empty property name")];
-
-        for (name, value, description) in invalid_cases {
-            let result = rsproperties::set(name, value);
-            println!("Testing {description}: {result:?}");
-            // Should either succeed or fail gracefully with a proper error
-            if let Err(e) = result {
-                assert!(
-                    !format!("{e}").is_empty(),
-                    "Error message should not be empty for {description}"
-                );
-            }
-        }
-    }
+    let result = rsproperties::set("", "some_value");
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "empty property name: {result:?}"
+    );
 }
 
-/// Test behavior with null bytes and other special characters
+/// A NUL byte in a name or value is rejected: the service reads both as C
+/// strings, so it would set a truncated name or value.
 #[test]
 #[cfg(feature = "builder")]
 fn test_null_bytes_and_special_chars() {
     setup_edge_test_env();
 
-    let test_cases = vec![
+    for (prop_name, prop_value) in [
         ("prop.with.null", "value\0with\0nulls"),
-        (
-            "prop.with.high.unicode",
-            "value with high unicode: \u{1F600}\u{1F601}",
-        ),
-        (
-            "prop.with.control.chars",
-            "value\x01with\x02control\x03chars",
-        ),
-        ("prop.with.del", "value\x7Fwith\x7Fdel"),
-        ("prop.with.escape", "value\x1Bwith\x1Bescape"),
-    ];
-
-    for (prop_name, prop_value) in test_cases {
+        ("prop.with\0null", "value"),
+    ] {
         let result = rsproperties::set(prop_name, prop_value);
-        match result {
-            Ok(_) => {
-                let retrieved: Result<String, _> = rsproperties::get(prop_name);
-                let retrieved_value = retrieved.unwrap();
-                println!(
-                    "✓ Special chars in '{}': {} bytes -> {} bytes",
-                    prop_name,
-                    prop_value.len(),
-                    retrieved_value.len()
-                );
-                // Value might be modified/filtered by the implementation
-            }
-            Err(e) => {
-                println!("✗ Failed to set '{prop_name}': {e}");
-            }
-        }
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(_))),
+            "{prop_name:?} = {prop_value:?}: {result:?}"
+        );
     }
 }

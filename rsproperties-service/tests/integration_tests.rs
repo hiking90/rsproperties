@@ -46,10 +46,12 @@ async fn test_get_nonexistent_property() {
     setup_test_env().await;
 
     let prop_name = "definitely.does.not.exist";
-    let result: String = rsproperties::get(prop_name).unwrap_or_default();
+    let result: Result<String, _> = rsproperties::get(prop_name);
 
-    // Should return empty string for non-existent property
-    assert!(result.is_empty());
+    assert!(
+        matches!(result, Err(rsproperties::Error::NotFound(_))),
+        "{result:?}"
+    );
 }
 
 mod builder_tests {
@@ -115,9 +117,12 @@ mod builder_tests {
     async fn test_set_invalid_property_name() {
         setup_test_env().await;
 
-        // Test with empty property name
+        // The client rejects an empty name before connecting.
         let result = rsproperties::set("", "value");
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(rsproperties::Error::InvalidArgument(_))),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
@@ -192,9 +197,9 @@ mod error_handling_tests {
         // Create a value close to PROP_VALUE_MAX
         let long_value = "x".repeat(rsproperties::PROP_VALUE_MAX - 10);
 
-        let result = rsproperties::set(prop_name, &long_value);
-        // This should succeed since it's within limits
-        assert!(result.is_ok());
+        rsproperties::set(prop_name, &long_value).expect("a value within limits is accepted");
+        let read: String = rsproperties::get(prop_name).expect("get after set");
+        assert_eq!(read, long_value);
     }
 
     #[tokio::test]
@@ -205,10 +210,13 @@ mod error_handling_tests {
         // Create a value that exceeds PROP_VALUE_MAX
         let too_long_value = "x".repeat(rsproperties::PROP_VALUE_MAX + 10);
 
+        // A non-`ro.` value is never truncated: the client rejects it
+        // before connecting (`wire::validate_value_len`).
         let result = rsproperties::set(prop_name, &too_long_value);
-        // This should fail or truncate the value
-        // The exact behavior depends on implementation
-        println!("Result for too long value: {result:?}");
+        assert!(
+            matches!(result, Err(rsproperties::Error::InvalidArgument(_))),
+            "{result:?}"
+        );
     }
 }
 
@@ -269,9 +277,13 @@ mod concurrency_tests {
                     rsproperties::set(&name, &value).unwrap();
                     // thread::sleep(Duration::from_millis(10));
 
-                    // Verify we can read some value back
-                    let retrieved: String = rsproperties::get(&name).unwrap_or_default();
-                    assert!(!retrieved.is_empty());
+                    // After this thread's set, "initial" is gone: the value
+                    // is the last write of one of the threads.
+                    let retrieved: String = rsproperties::get(&name).unwrap();
+                    assert!(
+                        (0..3).any(|t| retrieved == format!("thread_{t}_value")),
+                        "unexpected value {retrieved:?}"
+                    );
 
                     println!("Thread {i} set value: {value}, got: {retrieved}");
                 })
@@ -283,8 +295,11 @@ mod concurrency_tests {
         }
 
         // Final verification
-        let final_value: String = rsproperties::get(prop_name).unwrap_or_default();
-        assert!(!final_value.is_empty());
+        let final_value: String = rsproperties::get(prop_name)?;
+        assert!(
+            (0..3).any(|t| final_value == format!("thread_{t}_value")),
+            "unexpected final value {final_value:?}"
+        );
 
         Ok(())
     }

@@ -14,9 +14,13 @@
 //!   setprop debug.test.prop test_value         # Set a debug property
 //!   setprop persist.sys.usb.config adb         # Set USB configuration
 //!   setprop --socket-dir ./socket debug.prop value  # Use custom socket directory
+//!
+//! Exit code 0 is the success signal, like AOSP setprop (which prints
+//! nothing on success). Errors go to stderr with exit code 1.
 
 use clap::Parser;
 use rsproperties::PropertyConfig;
+use std::io::Write as _;
 
 #[derive(Parser, Debug)]
 #[command(name = "setprop")]
@@ -63,53 +67,43 @@ fn main() {
     }
 
     // Validate property name and value
-    if let Err(msg) = validate_property(&args.property_name, &args.property_value) {
-        eprintln!("Error: {msg}");
+    if let Err(msg) = validate_property(&args.property_name) {
+        // `let _ =` on every output write: a closed stderr must not turn
+        // into a panic (exit code 101) that hides the real exit code.
+        let _ = writeln!(std::io::stderr(), "Error: {msg}");
         std::process::exit(1);
     }
 
-    // Set the property
-    match rsproperties::set(&args.property_name, &args.property_value) {
-        Ok(_) => {
-            println!(
-                "Property '{}' set to '{}'",
-                args.property_name, args.property_value
-            );
-        }
-        Err(e) => {
-            eprintln!("Failed to set property '{}': {}", args.property_name, e);
-            std::process::exit(1);
-        }
+    // Set the property. Nothing is printed on success.
+    if let Err(e) = rsproperties::set(&args.property_name, &args.property_value) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "Failed to set property '{}': {}",
+            args.property_name,
+            e
+        );
+        std::process::exit(1);
     }
 }
 
-fn validate_property(name: &str, value: &str) -> Result<(), String> {
+/// Name checks only; length limits are checked by `rsproperties::set`,
+/// whose V2 caps differ by target (Android uses init's limit).
+fn validate_property(name: &str) -> Result<(), String> {
     // Basic validation similar to Android's setprop
     if name.is_empty() {
         return Err("Property name cannot be empty".to_string());
     }
 
-    if name.len() > 256 {
-        return Err("Property name too long (max 256 characters)".to_string());
-    }
-
-    if value.len() > 8192 {
-        return Err("Property value too long (max 8192 characters)".to_string());
-    }
-
-    // Check for invalid characters in property name
-    if !name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-')
-    {
-        return Err(
-            "Invalid characters in property name (only alphanumeric, ., _, - allowed)".to_string(),
-        );
-    }
+    // Same name rules as the library and AOSP `IsLegalPropertyName`
+    // (ASCII alphanumerics plus `_ . - @ :`).
+    rsproperties::wire::validate_property_name(name).map_err(|e| e.to_string())?;
 
     // Warn about read-only properties
     if name.starts_with("ro.") {
-        eprintln!("Warning: Property '{name}' is read-only and may not be settable");
+        let _ = writeln!(
+            std::io::stderr(),
+            "Warning: Property '{name}' is read-only and may not be settable"
+        );
     }
 
     Ok(())

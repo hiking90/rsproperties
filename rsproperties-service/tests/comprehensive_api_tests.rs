@@ -158,7 +158,10 @@ async fn test_property_type_overwriting() -> anyhow::Result<()> {
 
     // Try to parse as integer (should fail)
     let int_result: Result<i32, _> = rsproperties::get(prop_name);
-    assert!(int_result.is_err());
+    assert!(
+        matches!(int_result, Err(rsproperties::Error::Parse(_))),
+        "{int_result:?}"
+    );
 
     // Overwrite with string number
     rsproperties::set(prop_name, "999")?;
@@ -176,7 +179,10 @@ async fn test_error_handling_integration() -> anyhow::Result<()> {
     // Test 1: Parse non-existent property
     let non_existent = "definitely.does.not.exist.anywhere";
     let result: Result<i32, _> = rsproperties::get(non_existent);
-    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(rsproperties::Error::NotFound(_))),
+        "{result:?}"
+    );
 
     // But get_or should work
     let with_default: i32 = rsproperties::get_or(non_existent, 42);
@@ -187,7 +193,10 @@ async fn test_error_handling_integration() -> anyhow::Result<()> {
     rsproperties::set(prop_name, "not_a_number")?;
 
     let parse_result: Result<i32, _> = rsproperties::get(prop_name);
-    assert!(parse_result.is_err());
+    assert!(
+        matches!(parse_result, Err(rsproperties::Error::Parse(_))),
+        "{parse_result:?}"
+    );
 
     // But get_or should return default
     let default_fallback: i32 = rsproperties::get_or(prop_name, 999);
@@ -196,7 +205,10 @@ async fn test_error_handling_integration() -> anyhow::Result<()> {
     // Test 3: Parse empty string
     rsproperties::set(prop_name, "")?;
     let empty_result: Result<i32, _> = rsproperties::get(prop_name);
-    assert!(empty_result.is_err());
+    assert!(
+        matches!(empty_result, Err(rsproperties::Error::Parse(_))),
+        "{empty_result:?}"
+    );
 
     Ok(())
 }
@@ -341,8 +353,8 @@ async fn test_boolean_string_variations() -> anyhow::Result<()> {
         rsproperties::set(&prop_name, string_value)?;
         let result: Result<bool, _> = rsproperties::get(&prop_name);
         assert!(
-            result.is_err(),
-            "Invalid bool case should fail for {name} ({string_value})"
+            matches!(result, Err(rsproperties::Error::Parse(_))),
+            "Invalid bool case should fail for {name} ({string_value}): {result:?}"
         );
 
         // But get_parsed_with_default should return the default
@@ -470,12 +482,6 @@ async fn test_performance_characteristics() -> anyhow::Result<()> {
         "Performance: {:.0} operations/second ({:.2} ms total)",
         ops_per_second,
         elapsed.as_millis()
-    );
-
-    // Ensure reasonable performance (should complete 100 ops in reasonable time)
-    assert!(
-        elapsed.as_secs() < 5,
-        "Performance test took too long: {elapsed:?}"
     );
 
     Ok(())

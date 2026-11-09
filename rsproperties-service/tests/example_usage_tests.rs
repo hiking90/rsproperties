@@ -105,10 +105,12 @@ async fn example_error_handling() {
         Ok(config)
     }
 
-    match get_required_config() {
-        Ok(config) => println!("Config: {config}"),
-        Err(e) => println!("Configuration error: {e}"),
-    }
+    // No test sets `app.required.config`, so `get` reports it as missing.
+    let result = get_required_config();
+    assert!(
+        matches!(result, Err(rsproperties::Error::NotFound(_))),
+        "{result:?}"
+    );
 }
 
 /// Example showing different property patterns used in Android

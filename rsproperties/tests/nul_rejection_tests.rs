@@ -11,11 +11,13 @@
 
 #![cfg(all(feature = "builder", not(target_os = "android")))]
 
+mod common;
+
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use rsproperties::{build_trie, PropertyInfoEntry, SystemProperties};
+use rsproperties::{build_trie, AreaWriterLock, PropertyInfoEntry, SystemProperties};
 
 fn build_property_info(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
@@ -30,19 +32,20 @@ fn build_property_info(dir: &Path) {
     assert!(errors.is_empty(), "parse errors: {errors:?}");
 
     let data = build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap();
-    File::create(dir.join("property_info"))
+    // Mode 0444 whatever the umask; `File::create` under umask 002 makes
+    // a group-writable file that readers refuse.
+    AreaWriterLock::acquire(dir)
         .unwrap()
-        .write_all(&data)
+        .publish_property_info(&data)
         .unwrap();
 }
 
 #[test]
 fn test_interior_nul_rejected_and_area_stays_healthy() {
-    let dir = std::env::temp_dir().join(format!("rsprops_nul_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    build_property_info(&dir);
+    let dir = common::TempDir::new("rsprops_nul");
+    build_property_info(dir.path());
 
-    let mut props = SystemProperties::new_area(&dir).expect("new_area");
+    let mut props = SystemProperties::new_area(dir.path()).expect("new_area");
 
     // A NUL in the name would target C-string storage at a different key
     // than the caller asked for.
@@ -72,8 +75,6 @@ fn test_interior_nul_rejected_and_area_stays_healthy() {
         "2",
         "failed update must not modify the stored value"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -87,7 +88,12 @@ fn test_build_trie_rejects_nul_in_context_and_type() {
         false,
     )
     .unwrap()];
-    assert!(build_trie(&entries, "u:object_r:default:s0", "string").is_err());
+    // `InvalidArgument` (the gate), not the serializer's `FileValidation`
+    // that an ungated NUL string ends in.
+    assert!(matches!(
+        build_trie(&entries, "u:object_r:default:s0", "string"),
+        Err(rsproperties::Error::InvalidArgument(_))
+    ));
 
     // The defaults bypass `add_to_trie` and are interned directly, so they
     // have their own gate at `build_trie`'s entry.
@@ -98,6 +104,12 @@ fn test_build_trie_rejects_nul_in_context_and_type() {
         false,
     )
     .unwrap()];
-    assert!(build_trie(&entries, "u:object_r:def\0ault:s0", "string").is_err());
-    assert!(build_trie(&entries, "u:object_r:default:s0", "str\0ing").is_err());
+    assert!(matches!(
+        build_trie(&entries, "u:object_r:def\0ault:s0", "string"),
+        Err(rsproperties::Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        build_trie(&entries, "u:object_r:default:s0", "str\0ing"),
+        Err(rsproperties::Error::InvalidArgument(_))
+    ));
 }

@@ -14,6 +14,8 @@
 
 #![cfg(not(target_os = "android"))]
 
+mod common;
+
 use std::io::Read;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -81,13 +83,16 @@ fn test_v1_sys_powerctl_routes_to_for_system_socket() {
     // is re-derived from the env on every `set`.
     std::env::set_var("PROPERTY_SERVICE_VERSION", "1");
 
-    let dir = std::env::temp_dir().join(format!("rsprops_v1route_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    rsproperties::init(PropertyConfig::with_socket_dir(&dir));
+    // The longer of the two socket names sets the length limit.
+    let dir = common::socket_test_dir(
+        "rsprops_v1route",
+        1 + PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME.len(),
+    );
+    std::fs::create_dir_all(dir.path()).unwrap();
+    rsproperties::init(PropertyConfig::with_socket_dir(dir.path()));
 
-    let plain_path = dir.join(PROPERTY_SERVICE_SOCKET_NAME);
-    let system_path = dir.join(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
+    let plain_path = dir.path().join(PROPERTY_SERVICE_SOCKET_NAME);
+    let system_path = dir.path().join(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
 
     // Phase 1 — with both sockets present, `sys.powerctl` must go to the
     // for_system socket and ONLY there.
@@ -123,8 +128,6 @@ fn test_v1_sys_powerctl_routes_to_for_system_socket() {
     let frame = server.join().expect("server thread panicked");
     assert_eq!(frame_cstr(&frame[4..4 + PROP_NAME_MAX]), "test.v1.other");
     assert_no_pending_client(&system, "for_system");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Unlinks a socket path so a later bind can reclaim it.

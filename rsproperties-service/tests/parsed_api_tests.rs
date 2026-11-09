@@ -157,9 +157,10 @@ async fn test_get_parsed_nonexistent_property() {
     let prop_name = "completely.nonexistent.property";
     let result: Result<i32, _> = rsproperties::get(prop_name);
 
-    assert!(result.is_err());
-    let error_msg = result.unwrap_err().to_string();
-    assert!(error_msg.contains("NotFound") || error_msg.contains("not found"));
+    assert!(
+        matches!(result, Err(rsproperties::Error::NotFound(_))),
+        "{result:?}"
+    );
 }
 
 #[tokio::test]
@@ -172,9 +173,10 @@ async fn test_get_parsed_parsing_error() -> anyhow::Result<()> {
 
     let result: Result<i32, _> = rsproperties::get(prop_name);
 
-    assert!(result.is_err());
-    let error_msg = result.unwrap_err().to_string();
-    assert!(error_msg.contains("Parse") || error_msg.contains("parse"));
+    assert!(
+        matches!(result, Err(rsproperties::Error::Parse(_))),
+        "{result:?}"
+    );
 
     Ok(())
 }
@@ -189,7 +191,10 @@ async fn test_get_parsed_empty_property() -> anyhow::Result<()> {
 
     let result: Result<i32, _> = rsproperties::get(prop_name);
 
-    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(rsproperties::Error::Parse(_))),
+        "{result:?}"
+    );
     let error_msg = result.unwrap_err().to_string();
     assert!(error_msg.contains("cannot parse integer from empty string"));
 
@@ -246,23 +251,20 @@ async fn test_get_parsed_edge_cases() -> anyhow::Result<()> {
 async fn test_get_parsed_with_whitespace() -> anyhow::Result<()> {
     setup_test_env().await;
 
-    // Test parsing values with whitespace (should be trimmed by the property system)
+    // Neither `set` nor `get` trims the value, so the stored value keeps
+    // its spaces and `i32::from_str` rejects it.
     let prop_name = "test.parsed.whitespace";
     let test_value = "  123  ";
     rsproperties::set(prop_name, test_value)?;
 
-    // The property system should handle whitespace appropriately
     let result: Result<i32, _> = rsproperties::get(prop_name);
+    assert!(
+        matches!(result, Err(rsproperties::Error::Parse(_))),
+        "{result:?}"
+    );
 
-    // Note: The behavior here depends on how the property system handles whitespace
-    // We'll just verify that the function behaves consistently
-    match result {
-        Ok(value) => assert_eq!(value, 123),
-        Err(_) => {
-            // If whitespace causes parsing to fail, that's also acceptable behavior
-            // as it depends on the underlying property system implementation
-        }
-    }
+    let raw: String = rsproperties::get(prop_name)?;
+    assert_eq!(raw, test_value);
 
     Ok(())
 }

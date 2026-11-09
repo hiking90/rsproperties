@@ -37,7 +37,7 @@ where
                     ))
                 }),
             None => Err(Error::FileValidation(format!(
-                "'{s}' missing from the serialized string table (serializer invariant violation)"
+                "{s:?} missing from the serialized string table (serializer invariant violation)"
             ))),
         },
         _ => Ok(NO_INDEX),

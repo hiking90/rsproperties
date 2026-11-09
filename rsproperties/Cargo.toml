@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Pure Rust implementation of Android's property system with cross-platform support, real-time monitoring, and Linux emulation"
+description = "Pure Rust implementation of Android's property system for Linux and Android, with real-time monitoring and Linux emulation"
 
 [features]
 default = []
@@ -19,6 +19,11 @@ builder = []
 # debug-assertions enabled (which normally relax it for dev/test). For
 # release profiles that turn `debug-assertions = true` back on (e.g. for
 # overflow checks) without intending to relax file validation.
+# Also refuses (`Error::PermissionDenied`) a `property_info` whose
+# owner-write bit is set, in every build; without this feature such a
+# file is only logged with a warning. `property_info` must be replaced by
+# rename, never rewritten in place (`AreaWriterLock::publish_property_info`
+# writes it with mode 0444).
 strict-file-validation = []
 
 [dependencies]
@@ -35,6 +40,7 @@ env_logger.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 criterion = "0.8"
+libc = "0.2"
 
 [[bench]]
 name = "props_bench"

@@ -14,7 +14,8 @@ const RESTORECON_PROPERTY: &str = "selinux.restorecon_recursive";
 /// Bound on `import` nesting. Real prop files import at most one or two
 /// levels deep; the cap exists so pathological nesting fails loudly
 /// instead of recursing until the stack overflows. Cycles are cut by the
-/// import *stack* (a file cannot import itself, directly or transitively);
+/// import *stack* (an unfiltered import of a file already on the stack is
+/// skipped; a filtered import follows no `import` lines and is exempt);
 /// the depth cap bounds only nesting, NOT fan-out — that is
 /// [`MAX_TOTAL_LOADS`]' job.
 const MAX_IMPORT_DEPTH: u8 = 8;
@@ -27,6 +28,13 @@ const MAX_IMPORT_DEPTH: u8 = 8;
 /// times. A real Android build loads a few dozen prop files; 1,000 is far
 /// beyond any legitimate tree while stopping a crafted one immediately.
 const MAX_TOTAL_LOADS: u32 = 1_000;
+
+/// C `isspace` in the "C" locale — what AOSP `LoadProperties` trims.
+/// `char::is_ascii_whitespace` omits `\x0b`; `str::trim` adds Unicode
+/// whitespace such as U+00A0, which AOSP keeps.
+const fn is_c_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r')
+}
 
 /// Placeholder for future per-property SELinux permission enforcement.
 /// Currently a no-op; see TODO in caller.
@@ -97,7 +105,15 @@ pub(crate) fn read_bounded_line(
 /// last-wins semantics require — `MAX_TOTAL_LOADS` bounds pathological
 /// re-import fan-out. Non-UTF-8 lines are skipped with a warning — prop
 /// files on real devices are byte streams and may carry stray non-UTF-8
-/// comment bytes.
+/// comment bytes. Lines, keys, values, and `import` paths and filters are
+/// trimmed of C `isspace` characters only (space, `\t`, `\n`, `\v`, `\f`,
+/// `\r`); other Unicode whitespace is kept, like AOSP.
+///
+/// Every file, the root one included, is opened like AOSP init's
+/// `ReadFile`: with `O_NOFOLLOW`, so a symlink as the last path component
+/// fails to open (an error for the root file; a skipped import otherwise),
+/// and a file writable by group or others is skipped with a warning —
+/// for the root file this returns `Ok(())` with nothing loaded.
 ///
 /// On error (I/O failure reading the root file, or more than
 /// `MAX_TOTAL_LOADS` file loads across the whole pass), entries parsed
@@ -123,8 +139,11 @@ pub fn load_properties_from_file(
 }
 
 /// Expands property references in an import path against the entries
-/// loaded so far (AOSP expands against the live property store; during a
-/// bulk load the accumulator map is the equivalent source).
+/// loaded so far, including entries read earlier in the same load pass
+/// and whatever the caller put in the map beforehand. This differs from
+/// AOSP, which expands against the live property store: there, entries
+/// of the current bulk load are not yet visible, and store values such as
+/// kernel-derived `ro.boot.*` are visible without being in any prop file.
 ///
 /// AOSP `init/util.cpp::ExpandProps` parity:
 /// - `$$` is an escape for a literal `$`;
@@ -132,10 +151,11 @@ pub fn load_properties_from_file(
 /// - `${name:-default}` falls back to `default` when the property is
 ///   missing **or empty** (AOSP's `GetProperty(name, "")` cannot tell the
 ///   two apart);
-/// - a `$` not followed by `{` or `$`, an unterminated `${`, or a
-///   missing/empty property without a default is an error → `None`
-///   (AOSP returns `Error()` for each; the caller logs and skips the
-///   import).
+/// - a `$` at the end of the input is dropped and expansion succeeds;
+/// - a `$` not followed by `{` or `$`, an unterminated `${`, a
+///   zero-length name (`${}`, `${:-d}`), or a missing/empty property
+///   without a non-empty default is an error → `None` (AOSP returns
+///   `Error()` for each; the caller logs and skips the import).
 fn expand_import_path(raw: &str, properties: &HashMap<String, String>) -> Option<String> {
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
@@ -147,6 +167,11 @@ fn expand_import_path(raw: &str, properties: &HashMap<String, String>) -> Option
             rest = tail;
             continue;
         }
+        // AOSP: a `$` at the very end of the input ends expansion
+        // successfully, dropping the `$`.
+        if after.is_empty() {
+            return Some(out);
+        }
         let body = after.strip_prefix('{')?;
         let end = body.find('}')?;
         let reference = &body[..end];
@@ -154,10 +179,15 @@ fn expand_import_path(raw: &str, properties: &HashMap<String, String>) -> Option
             Some((name, default)) => (name, Some(default)),
             None => (reference, None),
         };
+        // AOSP rejects a zero-length property name even with a default.
+        if name.is_empty() {
+            return None;
+        }
         match properties.get(name).map(String::as_str) {
             Some(value) if !value.is_empty() => out.push_str(value),
-            // Missing and empty collapse to the default, like AOSP.
-            _ => out.push_str(default?),
+            // Missing and empty collapse to the default, like AOSP; an
+            // empty default (`${x:-}`) counts as no default there.
+            _ => out.push_str(default.filter(|d| !d.is_empty())?),
         }
         rest = &body[end + 1..];
     }
@@ -197,36 +227,76 @@ fn load_properties_impl(
         )));
     }
 
-    // Canonicalize so `a.prop`, `./a.prop`, and a symlink to it compare
-    // equal on the import stack; fall back to the raw path when
-    // canonicalization fails (e.g. the file doesn't exist — `File::open`
-    // below reports that).
+    // Canonicalize so `a.prop`, `./a.prop`, and a path through a symlinked
+    // directory compare equal on the import stack (a symlink as the last
+    // component fails the `O_NOFOLLOW` open in `open_prop_file`); fall back
+    // to the raw path when canonicalization fails (e.g. the file doesn't
+    // exist — the open below reports that).
     //
     // `visited` is a recursion *stack*, not a load-once set: the entry is
-    // removed again before returning. Only genuine cycles (a file
-    // importing itself, directly or transitively) are cut — a file
+    // removed again before returning. Only genuine cycles through
+    // unfiltered imports are cut (see the `filtered` exemption below) — a file
     // imported twice from different places is re-applied each time, like
     // AOSP init's `LoadProperties` (which has no dedup at all), so
     // re-imports keep their last-wins effect on earlier overrides.
     let canonical = std::fs::canonicalize(filename).unwrap_or_else(|_| filename.to_path_buf());
-    if !visited.insert(canonical.clone()) {
+    // A filtered load never processes `import` lines (AOSP `flen == 0`
+    // condition, mirrored in `load_properties_body`), so it cannot recurse
+    // and is exempt from the cycle check: AOSP re-applies a filtered import
+    // of a file that is still being loaded higher up the stack.
+    let filtered = filter.is_some_and(|f| !f.is_empty());
+    if !filtered && !visited.insert(canonical.clone()) {
         warn!("{filename:?} is already being loaded (import cycle) — skipping");
         return Ok(());
     }
     // From here on every exit must pop the stack entry; wrap the body so
     // one removal covers all paths.
-    let result = load_properties_body(
-        filename, &canonical, filter, context, properties, depth, visited, loads,
-    );
-    visited.remove(&canonical);
+    let result = load_properties_body(filename, filter, context, properties, depth, visited, loads);
+    if !filtered {
+        visited.remove(&canonical);
+    }
     result
+}
+
+/// Opens a prop file the way AOSP init's `ReadFile` does
+/// (`init/util.cpp`): `O_NOFOLLOW`, so a symlink as the last path
+/// component fails the open (`ELOOP`), and a file whose mode has the
+/// group- or other-write bit is skipped with a warning (`Ok(None)`).
+///
+/// Opens the caller's path, not the canonicalized cycle key:
+/// `O_NOFOLLOW` on the canonical path would accept a symlinked prop file,
+/// which init refuses. Directory components are still resolved at open
+/// time, so they can differ from what `canonicalize` saw if one is
+/// swapped in between; the depth/loads caps bound the effect on cycle
+/// detection, the same window the canonical-path open had.
+fn open_prop_file(filename: &Path) -> Result<Option<File>> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    // std adds O_CLOEXEC itself.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as _)
+        .open(filename)
+        .context_with_location(format!("Failed to open {filename:?}"))?;
+    let mode = file
+        .metadata()
+        .context_with_location(format!("Failed to stat {filename:?}"))?
+        .permissions()
+        .mode();
+    // 0o022 = S_IWGRP | S_IWOTH, the bits init's `ReadFile` refuses.
+    if mode & 0o022 != 0 {
+        warn!(
+            "{filename:?}: skipping group- or world-writable prop file (mode {:o}), like AOSP init",
+            mode & 0o7777
+        );
+        return Ok(None);
+    }
+    Ok(Some(file))
 }
 
 // See `load_properties_impl` for the arguments-count rationale.
 #[allow(clippy::too_many_arguments)]
 fn load_properties_body(
     filename: &Path,
-    canonical: &Path,
     filter: Option<&str>,
     context: &str,
     properties: &mut HashMap<String, String>,
@@ -234,18 +304,9 @@ fn load_properties_body(
     visited: &mut HashSet<PathBuf>,
     loads: &mut u32,
 ) -> Result<()> {
-    // Open the *canonicalized* path — the cycle-detection key above. This
-    // narrows (best-effort, does not close) the symlink-swap window between
-    // canonicalize and open: a component of the canonical path could still
-    // be replaced by a symlink in between, since `File::open` follows
-    // symlinks. Fully closing it would need openat2(RESOLVE_NO_SYMLINKS)
-    // or an open-then-fstat comparison; the depth/loads caps already keep
-    // any confusion bounded, so the narrowing is judged sufficient.
-    // Error messages still name the caller's path: on canonicalization
-    // failure `canonical` falls back to `filename`, so `File::open` reports
-    // the name the user wrote.
-    let file =
-        File::open(canonical).context_with_location(format!("Failed to open {filename:?}"))?;
+    let Some(file) = open_prop_file(filename)? else {
+        return Ok(());
+    };
     let mut reader = BufReader::new(file);
     let filter = filter.filter(|s| !s.is_empty());
 
@@ -276,21 +337,32 @@ fn load_properties_body(
             warn!("Line {line_count} of {filename:?}: skipping non-UTF-8 line");
             continue;
         };
-        let line = line.trim();
+        let line = line.trim_matches(is_c_space);
 
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
 
         if filter.is_none() {
-            if let Some(import_path) = line.strip_prefix("import ") {
+            if let Some(import_rest) = line.strip_prefix("import ") {
+                // AOSP `LoadProperties` splits `import <path> [<filter>]` at
+                // the first space after the path and forwards the filter to
+                // the nested load. Treating the whole rest as the path made
+                // every filtered import fail to open (ENOENT) and get
+                // skipped. An empty filter is mapped to `None` by the
+                // nested `load_properties_body`.
+                let import_rest = import_rest.trim_start_matches(is_c_space);
+                let (import_path, import_filter) = match import_rest.split_once(' ') {
+                    Some((path, filter)) => (path, Some(filter.trim_start_matches(is_c_space))),
+                    None => (import_rest, None),
+                };
                 // AOSP parity: resolve and load the import, but never let a
                 // broken import discard the rest of this file.
-                match expand_import_path(import_path.trim(), properties) {
+                match expand_import_path(import_path, properties) {
                     Some(expanded) => {
                         if let Err(e) = load_properties_impl(
                             Path::new(&expanded),
-                            None,
+                            import_filter,
                             context,
                             properties,
                             depth + 1,
@@ -323,7 +395,12 @@ fn load_properties_body(
         }
 
         let (key, value) = match line.find('=') {
-            Some(pos) => (line[..pos].trim_end(), line[pos + 1..].trim()),
+            // Value end: already trimmed with the line, like AOSP (which
+            // trims only the value start after splitting at `=`).
+            Some(pos) => (
+                line[..pos].trim_end_matches(is_c_space),
+                line[pos + 1..].trim_start_matches(is_c_space),
+            ),
             None => continue,
         };
 
@@ -345,15 +422,32 @@ fn load_properties_body(
         }
 
         if key.starts_with("ctl.") || key == "sys.powerctl" || key == RESTORECON_PROPERTY {
-            error!("Line {line_count} of {filename:?}: Ignoring disallowed property '{key}' with special meaning");
+            error!("Line {line_count} of {filename:?}: Ignoring disallowed property {key:?} with special meaning");
+            continue;
+        }
+
+        // AOSP `LoadProperties` drops a line whose key fails
+        // `IsLegalPropertyName` (first step of `CheckPermissions`); such a
+        // key could be stored but never `set` again.
+        if let Err(e) = crate::wire::validate_property_name(key) {
+            warn!("Line {line_count} of {filename:?}: ignoring illegal property name: {e}");
             continue;
         }
 
         check_permissions(key, value, context);
-        if let Some(old_value) = properties.insert(key.to_string(), value.to_string()) {
-            warn!(
-                "Line {line_count} of {filename:?}: Overriding previous property '{key}':'{old_value}' with new value '{value}'"
-            );
+        // Values stay out of the log, like every other log site that sees
+        // one (they may carry tokens or device identifiers). Warn only when
+        // the value actually changes, like AOSP `LoadProperties`: a
+        // re-applied duplicate `import` is not an override.
+        match properties.get_mut(key) {
+            Some(old) if old != value => {
+                *old = value.to_string();
+                warn!("Line {line_count} of {filename:?}: Overriding previous property {key:?}");
+            }
+            Some(_) => {}
+            None => {
+                properties.insert(key.to_string(), value.to_string());
+            }
         }
     }
 
@@ -368,14 +462,10 @@ mod tests {
     #[cfg(not(target_os = "android"))]
     #[test]
     fn test_load_properties_from_file() {
+        let tmp = TempDir::new("rsprops_fixture_test");
+        let file = crate::test_support::copy_android_fixture("system_build.prop", &tmp.0);
         let mut properties = HashMap::new();
-        load_properties_from_file(
-            Path::new("tests/android/system_build.prop"),
-            None,
-            "u:r:init:s0",
-            &mut properties,
-        )
-        .unwrap();
+        load_properties_from_file(&file, None, "u:r:init:s0", &mut properties).unwrap();
         assert_eq!(
             properties.get("persist.sys.usb.config"),
             Some(&"adb".to_string())
@@ -403,6 +493,141 @@ mod tests {
         }
     }
 
+    /// `File::create` with mode 0644: under a umask such as 002 a plain
+    /// `File::create` leaves the group-write bit, and the loader skips such
+    /// files (`open_prop_file`).
+    #[cfg(not(target_os = "android"))]
+    fn create_prop(path: &Path) -> std::io::Result<File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(path)
+    }
+
+    /// AOSP `LoadProperties` trims with C `isspace` (bionic: ASCII space
+    /// and `\t`..`\r`, false for every byte >= 0x80), at the line ends, the
+    /// key end and the value start. AOSP's `tmp > key` loop bound never
+    /// trims the key's first byte, but that byte is never a space after
+    /// the line-start trim, so `trim_end_matches` on the key gives the same
+    /// result; a line of only whitespace is skipped by both.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_trim_is_c_isspace_only() {
+        use std::io::Write;
+        let tmp = TempDir::new("rsprops_trim_test");
+        let path = tmp.0.join("trim.prop");
+        {
+            let mut f = create_prop(&path).unwrap();
+            writeln!(f, "ro.nbsp.value=foo\u{a0}").unwrap();
+            writeln!(f, "ro.lead.value=\u{3000}bar").unwrap();
+            writeln!(f, "\u{3000}ro.lead.key=1").unwrap();
+            writeln!(f, "ro.vt.value=\x0bbaz\x0b").unwrap();
+            writeln!(f, " \t ro.ws.key \x0c= \r qux \x0b\r").unwrap();
+        }
+
+        let mut properties = HashMap::new();
+        load_properties_from_file(&path, None, "u:r:init:s0", &mut properties).unwrap();
+        assert_eq!(
+            properties.get("ro.nbsp.value").map(String::as_str),
+            Some("foo\u{a0}")
+        );
+        assert_eq!(
+            properties.get("ro.lead.value").map(String::as_str),
+            Some("\u{3000}bar")
+        );
+        // U+3000 stays part of the key, which then fails
+        // `validate_property_name`: the line is skipped.
+        assert!(!properties.contains_key("ro.lead.key"));
+        assert!(!properties.contains_key("\u{3000}ro.lead.key"));
+        assert_eq!(
+            properties.get("ro.vt.value").map(String::as_str),
+            Some("baz")
+        );
+        assert_eq!(properties.get("ro.ws.key").map(String::as_str), Some("qux"));
+        assert_eq!(properties.len(), 4, "{properties:?}");
+    }
+
+    /// AOSP init opens prop files with `O_NOFOLLOW` (`ReadFile`): a
+    /// symlink as the last component fails the open — an error for the
+    /// root file, a skipped import (rest of the file still loaded).
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_symlinked_prop_file_is_refused() {
+        use std::io::Write;
+        let tmp = TempDir::new("rsprops_symlink_test");
+        let dir = &tmp.0;
+        let target = dir.join("target.prop");
+        writeln!(create_prop(&target).unwrap(), "from.target=1").unwrap();
+        let link = dir.join("link.prop");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut properties = HashMap::new();
+        let err = load_properties_from_file(&link, None, "u:r:init:s0", &mut properties)
+            .expect_err("symlinked root file must not be opened");
+        assert!(format!("{err:?}").contains("Failed to open"), "{err:?}");
+        assert!(properties.is_empty());
+
+        let root = dir.join("root.prop");
+        writeln!(
+            create_prop(&root).unwrap(),
+            "import {}\nafter.import=2",
+            link.display()
+        )
+        .unwrap();
+        load_properties_from_file(&root, None, "u:r:init:s0", &mut properties).unwrap();
+        assert_eq!(properties.get("from.target"), None);
+        assert_eq!(
+            properties.get("after.import").map(String::as_str),
+            Some("2")
+        );
+    }
+
+    /// AOSP init skips a prop file with `S_IWGRP` or `S_IWOTH` set
+    /// ("Skipping insecure file"). The root file is skipped with `Ok(())`;
+    /// an import is skipped and the importing file still loads.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_group_or_world_writable_prop_file_is_skipped() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new("rsprops_writable_test");
+        let dir = &tmp.0;
+        let set_mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+
+        let root = dir.join("root.prop");
+        let group_w = dir.join("group_w.prop");
+        let other_w = dir.join("other_w.prop");
+        writeln!(create_prop(&group_w).unwrap(), "from.group_w=1").unwrap();
+        writeln!(create_prop(&other_w).unwrap(), "from.other_w=1").unwrap();
+        writeln!(
+            create_prop(&root).unwrap(),
+            "import {}\nimport {}\nin.root=1",
+            group_w.display(),
+            other_w.display()
+        )
+        .unwrap();
+        set_mode(&group_w, 0o664);
+        set_mode(&other_w, 0o646);
+
+        let mut properties = HashMap::new();
+        load_properties_from_file(&root, None, "u:r:init:s0", &mut properties).unwrap();
+        assert_eq!(
+            properties.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["in.root"]
+        );
+
+        set_mode(&root, 0o620);
+        properties.clear();
+        load_properties_from_file(&root, None, "u:r:init:s0", &mut properties)
+            .expect("an insecure root file is skipped, not an error");
+        assert!(properties.is_empty(), "{properties:?}");
+    }
+
     #[cfg(not(target_os = "android"))]
     #[test]
     fn test_import_recursion_and_expansion() {
@@ -411,11 +636,11 @@ mod tests {
         let dir = &tmp.0;
 
         let imported = dir.join("imported.prop");
-        writeln!(File::create(&imported).unwrap(), "from.import=1").unwrap();
+        writeln!(create_prop(&imported).unwrap(), "from.import=1").unwrap();
 
         let root = dir.join("root.prop");
         {
-            let mut f = File::create(&root).unwrap();
+            let mut f = create_prop(&root).unwrap();
             writeln!(f, "ro.base={}", dir.display()).unwrap();
             writeln!(f, "import ${{ro.base}}/imported.prop").unwrap();
             // A missing import must not abort the rest of the file.
@@ -441,11 +666,11 @@ mod tests {
         let dir = &tmp.0;
 
         let overlay = dir.join("overlay.prop");
-        writeln!(File::create(&overlay).unwrap(), "key=from_overlay").unwrap();
+        writeln!(create_prop(&overlay).unwrap(), "key=from_overlay").unwrap();
 
         let root = dir.join("root.prop");
         {
-            let mut f = File::create(&root).unwrap();
+            let mut f = create_prop(&root).unwrap();
             writeln!(f, "import {}", overlay.display()).unwrap();
             writeln!(f, "key=local").unwrap();
             // The second import must re-apply the overlay (last wins), not
@@ -486,6 +711,45 @@ mod tests {
         assert_eq!(expand_import_path("a$b", &props), None);
         // Unterminated reference.
         assert_eq!(expand_import_path("${a", &props), None);
+        // A trailing lone `$` is dropped, expansion succeeds.
+        assert_eq!(expand_import_path("/a/b$", &props).as_deref(), Some("/a/b"));
+        // Zero-length name is an error even with a default.
+        assert_eq!(expand_import_path("${:-d}", &props), None);
+        assert_eq!(expand_import_path("${}", &props), None);
+        // An empty default counts as no default.
+        assert_eq!(expand_import_path("/v/${miss:-}/b", &props), None);
+        assert_eq!(expand_import_path("/v/${empty:-}/b", &props), None);
+    }
+
+    /// AOSP `LoadProperties`: `import <path> <filter>` loads only the keys
+    /// the filter selects from `<path>`.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_import_with_filter() {
+        use std::io::Write;
+        let tmp = TempDir::new("rsprops_import_filter_test");
+        let dir = &tmp.0;
+
+        let vendor = dir.join("vendor.prop");
+        writeln!(
+            create_prop(&vendor).unwrap(),
+            "ro.vendor.a=1\nro.vendor.b=2\nro.other=3\nexact.key=4"
+        )
+        .unwrap();
+
+        let root = dir.join("root.prop");
+        {
+            let mut f = create_prop(&root).unwrap();
+            writeln!(f, "import {} ro.vendor.*", vendor.display()).unwrap();
+            writeln!(f, "import {}   exact.key", vendor.display()).unwrap();
+        }
+
+        let mut properties = HashMap::new();
+        load_properties_from_file(&root, None, "u:r:init:s0", &mut properties).unwrap();
+        assert_eq!(properties.get("ro.vendor.a"), Some(&"1".to_string()));
+        assert_eq!(properties.get("ro.vendor.b"), Some(&"2".to_string()));
+        assert_eq!(properties.get("exact.key"), Some(&"4".to_string()));
+        assert_eq!(properties.get("ro.other"), None);
     }
 
     #[cfg(not(target_os = "android"))]
@@ -520,13 +784,32 @@ mod tests {
 
         let a = dir.join("a.prop");
         let b = dir.join("b.prop");
-        writeln!(File::create(&a).unwrap(), "import {}", b.display()).unwrap();
-        writeln!(File::create(&b).unwrap(), "import {}\nkey=v", a.display()).unwrap();
+        writeln!(create_prop(&a).unwrap(), "import {}", b.display()).unwrap();
+        writeln!(create_prop(&b).unwrap(), "import {}\nkey=v", a.display()).unwrap();
 
         // The cycle is cut by the visited set at first re-entry (logged +
         // skipped), and the rest of each file still loads.
         let mut properties = HashMap::new();
         load_properties_from_file(&a, None, "u:r:init:s0", &mut properties).unwrap();
         assert_eq!(properties.get("key"), Some(&"v".to_string()));
+    }
+
+    /// A filtered import of a file still on the import stack is applied,
+    /// like AOSP: a filtered load follows no imports, so it is not a cycle.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_filtered_reimport_of_ancestor_is_applied() {
+        use std::io::Write;
+        let tmp = TempDir::new("rsprops_filtered_reimport_test");
+        let dir = &tmp.0;
+
+        let a = dir.join("a.prop");
+        let b = dir.join("b.prop");
+        writeln!(create_prop(&a).unwrap(), "k=1\nimport {}", b.display()).unwrap();
+        writeln!(create_prop(&b).unwrap(), "k=2\nimport {} k", a.display()).unwrap();
+
+        let mut properties = HashMap::new();
+        load_properties_from_file(&a, None, "u:r:init:s0", &mut properties).unwrap();
+        assert_eq!(properties.get("k"), Some(&"1".to_string()));
     }
 }

@@ -85,9 +85,9 @@ impl TrieBuilderNode {
         if self.exact_matches.insert(entry) {
             Ok(())
         } else {
-            error!("Exact match already exists for '{full_name}'");
+            error!("Exact match already exists for {full_name:?}");
             Err(Error::FileValidation(format!(
-                "Exact match already exists for '{full_name}'"
+                "Exact match already exists for {full_name:?}"
             )))
         }
     }
@@ -109,9 +109,9 @@ impl TrieBuilderNode {
         if self.prefixes.insert(entry) {
             Ok(())
         } else {
-            error!("Prefix already exists for '{full_name}'");
+            error!("Prefix already exists for {full_name:?}");
             Err(Error::FileValidation(format!(
-                "Prefix already exists for '{full_name}'"
+                "Prefix already exists for {full_name:?}"
             )))
         }
     }
@@ -205,27 +205,39 @@ impl TrieBuilder {
         // names get the same effective limit — the empty trailing segment
         // never becomes a trie level.
         if name_parts.len() > MAX_NAME_SEGMENTS {
-            error!("Property name '{name}' exceeds {MAX_NAME_SEGMENTS} segments");
+            error!("Property name {name:?} exceeds {MAX_NAME_SEGMENTS} segments");
             return Err(Error::Parse(format!(
                 "Property name has more than {MAX_NAME_SEGMENTS} segments"
             )));
         }
 
-        // Reject empty segments ("a..b", "a..") — AOSP's IsLegalPropertyName
-        // forbids consecutive dots, and the parser side relies on "no empty
-        // node names" as an invariant: `cstr()` returns an empty string as
-        // its corruption fallback, so a legitimately-empty trie node name
-        // would be indistinguishable from a corrupt one during lookup.
+        // Reject empty segments ("a..b", "a..", ".a", "."), as 0.6.0 did.
+        // AOSP `AddToTrie` (trie_builder.cpp) accepts them: it pops one
+        // trailing empty piece and keeps the others, which gives
+        // - `.a`, `a..b`, prefix `a..`, prefix `.`: an empty-named child
+        //   node (prefix `a..` sets that child's context);
+        // - exact `a..` (exact `.`): an empty-named exact entry in node `a`
+        //   (in the root);
+        // - `a.`: no empty name (prefix: child `a` with a context; exact:
+        //   exact entry `a`), the same as here;
+        // - never an empty prefix entry.
+        // The serializer sorts children and exact entries by name, so an
+        // empty name is index 0. `property_info_parser` reads both shapes
+        // like AOSP `GetPropertyInfoIndexes`: only an empty segment
+        // descends into the empty-named child, and only a name ending in
+        // `.` matches the empty exact entry. No name that passes
+        // `IsLegalPropertyName` does either, and bionic `find_property`
+        // returns null for a name with an empty segment.
         if name_parts.iter().any(|p| p.is_empty()) {
-            error!("Property name '{name}' contains an empty segment");
+            error!("Property name {name:?} contains an empty segment");
             return Err(Error::Parse(format!(
-                "Property name contains an empty segment: '{name}'"
+                "Property name contains an empty segment: {name:?}"
             )));
         }
 
         let last_name: &str = name_parts
             .pop()
-            .ok_or_else(|| Error::Parse(format!("No name parts for '{name}'")))?;
+            .ok_or_else(|| Error::Parse(format!("No name parts for {name:?}")))?;
 
         // Intern only after the name has passed validation so rejected
         // lines don't leave their context/type behind in the string
@@ -270,9 +282,9 @@ impl TrieBuilder {
                 .or_insert_with(|| TrieBuilderNode::new(last_name));
 
             if child.context().is_some() || child.rtype().is_some() {
-                error!("Duplicate prefix match detected for '{name}'");
+                error!("Duplicate prefix match detected for {name:?}");
                 return Err(Error::FileValidation(format!(
-                    "Duplicate prefix match detected for '{name}'"
+                    "Duplicate prefix match detected for {name:?}"
                 )));
             }
 

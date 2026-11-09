@@ -390,11 +390,11 @@ async fn test_set_property_name_validation() {
     ];
 
     for prop_name in valid_names.iter() {
-        let result = rsproperties::set(prop_name, "test_value");
-        assert!(
-            result.is_ok(),
-            "Valid property name should succeed: {prop_name}"
-        );
+        rsproperties::set(prop_name, "test_value")
+            .unwrap_or_else(|e| panic!("Valid property name should succeed: {prop_name}: {e}"));
+        let value: String = rsproperties::get(prop_name)
+            .unwrap_or_else(|e| panic!("get({prop_name:?}) after set failed: {e}"));
+        assert_eq!(value, "test_value", "{prop_name}");
     }
 }
 
@@ -494,21 +494,26 @@ async fn test_set_error_handling() {
     let very_long_name = "a".repeat(1000);
     let very_long_value = "b".repeat(10000);
 
-    // Very long property name - should either succeed or fail gracefully
-    let result = rsproperties::set(&very_long_name, "test");
-    // We don't assert success/failure as it depends on system limits
-    // But we ensure it doesn't panic
-    match result {
-        Ok(_) => println!("Long property name was accepted"),
-        Err(e) => println!("Long property name was rejected: {e}"),
-    }
+    // Assumes the V2 protocol: this binary never sets
+    // `PROPERTY_SERVICE_VERSION` and its store has no
+    // `ro.property_service.version`, so the client uses V2. V1 would reject
+    // names of PROP_NAME_MAX (32) bytes or more with `InvalidArgument`.
+    rsproperties::set(&very_long_name, "test").unwrap_or_else(|e| {
+        panic!(
+            "V2 has no name-length rule beyond MAX_WIRE_NAME_LEN (1024), so a \
+             1000-byte valid name must be accepted: {e}"
+        )
+    });
+    let read: String = rsproperties::get(&very_long_name).expect("get of the 1000-byte name");
+    assert_eq!(read, "test");
 
-    // Very long property value - should either succeed or fail gracefully
+    // A non-`ro.` value of PROP_VALUE_MAX bytes or more is rejected by the
+    // client before connecting (`wire::validate_value_len`).
     let result = rsproperties::set("test.long.value", &very_long_value);
-    match result {
-        Ok(_) => println!("Long property value was accepted"),
-        Err(e) => println!("Long property value was rejected: {e}"),
-    }
+    assert!(
+        matches!(result, Err(rsproperties::Error::InvalidArgument(_))),
+        "{result:?}"
+    );
 }
 
 #[tokio::test]

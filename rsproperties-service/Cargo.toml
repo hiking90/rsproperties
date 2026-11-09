@@ -10,7 +10,7 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Service implementation for Android system properties"
+description = "Linux emulation of the Android system property service (not usable on Android)"
 # Not released to crates.io — consumed via git/path only.
 publish = false
 
@@ -19,6 +19,7 @@ builder = ["rsproperties/builder"]
 
 [dependencies]
 rsproperties = { path = "../rsproperties", features = ["builder"] }
+rustix.workspace = true
 log.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -30,6 +31,7 @@ env_logger.workspace = true
 ctrlc.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+libc = "0.2"
 
 [[example]]
 name = "example_service"

@@ -7,6 +7,11 @@
 //! property-service Unix-socket boundary. Both the client (`system_property_set`)
 //! and the server (`rsproperties-service`) must agree on these — duplicating
 //! them in each crate would let "client rejects, server accepts" drift sneak in.
+//!
+//! Exception: on Android the client talks to init, not to this crate's
+//! service (which does not build for Android), so its V2 length pre-check
+//! uses init's limit, [`AOSP_MAX_WIRE_STRING_LEN`], instead of
+//! [`MAX_WIRE_NAME_LEN`] / [`MAX_WIRE_VALUE_LEN`].
 
 use crate::errors::{Error, Result};
 
@@ -43,19 +48,28 @@ pub const PROP_ERROR: i32 = -1;
 /// allocation against a hostile peer; `validate_property_name` rejects
 /// anything actually malformed. Lives here (not in the server crate) so
 /// the client can pre-check the same limit — "client accepts, server
-/// rejects" drift is exactly what this module exists to prevent.
+/// rejects" drift is exactly what this module exists to prevent. The
+/// Android client checks against [`AOSP_MAX_WIRE_STRING_LEN`] instead.
 pub const MAX_WIRE_NAME_LEN: usize = 1024;
 
 /// Sanity cap on a V2 wire property-value length. Long `ro.` values may
 /// legitimately exceed `PROP_VALUE_MAX`, so the cap is generous; see
-/// `MAX_WIRE_NAME_LEN` for why it lives in this module.
+/// `MAX_WIRE_NAME_LEN` for why it lives in this module. The Android client
+/// checks against [`AOSP_MAX_WIRE_STRING_LEN`] instead.
 pub const MAX_WIRE_VALUE_LEN: usize = 8192;
+
+/// Largest V2 name or value length AOSP init accepts: `RecvString` in
+/// `init/property_service.cpp` rejects `len > 0xffff` (b/35166374).
+/// The Android client pre-checks against this; this crate's own service
+/// keeps the smaller [`MAX_WIRE_NAME_LEN`] / [`MAX_WIRE_VALUE_LEN`].
+pub const AOSP_MAX_WIRE_STRING_LEN: usize = 0xffff;
 
 /// Decides whether a property value is storable: length policy plus a
 /// NUL-byte check.
 ///
-/// Single policy used by both `system_property_set` (client), the service
-/// handler, and `SystemProperties::{add, update}`. Pre-change those sites
+/// Single policy used by the client (`system_property_set`), the service
+/// handler, and `SystemProperties::add`. `SystemProperties::update` uses
+/// `validate_short_value_len` instead (see below). Pre-change those sites
 /// disagreed on whether the comparison was `>` or `>=` — a value of
 /// exactly [`PROP_VALUE_MAX`] bytes could be sent by the client and then
 /// rejected by the server (or vice versa).
@@ -155,12 +169,12 @@ pub fn validate_property_name(name: &str) -> Result<()> {
     }
     if name.starts_with('.') {
         return Err(Error::InvalidArgument(format!(
-            "name cannot start with '.': {name}"
+            "name cannot start with '.': {name:?}"
         )));
     }
     if name.ends_with('.') {
         return Err(Error::InvalidArgument(format!(
-            "name cannot end with '.': {name}"
+            "name cannot end with '.': {name:?}"
         )));
     }
     let mut prev_dot = false;
@@ -168,12 +182,12 @@ pub fn validate_property_name(name: &str) -> Result<()> {
         let ok = c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '@' | ':');
         if !ok {
             return Err(Error::InvalidArgument(format!(
-                "invalid char {c:?} in name: {name}"
+                "invalid char {c:?} in name: {name:?}"
             )));
         }
         if c == '.' && prev_dot {
             return Err(Error::InvalidArgument(format!(
-                "consecutive '.' in name: {name}"
+                "consecutive '.' in name: {name:?}"
             )));
         }
         prev_dot = c == '.';

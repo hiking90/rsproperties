@@ -16,12 +16,16 @@
 
 #![cfg(all(feature = "builder", target_os = "linux"))]
 
+mod common;
+
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use rsproperties::{build_trie, PropertyConfig, PropertyInfoEntry, SystemProperties, Timespec};
+use rsproperties::{
+    build_trie, AreaWriterLock, PropertyConfig, PropertyInfoEntry, SystemProperties, Timespec,
+};
 
 fn build_property_info(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
@@ -36,9 +40,11 @@ fn build_property_info(dir: &Path) {
     assert!(errors.is_empty(), "parse errors: {errors:?}");
 
     let data = build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap();
-    File::create(dir.join("property_info"))
+    // Mode 0444 whatever the umask; `File::create` under umask 002 makes
+    // a group-writable file that readers refuse.
+    AreaWriterLock::acquire(dir)
         .unwrap()
-        .write_all(&data)
+        .publish_property_info(&data)
         .unwrap();
 }
 
@@ -51,24 +57,25 @@ fn timespec(d: Duration) -> Timespec {
 
 #[test]
 fn test_wait_wake_across_instances() {
-    let dir = std::env::temp_dir().join(format!("rsprops_waitwake_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    build_property_info(&dir);
+    let dir = common::TempDir::new("rsprops_waitwake");
+    build_property_info(dir.path());
 
-    let mut writer = SystemProperties::new_area(&dir).expect("writer new_area");
+    let mut writer = SystemProperties::new_area(dir.path()).expect("writer new_area");
     writer.add("test.wait.prop", "0").unwrap();
 
-    rsproperties::init(PropertyConfig::with_properties_dir(&dir));
+    rsproperties::init(PropertyConfig::with_properties_dir(dir.path()));
     let reader = rsproperties::system_properties();
     let idx = reader
         .find("test.wait.prop")
         .unwrap()
         .expect("property added by the writer must be visible to the reader");
 
-    // Phase 1 — wake: a waiter parked on the property's serial must observe
-    // a cross-instance write. The 300ms delay before the set spans several
-    // 100ms lock slices, so this also exercises the re-acquire/re-check
-    // loop, not just the first futex wait.
+    // Phase 1 — cross-instance update observed across lock slices (the
+    // re-check path): the 300ms delay before the set spans several 100ms
+    // slices, and the waiter compares the serial again on each one, so this
+    // passes without the per-property futex wake. The wake itself is
+    // checked by `system_properties::wait_tests::update_wakes_property_futex`,
+    // which waits without slicing.
     let old = reader.serial(&idx).expect("initial serial");
     let waiter = std::thread::spawn(move || {
         let reader = rsproperties::system_properties();
@@ -144,5 +151,33 @@ fn test_wait_wake_across_instances() {
         "global-serial wait must observe the update"
     );
 
-    let _ = std::fs::remove_dir_all(&dir);
+    // Phase 5 — an expired or invalid timeout still compares `old_serial`
+    // first. bionic gets the same answer from the kernel: FUTEX_WAIT
+    // returns EAGAIN for a changed word with a zero timeout and EINVAL for
+    // an out-of-range one, and bionic reloads the serial after both.
+    let old = reader.serial(&idx).unwrap();
+    writer.set("test.wait.prop", "4").unwrap();
+    for (sec, nsec) in [(0, 0), (-1, 0), (0, 1_000_000_000)] {
+        let ts = Timespec {
+            tv_sec: sec,
+            tv_nsec: nsec as _,
+        };
+        let got = reader.wait(Some(&idx), Some(old), Some(&ts));
+        assert!(
+            got.is_some_and(|s| s != old),
+            "({sec}, {nsec}): already-changed serial must be reported, got {got:?}"
+        );
+    }
+    // An unchanged serial with a zero timeout returns `None` without waiting.
+    let cur = reader.serial(&idx).unwrap();
+    let zero = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    assert_eq!(reader.wait(Some(&idx), Some(cur), Some(&zero)), None);
+    // Regression only (passes before the fix): the global-serial path
+    // compared before the futex already, and gives the same answer.
+    let g = reader.context_serial();
+    writer.set("test.wait.prop", "5").unwrap();
+    assert!(reader.wait(None, Some(g), Some(&zero)).is_some());
 }

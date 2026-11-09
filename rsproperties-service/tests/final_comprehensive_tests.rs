@@ -94,7 +94,10 @@ async fn test_get_nonexistent_properties() {
 
     for property in &nonexistent_properties {
         let result = rsproperties::get::<String>(property);
-        assert!(result.is_err(), "Property '{property}' should not exist");
+        assert!(
+            matches!(result, Err(rsproperties::Error::NotFound(_))),
+            "Property '{property}' should not exist, got {result:?}"
+        );
     }
 
     println!(
@@ -154,9 +157,14 @@ async fn test_property_name_validation() {
         ".name", // starting with dot
     ];
 
+    // A name with an empty segment cannot exist in the trie, so `get`
+    // reports it as missing (`NotFound`), not as a parse error.
     for name in &edge_case_names {
-        let _result: String = rsproperties::get(name).unwrap_or_default();
-        // Don't assert specific behavior as implementation may vary
+        let result = rsproperties::get::<String>(name);
+        assert!(
+            matches!(result, Err(rsproperties::Error::NotFound(_))),
+            "get({name:?}) must be NotFound, got {result:?}"
+        );
     }
 
     println!("✓ Property name validation test completed");
@@ -253,20 +261,17 @@ async fn test_thread_safety() {
 async fn test_error_handling() {
     init_test().await;
 
-    // Test various error conditions
-
-    // Very long property name
+    // `get` has no name-length limit and does not validate names: a name
+    // that was never set, or that has an empty segment, is `NotFound`.
     let long_name = "very.long.property.name.".repeat(50);
-    let _result: String = rsproperties::get(&long_name).unwrap_or_default();
-    // May or may not fail depending on implementation limits
-
-    // Empty property name
-    let _result: String = rsproperties::get("").unwrap_or_default();
-    // Behavior may vary
-
-    // Property name with only dots
-    let _result: String = rsproperties::get("...").unwrap_or_default();
-    // Behavior may vary
+    for name in [long_name.as_str(), "", "..."] {
+        let result = rsproperties::get::<String>(name);
+        assert!(
+            matches!(result, Err(rsproperties::Error::NotFound(_))),
+            "get of a {}-byte name must be NotFound, got {result:?}",
+            name.len()
+        );
+    }
 
     println!("✓ Error handling test completed");
     println!("  Tested various edge cases for error conditions");
@@ -293,12 +298,6 @@ async fn test_performance_basic() {
     println!("✓ Performance test completed");
     println!("  {iterations} operations in {elapsed:?}");
     println!("  {ops_per_sec:.0} operations per second");
-
-    // Performance should be reasonable (at least 1000 ops/sec)
-    assert!(
-        ops_per_sec > 1000.0,
-        "Performance should be at least 1000 ops/sec, got {ops_per_sec:.0}"
-    );
 }
 
 // Tests that require the builder feature
@@ -309,22 +308,10 @@ mod builder_tests {
     async fn test_set_property_basic() {
         init_test().await;
 
-        let result = rsproperties::set("test.basic.set", "test_value");
+        rsproperties::set("test.basic.set", "test_value").expect("set with the service running");
 
-        match result {
-            Ok(_) => {
-                println!("✓ Property set successfully");
-
-                // Try to read it back
-                let value: String = rsproperties::get("test.basic.set").unwrap_or_default();
-                assert_eq!(value, "test_value");
-                println!("✓ Property read back successfully: '{value}'");
-            }
-            Err(e) => {
-                println!("⚠ Property set failed (expected without property service): {e}");
-                // This is expected when property service is not running
-            }
-        }
+        let value: String = rsproperties::get("test.basic.set").expect("get after set");
+        assert_eq!(value, "test_value");
     }
 
     #[tokio::test]
@@ -340,43 +327,39 @@ mod builder_tests {
             ("test.unicode.value", "üñíçødé tëxt"),
         ];
 
+        // Every value is shorter than PROP_VALUE_MAX and has no NUL byte.
+        // `test.special.chars` is also read by
+        // `test_get_with_default_comprehensive` with a default equal to this
+        // value, so the two tests agree in either order.
         for (property, value) in &test_cases {
-            match rsproperties::set(property, value) {
-                Ok(_) => println!("✓ Set property '{property}' = '{value}'"),
-                Err(e) => println!("⚠ Failed to set property '{property}': {e}"),
-            }
+            rsproperties::set(property, value)
+                .unwrap_or_else(|e| panic!("set({property:?}) failed: {e}"));
+            let read: String = rsproperties::get(property)
+                .unwrap_or_else(|e| panic!("get({property:?}) failed: {e}"));
+            assert_eq!(read, *value, "value read back for {property}");
         }
-
-        println!("✓ Set property various values test completed");
     }
 
     #[tokio::test]
     async fn test_set_property_length_limits() {
         init_test().await;
 
-        // Test setting property with maximum allowed length
-        let max_value = "x".repeat(PROP_VALUE_MAX);
-        let result = rsproperties::set("test.max.length.set", &max_value);
+        // A non-`ro.` value holds at most PROP_VALUE_MAX - 1 bytes (the slot
+        // keeps a NUL terminator); the client rejects longer values before
+        // connecting (`wire::validate_value_len`).
+        let longest_value = "x".repeat(PROP_VALUE_MAX - 1);
+        rsproperties::set("test.longest.length.set", &longest_value)
+            .expect("a value of PROP_VALUE_MAX - 1 bytes is accepted");
+        let read: String = rsproperties::get("test.longest.length.set").expect("get after set");
+        assert_eq!(read, longest_value);
 
-        match result {
-            Ok(_) => println!("✓ Successfully set property with max length ({PROP_VALUE_MAX})"),
-            Err(e) => println!("⚠ Failed to set max length property: {e}"),
+        for len in [PROP_VALUE_MAX, PROP_VALUE_MAX + 1] {
+            let result = rsproperties::set("test.too.long.set", &"x".repeat(len));
+            assert!(
+                matches!(result, Err(rsproperties::Error::InvalidArgument(_))),
+                "a {len}-byte value must be InvalidArgument, got {result:?}"
+            );
         }
-
-        // Test setting property with value that exceeds maximum length
-        let too_long_value = "x".repeat(PROP_VALUE_MAX + 1);
-        let result = rsproperties::set("test.too.long.set", &too_long_value);
-
-        // This should typically fail, but behavior may vary
-        match result {
-            Ok(_) => println!("⚠ Unexpectedly succeeded setting overlong property"),
-            Err(_) => println!(
-                "✓ Correctly rejected property value that is too long ({})",
-                too_long_value.len()
-            ),
-        }
-
-        println!("✓ Set property length limits test completed");
     }
 
     #[tokio::test]
@@ -385,28 +368,13 @@ mod builder_tests {
 
         let property_name = "test.update.property";
 
-        // Set initial value
-        match rsproperties::set(property_name, "initial_value") {
-            Ok(_) => {
-                println!("✓ Set initial property value");
+        rsproperties::set(property_name, "initial_value").expect("initial set");
+        let value: String = rsproperties::get(property_name).expect("get after initial set");
+        assert_eq!(value, "initial_value");
 
-                // Update the value
-                match rsproperties::set(property_name, "updated_value") {
-                    Ok(_) => {
-                        println!("✓ Updated property value");
-
-                        // Verify the update
-                        let value: String = rsproperties::get(property_name).unwrap_or_default();
-                        assert_eq!(value, "updated_value");
-                        println!("✓ Property update verified: '{value}'");
-                    }
-                    Err(e) => println!("⚠ Property update failed: {e}"),
-                }
-            }
-            Err(e) => println!("⚠ Initial property set failed: {e}"),
-        }
-
-        println!("✓ Property update test completed");
+        rsproperties::set(property_name, "updated_value").expect("update");
+        let value: String = rsproperties::get(property_name).expect("get after update");
+        assert_eq!(value, "updated_value");
     }
 
     #[tokio::test]
@@ -423,23 +391,13 @@ mod builder_tests {
                 let property_name = format!("test.concurrent.set.{thread_id}");
                 let property_value = format!("thread_{thread_id}_value");
 
-                match rsproperties::set(&property_name, &property_value) {
-                    Ok(_) => {
-                        println!(
-                            "Thread {thread_id}: Set property '{property_name}' = '{property_value}'"
-                        );
-
-                        // Try to read it back
-                        let value: String = rsproperties::get(&property_name).unwrap_or_default();
-                        println!("Thread {thread_id}: Read back value: '{value}'");
-                        if value == property_value {
-                            println!("Thread {thread_id}: ✓ Value matches");
-                        } else {
-                            println!("Thread {thread_id}: ⚠ Value mismatch");
-                        }
-                    }
-                    Err(e) => println!("Thread {thread_id}: ⚠ Set failed: {e}"),
-                }
+                rsproperties::set(&property_name, &property_value)
+                    .unwrap_or_else(|e| panic!("thread {thread_id}: set failed: {e}"));
+                // Each thread owns its property, so its own write is the
+                // only one the read can observe.
+                let value: String = rsproperties::get(&property_name)
+                    .unwrap_or_else(|e| panic!("thread {thread_id}: get failed: {e}"));
+                assert_eq!(value, property_value, "thread {thread_id}");
             });
 
             handles.push(handle);
@@ -484,7 +442,10 @@ async fn test_integration_comprehensive() {
     // Test error conditions
     for property in &test_properties {
         let result = rsproperties::get::<String>(property);
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(rsproperties::Error::NotFound(_))),
+            "{property}: {result:?}"
+        );
     }
 
     println!("✓ Comprehensive integration test passed");

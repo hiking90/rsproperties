@@ -25,30 +25,28 @@ async fn test_get_parsed_error_types() -> anyhow::Result<()> {
     // Test NotFound error
     let non_existent_prop = "absolutely.does.not.exist";
     let result: Result<i32, _> = rsproperties::get(non_existent_prop);
-    assert!(result.is_err());
-    let error_str = result.unwrap_err().to_string();
     assert!(
-        error_str.to_lowercase().contains("not found")
-            || error_str.to_lowercase().contains("notfound"),
-        "Expected NotFound error, got: {error_str}"
+        matches!(result, Err(rsproperties::Error::NotFound(_))),
+        "Expected NotFound error, got: {result:?}"
     );
 
     // Test Parse error
     let parse_error_prop = "test.error.parse";
     rsproperties::set(parse_error_prop, "definitely_not_a_number")?;
     let result: Result<i32, _> = rsproperties::get(parse_error_prop);
-    assert!(result.is_err());
-    let error_str = result.unwrap_err().to_string();
     assert!(
-        error_str.to_lowercase().contains("parse") || error_str.to_lowercase().contains("failed"),
-        "Expected Parse error, got: {error_str}"
+        matches!(result, Err(rsproperties::Error::Parse(_))),
+        "Expected Parse error, got: {result:?}"
     );
 
     // Test empty string parsing
     let empty_prop = "test.error.empty";
     rsproperties::set(empty_prop, "")?;
     let result: Result<i32, _> = rsproperties::get(empty_prop);
-    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(rsproperties::Error::Parse(_))),
+        "Expected Parse error, got: {result:?}"
+    );
 
     Ok(())
 }
@@ -76,7 +74,10 @@ async fn test_numeric_overflow_edge_cases() -> anyhow::Result<()> {
         // But should fail for smaller types (depending on the specific case)
         if name.contains("i8") {
             let result: Result<i8, _> = rsproperties::get(&prop_name);
-            assert!(result.is_err(), "i8 should overflow for {overflow_value}");
+            assert!(
+                matches!(result, Err(rsproperties::Error::Parse(_))),
+                "i8 should overflow for {overflow_value}, got {result:?}"
+            );
         }
     }
 
@@ -101,22 +102,20 @@ async fn test_floating_point_special_values() -> anyhow::Result<()> {
 
         let result: Result<f64, _> = rsproperties::get(&prop_name);
 
+        // The service stores the value unchanged, `get` does not trim it,
+        // and `f64::from_str` accepts "inf", "-inf" and "NaN".
         match *name {
             "infinity" => {
-                if let Ok(val) = result {
-                    assert!(val.is_infinite() && val.is_sign_positive());
-                }
-                // Some systems might not support parsing "inf"
+                let val: f64 = result?;
+                assert!(val.is_infinite() && val.is_sign_positive());
             }
             "negative_infinity" => {
-                if let Ok(val) = result {
-                    assert!(val.is_infinite() && val.is_sign_negative());
-                }
+                let val: f64 = result?;
+                assert!(val.is_infinite() && val.is_sign_negative());
             }
             "nan" => {
-                if let Ok(val) = result {
-                    assert!(val.is_nan());
-                }
+                let val: f64 = result?;
+                assert!(val.is_nan());
             }
             "scientific_notation" => {
                 let val: f64 = result?;
@@ -156,7 +155,13 @@ async fn test_string_parsing_edge_cases() -> anyhow::Result<()> {
 
         // Try parsing as integer
         let int_result: Result<i32, _> = rsproperties::get(&prop_name);
-        let is_error = int_result.is_err();
+        // The property was just set, so `get` finds it; a `FromStr`
+        // failure is reported as `Error::Parse`, never as another variant.
+        let is_error = matches!(int_result, Err(rsproperties::Error::Parse(_)));
+        assert!(
+            is_error || int_result.is_ok(),
+            "{name}: unexpected error {int_result:?}"
+        );
 
         // Check if the result makes sense
         match name {
@@ -202,36 +207,53 @@ async fn test_string_parsing_edge_cases() -> anyhow::Result<()> {
 async fn test_property_name_edge_cases() -> anyhow::Result<()> {
     setup_test_env().await;
 
+    // (case, name, accepted). The outcome follows from
+    // `wire::validate_property_name`, which the client runs before
+    // connecting: ASCII alphanumerics and `_ . - @ :` only, no leading,
+    // trailing or consecutive `.`.
+    //
+    // The 500-byte name assumes the V2 protocol: this binary never sets
+    // `PROPERTY_SERVICE_VERSION` and its store has no
+    // `ro.property_service.version`, so the client uses V2. V1 would reject
+    // names of PROP_NAME_MAX (32) bytes or more with `InvalidArgument`.
     let name_cases = [
-        ("very_long_name", "a".repeat(500)),
-        ("unicode_name", "测试.property.名称".to_string()),
-        ("special_chars_name", "test.@#$%.property".to_string()),
-        ("numbers_only", "123.456.789".to_string()),
-        ("single_char", "a".to_string()),
-        ("dots_only", "...".to_string()),
-        ("mixed_case", "Test.Property.Name".to_string()),
+        ("very_long_name", "a".repeat(500), true),
+        ("unicode_name", "测试.property.名称".to_string(), false),
+        (
+            "special_chars_name",
+            "test.@#$%.property".to_string(),
+            false,
+        ),
+        ("numbers_only", "123.456.789".to_string(), true),
+        ("single_char", "a".to_string(), true),
+        ("dots_only", "...".to_string(), false),
+        ("mixed_case", "Test.Property.Name".to_string(), true),
     ];
 
-    for (test_name, prop_name) in name_cases.iter() {
+    for (test_name, prop_name, accepted) in name_cases.iter() {
         let test_value = "test_value";
 
-        // Try setting the property
         let set_result = rsproperties::set(prop_name, test_value);
 
-        match set_result {
-            Ok(_) => {
-                // If setting succeeded, getting should work too
-                let retrieved: String = rsproperties::get(prop_name)?;
-                assert_eq!(
-                    retrieved, test_value,
-                    "Retrieved value doesn't match for property name case: {test_name}"
-                );
-            }
-            Err(e) => {
-                // Some property names might be rejected by the system
-                println!("Property name '{prop_name}' was rejected: {e}");
-                // This is acceptable behavior for invalid names
-            }
+        if *accepted {
+            set_result.unwrap_or_else(|e| {
+                panic!(
+                    "{test_name}: V2 has no name-length rule beyond MAX_WIRE_NAME_LEN \
+                     (1024) and the name passes validate_property_name, so set must \
+                     succeed: {e}"
+                )
+            });
+            let retrieved: String = rsproperties::get(prop_name)?;
+            assert_eq!(
+                retrieved, test_value,
+                "Retrieved value doesn't match for property name case: {test_name}"
+            );
+        } else {
+            assert!(
+                matches!(set_result, Err(rsproperties::Error::InvalidArgument(_))),
+                "{test_name}: the client must reject {prop_name:?} with InvalidArgument, \
+                 got {set_result:?}"
+            );
         }
     }
 
@@ -250,33 +272,24 @@ async fn test_property_value_size_limits() -> anyhow::Result<()> {
         ("extremely_large", "x".repeat(100000)),
     ];
 
+    // `test.size_limits.*` is not an `ro.` name, so values of
+    // PROP_VALUE_MAX (92) bytes or more are rejected by the client
+    // (`wire::validate_value_len`) and values are never truncated.
     for (test_name, test_value) in size_cases.iter() {
         let prop_name = format!("test.size_limits.{test_name}");
 
         let set_result = rsproperties::set(&prop_name, test_value);
 
-        match set_result {
-            Ok(_) => {
-                let retrieved: String = rsproperties::get(&prop_name)?;
-                // The value might be truncated by the system
-                if retrieved.len() != test_value.len() {
-                    println!(
-                        "Value was truncated for {}: {} -> {} chars",
-                        test_name,
-                        test_value.len(),
-                        retrieved.len()
-                    );
-                }
-                // Should at least preserve some of the value
-                assert!(
-                    !retrieved.is_empty() || test_value.is_empty(),
-                    "Value completely lost for {test_name}"
-                );
-            }
-            Err(e) => {
-                println!("Large value rejected for {test_name}: {e}");
-                // This is acceptable for very large values
-            }
+        if test_value.len() < rsproperties::PROP_VALUE_MAX {
+            set_result?;
+            let retrieved: String = rsproperties::get(&prop_name)?;
+            assert_eq!(retrieved, *test_value, "value read back for {test_name}");
+        } else {
+            assert!(
+                matches!(set_result, Err(rsproperties::Error::InvalidArgument(_))),
+                "{test_name} ({} bytes) must be InvalidArgument, got {set_result:?}",
+                test_value.len()
+            );
         }
     }
 
@@ -298,13 +311,19 @@ async fn test_concurrent_error_scenarios() -> anyhow::Result<()> {
                 // Try parsing non-existent property
                 let non_existent = format!("{base_name}.non_existent");
                 let result: Result<i32, _> = rsproperties::get(&non_existent);
-                assert!(result.is_err());
+                assert!(
+                    matches!(result, Err(rsproperties::Error::NotFound(_))),
+                    "{result:?}"
+                );
 
                 // Set invalid value and try parsing
                 let invalid_prop = format!("{base_name}.invalid");
                 rsproperties::set(&invalid_prop, "not_a_number")?;
                 let result: Result<i32, _> = rsproperties::get(&invalid_prop);
-                assert!(result.is_err());
+                assert!(
+                    matches!(result, Err(rsproperties::Error::Parse(_))),
+                    "{result:?}"
+                );
 
                 // But get_parsed_with_default should work
                 let with_default: i32 = rsproperties::get_or(&invalid_prop, 42);
@@ -345,22 +364,19 @@ async fn test_api_contract_validation() -> anyhow::Result<()> {
         );
     }
 
-    // Contract 2: get() never panics, always returns a string
-    let problematic_names = [
-        "non.existent.property",
-        "",                     // empty name
-        "test.non.empty.value", // Changed from test.empty.value since empty strings might not be supported
-    ];
-
+    // Contract 2: get() reports a missing property, including the empty
+    // name, as NotFound and returns a set value unchanged
     rsproperties::set("test.non.empty.value", "some_value")?;
 
-    for prop_name in problematic_names.iter() {
-        // For contract testing, we want to check that get() never panics
-        // even for non-existent properties. Use unwrap_or_default to handle errors gracefully
-        let result: String = rsproperties::get(prop_name).unwrap_or_default();
-        // Should always return a string (ensures no panic occurs)
-        let _ = result.len(); // This accesses the result to ensure no panic
+    for prop_name in ["non.existent.property", ""] {
+        let result: Result<String, _> = rsproperties::get(prop_name);
+        assert!(
+            matches!(result, Err(rsproperties::Error::NotFound(_))),
+            "get({prop_name:?}) must be NotFound, got {result:?}"
+        );
     }
+    let value: String = rsproperties::get("test.non.empty.value")?;
+    assert_eq!(value, "some_value");
 
     // Contract 3: set operations with valid strings should not fail
     let valid_operations = [
@@ -371,11 +387,11 @@ async fn test_api_contract_validation() -> anyhow::Result<()> {
     ];
 
     for (prop_name, prop_value) in valid_operations.iter() {
-        let result = rsproperties::set(prop_name, prop_value);
-        assert!(
-            result.is_ok(),
-            "Valid set operation should succeed: {prop_name}={prop_value}"
-        );
+        rsproperties::set(prop_name, prop_value).unwrap_or_else(|e| {
+            panic!("Valid set operation should succeed: {prop_name}={prop_value}: {e}")
+        });
+        let value: String = rsproperties::get(prop_name)?;
+        assert_eq!(value, *prop_value);
     }
 
     Ok(())
@@ -416,7 +432,10 @@ async fn test_error_message_quality() -> anyhow::Result<()> {
 
     // Test 1: Non-existent property
     let result: Result<i32, _> = rsproperties::get("non.existent.test.property");
-    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(rsproperties::Error::NotFound(_))),
+        "{result:?}"
+    );
     let error_msg = result.unwrap_err().to_string();
     // Error should mention the property name
     assert!(
@@ -429,7 +448,10 @@ async fn test_error_message_quality() -> anyhow::Result<()> {
     // Test 2: Parse error
     rsproperties::set("test.error_msg.parse", "invalid_for_integer")?;
     let result: Result<i32, _> = rsproperties::get("test.error_msg.parse");
-    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(rsproperties::Error::Parse(_))),
+        "{result:?}"
+    );
     let error_msg = result.unwrap_err().to_string();
     // Error should mention parsing failure and the value
     assert!(
@@ -468,26 +490,28 @@ async fn test_type_conversion_boundaries() -> anyhow::Result<()> {
         let unsigned_result: Result<u32, _> = rsproperties::get(&prop_name);
 
         if *should_succeed_signed {
-            assert!(
-                signed_result.is_ok(),
+            assert_eq!(
+                signed_result.as_ref().ok().map(i32::to_string).as_deref(),
+                Some(value_str.as_str()),
                 "Should parse successfully as i32 for {test_name}: {value_str}"
             );
         } else {
             assert!(
-                signed_result.is_err(),
-                "Should fail to parse as i32 for {test_name}: {value_str}"
+                matches!(signed_result, Err(rsproperties::Error::Parse(_))),
+                "Should fail to parse as i32 for {test_name}: {value_str}: {signed_result:?}"
             );
         }
 
         if *should_succeed_unsigned {
-            assert!(
-                unsigned_result.is_ok(),
+            assert_eq!(
+                unsigned_result.as_ref().ok().map(u32::to_string).as_deref(),
+                Some(value_str.as_str()),
                 "Should parse successfully as u32 for {test_name}: {value_str}"
             );
         } else {
             assert!(
-                unsigned_result.is_err(),
-                "Should fail to parse as u32 for {test_name}: {value_str}"
+                matches!(unsigned_result, Err(rsproperties::Error::Parse(_))),
+                "Should fail to parse as u32 for {test_name}: {value_str}: {unsigned_result:?}"
             );
         }
 
