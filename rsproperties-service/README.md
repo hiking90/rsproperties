@@ -79,12 +79,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         PathBuf::from("/tmp/sockets")
     );
 
-    // Start the services
-    let (socket_service, properties_service) = rsproperties_service::run(
-        config,
-        vec![], // property_contexts_files
-        vec![], // build_prop_files
-    ).await?;
+    // Start the services (no input files, no persistence)
+    let (socket_service, properties_service) =
+        rsproperties_service::run(config, rsproperties_service::ServiceOptions::new()).await?;
 
     println!("Services started successfully!");
 
@@ -140,12 +137,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         socket_dir
     );
 
-    // Start services with configuration files
-    let (socket_service, properties_service) = rsproperties_service::run(
-        config,
-        property_contexts,
-        build_props,
-    ).await?;
+    // Start services with configuration files. `persist.*` properties are
+    // kept in an AOSP-format persistent_properties file (its directory must
+    // exist); `ctl.*` sets go to the handler instead of being stored.
+    let options = rsproperties_service::ServiceOptions::new()
+        .property_contexts_files(property_contexts)
+        .build_prop_files(build_props)
+        .persistent_properties_file("/data/property/persistent_properties")
+        .control_handler(|msg| {
+            eprintln!("ctl.{} {} from pid {:?}", msg.action, msg.target, msg.pid);
+            false // no services to control: report failure
+        });
+    let (socket_service, properties_service) =
+        rsproperties_service::run(config, options).await?;
 
     // Services are now running with full Android-compatible configuration
     tokio::join!(
@@ -200,7 +204,19 @@ The socket service implements the Android property service protocol:
 
 - **Socket Names**: Uses standard Android socket names (`property_service`, `property_service_for_system`)
 - **Commands**: Supports `PROP_MSG_SETPROP2` (0x00020001) and the legacy V1 `PROP_MSG_SETPROP` (1), which gets no reply (AOSP V1 behavior)
-- **Response Codes**: Returns `PROP_SUCCESS` (0) or `PROP_ERROR` (-1)
+- **Response Codes**: `PROP_SUCCESS` (0) or init's error codes
+  (`rsproperties::wire::PROP_ERROR_*`): `READ_DATA` for an unreadable
+  frame, `INVALID_CMD`, `INVALID_NAME`, `INVALID_VALUE` (too long, not
+  UTF-8, or not matching the `property_contexts` type), `READ_ONLY_PROPERTY`,
+  `HANDLE_CONTROL_MESSAGE` (`ctl.*` refused or failed), `SET_FAILED`
+- **Type check**: values are checked against the `property_contexts` type
+  (`bool`, `int`, `uint`, `double`, `size`, `enum ...`) as init's
+  `CheckType` does; an empty value is always accepted
+- **`ctl.*`**: never stored; passed to `ServiceOptions::control_handler`,
+  or refused without one
+- **Startup properties**: `ro.property_service.version=2`, the persistent
+  properties, then `ro.persistent_properties.ready=true`, after the
+  build.prop entries
 - **Message Format**: Compatible with Android's binary protocol
 
 ## Error Handling
@@ -214,7 +230,7 @@ lock or the socket service.
 ```rust
 use rsproperties_service::StartupStage;
 
-match rsproperties_service::run(config, contexts, props).await {
+match rsproperties_service::run(config, options).await {
     Ok((_socket_service, _properties_service)) => {
         println!("All services running");
     }

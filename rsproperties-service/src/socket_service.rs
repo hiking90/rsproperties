@@ -21,8 +21,10 @@ use rsactor::{Actor, ActorRef, ActorWeak};
 
 use rsproperties::errors::*;
 use rsproperties::wire::{
-    MAX_WIRE_NAME_LEN, MAX_WIRE_VALUE_LEN, PROP_ERROR, PROP_MSG_SETPROP, PROP_MSG_SETPROP2,
-    PROP_NAME_MAX, PROP_SUCCESS, PROP_VALUE_MAX,
+    validate_property_name, MAX_WIRE_NAME_LEN, MAX_WIRE_VALUE_LEN,
+    PROP_ERROR_HANDLE_CONTROL_MESSAGE, PROP_ERROR_INVALID_CMD, PROP_ERROR_INVALID_NAME,
+    PROP_ERROR_INVALID_VALUE, PROP_ERROR_READ_DATA, PROP_ERROR_SET_FAILED, PROP_MSG_SETPROP,
+    PROP_MSG_SETPROP2, PROP_NAME_MAX, PROP_SUCCESS, PROP_VALUE_MAX,
 };
 use rsproperties::{PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME, PROPERTY_SERVICE_SOCKET_NAME};
 
@@ -54,7 +56,9 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// **Access model.** This file mode is the service's *entire* access
 /// control: any peer that can `connect()` (i.e. has write permission on
 /// the socket file — owner or group) may set any non-`ro.` property, and
-/// any `ro.` property that has no value yet (the first writer fixes it).
+/// any `ro.` property that has no value yet (the first writer fixes it),
+/// and send any `ctl.*` control message to the configured handler. The
+/// `property_contexts` type check applies to values, not to senders.
 /// Unlike AOSP init, no per-property SO_PEERCRED / property_contexts
 /// authorization is performed, and the "property" / "system" sockets
 /// share one handler; peer credentials are logged for auditability only.
@@ -390,6 +394,9 @@ fn bind_service_sockets_at(dir: &Path, dirfd: OwnedFd) -> Result<BoundSockets> {
 pub struct SocketServiceArgs {
     pub socket_dir: PathBuf,
     pub properties_service: ActorRef<crate::PropertiesService>,
+    /// Handles `ctl.*` sets; `None` refuses them. See
+    /// [`crate::ServiceOptions::control_handler`].
+    pub control_handler: Option<crate::ControlHandler>,
 }
 
 // Run the service in a separate task
@@ -475,6 +482,7 @@ pub struct SocketService {
     waiting_sem: Arc<Semaphore>,
     /// The two final socket names; unlinked when the service is dropped.
     _socket_files: SocketDirEntries,
+    control_handler: Option<crate::ControlHandler>,
 }
 
 impl Actor for SocketService {
@@ -535,6 +543,7 @@ impl Actor for SocketService {
             connection_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS)),
             waiting_sem: Arc::new(Semaphore::new(MAX_WAITING_CLIENTS)),
             _socket_files: entries,
+            control_handler: args.control_handler,
         })
     }
 
@@ -596,6 +605,7 @@ impl Actor for SocketService {
         };
         let sem = self.connection_sem.clone();
         let connection_sender = self.properties_service.clone();
+        let control_handler = self.control_handler.clone();
         tokio::spawn(async move {
             let permit = {
                 let _waiting = waiting; // released once a handler slot is ours
@@ -626,7 +636,7 @@ impl Actor for SocketService {
             let _permit = permit; // dropped when the task ends
             match tokio::time::timeout(
                 CLIENT_TIMEOUT,
-                Self::handle_client(stream, connection_sender),
+                Self::handle_client(stream, connection_sender, control_handler),
             )
             .await
             {
@@ -672,11 +682,16 @@ impl SocketService {
     /// Handles a client connection. Generic over the receiving actor so
     /// tests can record forwarded requests; production passes
     /// `PropertiesService`.
-    async fn handle_client<A>(mut stream: UnixStream, service: ActorRef<A>) -> Result<()>
+    async fn handle_client<A>(
+        mut stream: UnixStream,
+        service: ActorRef<A>,
+        control: Option<crate::ControlHandler>,
+    ) -> Result<()>
     where
-        A: rsactor::Message<crate::PropertyMessage, Reply = bool>,
+        A: rsactor::Message<crate::PropertyMessage, Reply = i32>,
     {
         trace!("Handling new client connection");
+        let pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
 
         // Read the command (u32)
         let mut cmd_buf = [0u8; 4];
@@ -696,20 +711,101 @@ impl SocketService {
         match cmd {
             PROP_MSG_SETPROP => {
                 trace!("Processing SETPROP (V1) command");
-                Self::handle_setprop_v1(&mut stream, service).await?;
+                Self::handle_setprop_v1(&mut stream, service, control, pid).await?;
             }
             PROP_MSG_SETPROP2 => {
                 trace!("Processing SETPROP2 command");
-                Self::handle_setprop2(&mut stream, service).await?;
+                Self::handle_setprop2(&mut stream, service, control, pid).await?;
             }
             _ => {
                 warn!("Unknown command received: 0x{cmd:08X}");
-                Self::send_response(&mut stream, PROP_ERROR).await?;
+                Self::send_response(&mut stream, PROP_ERROR_INVALID_CMD).await?;
             }
         }
 
         trace!("Client connection handled successfully");
         Ok(())
+    }
+
+    /// The response code for one decoded set. A `ctl.*` name goes to the
+    /// control handler and never reaches the properties service, so it is
+    /// never stored (init: `HandlePropertySet` sends it to
+    /// `SendControlMessage`); any other name goes to the properties
+    /// service, whose reply is the code ([`crate::PropertiesService`]).
+    async fn dispatch<A>(
+        name: String,
+        value: String,
+        pid: Option<i32>,
+        service: ActorRef<A>,
+        control: Option<crate::ControlHandler>,
+    ) -> i32
+    where
+        A: rsactor::Message<crate::PropertyMessage, Reply = i32>,
+    {
+        if name.starts_with("ctl.") {
+            return Self::handle_control(name, value, pid, control).await;
+        }
+        match service.ask(crate::PropertyMessage { name, value }).await {
+            Ok(code) => code,
+            Err(e) => {
+                error!("Failed to send property message through channel: {e}");
+                PROP_ERROR_SET_FAILED
+            }
+        }
+    }
+
+    /// init `CheckPermissions` + `SendControlMessage` for `ctl.<action>` =
+    /// `<target>`: an illegal name is `PROP_ERROR_INVALID_NAME`; without a
+    /// handler, or when the handler returns `false` or panics, the reply is
+    /// `PROP_ERROR_HANDLE_CONTROL_MESSAGE`. The handler runs on the
+    /// blocking pool; a call that outlasts the connection's `CLIENT_TIMEOUT`
+    /// still runs to completion, but its client gets no reply.
+    async fn handle_control(
+        name: String,
+        value: String,
+        pid: Option<i32>,
+        control: Option<crate::ControlHandler>,
+    ) -> i32 {
+        if let Err(e) = validate_property_name(&name) {
+            error!("Rejected control message: {e}");
+            return PROP_ERROR_INVALID_NAME;
+        }
+        let Some(handler) = control else {
+            warn!("No control handler; refusing {name:?}");
+            return PROP_ERROR_HANDLE_CONTROL_MESSAGE;
+        };
+        let message = crate::ControlMessage {
+            action: name["ctl.".len()..].to_owned(),
+            target: value,
+            pid,
+        };
+        match tokio::task::spawn_blocking(move || handler(&message)).await {
+            Ok(true) => {
+                info!("Control message {name:?} handled");
+                PROP_SUCCESS
+            }
+            Ok(false) => {
+                warn!("Control message {name:?} failed");
+                PROP_ERROR_HANDLE_CONTROL_MESSAGE
+            }
+            Err(e) => {
+                error!("Control handler for {name:?} panicked: {e}");
+                PROP_ERROR_HANDLE_CONTROL_MESSAGE
+            }
+        }
+    }
+
+    /// Response code for a V2 field that could not be read: an I/O error
+    /// (including EOF) is `PROP_ERROR_READ_DATA` (init `RecvString`
+    /// failing); bytes that were read but are not a valid string (interior
+    /// NUL, not UTF-8) get the code init's later name/value check gives
+    /// them, `invalid`.
+    fn read_error_code(e: &Error, invalid: i32) -> i32 {
+        if matches!(e, Error::Io(_)) {
+            PROP_ERROR_READ_DATA
+        } else {
+            invalid
+        }
     }
 
     /// Handles the legacy V1 SETPROP command: after the already-consumed
@@ -720,9 +816,14 @@ impl SocketService {
     /// connection is the implicit ack — so failures are logged and the
     /// connection is closed without a response. Validation still happens in
     /// `PropertiesService::handle`, identical to the V2 path.
-    async fn handle_setprop_v1<A>(stream: &mut UnixStream, service: ActorRef<A>) -> Result<()>
+    async fn handle_setprop_v1<A>(
+        stream: &mut UnixStream,
+        service: ActorRef<A>,
+        control: Option<crate::ControlHandler>,
+        pid: Option<i32>,
+    ) -> Result<()>
     where
-        A: rsactor::Message<crate::PropertyMessage, Reply = bool>,
+        A: rsactor::Message<crate::PropertyMessage, Reply = i32>,
     {
         trace!("Handling SETPROP (V1) request");
 
@@ -741,13 +842,10 @@ impl SocketService {
         let value = Self::string_from_fixed(&value_buf)?;
         info!("Forwarding V1 property: {name:?} ({} bytes)", value.len());
 
-        let property_msg = crate::PropertyMessage { name, value };
-        match service.ask(property_msg).await {
-            Ok(true) => {}
-            // The property name was already logged by the `info!` above;
-            // mirroring the V2 handler, the result logs omit it.
-            Ok(false) => warn!("V1 property was rejected by service"),
-            Err(e) => error!("Failed to forward V1 property: {e}"),
+        // The property name was already logged by the `info!` above.
+        let code = Self::dispatch(name, value, pid, service, control).await;
+        if code != PROP_SUCCESS {
+            warn!("V1 property was rejected: error code {code:#x}");
         }
 
         Ok(())
@@ -772,23 +870,30 @@ impl SocketService {
     }
 
     /// Handles SETPROP2 command
-    async fn handle_setprop2<A>(stream: &mut UnixStream, service: ActorRef<A>) -> Result<()>
+    async fn handle_setprop2<A>(
+        stream: &mut UnixStream,
+        service: ActorRef<A>,
+        control: Option<crate::ControlHandler>,
+        pid: Option<i32>,
+    ) -> Result<()>
     where
-        A: rsactor::Message<crate::PropertyMessage, Reply = bool>,
+        A: rsactor::Message<crate::PropertyMessage, Reply = i32>,
     {
         trace!("Handling SETPROP2 request");
 
         // Protocol consistency: every V2 failure after the command word
         // answers with a status code before closing — a bare connection
         // close left the client's `recv_i32` to diagnose an EOF instead of
-        // a definite error. (`send_response` results are ignored: the peer
-        // may already be gone, which is fine — the response is
-        // best-effort, and `?` would replace the real error with a write
-        // failure.)
+        // a definite error. The codes are init's: a field that cannot be
+        // read (including a length over the limit, which init's
+        // `RecvString` also refuses) is `PROP_ERROR_READ_DATA`.
+        // (`send_response` results are ignored: the peer may already be
+        // gone, which is fine — the response is best-effort, and `?` would
+        // replace the real error with a write failure.)
         let name_len = match Self::read_u32(stream).await {
             Ok(len) => len,
             Err(e) => {
-                let _ = Self::send_response(stream, PROP_ERROR).await;
+                let _ = Self::send_response(stream, PROP_ERROR_READ_DATA).await;
                 return Err(e);
             }
         };
@@ -796,7 +901,7 @@ impl SocketService {
 
         if name_len as usize > MAX_WIRE_NAME_LEN {
             error!("Name length too large: {name_len} (max {MAX_WIRE_NAME_LEN})");
-            let _ = Self::send_response(stream, PROP_ERROR).await;
+            let _ = Self::send_response(stream, PROP_ERROR_READ_DATA).await;
             return Err(rsproperties::errors::Error::FileValidation(format!(
                 "Name length too large: {name_len}"
             )));
@@ -805,7 +910,8 @@ impl SocketService {
         let name = match Self::read_string(stream, name_len as usize).await {
             Ok(name) => name,
             Err(e) => {
-                let _ = Self::send_response(stream, PROP_ERROR).await;
+                let code = Self::read_error_code(&e, PROP_ERROR_INVALID_NAME);
+                let _ = Self::send_response(stream, code).await;
                 return Err(e);
             }
         };
@@ -815,7 +921,7 @@ impl SocketService {
         let value_len = match Self::read_u32(stream).await {
             Ok(len) => len,
             Err(e) => {
-                let _ = Self::send_response(stream, PROP_ERROR).await;
+                let _ = Self::send_response(stream, PROP_ERROR_READ_DATA).await;
                 return Err(e);
             }
         };
@@ -824,7 +930,7 @@ impl SocketService {
         if value_len as usize > MAX_WIRE_VALUE_LEN {
             error!("Value length too large: {value_len} (max {MAX_WIRE_VALUE_LEN})");
             // Best-effort — see the name-length branch above.
-            let _ = Self::send_response(stream, PROP_ERROR).await;
+            let _ = Self::send_response(stream, PROP_ERROR_READ_DATA).await;
             return Err(rsproperties::errors::Error::FileValidation(format!(
                 "Value length too large: {value_len}"
             )));
@@ -833,7 +939,8 @@ impl SocketService {
         let value = match Self::read_string(stream, value_len as usize).await {
             Ok(value) => value,
             Err(e) => {
-                let _ = Self::send_response(stream, PROP_ERROR).await;
+                let code = Self::read_error_code(&e, PROP_ERROR_INVALID_VALUE);
+                let _ = Self::send_response(stream, code).await;
                 return Err(e);
             }
         };
@@ -844,24 +951,16 @@ impl SocketService {
 
         info!("Forwarding property: {name:?} ({} bytes)", value.len());
 
-        let property_msg = crate::PropertyMessage { name, value };
-
         // Forwarded whether or not the client is still connected, as AOSP
         // init applies every request it received in full and ignores the
         // result of sending the reply. A client that gave up waiting
         // (`TimedOut`) may therefore find its set applied; checking the
         // peer here would narrow that window, not close it.
-        match service.ask(property_msg).await {
-            Ok(true) => Self::send_response(stream, PROP_SUCCESS).await?,
-            Ok(false) => {
-                warn!("Property message was not processed by service");
-                Self::send_response(stream, PROP_ERROR).await?;
-            }
-            Err(e) => {
-                error!("Failed to send property message through channel: {e}");
-                Self::send_response(stream, PROP_ERROR).await?;
-            }
+        let code = Self::dispatch(name, value, pid, service, control).await;
+        if code != PROP_SUCCESS {
+            warn!("Property set was rejected: error code {code:#x}");
         }
+        Self::send_response(stream, code).await?;
 
         Ok(())
     }
@@ -1295,7 +1394,7 @@ pub(crate) mod tests {
         runtime.block_on(async {
             let (mut server, client) = UnixStream::pair().unwrap();
             drop(client);
-            let err = SocketService::send_response(&mut server, PROP_ERROR)
+            let err = SocketService::send_response(&mut server, PROP_ERROR_SET_FAILED)
                 .await
                 .expect_err("peer-closed socket must error");
             assert!(
@@ -1322,16 +1421,30 @@ pub(crate) mod tests {
     }
 
     impl rsactor::Message<crate::PropertyMessage> for Recorder {
-        type Reply = bool;
+        type Reply = i32;
 
         async fn handle(
             &mut self,
             _message: crate::PropertyMessage,
             _actor_ref: &ActorRef<Self>,
-        ) -> bool {
+        ) -> i32 {
             self.0.fetch_add(1, Ordering::SeqCst);
-            true
+            PROP_SUCCESS
         }
+    }
+
+    /// Sends `frame`, runs one `handle_client`, and returns the reply code.
+    async fn exchange(
+        frame: &[u8],
+        service: ActorRef<Recorder>,
+        control: Option<crate::ControlHandler>,
+    ) -> i32 {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(frame).await.unwrap();
+        let _ = SocketService::handle_client(server, service, control).await;
+        let mut reply = [0u8; 4];
+        client.read_exact(&mut reply).await.unwrap();
+        i32::from_ne_bytes(reply)
     }
 
     fn recorder() -> (ActorRef<Recorder>, Arc<AtomicUsize>) {
@@ -1362,7 +1475,7 @@ pub(crate) mod tests {
         drop(client);
 
         // The reply then fails with EPIPE; only the forwarding matters.
-        let _ = SocketService::handle_client(server, service).await;
+        let _ = SocketService::handle_client(server, service, None).await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
@@ -1375,15 +1488,115 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        SocketService::handle_client(server, service).await.unwrap();
+        SocketService::handle_client(server, service, None)
+            .await
+            .unwrap();
         let mut reply = [0u8; 4];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(i32::from_ne_bytes(reply), PROP_SUCCESS);
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
+    /// init's codes for frames that never reach the properties service.
+    #[tokio::test]
+    async fn protocol_errors_get_init_codes() {
+        let (service, count) = recorder();
+        let unknown = 0x1234u32.to_ne_bytes();
+        assert_eq!(
+            exchange(&unknown, service.clone(), None).await,
+            PROP_ERROR_INVALID_CMD
+        );
+        assert_eq!(
+            exchange(&v2_frame("a\0b", "1"), service.clone(), None).await,
+            PROP_ERROR_INVALID_NAME
+        );
+        assert_eq!(
+            exchange(&v2_frame("test.nul", "a\0b"), service.clone(), None).await,
+            PROP_ERROR_INVALID_VALUE
+        );
+        let mut huge = PROP_MSG_SETPROP2.to_ne_bytes().to_vec();
+        huge.extend_from_slice(&((MAX_WIRE_NAME_LEN + 1) as u32).to_ne_bytes());
+        assert_eq!(
+            exchange(&huge, service.clone(), None).await,
+            PROP_ERROR_READ_DATA
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    /// `ctl.*` never reaches the properties service: without a handler it
+    /// is refused, with one the handler decides.
+    #[tokio::test]
+    async fn control_messages_go_to_the_handler() {
+        let (service, count) = recorder();
+        assert_eq!(
+            exchange(&v2_frame("ctl.start", "svc"), service.clone(), None).await,
+            PROP_ERROR_HANDLE_CONTROL_MESSAGE
+        );
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let handler: crate::ControlHandler = Arc::new(move |msg: &crate::ControlMessage| {
+            log.lock().unwrap().push(msg.clone());
+            msg.target == "known"
+        });
+        assert_eq!(
+            exchange(
+                &v2_frame("ctl.restart", "known"),
+                service.clone(),
+                Some(handler.clone())
+            )
+            .await,
+            PROP_SUCCESS
+        );
+        assert_eq!(
+            exchange(
+                &v2_frame("ctl.stop", "other"),
+                service.clone(),
+                Some(handler.clone())
+            )
+            .await,
+            PROP_ERROR_HANDLE_CONTROL_MESSAGE
+        );
+        assert_eq!(
+            exchange(
+                &v2_frame("ctl..bad", "x"),
+                service.clone(),
+                Some(handler.clone())
+            )
+            .await,
+            PROP_ERROR_INVALID_NAME
+        );
+        let panicking: crate::ControlHandler = Arc::new(|_: &crate::ControlMessage| panic!("boom"));
+        assert_eq!(
+            exchange(
+                &v2_frame("ctl.start", "x"),
+                service.clone(),
+                Some(panicking)
+            )
+            .await,
+            PROP_ERROR_HANDLE_CONTROL_MESSAGE
+        );
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            (seen[0].action.as_str(), seen[0].target.as_str()),
+            ("restart", "known")
+        );
+        assert_eq!(
+            (seen[1].action.as_str(), seen[1].target.as_str()),
+            ("stop", "other")
+        );
+        assert_eq!(seen[0].pid, Some(std::process::id() as i32));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "ctl.* must not be forwarded"
+        );
+    }
+
     /// A V2 frame that ends inside the name-length field gets a
-    /// `PROP_ERROR` reply, like other malformed frames.
+    /// `PROP_ERROR_READ_DATA` reply, like other unreadable frames.
     #[tokio::test]
     async fn v2_truncated_name_len_gets_error_reply() {
         let (service, count) = recorder();
@@ -1395,10 +1608,12 @@ pub(crate) mod tests {
         client.write_all(&[0u8; 2]).await.unwrap();
         client.shutdown().await.unwrap();
 
-        assert!(SocketService::handle_client(server, service).await.is_err());
+        assert!(SocketService::handle_client(server, service, None)
+            .await
+            .is_err());
         let mut reply = [0u8; 4];
         client.read_exact(&mut reply).await.unwrap();
-        assert_eq!(i32::from_ne_bytes(reply), PROP_ERROR);
+        assert_eq!(i32::from_ne_bytes(reply), PROP_ERROR_READ_DATA);
         assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 }

@@ -30,6 +30,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read-only instance created while `BIONIC_APPCOMPAT_OVERRIDE` is set
   looks up `ro.appcompat_override.<name>` first in `find` and
   `read_with`, as bionic does.
+- `wire::PROP_ERROR_*`: AOSP init's V2 error codes (`READ_CMD`,
+  `READ_DATA`, `READ_ONLY_PROPERTY`, `INVALID_NAME`, `INVALID_VALUE`,
+  `PERMISSION_DENIED`, `INVALID_CMD`, `HANDLE_CONTROL_MESSAGE`,
+  `SET_FAILED`).
+- `SystemProperties::property_type(name)` (`builder` feature): the
+  `property_contexts` type `property_info` records for a name.
+- Service: `ServiceOptions` (property_contexts files, build.prop files,
+  `persistent_properties_file`, `control_handler`), `ControlMessage` and
+  `ControlHandler`.
+- Service: `persist.*` / `next_boot.*` persistence in AOSP init's
+  `persistent_properties` format (protobuf, written by temp file + fsync
+  + rename + directory fsync; loaded after the build.prop files, staged
+  `next_boot.` values applied; an unparsable file is deleted, as init
+  does).
+- Service: values are checked against the `property_contexts` type
+  (init `CheckType`); `ctl.*` sets go to the control handler and are
+  never stored; `ro.property_service.version=2` and
+  `ro.persistent_properties.ready=true` are set at startup.
 
 - `AreaWriterLock` (`builder` feature): the properties directory's writer
   lock (an exclusive `flock` on `<dir>/.writer_lock`) as a value.
@@ -51,6 +69,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (service):** `rsproperties_service::run(config, options)`
+  takes a `ServiceOptions` instead of the property_contexts and build.prop
+  file lists: `run(config, contexts, props)` becomes
+  `run(config, ServiceOptions::new().property_contexts_files(contexts).build_prop_files(props))`.
+  `SocketServiceArgs` has a new `control_handler` field.
+- Service: V2 replies carry init's error codes instead of `PROP_ERROR`
+  (-1), so a client's `Error::ServiceError { code }` names the reason
+  (e.g. `PROP_ERROR_READ_ONLY_PROPERTY` for a second set of a `ro.`
+  property). A value that does not match its `property_contexts` type is
+  now rejected (`PROP_ERROR_INVALID_VALUE`), and `ctl.*` sets are no
+  longer stored.
 - `rsproperties_service::run` returns `Result<_, StartupError>` instead of
   `Box<dyn Error + Send + Sync>`. `StartupError::stage()` names the step
   that failed (`Config` for `try_init`, `WriterLock`, `PropertiesService`,

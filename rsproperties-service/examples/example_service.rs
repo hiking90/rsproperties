@@ -19,6 +19,24 @@ struct Args {
     /// Socket directory path
     #[arg(long, help = "Directory path for property service sockets")]
     socket_dir: Option<PathBuf>,
+
+    /// property_contexts files
+    #[arg(
+        long = "property-contexts",
+        help = "property_contexts file (repeatable)"
+    )]
+    property_contexts: Vec<PathBuf>,
+
+    /// build.prop files
+    #[arg(long = "build-prop", help = "build.prop file (repeatable)")]
+    build_prop: Vec<PathBuf>,
+
+    /// Persistent properties file
+    #[arg(
+        long,
+        help = "Store persist.* properties in this file (AOSP persistent_properties format)"
+    )]
+    persistent_properties_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -61,12 +79,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("🚀 Starting rsproperties services...");
 
     // Initialize the services
-    let (socket_service, properties_service) = rsproperties_service::run(
-        config,
-        vec![], // property_contexts_files
-        vec![], // build_prop_files
-    )
-    .await?;
+    let mut options = rsproperties_service::ServiceOptions::new()
+        .property_contexts_files(args.property_contexts)
+        .build_prop_files(args.build_prop)
+        // No services to control here: log ctl.* requests and refuse them.
+        .control_handler(|msg| {
+            println!(
+                "ctl.{} {:?} from pid {:?}: refused",
+                msg.action, msg.target, msg.pid
+            );
+            false
+        });
+    if let Some(path) = args.persistent_properties_file {
+        options = options.persistent_properties_file(path);
+    }
+    let (socket_service, properties_service) = rsproperties_service::run(config, options).await?;
 
     println!("✅ Services started successfully!");
     println!("🔄 Services are running. Press Ctrl+C to stop.");

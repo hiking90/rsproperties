@@ -208,11 +208,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ];
 
     // Start the property service
-    let (_socket_service, _properties_service) = rsproperties_service::run(
-        config,
-        property_contexts,
-        build_props
-    ).await?;
+    let options = rsproperties_service::ServiceOptions::new()
+        .property_contexts_files(property_contexts)
+        .build_prop_files(build_props);
+    let (_socket_service, _properties_service) =
+        rsproperties_service::run(config, options).await?;
 
     println!("Property service running...");
 

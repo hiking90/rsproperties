@@ -29,11 +29,11 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
 | C3 | client | appcompat override 조회(API 35+) | (c) | 이 branch에서 수정 |
 | C4 | client | `WaitForProperty` / `WaitForPropertyCreation` | (d) | 이 branch에서 추가 |
 | C5 | client | `GetBoolProperty` / `GetIntProperty` 파싱 규칙 | (d), (c) | 이 branch에서 추가 |
-| S1 | service | `persist.*` / `next_boot.*` 영속화 | (d) | 미착수 |
-| S2 | service | property type 검사(`CheckType`) | (c) | 미착수 |
-| S3 | service | `ctl.*`를 일반 property로 저장 | (c) | 미착수 |
-| S4 | service | 실패 응답 코드가 항상 `PROP_ERROR` | (c) | 미착수 |
-| S5 | service | `ro.property_service.version` 미설정 | (c) | 미착수 |
+| S1 | service | `persist.*` / `next_boot.*` 영속화 | (d) | 이 branch에서 추가 |
+| S2 | service | property type 검사(`CheckType`) | (c) | 이 branch에서 수정 |
+| S3 | service | `ctl.*`를 일반 property로 저장 | (c) | 이 branch에서 수정 |
+| S4 | service | 실패 응답 코드가 항상 `PROP_ERROR` | (c) | 이 branch에서 수정 |
+| S5 | service | `ro.property_service.version` 미설정 | (c) | 이 branch에서 수정 |
 | S6 | service | 변경 알림 hook 없음 | (a) | 검토 대상 아님 |
 
 ## Client
@@ -224,8 +224,33 @@ init은 set이 성공하면 이름이 `persist.` 또는 `next_boot.`로 시작�
 persistent store에 기록한다(`property_service.cpp:414-423`). 부팅할 때 다시
 load하고 `ro.persistent_properties.ready=true`를 설정한다(`:1462`).
 rsproperties-service는 이 값을 저장하지 않으므로, 재시작하면 모두 잃는다.
-구현하려면 저장 형식(AOSP protobuf 형식과 호환할지)과 저장 위치를 먼저
-정해야 한다.
+
+**AOSP 세부 동작** (`persistent_properties.cpp`).
+- 형식은 proto2 `PersistentProperties { repeated PersistentPropertyRecord
+  { optional string name = 1; optional string value = 2; } properties = 1; }`다.
+- 쓰기(`WritePersistentProperty`): 파일을 다시 읽고, 같은 이름의 첫 record를
+  고치거나 끝에 추가한다. 값이 같으면 쓰지 않는다. `<file>.tmp`(0600,
+  `O_NOFOLLOW`)에 쓰고 fsync, rename, 디렉터리 fsync 순서로 진행한다.
+  실패는 log만 남기고 set은 성공으로 응답한다.
+- 읽기(`LoadPersistentProperties`): 남은 `.tmp`를 지우고 파일을 읽는다.
+  파싱에 실패하거나 `persist.`/`next_boot.`가 아닌 이름이 있으면 파일을
+  삭제한다. `next_boot.<name>` record는 `<name>`의 값을 바꾸고 제거된 뒤
+  파일에 다시 기록된다. 각 record는 `InitPropertySet`으로 설정되므로 type
+  검사를 거친다. 그다음 `ro.persistent_properties.ready=true`를 설정한다.
+
+**변경.** `ServiceOptions::persistent_properties_file(path)`로 켠다. 위 규칙을
+그대로 따르며, codec은 새 dependency 없이 crate 안에 직접 구현했다(약 150줄).
+init과 다른 점은 다음과 같다.
+- (a) Android 8 이전의 legacy layout(`/data/property/persist.*` 파일들)은
+  읽지 않는다.
+- (a) 시작 후에는 record를 메모리에 두고, 쓸 때마다 파일을 다시 읽지
+  않는다. 실행 중에 다른 program이 파일을 고치면 다음 persist set이 그
+  내용을 덮어쓴다.
+- (b) 파일의 디렉터리가 없으면 시작을 실패시킨다. init에서는 이 디렉터리가
+  항상 있다.
+- 남은 staged record를 덧붙이는 순서는 init에서는 `unordered_map` 순서라
+  정해져 있지 않다. 여기서는 파일에 나온 순서를 따른다.
+- 손상된 파일은 owner 결정에 따라 init처럼 삭제한다.
 
 ### S2. type 검사 — (c)
 
@@ -236,6 +261,19 @@ handler(`properties_service.rs:227-239`)는 이름과 길이만 검사한다. in
 반환한다(`:530-533`). `socket_service.rs:54-63`에 문서화된 access model은
 SELinux와 SO_PEERCRED 검사 생략만 다루고, type 검사 생략은 언급하지 않는다.
 
+**AOSP 규칙** (`property_type.cpp` `CheckType`): 빈 값은 항상 통과한다.
+`string`은 모두 통과, `bool`은 `true`/`false`/`1`/`0`, `int`/`uint`는 libbase
+`ParseInt`/`ParseUint`(64 bit), `double`은 `ParseDouble`(`strtod`, 문자열 전체,
+`ERANGE` 거부), `size`는 `[0-9]+[gkm]`, `enum a b`는 나열된 값 중 하나여야
+한다. 그 밖의 type은 거부한다. `bool`의 허용 집합은 `ParseBool`보다 좁다.
+
+**변경.** `rsproperties-service/src/property_type.rs`에 같은 규칙을
+구현했다. type은 새 API `SystemProperties::property_type(name)`(builder)으로
+`property_info`에서 읽는다. init과 다른 점: `double`에서 `strtod`가 받는
+hex float(`0x1p3`)와 `nan(...)`을 Rust float parser가 받지 않으므로 거부한다.
+subnormal 결과에 `strtod`가 `ERANGE`를 설정하는지는 확인 필요다(여기서는
+허용한다).
+
 ### S3. `ctl.*` 저장 — 저장 동작은 (c), dispatch 없음은 (a)
 
 init은 `ctl.*`를 area에 저장하지 않는다. 권한을 검사한 뒤 control
@@ -243,6 +281,22 @@ message로 처리한다(`:505-512`, `:548-549`). build.prop loader는 `ctl.*`,
 `sys.powerctl`, `selinux.restorecon_recursive`를 버린다
 (`build_property_parser.rs:424`). 하지만 runtime set 경로는 `ctl.start` 같은
 이름을 그대로 area에 기록한다.
+
+init은 control message를 queue에 넣고 main thread의 `HandleControlMessage`가
+처리한 뒤 응답한다. 성공하면 `PROP_SUCCESS`, service가 없거나 action이
+실패하면 `PROP_ERROR_HANDLE_CONTROL_MESSAGE`다(`init.cpp:556-649`).
+
+**변경.** owner 결정에 따라 handler callback을 추가했다.
+`ServiceOptions::control_handler(|msg: &ControlMessage| -> bool)`이며,
+`ControlMessage`는 `action`(`ctl.` 뒤), `target`(값), `pid`(SO_PEERCRED)를
+담는다.
+- socket service가 이름을 검사한 뒤(`INVALID_NAME`) handler를 tokio blocking
+  pool에서 호출한다. `true`면 `PROP_SUCCESS`, `false`이거나 panic이면
+  `PROP_ERROR_HANDLE_CONTROL_MESSAGE`다. properties service로는 넘기지 않으므로
+  area에 저장되지 않는다.
+- handler가 없으면 `PROP_ERROR_HANDLE_CONTROL_MESSAGE`로 거부한다.
+- init이 하는 권한 검사(`CheckControlPropertyPerms`)는 하지 않는다. 다른
+  property와 같은 access model이다.
 
 ### S4. 실패 응답 코드 — (c)
 
@@ -252,11 +306,28 @@ service는 실패하면 항상 `PROP_ERROR(-1)`를 보낸다. init은
 client의 `Error::ServiceError { code }`(`errors.rs:80`)에는 Linux에서 항상
 -1만 들어온다.
 
+**변경.** `wire::PROP_ERROR_*`에 bionic의 code 값을 추가하고, init과 같은
+조건에서 같은 code를 보낸다.
+- 읽을 수 없는 field와 한도를 넘는 길이: `READ_DATA`(init `RecvString`).
+- 알 수 없는 command: `INVALID_CMD`.
+- 이름 검사 실패, 또는 이름에 NUL이 있거나 UTF-8이 아님: `INVALID_NAME`.
+- type 불일치, 값이 너무 길거나 NUL이 있거나 UTF-8이 아님: `INVALID_VALUE`.
+- 값이 이미 있는 `ro.`: `READ_ONLY_PROPERTY`.
+- 그 밖의 저장 실패: `SET_FAILED`.
+
+검사 순서는 init(`CheckPermissions` → `PropertySet`)과 같다. 이름, `ctl.`,
+type, 값 길이, 저장 순이다. 공개 `PROP_ERROR`(-1) 상수는 그대로 두었다.
+
 ### S5. `ro.property_service.version` — (c), 이 crate의 client에는 영향 없음
 
 init은 `ro.property_service.version=2`를 설정한다(`:1552`). service는 설정하지
 않는다. 이 crate의 client는 값이 없으면 V2를 기본으로 쓰므로 영향이 없다.
 영향을 받는 것은 bionic 규칙(값이 없으면 V1)을 따르는 다른 client다.
+
+**변경.** build.prop entry를 적용한 뒤 `ro.property_service.version=2`를
+설정한다. build.prop가 이미 값을 정했다면 그 값이 남는다(`ro.`는 write-once).
+S1의 persist load 뒤에는 `ro.persistent_properties.ready=true`를 설정한다.
+persist 파일을 지정하지 않아도 설정한다. init이 항상 설정하기 때문이다.
 
 ### S6. 변경 알림 hook — (a)
 

@@ -904,6 +904,17 @@ impl SystemProperties {
         Ok(())
     }
 
+    /// The type `property_info` records for `name` — the `property_contexts`
+    /// type field (`"string"`, `"bool"`, `"int"`, `"uint"`, `"double"`,
+    /// `"size"`, or `"enum <values...>"`), or the default type the trie was
+    /// built with when no entry gives one. `None` when neither exists. A
+    /// property service checks a value against it before a set, as AOSP
+    /// init's `CheckType` does; `set` and `add` do not check it.
+    #[cfg(feature = "builder")]
+    pub fn property_type(&self, name: &str) -> Result<Option<&str>> {
+        self.contexts.property_type(name)
+    }
+
     /// Adds a new property.
     ///
     /// If a property with `name` already exists this is a silent no-op that
