@@ -18,6 +18,7 @@
 
 use clap::Parser;
 use rsproperties::PropertyConfig;
+use std::io::Write as _;
 
 #[derive(Parser, Debug)]
 #[command(name = "getprop")]
@@ -65,21 +66,20 @@ fn main() {
             let value = if let Some(default) = args.default_value {
                 rsproperties::get_or(&name, default)
             } else {
-                let result: Result<String, _> = rsproperties::get(&name);
-                match result {
-                    Ok(val) if !val.is_empty() => val,
-                    _ => {
-                        // Property not found, print nothing (Android getprop behavior)
-                        return;
-                    }
-                }
+                // Missing or empty: print an empty line (toybox getprop).
+                rsproperties::get::<String>(&name).unwrap_or_default()
             };
-            println!("{value}");
+            // `let _ =`: a closed stdout must not turn into a panic
+            // (exit code 101).
+            let _ = writeln!(std::io::stdout(), "{value}");
         }
         None => {
             // List all properties (simplified implementation)
-            println!("Listing all properties is not yet implemented.");
-            println!("Use 'getprop <property_name>' to get a specific property.");
+            let _ = writeln!(
+                std::io::stdout(),
+                "Listing all properties is not yet implemented.\n\
+                 Use 'getprop <property_name>' to get a specific property."
+            );
             std::process::exit(1);
         }
     }

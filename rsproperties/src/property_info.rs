@@ -3,29 +3,43 @@
 
 //! Per-property entries in the mmap'd property area.
 //!
+//! The rules cited below (\[SM1\]–\[SM5\], \[R-UNION\], \[R-WRITE\], …) are
+//! defined once, in the `# Shared-mapping contract` section of
+//! `property_area.rs`.
+//!
 //! # Concurrency model
 //!
 //! - `serial` is the seqlock that synchronizes reader/writer races. Readers
-//!   load it Acquire before and after a value read; on mismatch they retry.
-//! - `data` is byte-wise atomic ([`AtomicU8`] array). Writers mutate via
-//!   [`PropertyInfoWriter`] which requires `&mut self` (the borrow checker
-//!   enforces single-writer within a process).
-//! - **Cross-process invariant.** Multi-process mmap sharing requires a
-//!   system-level single-writer policy (e.g. Android `init` owns the writable
-//!   mapping). This crate cannot enforce that policy from Rust; the
-//!   `unsafe impl Sync` below documents the assumption.
+//!   load it before a value read (`load_acquire`: `Relaxed` load +
+//!   `fence(Acquire)`, \[R-RO\]) and again after `fence(Acquire)` with a
+//!   `Relaxed` load; on mismatch they retry.
+//! - `data` is accessed only through atomics once published \[SM2\](a): the
+//!   byte-wise `value` array ([`AtomicU8`]) and a long entry's `AtomicU32`
+//!   `offset`, as listed in \[R-UNION\]; plain writes happen only while the
+//!   entry is fresh \[SM3\].
+//! - Writers mutate a published entry only through [`PropertyInfoWriter`],
+//!   which needs an `AreaWriteAccess` (\[R-WRITE\]) and is reachable only
+//!   from `PropertyAreaMap::backup_and_apply_write(&mut self)` \[SM4\].
+//! - Whether an entry is LONG depends on its name as well as its serial
+//!   (\[R-UNION\]): see [`PropertyInfo::is_long_for`].
+
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 use std::cell::UnsafeCell;
 use std::mem;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use crate::errors::{Error, Result};
+#[cfg(feature = "builder")]
+use crate::property_area::AreaWriteAccess;
 use crate::system_properties::PROP_VALUE_MAX;
 
 #[cfg(feature = "builder")]
 const LONG_LEGACY_ERROR: &str = "Must use __system_property_read_callback() to read";
 
-const LONG_FLAG: u32 = 1 << 16;
+/// bionic `prop_info::kLongFlag`. Meaningful only on `ro.` names
+/// \[R-UNION\].
+pub(crate) const LONG_FLAG: u32 = 1 << 16;
 const LONG_LEGACY_ERROR_BUFFER_SIZE: usize = 56;
 
 // The legacy error message must fit the fixed buffer *with* its NUL
@@ -70,12 +84,13 @@ pub(crate) struct PropertyInfo {
     data: UnsafeCell<Union>,
 }
 
-// SAFETY: All writes to `data` go through `PropertyInfoWriter`, which holds
-// `&mut PropertyInfo` — the borrow checker enforces a single in-process
-// writer. All reader-visible memory is byte-wise atomic, so concurrent
-// reads against an in-flight writer are well-defined (no torn-byte UB under
-// the Rust abstract machine). Cross-process mmap sharing requires a
-// system-level single-writer policy; see module-level docs.
+// SAFETY: `&PropertyInfo` hands out only atomics: `serial`, the value slot
+// and the long `offset` ([SM2](a)). The non-atomic `error_message` is
+// written only through `&mut` while fresh [SM3]; after publication its
+// bytes are read only as the value slot's atomics, never as `u8`. Stores to
+// a published entry come from the single writer [SM4] and are byte-wise on
+// entries whose `offset` is never loaded; [R-UNION] lists every access to
+// the union bytes. Foreign writers: [R-INIT]; corrupt offsets: [SM5].
 unsafe impl Sync for PropertyInfo {}
 
 impl PropertyInfo {
@@ -90,10 +105,11 @@ impl PropertyInfo {
 
         self.serial.store(serial_value, Ordering::Relaxed);
 
-        // SAFETY: `&mut self` grants exclusive access; the union variant we
-        // write (`long_property`) matches what `value()` reads when the LONG
-        // flag is set in `serial`. `get_mut()` on the atomic is the no-fence
-        // assignment appropriate for init time (no concurrent readers).
+        // SAFETY: [SM3] — `&mut self` comes from `fresh_object_mut`, so the
+        // entry is unlinked and no other access to these bytes exists. The
+        // variant written (`long_property`) matches the LONG flag set above,
+        // which this crate's writer sets only on `ro.` names
+        // (`wire::validate_value_len` in `PropertyAreaMap::add`, [R-UNION]).
         unsafe {
             let long_property = &mut *(*self.data.get()).long_property;
             long_property.error_message =
@@ -125,8 +141,9 @@ impl PropertyInfo {
         let serial_value = (stored_len as u32) << 24;
         self.serial.store(serial_value, Ordering::Relaxed);
 
-        // SAFETY: `&mut self` grants exclusive access; we initialize the
-        // `value` variant of the union to match the non-LONG `serial` state.
+        // SAFETY: [SM3] — `&mut self` comes from `fresh_object_mut`, so the
+        // entry is unlinked; the `value` variant matches the non-LONG
+        // serial set above.
         unsafe {
             let slot = &mut *(*self.data.get()).value;
             init_value_bytes(slot, value.as_bytes());
@@ -140,19 +157,22 @@ impl PropertyInfo {
     /// aborting on `?`. The returned slice borrows `buf`, not `self` — it
     /// is a copy, valid independent of later writes to the entry.
     ///
-    /// Contract: the caller must have checked `!self.is_long()` (the sole
-    /// callers, `PropertyAreaMap::property_value_bytes` and the seqlock
-    /// read loop, both do). On a LONG entry this would misread the
-    /// `LongProperty` header bytes as value bytes — not UB (the union is
-    /// all plain bytes, and long entries are write-once so there is no
-    /// race), but garbage; the `debug_assert!` documents the contract.
-    /// For long entries use `PropertyAreaMap::long_property_value`.
+    /// Contract: the caller has decided the entry is short
+    /// (`!self.is_long_for(name)`; the sole callers,
+    /// `PropertyAreaMap::property_value_bytes` and the seqlock read loop,
+    /// both do). On a LONG entry this would misread the `LongProperty`
+    /// header bytes as value bytes — not UB (both variants are valid for
+    /// every bit pattern, and long entries get no stores after publication
+    /// \[R-UNION\]), but garbage. A corrupt trie reaches this case: a
+    /// non-`ro.` lookup of a LONG `ro.` entry. For long entries use
+    /// `PropertyAreaMap::long_property_value`.
     pub(crate) fn short_value_bytes<'a>(&self, buf: &'a mut [u8; PROP_VALUE_MAX]) -> &'a [u8] {
-        debug_assert!(!self.is_long(), "short_value_bytes on a LONG entry");
-        // SAFETY: reading the `value` union variant. Both union variants
-        // are plain (atomic) bytes with no validity requirement, the array
-        // lies entirely within `self` (provenance-safe), and all
-        // concurrent access to this range is byte-wise atomic.
+        // SAFETY: [SM2](a) — the `value` variant is an array of atomics,
+        // valid for every bit pattern and lying entirely within `self`.
+        // Concurrent stores to these bytes are byte-wise atomic (single
+        // writer [SM4]); the only other-width access, the `u32` long
+        // `offset` load, is made only on entries without stores [R-UNION].
+        // Foreign writers: [R-INIT]; corrupt offsets: [SM5].
         unsafe {
             let slot = &*(*self.data.get()).value;
             read_value_atomic(slot, buf)
@@ -162,6 +182,11 @@ impl PropertyInfo {
     /// Reads the long-variant relative offset (from the start of this entry
     /// to the out-of-line value bytes). Errors when the LONG flag is not
     /// set — the union would be reinterpreting value bytes as an offset.
+    ///
+    /// Precondition \[R-UNION\]: the entry's trailing name starts with
+    /// `ro.`. The raw bit does not ensure it (on other names bit 16 is
+    /// counter, and the writer stores byte-wise into those entries), so
+    /// call this only through `PropertyAreaMap::long_property_value`.
     pub(crate) fn long_offset(&self) -> Result<u32> {
         if !self.is_long() {
             // API misuse by the caller, not a data-encoding failure.
@@ -169,45 +194,68 @@ impl PropertyInfo {
                 "long_offset called on a short property entry".into(),
             ));
         }
-        // SAFETY: LONG flag checked above, so the active union variant is
-        // `long_property`, which lies entirely within `self`.
-        unsafe {
-            let long_property = &*(*self.data.get()).long_property;
-            Ok(long_property.offset.load(Ordering::Relaxed))
-        }
+        // SAFETY: only the atomic `offset` field is referenced. Both
+        // projections are raw (`addr_of!`; `ManuallyDrop` is
+        // `repr(transparent)`, so the field pointer casts to
+        // `*const LongProperty`), so no `&LongProperty` covering the
+        // non-atomic `error_message` is formed. The field lies within
+        // `self`, and `AtomicU32` is valid for every bit pattern. The load
+        // races no byte store: the sole caller,
+        // `PropertyAreaMap::long_property_value`, calls this only after
+        // checking that the entry's trailing name starts with `ro.`, and
+        // the writer stores to no such entry [R-UNION]; corrupt offsets:
+        // [SM5].
+        let offset: &AtomicU32 = unsafe {
+            let long_property =
+                std::ptr::addr_of!((*self.data.get()).long_property).cast::<LongProperty>();
+            &*std::ptr::addr_of!((*long_property).offset)
+        };
+        Ok(offset.load(Ordering::Relaxed))
     }
 
-    pub(crate) fn is_long(&self) -> bool {
+    /// The raw LONG bit. Private: whether the bit selects the long variant
+    /// depends on the name ([`Self::is_long_for`]).
+    fn is_long(&self) -> bool {
         let serial = self.serial.load(Ordering::Relaxed);
         serial & LONG_FLAG != 0
     }
 
-    /// Returns a writer that has exclusive update rights to this entry.
+    /// Whether the entry named `name` stores its value out of line
+    /// \[R-UNION\]: the LONG flag counts only on `ro.` names, like bionic's
+    /// `ReadCallback`. On any other name bit 16 is part of the update
+    /// counter (bionic's writer reaches it on the 32768th update).
+    pub(crate) fn is_long_for(&self, name: &[u8]) -> bool {
+        name.starts_with(b"ro.") && self.is_long()
+    }
+
+    /// Returns the writer for a published entry.
     ///
-    /// `&mut self` ensures only one writer exists within a process; the
-    /// returned writer enforces the entry-side seqlock + LONG-flag
-    /// invariants. It does NOT cover the area-side precondition: readers
-    /// that observe the dirty serial read the per-area dirty backup slot,
-    /// which must hold this entry's current value *before* `apply_write`
-    /// publishes the dirty bit. That ordering is enforced structurally by
-    /// `PropertyAreaMap::backup_and_apply_write` — the only path from
-    /// outside `property_area.rs` to this writer.
-    /// Cross-process invariants are documented at the module level.
+    /// `access` proves the mapping is PROT_WRITE \[R-WRITE\]; it is created
+    /// only in `PropertyAreaMap::backup_and_apply_write`, which holds
+    /// `&mut PropertyAreaMap` (one writer per mapping in this process,
+    /// \[SM4\]) and writes the dirty backup slot first. That ordering — the
+    /// slot must hold this entry's current value before `apply_write`
+    /// publishes the dirty bit — is why no other path reaches this writer.
     #[cfg(feature = "builder")]
-    pub(crate) fn writer(&mut self) -> PropertyInfoWriter<'_> {
+    pub(crate) fn writer(&self, _access: AreaWriteAccess<'_>) -> PropertyInfoWriter<'_> {
         PropertyInfoWriter(self)
     }
 }
 
-/// Single-writer handle. Construction requires `&mut PropertyInfo`, so the
-/// borrow checker enforces one-writer-per-process. All publish operations
-/// use `Ordering::Release` so paired Acquire readers see the value writes.
+/// Single-writer handle for a published entry. All stores are atomic
+/// \[SM2\](a); publish operations use `Ordering::Release` so paired Acquire
+/// readers see the value writes.
 #[cfg(feature = "builder")]
-pub(crate) struct PropertyInfoWriter<'a>(&'a mut PropertyInfo);
+pub(crate) struct PropertyInfoWriter<'a>(&'a PropertyInfo);
 
 /// Counter bits in `serial` — bits 0..24 excluding `LONG_FLAG` (bit 16).
-/// Using a wider mask would let the counter wrap into the LONG_FLAG bit and
-/// silently flip the union variant under readers.
+/// bionic's writer does not mask bit 16 (\[R-UNION\]: readers ignore it on
+/// non-`ro.` names); this crate's writer keeps its counter out of it anyway
+/// so its serials never carry a bit an older reader of this crate (≤ 0.6)
+/// reads as LONG: `apply_write` carries a set bit 16 into bit 17, so the
+/// counter (bits 1..15 and 17..23) repeats every 2^22 updates. Serial
+/// values therefore differ from bionic's after 32768 updates; waiters
+/// compare serials only for equality.
 #[cfg(feature = "builder")]
 const SERIAL_COUNTER_MASK: u32 = 0x00ff_ffff & !LONG_FLAG;
 
@@ -229,19 +277,14 @@ impl PropertyInfoWriter<'_> {
     /// not the entry, so publishing the dirty bit without a fresh backup
     /// serves a previous update's backup bytes as this value. The ordering
     /// is enforced by `PropertyAreaMap::backup_and_apply_write` — keep it
-    /// the only external route to this method.
+    /// the only route to this method.
     ///
-    /// Rejects when the LONG flag is set — switching the union variant
-    /// in-place would leak the out-of-line long-property buffer.
+    /// The entry is short: `backup_and_apply_write` refuses entries named
+    /// `ro.…`, and only `ro.` entries are long \[R-UNION\]. A set bit 16 in
+    /// the serial is therefore counter, not LONG; the carry below moves it
+    /// into bit 17, so the published serial never has bit 16 set.
     pub(crate) fn apply_write(self, value: &str) -> Result<u32> {
         let current = self.0.serial.load(Ordering::Relaxed);
-        if current & LONG_FLAG != 0 {
-            // A caller-contract violation (unsupported operation on this
-            // entry kind), not corrupt on-disk state.
-            return Err(Error::InvalidArgument(format!(
-                "in-place update of long property is not supported (serial={current:#x})"
-            )));
-        }
         if value.len() >= PROP_VALUE_MAX {
             // `PROP_VALUE_MAX - 1`: the slot reserves one byte for the NUL,
             // so 92 bytes is rejected and the honest maximum is 91.
@@ -257,11 +300,15 @@ impl PropertyInfoWriter<'_> {
 
         // bionic seqlock convention: even serial = clean, odd = dirty. We
         // first publish `current | 1` (dirty), then `(dirty + 1)` carries
-        // the LSB back to 0 (clean) while bumping the counter. The counter
-        // mask excludes LONG_FLAG so a long-lived short property cannot
-        // wrap into the LONG variant.
+        // the LSB back to 0 (clean) while bumping the counter.
         let dirty_serial = current | 1;
-        let counter_next = (dirty_serial.wrapping_add(1)) & SERIAL_COUNTER_MASK;
+        let mut next = dirty_serial.wrapping_add(1);
+        if next & LONG_FLAG != 0 {
+            // Skip bit 16: carry into bit 17 instead of masking the carry
+            // away, which would reset the counter every 32768 updates.
+            next = next.wrapping_add(LONG_FLAG);
+        }
+        let counter_next = next & SERIAL_COUNTER_MASK;
         let new_serial = (len_u32 << 24) | counter_next;
 
         // From here on no further early returns: each step is infallible.
@@ -275,10 +322,12 @@ impl PropertyInfoWriter<'_> {
         // written after this fence is guaranteed to observe the dirty serial
         // at its re-check and retry.
         std::sync::atomic::fence(Ordering::Release);
-        // SAFETY: `&mut self` on the writer guarantees no concurrent writer
-        // in this process; the LONG flag check above confirms the active
-        // variant is `value`. Byte-wise atomic stores keep concurrent
-        // readers race-free per the Rust memory model.
+        // SAFETY: [SM2](a) — the `value` variant is an array of atomics
+        // within the entry, and every store below is byte-wise atomic; the
+        // entry is short and its `offset` is never loaded [R-UNION] (the
+        // sole caller `backup_and_apply_write` refused `ro.` trailing
+        // names), so no access of another width overlaps these stores, and
+        // the writer is single [SM4]. Corrupt offsets: [SM5].
         unsafe {
             let slot = &*(*self.0.data.get()).value;
             write_value_atomic(slot, value.as_bytes());
@@ -334,7 +383,7 @@ fn write_value_atomic(slot: &[AtomicU8; PROP_VALUE_MAX], bytes: &[u8]) {
 
 /// Init-only variant for `init_with_value`. Uses `get_mut()` (plain
 /// non-atomic assignment) since the property has not yet been published to
-/// readers.
+/// readers \[SM3\].
 #[cfg(feature = "builder")]
 fn init_value_bytes(slot: &mut [AtomicU8; PROP_VALUE_MAX], bytes: &[u8]) {
     let copy_len = bytes.len().min(PROP_VALUE_MAX - 1);

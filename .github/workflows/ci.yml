@@ -61,10 +61,12 @@ jobs:
     # - name: Run tests (release mode)
     #   run: cargo test --verbose --features builder --release
 
-    - name: Test workspace examples
+    # Build only: getprop needs a property area to read, and running it
+    # without arguments exits 1.
+    - name: Build workspace examples
       run: |
         cd rsproperties
-        cargo run --example getprop --features=builder || echo "Example may require Android environment"
+        cargo build --example getprop --features=builder
 
   coverage:
     name: Coverage
@@ -138,7 +140,7 @@ jobs:
       run: cargo build --examples --verbose --all-features
 
     - name: Check benches compilation
-      run: cargo check --benches --all-features || echo "No benches found"
+      run: cargo check --benches --all-features
 
   msrv:
     name: Minimum Supported Rust Version
@@ -161,8 +163,32 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-msrv-
 
+    # The committed manifests and Cargo.lock as they are. Cargo.lock must
+    # stay `version = 3`: cargo 1.77 cannot read v4 (stable since 1.78).
     - name: Check MSRV
-      run: cargo check --all-features
+      run: cargo check --locked --all-features
+
+    # Lib unit tests build the dev-dependencies, and two of them cannot be
+    # built by 1.77: clap 4.6 is edition 2024 (cargo 1.77 cannot parse its
+    # manifest) and criterion 0.8 declares rust-version 1.86. Remove them
+    # in this CI checkout only (nothing is committed); `cargo remove` also
+    # prunes Cargo.lock, so `--locked` below still holds. If another
+    # dev-dependency stops building on 1.77, add it to these lines.
+    # Scope: the lib unit tests of both crates. Integration tests,
+    # examples and benches are not built here.
+    - name: Strip dev-dependencies that need a newer toolchain
+      run: |
+        cargo remove --dev -p rsproperties clap criterion
+        cargo remove --dev -p rsproperties-service clap
+
+    # send() (client) and send_response() (service) must not fall back to
+    # std's UnixStream::write, a plain write(2) — SIGPIPE — on 1.77..=1.86.
+    # Current stable passes those regression tests either way, so they run
+    # here.
+    - name: Lib unit tests on MSRV
+      run: |
+        cargo test --locked --lib -p rsproperties --features builder
+        cargo test --locked --lib -p rsproperties-service --features builder
 
   security:
     name: Security audit
@@ -224,21 +250,56 @@ jobs:
           ${{ runner.os }}-cargo-android-${{ matrix.target }}-
           ${{ runner.os }}-cargo-android-
 
+    # `-p rsproperties`: rsproperties-service compiles only for Linux (see
+    # the last step of this job).
     - name: Build for Android (${{ matrix.target }})
       run: |
         export ANDROID_NDK_HOME=$ANDROID_NDK_ROOT
-        cargo ndk --target ${{ matrix.target }} --platform 21 build --all-features
+        cargo ndk --target ${{ matrix.target }} --platform 21 build -p rsproperties --all-features
 
     - name: Build examples for Android (${{ matrix.target }})
       run: |
         export ANDROID_NDK_HOME=$ANDROID_NDK_ROOT
-        cargo ndk --target ${{ matrix.target }} --platform 21 build --examples --all-features
+        cargo ndk --target ${{ matrix.target }} --platform 21 build -p rsproperties --examples --all-features
 
     - name: Check workspace for Android (${{ matrix.target }})
       run: |
         export ANDROID_NDK_HOME=$ANDROID_NDK_ROOT
         cd rsproperties
         cargo ndk --target ${{ matrix.target }} --platform 21 check --all-features
+
+    # rsproperties-service is Linux-only: its compile_error! must fire on
+    # Android. One target is enough; the cfg does not depend on the arch.
+    - name: Service refuses to build for Android
+      if: matrix.target == 'x86_64-linux-android'
+      run: |
+        export ANDROID_NDK_HOME=$ANDROID_NDK_ROOT
+        if cargo ndk --target ${{ matrix.target }} --platform 21 check -p rsproperties-service 2> err.txt; then
+          echo "rsproperties-service unexpectedly built for Android"; exit 1
+        fi
+        grep -q "builds only for" err.txt
+
+  # Linux targets without 64-bit atomics (no `AtomicU64`). The client must
+  # build there; rsproperties-service does not (rsactor uses `AtomicU64`).
+  linux-32bit:
+    name: Client check on ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - armv5te-unknown-linux-gnueabi
+          - powerpc-unknown-linux-gnu
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Check rsproperties (${{ matrix.target }})
+      run: cargo check -p rsproperties --all-features --target ${{ matrix.target }}
 
   docs:
     name: Documentation
@@ -268,10 +329,3 @@ jobs:
       env:
         RUSTDOCFLAGS: -D warnings
       run: cargo doc --all-features --no-deps --document-private-items
-
-    - name: Check README examples
-      run: |
-        # Verify that actual code matches examples in README.md
-        if [ -f README.md ]; then
-          echo "README.md exists - manual verification recommended"
-        fi

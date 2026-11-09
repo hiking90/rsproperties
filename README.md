@@ -7,7 +7,7 @@ A pure Rust implementation of Android's property system for Linux and Android.
 `rsproperties` is a comprehensive Rust library that provides Android system property functionality across platforms:
 
 - **`rsproperties`**: Core library for getting/setting Android properties with memory-mapped access
-- **`rsproperties-service`**: Full async property service implementation for Linux environments
+- **`rsproperties-service`**: Linux emulation of the Android property service (async daemon; not usable on Android)
 
 The library implements Android's property system semantics, including property contexts, SELinux integration, and futex-based property change notifications.
 
@@ -21,7 +21,7 @@ This library supports Android versions from Android 9 (API level 28) to Android 
 
 - **Complete Android Properties Implementation**: Full Rust implementation of Android's property system - read, write, and monitor properties exactly like Android native code
 - **Cross-Platform Compatibility**: Works seamlessly on both Android devices and Linux systems without modification
-- **Pure Rust Solution**: No dependencies on Android's C libraries or JNI - everything implemented in safe Rust
+- **Pure Rust Solution**: No dependencies on Android's C libraries or JNI - everything implemented in Rust (`unsafe` is limited to the mmap / shared-memory layer)
 - **Real-time Property Monitoring**: Watch for property changes in real-time, enabling reactive applications
 - **High Performance**: Optimized for speed with direct memory access and zero-copy operations
 - **Drop-in Replacement**: Compatible with Android's property naming conventions and value constraints
@@ -35,12 +35,23 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 rsproperties = "0.6"
-# For the Linux property service daemon (not published on crates.io):
-rsproperties-service = { git = "https://github.com/hiking90/rsproperties" }
 
 # Optional features
 [features]
 builder = ["rsproperties/builder"]  # Enable property database building
+```
+
+To also run the Linux property service daemon (`rsproperties-service`, not
+published on crates.io), take `rsproperties` from the same git source.
+Mixing crates.io `rsproperties` with the git `rsproperties-service` builds two
+separate `rsproperties` crates: the `PropertyConfig` you pass to `run` has the
+wrong type, and the two copies do not share their configured directories.
+
+```toml
+[dependencies]
+rsproperties = { git = "https://github.com/hiking90/rsproperties" }
+rsproperties-service = { git = "https://github.com/hiking90/rsproperties" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ```
 
 ## Quick Start
@@ -56,7 +67,9 @@ println!("SDK Version: {}", sdk_version);
 
 // Get property with type parsing and default fallback
 let sdk_version: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
-let is_debuggable: bool = rsproperties::get_or("ro.debuggable", false);
+// ro.debuggable is "0"/"1"; other boolean properties (e.g. ro.apex.updatable)
+// use "true"/"false" — read those with get_or(.., false).
+let is_debuggable: bool = rsproperties::get_or("ro.debuggable", 0) != 0;
 
 // Get property with error handling
 match rsproperties::get::<String>("ro.build.version.release") {
@@ -78,9 +91,10 @@ if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
 
 ### Panic-free Initialization
 
-By default `init()` and `system_properties()` may panic when initialization
-fails (e.g. missing directory, corrupt mmap). For embedded use or where
-panics are unacceptable, use the `try_*` variants:
+`system_properties()` panics when initialization fails (e.g. missing
+directory, corrupt mmap); `init()` does not panic but only logs its failure
+with `log::warn!` and returns. For embedded use or where panics or silently
+ignored failures are unacceptable, use the `try_*` variants:
 
 ```rust
 use rsproperties::{try_init, try_system_properties, PropertyConfig};
@@ -90,8 +104,10 @@ let props = try_system_properties()?;          // &'static SystemProperties
 let sdk: String = rsproperties::get_or("ro.build.version.sdk", "0".into());
 ```
 
-`try_init` succeeds only on the first call; later calls return an error
-without poisoning the global state. `try_system_properties` caches both
+`try_init` fails with `Error::AlreadyInitialized` when a directory it
+names is already set — by an earlier `init`/`try_init`, or by the default
+being latched: a property read latches the properties dir, a `set()` (or
+`socket_dir()`) call latches the socket dir — without poisoning the global state. `try_system_properties` caches both
 success *and* failure in a `OnceLock`, so repeated calls observe a
 consistent result.
 
@@ -113,7 +129,8 @@ std::thread::spawn(|| {
 std::thread::spawn(|| {
     if let Ok(Some(prop_index)) = system_properties.find("sys.boot_completed") {
         println!("Waiting for boot completion...");
-        if let Some(_) = system_properties.wait(Some(&prop_index), None) {
+        let old_serial = system_properties.serial(&prop_index);
+        if let Some(_) = system_properties.wait(Some(&prop_index), old_serial, None) {
             println!("System boot completed!");
         }
     }
@@ -141,11 +158,11 @@ for prop_name in monitored_props {
 ```rust
 use rsproperties::PropertyConfig;
 
+// Alternatives — call `init` once. A later `init` naming a directory that
+// is already set is ignored as a whole (`init` only logs the rejection).
+
 // Configure custom directories
-let config = PropertyConfig {
-    properties_dir: Some("/custom/properties".into()),
-    socket_dir: Some("/custom/socket".into()),
-};
+let config = PropertyConfig::with_both_dirs("/custom/properties", "/custom/socket");
 rsproperties::init(config);
 
 // Using the builder pattern
@@ -161,19 +178,23 @@ rsproperties::init(PropertyConfig::with_properties_dir("/my/props"));
 
 ### Linux Property Service
 
-For Linux environments, you can run a full property service daemon:
+On a Linux host, `rsproperties-service` emulates the Android property
+service (it compiles only for Linux; on Android, init owns the property
+service):
 
 ```rust
 use rsproperties_service;
 use rsproperties::PropertyConfig;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // `run` creates a missing properties dir (last component only, 0711) and
+    // socket dir (0755, parents included), both minus the umask's bits;
+    // create them yourself to choose owner and mode.
+    std::fs::create_dir_all("./properties")?;
+
     // Configure the service
-    let config = PropertyConfig {
-        properties_dir: Some("./properties".into()),
-        socket_dir: Some("./socket".into()),
-    };
+    let config = PropertyConfig::with_both_dirs("./properties", "./socket");
 
     // Optional: Load property contexts and build.prop files
     let property_contexts = vec![
@@ -237,7 +258,7 @@ With the `builder` feature enabled, you can create property databases:
 ```rust
 #[cfg(feature = "builder")]
 use rsproperties::{
-    build_trie, load_properties_from_file, PropertyInfoEntry, SystemProperties,
+    build_trie, load_properties_from_file, AreaWriterLock, PropertyInfoEntry, SystemProperties,
 };
 use std::{collections::HashMap, path::Path};
 
@@ -258,17 +279,38 @@ let trie_data = build_trie(
     "string",                    // default type
 )?;
 
+// Take the directory's writer lock first (this creates a missing
+// `./properties`, last component only), then publish the trie as
+// `<dir>/property_info` and create the areas under that lock. Writing
+// `property_info` yourself and then calling `new_area` lets another writer
+// replace it between your write and `new_area`'s lock, and rewriting it in
+// place breaks readers that still map it. Release builds (no `debug-assertions`) and the
+// `strict-file-validation` feature require `property_info` to be owned by
+// root (uid 0, gid 0), so run this as root there.
+let lock = AreaWriterLock::acquire(Path::new("./properties"))?;
+lock.publish_property_info(&trie_data)?;
+
 // Create the on-disk property area and populate it.
-let mut system_properties = SystemProperties::new_area(Path::new("./properties"))?;
+let mut system_properties = SystemProperties::new_area_locked(lock)?;
 for (key, value) in properties {
     system_properties.add(&key, &value)?;
 }
 ```
 
+`property_info` is replaced only by rename. Readers map it read-only and
+shared, as bionic does, so a writer must write a complete new file and
+rename it over the old one (`AreaWriterLock::publish_property_info` does
+this, with mode 0444) and must never rewrite the existing file in place
+(`std::fs::write`, `File::create`, `O_TRUNC`): a reader that has the file
+mapped can fault with `SIGBUS` or read a torn trie. Readers log a warning
+when `property_info` has the owner-write bit set, and refuse it with the
+`strict-file-validation` feature. A group- or other-writable or symlinked
+`property_info` is always refused.
+
 ### Error Handling
 
 `rsproperties::Error` is a `thiserror`-derived enum with `#[from]` impls
-for `std::io::Error`, `rustix::io::Errno`, `Utf8Error`, and `ParseIntError`.
+for `std::io::Error`, `rustix::io::Errno`, and `Utf8Error`.
 The `Error::Context` variant carries a `panic::Location` so the caller
 site is preserved across error boundaries.
 
@@ -286,7 +328,7 @@ fn handle_property_operation() {
     match rsproperties::set("debug.my_app.config", "value") {
         Ok(_) => println!("Property set"),
         Err(Error::Io(e))            => eprintln!("I/O failure: {e}"),
-        Err(Error::PermissionDenied(m)) => eprintln!("denied: {m}"),
+        Err(Error::ServiceError { name, code }) => eprintln!("{name} rejected: {code:#x}"),
         Err(e)                       => eprintln!("other: {e}"),
     }
 }
@@ -314,6 +356,15 @@ for handle in handles {
 ```
 
 ## Platform Support
+
+| Component | Linux | Android | macOS |
+|---|---|---|---|
+| `rsproperties` client (`get`, `set`, `wait`) | supported | supported | not supported |
+| `builder` feature (creating property areas) | supported | — (init creates the areas) | not supported |
+| `rsproperties-service` | supported | does not compile (init owns the property service) | does not compile |
+
+macOS is not a supported target: the client crate still compiles for it,
+but CI neither builds nor tests it.
 
 ### Android
 - **Native Integration**: Direct access to `/dev/__properties__`
@@ -343,14 +394,19 @@ The library follows Android property naming conventions:
 - **Vendor properties**: `vendor.*` (e.g., `vendor.audio.config`)
 
 ### Property Constraints
-- **Name length**: 32 bytes max in the V1 wire protocol (`PROP_NAME_MAX`).
-  V2 is length-prefixed and does not impose a wire-layer cap.
+- **Name length**: 31 bytes max in the V1 wire protocol
+  (`name.len() < PROP_NAME_MAX`; the 32-byte buffer includes the NUL).
+  V2 is length-prefixed; on Linux, client and service both enforce
+  `wire::MAX_WIRE_NAME_LEN` (1024 bytes) on names (and
+  `wire::MAX_WIRE_VALUE_LEN`, 8192 bytes, on values). On Android the
+  client checks AOSP init's limit, `wire::AOSP_MAX_WIRE_STRING_LEN`
+  (65535 bytes), instead.
 - **Value length**: `PROP_VALUE_MAX = 92` is the **buffer size including
   the trailing NUL**, so user content is capped at **91 bytes**
   (matching bionic's `__system_property_set`). `ro.*` properties may
   exceed this via the long-property out-of-line storage path.
 - **Character set**: ASCII alphanumeric plus `_`, `.`, `-`, `@`, `:`.
-  Names must not begin with `.`, `-`, `@`, or `:`. See
+  Names must not begin with `.`. See
   [`rsproperties::wire::validate_property_name`] for the canonical check.
 
 [`rsproperties::wire::validate_property_name`]: https://docs.rs/rsproperties/latest/rsproperties/wire/fn.validate_property_name.html
@@ -391,16 +447,16 @@ cargo run -p rsproperties-service --example example_service
 rustup target add aarch64-linux-android
 
 # Build for Android
-cargo build --target aarch64-linux-android --workspace
+cargo build --target aarch64-linux-android -p rsproperties  # rsproperties-service is Linux-only
 ```
 
 ## Examples
 
-See the `examples/` directory for complete working examples:
+See `rsproperties/examples/` and `rsproperties-service/examples/` for complete working examples:
 
 - **`getprop.rs`**: Android-compatible property getter
 - **`setprop.rs`**: Android-compatible property setter
-- **Property service examples**: Complete property service implementations
+- **`example_service.rs`** (`rsproperties-service`, Linux only): property service daemon
 
 ## Contributing
 

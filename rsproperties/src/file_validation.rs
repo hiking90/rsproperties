@@ -102,3 +102,72 @@ pub(crate) fn validate_file_metadata(
 
     Ok(())
 }
+
+/// Owner-write check for `property_info` (\[IMM\] in property_area.rs).
+///
+/// bionic checks only the group/other write bits (done by
+/// [`validate_file_metadata`]). A writer that follows \[IMM\] publishes
+/// the file 0444 by rename, as `AreaWriterLock::publish_property_info` and
+/// AOSP init do; an owner-writable file usually comes from an in-place
+/// writer such as `std::fs::write`, which can SIGBUS readers mapping it.
+/// Warns by default; `strict` (the `strict-file-validation` feature)
+/// refuses the file with `PermissionDenied`.
+pub(crate) fn check_owner_write(
+    metadata: &std::fs::Metadata,
+    path: &std::path::Path,
+    strict: bool,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    // 0o200 = S_IWUSR.
+    if metadata.mode() & 0o200 == 0 {
+        return Ok(());
+    }
+    let msg = format!(
+        "property_info is owner-writable: mode={:#o} for {path:?}; publish it read-only \
+         (0444) by rename, never rewrite it in place while readers map it",
+        metadata.mode()
+    );
+    if strict {
+        log::error!("{msg}");
+        return Err(Error::PermissionDenied(msg));
+    }
+    log::warn!("{msg}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn file_with_mode(tag: &str, mode: u32) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("rsprops_owner_write_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"x").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[test]
+    fn owner_write_warns_by_default_and_strict_refuses() {
+        let path = file_with_mode("rw", 0o644);
+        let md = std::fs::metadata(&path).unwrap();
+        assert!(check_owner_write(&md, &path, false).is_ok());
+        assert!(matches!(
+            check_owner_write(&md, &path, true),
+            Err(Error::PermissionDenied(_))
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_only_file_passes_strict() {
+        let path = file_with_mode("ro", 0o444);
+        let md = std::fs::metadata(&path).unwrap();
+        assert!(check_owner_write(&md, &path, true).is_ok());
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::remove_file(&path);
+    }
+}

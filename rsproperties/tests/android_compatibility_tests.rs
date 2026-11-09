@@ -8,6 +8,8 @@
 
 #![cfg(feature = "builder")]
 
+mod common;
+
 use rsproperties::{self, build_trie, load_properties_from_file, PropertyInfoEntry};
 use std::collections::HashMap;
 use std::path::Path;
@@ -31,9 +33,7 @@ fn test_android_property_contexts_parsing() {
             "Should have parsed some property info from {file}"
         );
 
-        if !errors.is_empty() {
-            println!("Parsing errors in {file}: {errors:?}");
-        }
+        assert!(errors.is_empty(), "{file}: {errors:?}");
 
         println!(
             "Parsed {} property entries from {}",
@@ -58,10 +58,13 @@ fn test_android_build_prop_parsing() {
         "tests/android/product_build.prop",
     ];
 
+    // 0644 copies: a checkout under umask 002 leaves the originals
+    // group-writable, and the loader skips those.
+    let copies = common::TempDir::new("rsprops_compat_prop");
     for file in build_files {
+        let copy = common::copy_fixture_0644(Path::new(file), copies.path());
         let mut properties = HashMap::new();
-        let result =
-            load_properties_from_file(Path::new(file), None, "u:r:init:s0", &mut properties);
+        let result = load_properties_from_file(&copy, None, "u:r:init:s0", &mut properties);
 
         match result {
             Ok(_) => {
@@ -77,7 +80,7 @@ fn test_android_build_prop_parsing() {
                 }
             }
             Err(e) => {
-                eprintln!("Failed to load {file}: {e}");
+                panic!("Failed to load {file}: {e}");
             }
         }
     }

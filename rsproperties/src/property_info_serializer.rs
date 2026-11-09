@@ -40,7 +40,7 @@ impl PropertyInfoEntry {
         let type_strings: Vec<&str> = type_str.split_whitespace().collect();
         if !type_strings.is_empty() && !Self::is_type_valid(&type_strings) {
             return Err(Error::InvalidArgument(format!(
-                "Type '{type_str}' is not valid."
+                "Type {type_str:?} is not valid."
             )));
         }
         Ok(Self {
@@ -101,11 +101,11 @@ impl PropertyInfoEntry {
 
         let property = tokenizer
             .next()
-            .ok_or_else(|| Error::Parse(format!("Did not find a property entry in '{line}'")))?;
+            .ok_or_else(|| Error::Parse(format!("Did not find a property entry in {line:?}")))?;
 
         let context = tokenizer
             .next()
-            .ok_or_else(|| Error::Parse(format!("Did not find a context entry in '{line}'")))?;
+            .ok_or_else(|| Error::Parse(format!("Did not find a context entry in {line:?}")))?;
 
         let match_operation = tokenizer.next();
 
@@ -116,25 +116,25 @@ impl PropertyInfoEntry {
 
         if match_operation == Some("exact") {
             exact_match = true;
-        } else if let Some(op) = match_operation.filter(|&op| op != "prefix") {
-            // AOSP parity (`ParsePropertyInfoLine`): a *missing* operation
-            // is legal even with `require_prefix_or_exact` — legacy
-            // two-token `<property> <context>` lines default to prefix
-            // match. Only a token that is present but neither
-            // 'prefix'/'exact' is an error.
+        } else if require_prefix_or_exact && match_operation != Some("prefix") {
+            // AOSP parity (`ParsePropertyInfoLine`): with
+            // `require_prefix_or_exact`, anything but 'prefix'/'exact' is
+            // an error — including a *missing* operation (AOSP's tokenizer
+            // yields "" there, and `"" != "prefix"`). Legacy two-token
+            // `<property> <context>` lines are only legal when the flag is
+            // false, where they default to prefix match.
             // No log here: the only caller (`parse_from_file`) already
             // warns with line context — logging both duplicated every
             // parse failure.
-            if require_prefix_or_exact {
-                return Err(Error::Parse(format!(
-                    "Match operation '{op}' is not valid. Must be 'prefix' or 'exact'"
-                )));
-            }
+            return Err(Error::Parse(format!(
+                "Match operation {:?} is not valid. Must be 'prefix' or 'exact'",
+                match_operation.unwrap_or("")
+            )));
         }
 
         if !type_strings.is_empty() && !Self::is_type_valid(&type_strings) {
             return Err(Error::Parse(format!(
-                "Type '{}' is not valid.",
+                "Type {:?} is not valid.",
                 type_strings.join(" ")
             )));
         }
@@ -218,7 +218,7 @@ impl PropertyInfoEntry {
                     entries.push(entry);
                 }
                 Err(err) => {
-                    warn!("Line {line_count}: Failed to parse line '{line}': {err}");
+                    warn!("Line {line_count}: Failed to parse line {line:?}: {err}");
                     // Same self-describing contract as the UTF-8 arm above:
                     // callers consume the returned Vec, so the position
                     // must live in the error itself, not only in the warn.
@@ -249,7 +249,7 @@ pub fn build_trie(
     default_type: &str,
 ) -> Result<Vec<u8>> {
     info!(
-        "Building trie from {} property info entries (default_context='{}', default_type='{}')",
+        "Building trie from {} property info entries (default_context={:?}, default_type={:?})",
         property_info.len(),
         default_context,
         default_type
@@ -288,6 +288,24 @@ pub fn build_trie(
 mod tests {
     use super::*;
 
+    /// Names reach `build_trie` from `property_contexts` lines and from
+    /// `PropertyInfoEntry::new`; its errors print them `Debug`-escaped.
+    #[test]
+    fn build_trie_error_escapes_the_name() {
+        let entry = PropertyInfoEntry::new(
+            "a..b\u{1b}[31m".into(),
+            "u:object_r:x:s0".into(),
+            "string",
+            false,
+        )
+        .unwrap();
+        let msg = build_trie(&[entry], "u:object_r:default_prop:s0", "string")
+            .unwrap_err()
+            .to_string();
+        assert!(!msg.contains('\u{1b}'), "raw ESC in {msg:?}");
+        assert!(msg.contains(r#""a..b\u{1b}[31m""#), "{msg:?}");
+    }
+
     #[test]
     fn test_parse_from_line() {
         let entry = PropertyInfoEntry::parse_from_line(
@@ -318,13 +336,13 @@ mod tests {
         assert_eq!(entry.type_str, "");
         assert!(!entry.exact_match);
 
-        // AOSP parity: a legacy two-token line is legal even when
-        // require_prefix_or_exact is true — a MISSING operation defaults
-        // to prefix match; only a present-but-invalid one is an error.
-        let entry =
+        // AOSP parity: with require_prefix_or_exact, a MISSING operation
+        // is an error just like a present-but-invalid one; the legacy
+        // two-token form is only accepted when the flag is false (above).
+        assert!(
             PropertyInfoEntry::parse_from_line("ro.build.host u:object_r:build_prop:s0", true)
-                .unwrap();
-        assert!(!entry.exact_match);
+                .is_err()
+        );
         assert!(PropertyInfoEntry::parse_from_line(
             "ro.build.host u:object_r:build_prop:s0 bogus string",
             true

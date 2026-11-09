@@ -8,6 +8,7 @@ extern crate rsproperties;
 use rsproperties::{PROP_DIRNAME, PROP_VALUE_MAX};
 
 mod common;
+#[cfg(any(feature = "builder", target_os = "android"))]
 use common::init_test;
 
 #[test]
@@ -17,9 +18,10 @@ fn test_constants() {
     println!("Constants test passed");
 }
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_basic_functionality() {
-    // Initialize with the existing __properties__ directory
+    // Loads this binary's store (Android: the device store).
     init_test();
 
     // Test get_or

@@ -1,11 +1,16 @@
-use std::fs::{create_dir_all, remove_dir_all};
+use std::fs::DirBuilder;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 
 use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(name = "example_service")]
-#[command(about = "Example service for rsproperties-service")]
+#[command(
+    about = "Example service for rsproperties-service. Missing directories are created and \
+             nothing is deleted: existing files are reused; property_info, areas and sockets \
+             are recreated."
+)]
 struct Args {
     /// Properties directory path
     #[arg(long, help = "Directory path for system properties")]
@@ -32,13 +37,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .socket_dir
         .unwrap_or_else(|| properties_dir.join("sockets"));
 
-    // Clean and create directories
-    let _ = remove_dir_all(&properties_dir);
-    let _ = remove_dir_all(&socket_dir);
-    create_dir_all(&properties_dir)?;
-    create_dir_all(&socket_dir)?;
+    // Create the directories if missing. Nothing is deleted: the paths come
+    // from the command line and may hold other software's files. The modes
+    // are those `run` uses (0711 properties dir, 0755 socket dir), minus
+    // the umask's bits; `create_dir_all` would use 0777 minus the umask's
+    // bits, world-writable under umask 0000.
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o711)
+        .create(&properties_dir)?;
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(&socket_dir)?;
 
-    println!("📁 Created directories:");
+    println!("📁 Directories:");
     println!("   Properties: {properties_dir:?}");
     println!("   Sockets: {socket_dir:?}");
 

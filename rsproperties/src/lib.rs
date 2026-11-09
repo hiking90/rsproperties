@@ -39,9 +39,10 @@ use std::{
 /// Configuration for initializing the property system
 ///
 /// `#[non_exhaustive]`: construct via [`PropertyConfig::builder`],
-/// [`PropertyConfig::with_both_dirs`], `From`, or `..Default::default()`
-/// struct update — never an exhaustive literal — so adding a field is not
-/// semver-breaking (which is the reason the builder exists at all).
+/// [`PropertyConfig::with_both_dirs`], or `From` — never a struct literal,
+/// which outside this crate is E0639 even with `..Default::default()` —
+/// so adding a field is not semver-breaking (which is the reason the
+/// builder exists at all).
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct PropertyConfig {
@@ -169,10 +170,110 @@ mod trie_node_arena;
 #[cfg(feature = "builder")]
 mod trie_serializer;
 
+/// Unit-test fixtures shared by `tests` below and `build_property_parser`.
+#[cfg(all(test, feature = "builder", not(target_os = "android")))]
+pub(crate) mod test_support {
+    use std::fs::{File, OpenOptions, Permissions};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+
+    /// `temp_dir()/<tag>_<pid>`, removed on drop (panics included). The
+    /// guard holds the path before the dir is created, so nothing created
+    /// after `new` outlives a failing test. Tests of one binary share the
+    /// pid: `tag` must differ between tests that can run concurrently.
+    pub(crate) struct FixtureDir(PathBuf);
+
+    impl FixtureDir {
+        pub(crate) fn new(tag: &str) -> Self {
+            let guard = Self(std::env::temp_dir().join(format!("{tag}_{}", std::process::id())));
+            std::fs::create_dir_all(&guard.0).unwrap();
+            guard
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for FixtureDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    /// Copies `tests/android/<name>` into `into` with mode 0644 and returns
+    /// the copy's path.
+    ///
+    /// The loader skips group/other-writable prop files like AOSP init
+    /// (`open_prop_file`), and git checks the fixtures out as
+    /// `0666 & ~umask` — 0664 under umask 002 — so tests load copies, not
+    /// the checkout.
+    pub(crate) fn copy_android_fixture(name: &str, into: &Path) -> PathBuf {
+        copy_fixture(&Path::new("tests/android").join(name), into)
+    }
+
+    fn copy_fixture(src: &Path, into: &Path) -> PathBuf {
+        let dst = into.join(src.file_name().expect("fixture path has a file name"));
+        // Overwrite rather than `create_new`: a copy left at `dst` (pid
+        // reuse, an earlier caller) must not fail with EEXIST. `mode` only
+        // applies when the file is created, so `fchmod` re-asserts 0644 on
+        // an existing one.
+        let mut out = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(&dst)
+            .unwrap_or_else(|e| panic!("create {dst:?}: {e}"));
+        out.set_permissions(Permissions::from_mode(0o644))
+            .unwrap_or_else(|e| panic!("fchmod {dst:?}: {e}"));
+        let mut input = File::open(src).unwrap_or_else(|e| panic!("open {src:?}: {e}"));
+        std::io::copy(&mut input, &mut out).unwrap_or_else(|e| panic!("copy {src:?}: {e}"));
+        dst
+    }
+
+    #[test]
+    fn copy_fixture_is_0644_over_writable_source_and_stale_copy() {
+        use std::collections::HashMap;
+        use std::fs::{create_dir, metadata, set_permissions, write};
+
+        let dir = FixtureDir::new("rsprops_copy_fixture");
+        let (src_dir, out_dir) = (dir.path().join("src"), dir.path().join("out"));
+        create_dir(&src_dir).unwrap();
+        create_dir(&out_dir).unwrap();
+
+        // Source as a umask 002 checkout leaves it.
+        let src = src_dir.join("a.prop");
+        write(&src, "ro.x=1\n").unwrap();
+        set_permissions(&src, Permissions::from_mode(0o664)).unwrap();
+        // A longer, world-writable copy already at the destination.
+        let stale = out_dir.join("a.prop");
+        write(&stale, "#######\nro.y=stale\n").unwrap();
+        set_permissions(&stale, Permissions::from_mode(0o666)).unwrap();
+
+        let copy = copy_fixture(&src, &out_dir);
+        assert_eq!(copy, stale);
+        assert_eq!(
+            metadata(&copy).unwrap().permissions().mode() & 0o7777,
+            0o644
+        );
+
+        let mut properties = HashMap::new();
+        crate::load_properties_from_file(&copy, None, "u:r:init:s0", &mut properties).unwrap();
+        assert_eq!(properties.get("ro.x").map(String::as_str), Some("1"));
+        assert!(
+            !properties.contains_key("ro.y"),
+            "stale bytes left: {properties:?}"
+        );
+    }
+}
+
 // Explicit re-export lists (not globs) so the public API surface is
 // visible here and additions to the modules don't silently become public.
 #[cfg(feature = "builder")]
 pub use build_property_parser::load_properties_from_file;
+#[cfg(feature = "builder")]
+pub use contexts_serialized::AreaWriterLock;
 #[cfg(feature = "builder")]
 pub use property_info_serializer::{build_trie, PropertyInfoEntry};
 pub use system_properties::SystemProperties;
@@ -235,12 +336,21 @@ static SYSTEM_PROPERTIES: OnceLock<
 ///   - a fully populated config - set both directories
 ///
 /// # Examples
+///
+/// The two examples below are alternatives: call `init` once. A later call
+/// naming a directory that is already set is rejected as a whole by
+/// [`try_init`], and `init` only logs that rejection.
+///
 /// ```rust,no_run
 /// use rsproperties::{init, PropertyConfig};
 /// use std::path::PathBuf;
 ///
 /// // Set only properties directory
 /// init(PropertyConfig::from(PathBuf::from("/custom/properties")));
+/// ```
+///
+/// ```rust,no_run
+/// use rsproperties::{init, PropertyConfig};
 ///
 /// // Full configuration
 /// let config = PropertyConfig::with_both_dirs("/custom/properties", "/custom/socket");
@@ -257,8 +367,9 @@ pub fn init(config: PropertyConfig) {
 
 /// Initialize system properties, returning an error when an option cannot be
 /// applied — typically because it was already set, either explicitly by a
-/// previous `init()`/`try_init()` or implicitly by the first property read
-/// (`properties_dir()` latches the default directory on first use).
+/// previous `init()`/`try_init()` or implicitly: the properties directory by
+/// the first property read (`properties_dir()`), the socket directory by the
+/// first `set()` or `socket_dir()` call.
 ///
 /// Only the options present in `config` are touched: a socket-only config
 /// leaves the properties directory unset (still overridable later), and
@@ -413,10 +524,13 @@ pub(crate) fn bionic_align(value: usize, alignment: usize) -> usize {
 /// falls back to the default.
 ///
 /// The `FromStr` parse runs while the property area's internal read lock
-/// is held (see [`SystemProperties::read_with`]): a `FromStr` impl that
-/// blocks, or re-enters this crate's property API, can deadlock against a
-/// same-process `builder` writer. Keep parsing cheap and non-reentrant —
-/// every ordinary `FromStr` (ints, floats, `String`) is fine.
+/// is held (see [`SystemProperties::read_with`]): keep it cheap and do not
+/// re-enter this crate's property API from it — every ordinary `FromStr`
+/// (ints, floats, `String`) is fine.
+///
+/// This crate has no counterpart of AOSP's `GetBoolProperty` (which accepts
+/// `1`/`y`/`yes`/`on`/`true` and `0`/`n`/`no`/`off`/`false`); parse such
+/// values yourself.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -425,9 +539,12 @@ pub(crate) fn bionic_align(value: usize, alignment: usize) -> usize {
 /// let sdk_version: i32 = get("ro.build.version.sdk").unwrap();
 /// let version: String = get("ro.build.version.release").unwrap();
 ///
-/// // Android stores booleans as "0"/"1", which Rust's `bool: FromStr`
-/// // ("true"/"false" only) does NOT parse — read them numerically:
+/// // Boolean properties are written either as "0"/"1" (`ro.debuggable`)
+/// // or as "true"/"false" (`ro.apex.updatable`), depending on the
+/// // property. `bool: FromStr` accepts only "true"/"false", so read a
+/// // "0"/"1" property as an integer:
 /// let is_debuggable: bool = get::<i32>("ro.debuggable").unwrap() != 0;
+/// let apex_updatable: bool = get("ro.apex.updatable").unwrap_or(false);
 ///
 /// // With fallback
 /// let sdk_version: i32 = get("ro.build.version.sdk").unwrap_or(0);
@@ -443,16 +560,22 @@ where
     // `&str` borrowed from the seqlock buffer (short variant) or the mmap
     // (long variant).
     try_system_properties()?.read_with(name, |value| {
+        // The raw value is not formatted here (the error's Display reaches
+        // logs), same policy as the set path's error log. `T::Err`'s Display
+        // is included verbatim: std's numeric/bool/addr parse errors do not
+        // echo their input, but a third-party `T` may.
         value.parse().map_err(|e| {
             Error::Parse(format!(
-                "Failed to parse '{value}' for property '{name}': {e}"
+                "Failed to parse property {name:?} (<{} bytes>): {e}",
+                value.len()
             ))
         })
     })?
 }
 
 /// Get a property value with default fallback
-/// Never fails - always returns a valid value
+/// Never fails - always returns a valid value; falls back on the same
+/// conditions as [`get_or_else`].
 ///
 /// The default is constructed eagerly; when it is expensive to build
 /// (e.g. an allocated `String`), prefer [`get_or_else`], which only
@@ -468,11 +591,11 @@ where
 /// let sdk_version: i32 = get_or("ro.build.version.sdk", 0);
 /// let version: String = get_or("ro.build.version.release", "unknown".to_owned());
 ///
-/// // Android stores booleans as "0"/"1", which Rust's `bool: FromStr`
-/// // ("true"/"false" only) does NOT parse — this would ALWAYS yield the
-/// // default:
-/// // let is_debuggable: bool = get_or("ro.debuggable", false);   // wrong
-/// let is_debuggable: bool = get_or("ro.debuggable", 0) != 0; // right
+/// // Boolean properties are written either as "0"/"1" (`ro.debuggable`)
+/// // or as "true"/"false" (`ro.apex.updatable`), depending on the
+/// // property. `bool: FromStr` accepts only "true"/"false":
+/// let is_debuggable: bool = get_or("ro.debuggable", 0) != 0;
+/// let apex_updatable: bool = get_or("ro.apex.updatable", false);
 /// ```
 pub fn get_or<T>(name: &str, default: T) -> T
 where
@@ -481,11 +604,13 @@ where
     get_or_else(name, move || default)
 }
 
-/// Like [`get_or`], but the default is produced lazily — the closure runs
-/// only when the property is missing, empty, fails to parse, or the global
-/// property store failed to initialize (see [`try_system_properties`]:
-/// failure is latched), so the found-and-parsed hot path never pays for
-/// constructing it.
+/// Like [`get_or`], but the default is produced lazily: the closure runs
+/// when the property is missing or empty, when its value fails to parse as
+/// `T`, or when the read fails for any other reason — a non-UTF-8 value
+/// (`Error::Utf8`), a corrupt property area, or a failed global
+/// initialization (see [`try_system_properties`]: the failure is latched).
+/// Use [`get`] to tell these cases apart. The found-and-parsed hot path
+/// never pays for constructing the default.
 ///
 /// The `FromStr` parse runs under the property area's read lock — see the
 /// caution on [`get`]. (The `default` closure runs after the lock is
@@ -533,7 +658,21 @@ where
 /// when setting well-known system properties that may be read by other applications.
 ///
 /// If an error occurs, it returns Err.
+/// The V1 protocol has no status reply: a server-side rejection is not
+/// observable and returns `Ok(())`; only V2 reports `Error::ServiceError`.
+/// V2 names and `ro.` values are limited to 65535 bytes on Android
+/// (`wire::AOSP_MAX_WIRE_STRING_LEN`, AOSP init's limit) and to
+/// [`wire::MAX_WIRE_NAME_LEN`] / [`wire::MAX_WIRE_VALUE_LEN`] elsewhere
+/// (this crate's service).
 /// It uses socket communication to set the property. Because it is designed for client applications.
+///
+/// On Linux a V2 `set` waits at most 2 s for the service's reply. An
+/// `Error::Io` of kind `TimedOut` from that wait does not mean the
+/// property was not set: the service applies a fully received request
+/// even after the client stopped waiting. A `TimedOut` while connecting
+/// or sending means the request was not delivered. On Android `set`
+/// waits for init's reply without a timeout, like bionic; connecting and
+/// sending keep the 2 s bound there too, where bionic waits without one.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -570,9 +709,7 @@ mod tests {
     #[cfg(all(feature = "builder", not(target_os = "android")))]
     use std::collections::HashMap;
     #[cfg(all(feature = "builder", not(target_os = "android")))]
-    use std::fs::{create_dir, remove_dir_all, File};
-    #[cfg(all(feature = "builder", not(target_os = "android")))]
-    use std::io::Write;
+    use std::fs::remove_dir_all;
     #[cfg(all(feature = "builder", not(target_os = "android")))]
     use std::path::Path;
     #[cfg(all(feature = "builder", not(target_os = "android")))]
@@ -643,23 +780,34 @@ mod tests {
     }
 
     #[cfg(all(feature = "builder", not(target_os = "android")))]
-    fn load_properties() -> HashMap<String, String> {
-        let build_prop_files = vec![
-            "tests/android/product_build.prop",
-            "tests/android/system_build.prop",
-            "tests/android/system_dlkm_build.prop",
-            "tests/android/system_ext_build.prop",
-            "tests/android/vendor_build.prop",
-            "tests/android/vendor_dlkm_build.prop",
-            "tests/android/vendor_odm_build.prop",
-            "tests/android/vendor_odm_dlkm_build.prop",
+    fn load_properties(tag: &str) -> HashMap<String, String> {
+        let build_prop_files = [
+            "product_build.prop",
+            "system_build.prop",
+            "system_dlkm_build.prop",
+            "system_ext_build.prop",
+            "vendor_build.prop",
+            "vendor_dlkm_build.prop",
+            "vendor_odm_build.prop",
+            "vendor_odm_dlkm_build.prop",
         ];
 
+        // Outside the properties dir: creating `<dir>/android/` would
+        // create `<dir>` ahead of `AreaWriterLock::acquire`, which sets
+        // mode 0711 only on a dir it creates.
+        let fixtures = crate::test_support::FixtureDir::new(tag);
         let mut properties = HashMap::new();
-        for file in build_prop_files {
-            load_properties_from_file(Path::new(file), None, "u:r:init:s0", &mut properties)
-                .unwrap();
+        for name in build_prop_files {
+            let file = crate::test_support::copy_android_fixture(name, fixtures.path());
+            load_properties_from_file(&file, None, "u:r:init:s0", &mut properties).unwrap();
         }
+        // A group/other-writable prop file (git checkout under umask 002)
+        // is skipped with `Ok`, which would leave callers looping over
+        // nothing.
+        assert!(
+            properties.contains_key("ro.build.version.sdk"),
+            "tests/android/*.prop not loaded (group/other-writable?)"
+        );
 
         properties
     }
@@ -709,23 +857,23 @@ mod tests {
 
         let dir = properties_dir();
         // Missing dir is fine on first run; any other failure (permissions)
-        // surfaces at `create_dir` below.
+        // surfaces at `acquire` below, which recreates the dir.
         let _ = remove_dir_all(dir);
-        // `unwrap`, not `unwrap_or_default`: swallowing a create failure
-        // here only defers the crash to `File::create` with a less
-        // accurate message.
-        create_dir(dir).unwrap();
-        File::create(dir.join("property_info"))
-            .unwrap()
-            .write_all(&data)
-            .unwrap();
 
-        let properties = load_properties();
+        let properties = load_properties("rsprops_lib_build");
 
-        let dir = properties_dir();
-        let mut system_properties = SystemProperties::new_area(dir).unwrap_or_else(|e| {
-            panic!("Cannot create system properties: {e}. Please check if {dir:?} exists.")
-        });
+        // The documented writer sequence: lock, publish, create the areas.
+        let lock = AreaWriterLock::acquire(dir).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // `acquire` created the dir (0711 minus umask); nothing above
+            // created it first with a group/other-readable mode.
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o066, 0, "{dir:?} mode {:o}", mode & 0o7777);
+        }
+        lock.publish_property_info(&data).unwrap();
+        let mut system_properties = SystemProperties::new_area_locked(lock)
+            .unwrap_or_else(|e| panic!("Cannot create system properties in {dir:?}: {e}"));
         for (key, value) in properties.iter() {
             match system_properties.find(key.as_str()).unwrap() {
                 Some(prop_ref) => {
@@ -749,7 +897,7 @@ mod tests {
 
         let system_properties = system_properties();
 
-        let properties = load_properties();
+        let properties = load_properties("rsprops_lib_expect");
 
         for (key, value) in properties.iter() {
             let prop_value = system_properties

@@ -3,7 +3,11 @@
 //! This test suite provides complete coverage of the rsproperties library's public API,
 //! testing both read and write functionality with the real Android property system.
 
+#[cfg(any(feature = "builder", target_os = "android"))]
+use rsproperties::Error;
+
 mod common;
+#[cfg(any(feature = "builder", target_os = "android"))]
 use common::init_test;
 
 #[test]
@@ -25,6 +29,7 @@ fn test_library_constants() {
     println!("  PROP_DIRNAME = {}", rsproperties::PROP_DIRNAME);
 }
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn init_test_and_dirname() {
     init_test();
@@ -40,6 +45,7 @@ fn init_test_and_dirname() {
     println!("  Property directory: {dirname:?}");
 }
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_get_with_default_functionality() {
     init_test();
@@ -72,6 +78,7 @@ fn test_get_with_default_functionality() {
     println!("✓ get_or() works correctly for non-existent properties");
 }
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_get_functionality() {
     init_test();
@@ -79,70 +86,62 @@ fn test_get_functionality() {
     // Test with non-existent property
     let result: Result<String, _> = rsproperties::get("test.nonexistent.property.67890");
     assert!(
-        result.is_err(),
-        "Should return error for non-existent property"
+        matches!(result, Err(Error::NotFound(_))),
+        "Should return NotFound for non-existent property: {result:?}"
     );
 
     println!("✓ get() returns error for non-existent properties");
 }
 
+/// A name with an empty segment never names a stored property: the public
+/// read paths report it as absent (bionic `__system_property_find`
+/// returns `nullptr`), not as a parse error.
+#[cfg(any(feature = "builder", target_os = "android"))]
+#[test]
+fn test_empty_segment_names_are_not_found() {
+    init_test();
+
+    for name in ["a..b", "foo.", ".foo", "ro.build..sdk"] {
+        let result = rsproperties::get::<String>(name);
+        assert!(
+            matches!(result, Err(Error::NotFound(_))),
+            "get({name:?}): {result:?}"
+        );
+    }
+    assert!(
+        matches!(rsproperties::system_properties().find("a."), Ok(None)),
+        "find(\"a.\") must be Ok(None)"
+    );
+}
+
+// Successful `set` frames are checked in `set_frame_tests.rs`; these
+// inputs are rejected before `set` connects.
 #[cfg(feature = "builder")]
 mod write_tests {
     use super::*;
 
     #[test]
-    fn test_set_functionality() {
-        init_test();
-
-        // Try to set a property using TestPropertyService
-        let result = rsproperties::set("test.property.name", "test_value");
-
-        match result {
-            Ok(_) => {
-                println!("✓ set() function succeeded");
-
-                // Try to read the property back
-                let value: Result<String, _> = rsproperties::get("test.property.name");
-                assert_eq!(
-                    value.unwrap(),
-                    "test_value",
-                    "Read value should match written value"
-                );
-                println!("✓ Property read/write cycle successful");
-            }
-            Err(e) => {
-                println!("⚠ set() function failed: {e}");
-            }
-        }
-    }
-
-    #[test]
     fn test_set_property_edge_cases() {
         init_test();
-        // Test setting empty value
-        let result = rsproperties::set("test.empty.value", "");
-        match result {
-            Ok(_) => println!("✓ Setting empty value succeeded"),
-            Err(e) => println!("⚠ Setting empty value failed: {e}"),
-        }
 
-        // Test setting very long value (should respect PROP_VALUE_MAX)
+        // Non-`ro.` values must be shorter than PROP_VALUE_MAX.
         let long_value = "x".repeat(rsproperties::PROP_VALUE_MAX + 10);
         let result = rsproperties::set("test.long.value", &long_value);
-        match result {
-            Ok(_) => println!("✓ Setting long value succeeded"),
-            Err(e) => println!("⚠ Setting long value failed (expected): {e}"),
-        }
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(_))),
+            "long value: {result:?}"
+        );
 
-        // Test setting property with special characters in name
+        // `!` and `#` are not property name characters.
         let result = rsproperties::set("test.special.chars!@#", "special_value");
-        match result {
-            Ok(_) => println!("✓ Setting property with special chars succeeded"),
-            Err(e) => println!("⚠ Setting property with special chars failed: {e}"),
-        }
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(_))),
+            "invalid name: {result:?}"
+        );
     }
 }
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_property_name_validation() {
     init_test();
@@ -171,6 +170,7 @@ fn test_property_name_validation() {
     println!("✓ Property name edge cases handled correctly");
 }
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_thread_safety() {
     init_test();
@@ -218,6 +218,7 @@ fn test_thread_safety() {
     );
 }
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_api_completeness() {
     init_test();
@@ -250,6 +251,7 @@ fn test_api_completeness() {
     println!("  ⚠ Builder feature disabled - write functions not available");
 }
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_error_handling_robustness() {
     init_test();
@@ -277,6 +279,7 @@ fn test_error_handling_robustness() {
     println!("✓ Error handling robustness tests passed");
 }
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_performance_characteristics() {
     init_test();
@@ -298,55 +301,61 @@ fn test_performance_characteristics() {
     println!("✓ Performance test completed");
     println!("  {iterations} iterations in {duration:?}");
     println!("  Average time per operation: {avg_time_ns} ns");
-
-    // Reasonable performance expectation (less than 100 microseconds per operation)
-    assert!(
-        avg_time_ns < 200_000,
-        "Operations should be reasonably fast"
-    );
+    // No time bound: wall-clock limits fail on loaded CI hosts without a
+    // regression. `benches/props_bench.rs` measures performance.
 }
 
+/// Host: values from `tests/android/*.prop`, loaded by `init_test`.
+#[cfg(all(feature = "builder", not(target_os = "android")))]
 #[test]
 fn test_real_android_properties() {
     init_test();
 
-    // Try to read some common Android properties that might exist
-    // These tests are informational and should not fail
-
-    let common_properties = vec![
-        "ro.build.version.sdk",
-        "ro.build.version.release",
-        "ro.product.model",
-        "ro.product.manufacturer",
-        "ro.hardware",
-        "ro.board.platform",
-        "sys.boot_completed",
-        "init.svc.zygote",
-    ];
-
-    let mut found_count = 0;
-
-    for prop in common_properties {
-        match rsproperties::get::<String>(prop) {
-            Ok(value) => {
-                found_count += 1;
-                println!("  {prop} = {value}");
-            }
-            Err(_) => {
-                // Property doesn't exist, which is fine
-                let default_val = rsproperties::get_or(prop, "not_found".to_string());
-                assert_eq!(
-                    default_val, "not_found",
-                    "get_or should work even if get fails"
-                );
-            }
-        }
+    for (prop, expected) in [
+        ("ro.build.version.sdk", "34"),
+        ("ro.build.version.release", "14"),
+        ("ro.product.vendor.model", "sdk_gphone64_x86_64"),
+        ("ro.board.platform", ""),
+    ] {
+        assert_eq!(
+            rsproperties::get::<String>(prop).unwrap_or_else(|e| panic!("{prop}: {e}")),
+            expected,
+            "{prop}"
+        );
     }
+    // Empty means unset for get_or (Android convention).
+    assert_eq!(
+        rsproperties::get_or("ro.board.platform", "not_found".to_string()),
+        "not_found"
+    );
+    assert_eq!(
+        rsproperties::get::<i32>("ro.build.version.sdk").unwrap(),
+        34
+    );
 
-    println!("✓ Real Android property tests completed");
-    println!("  Found {found_count} real properties");
-
-    if found_count == 0 {
-        println!("  ⚠ No real Android properties found (running on non-Android system)");
+    // Not in the fixture.
+    for prop in ["ro.hardware", "sys.boot_completed", "init.svc.zygote"] {
+        let result = rsproperties::get::<String>(prop);
+        assert!(
+            matches!(result, Err(Error::NotFound(_))),
+            "{prop}: {result:?}"
+        );
+        assert_eq!(
+            rsproperties::get_or(prop, "not_found".to_string()),
+            "not_found"
+        );
     }
+}
+
+/// Android: every device sets these.
+#[cfg(target_os = "android")]
+#[test]
+fn test_real_android_properties() {
+    init_test();
+
+    let sdk: i32 = rsproperties::get("ro.build.version.sdk").expect("ro.build.version.sdk");
+    assert!(sdk > 0, "ro.build.version.sdk = {sdk}");
+    let release: String =
+        rsproperties::get("ro.build.version.release").expect("ro.build.version.release");
+    assert!(!release.is_empty());
 }

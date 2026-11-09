@@ -1,7 +1,7 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io::{prelude::*, IoSlice};
+use std::io::prelude::*;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::OnceLock;
@@ -95,14 +95,42 @@ fn get_property_service_for_system_socket() -> PathBuf {
     socket_dir().join(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME)
 }
 
-/// Bound on every socket operation against the property service —
-/// **including connect** (see `connect_with_timeout`). The V1 path
+/// Bound on connect and send against the property service, and on the V2
+/// response wait outside Android (see [`RESPONSE_TIMEOUT`]). The V1 path
 /// additionally enforces its own (shorter) close-wait budget; this cap
 /// exists so a stalled server — one that stopped accepting, never
 /// responds, or stops draining our send — cannot block the caller's
 /// thread forever, the exact hazard the V1 arm defends against with
 /// `wait_for_socket_close`.
+///
+/// A connect or send timeout means the server did not receive the whole
+/// request, so it cannot apply it. A response-wait timeout does not: the
+/// request was sent in full, and both AOSP init and this crate's service
+/// apply a fully received request whether or not the client still waits
+/// for the reply. That `TimedOut` leaves the outcome unknown.
 const SERVICE_IO_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Budget for the V2 status reply after the request was sent in full.
+///
+/// Android: `None` — wait without a timeout, like bionic
+/// `__system_property_set` (`recv(MSG_WAITALL)` with no timeout). init's
+/// single property thread serves connections in order and may spend up to
+/// 2 s receiving each one, and a `persist.` set with async persist writes
+/// replies only after a 1 s sleep plus the file write, so a reply later
+/// than 2 s is normal there. A client timeout would report failure for a
+/// set that init still applies. The cost: a hung init blocks the caller,
+/// as it blocks every bionic caller.
+///
+/// Elsewhere: [`SERVICE_IO_TIMEOUT`], unchanged from 0.6.0. The peer is
+/// this crate's service, which receives each connection in its own
+/// handler task and writes no persist files, so its reply takes 2 s only
+/// when the service is stalled or out of handler slots; the bound keeps
+/// such a service from blocking the caller's thread. The outcome of a set
+/// that hits this timeout is unknown (see [`SERVICE_IO_TIMEOUT`]).
+#[cfg(target_os = "android")]
+const RESPONSE_TIMEOUT: Option<Duration> = None;
+#[cfg(not(target_os = "android"))]
+const RESPONSE_TIMEOUT: Option<Duration> = Some(SERVICE_IO_TIMEOUT);
 
 /// Maps a read/write-timeout expiry to a clearly-labelled `TimedOut` error
 /// (preserving the original as text); passes every other error through.
@@ -256,33 +284,45 @@ impl ServiceConnection {
         Ok(Self { stream })
     }
 
-    fn recv_i32(&mut self) -> Result<i32> {
+    /// Reads the 4-byte V2 status. `budget` bounds the total wait; `None`
+    /// waits without a timeout (see [`RESPONSE_TIMEOUT`]).
+    fn recv_i32(&mut self, budget: Option<Duration>) -> Result<i32> {
         // SO_RCVTIMEO re-arms per *syscall*: a plain `read_exact` against a
         // server trickling one byte per window would stretch "2 seconds"
-        // into 4×. Enforce SERVICE_IO_TIMEOUT as a total budget — the same
+        // into 4×. Enforce `budget` as a total budget — the same
         // deadline pattern as `send` and `wait_for_socket_close`.
-        let deadline = Instant::now() + SERVICE_IO_TIMEOUT;
+        let deadline = budget.map(|budget| (budget, Instant::now() + budget));
+        if deadline.is_none() {
+            // Clear the connect-time static timeout, or it would still end
+            // the wait after SERVICE_IO_TIMEOUT. Propagated, unlike the
+            // best-effort re-arm below: if it stays armed, a slow reply
+            // becomes the `TimedOut` this mode exists to avoid.
+            self.stream.set_read_timeout(None)?;
+        }
         let mut buf = [0u8; 4];
         let mut filled = 0usize;
         while filled < buf.len() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "timed out waiting for property service response \
-                         ({SERVICE_IO_TIMEOUT:?} total, {filled}/4 bytes received)"
-                    ),
-                )));
+            if let Some((budget, deadline)) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out waiting for property service response \
+                             ({budget:?} total, {filled}/4 bytes received)"
+                        ),
+                    )));
+                }
+                // Best-effort re-arm: on macOS `setsockopt` fails with
+                // EINVAL once the peer's FIN has been processed ("the
+                // socket has been shut down"), even though the buffered
+                // response bytes are still readable. Failing here would
+                // drop a response the server already sent; the
+                // connect-time static timeout remains armed as the
+                // per-syscall bound, and the deadline check above still
+                // bounds the total.
+                let _ = self.stream.set_read_timeout(Some(remaining));
             }
-            // Best-effort re-arm: on macOS `setsockopt` fails with EINVAL
-            // once the peer's FIN has been processed ("the socket has been
-            // shut down"), even though the buffered response bytes are
-            // still readable. Failing here would drop a response the
-            // server already sent; the connect-time static timeout remains
-            // armed as the per-syscall bound, and the deadline check above
-            // still bounds the total.
-            let _ = self.stream.set_read_timeout(Some(remaining));
             match self.stream.read(&mut buf[filled..]) {
                 Ok(0) => {
                     return Err(Error::Io(std::io::Error::new(
@@ -322,10 +362,8 @@ impl WireBuf<'_> {
 }
 
 struct ServiceWriter<'a> {
-    // Raw byte fragments rather than `IoSlice`s: the short-write loop in
-    // `send` needs to re-slice past already-written bytes, and `IoSlice`
-    // doesn't expose its inner slice on stable (`advance_slices` is
-    // 1.81+, above this crate's MSRV).
+    // Raw byte fragments; `send` joins them into one contiguous frame
+    // before writing (see the SIGPIPE note there).
     buffers: Vec<WireBuf<'a>>,
 }
 
@@ -359,7 +397,7 @@ impl<'a> ServiceWriter<'a> {
     }
 
     fn send(self, conn: &mut ServiceConnection) -> Result<()> {
-        // A single `write_vectored` may write fewer bytes than requested
+        // A single `write` may write fewer bytes than requested
         // (signal after a partial transfer, full socket buffer). Loop until
         // every byte is on the wire — a short write would otherwise
         // desynchronise the length-prefixed protocol and leave the server
@@ -371,8 +409,25 @@ impl<'a> ServiceWriter<'a> {
         // budget instead: re-arm the write timeout with the remaining
         // budget before every syscall and fail once it hits zero — the
         // same pattern `wait_for_socket_close` uses for reads.
+        //
+        // One contiguous frame sent with rustix `send(MSG_NOSIGNAL)` on
+        // Linux/Android: a plain `write`/`writev` to a peer-closed socket
+        // raises SIGPIPE. A Rust `main` ignores SIGPIPE at startup; a
+        // staticlib/cdylib/JNI host typically does not, and dies before the
+        // EPIPE reaches us. std's `UnixStream::write` is not used here
+        // because it is a plain `write(2)` on older std (1.77 through at
+        // least 1.86, inside this crate's `rust-version` range). Apple
+        // targets get the guarantee from SO_NOSIGPIPE (set in
+        // `connect_with_timeout`). The copy is at most one V2 frame
+        // (12 + name + value bytes). A regression to std's `write` passes
+        // on current stable; the CI `msrv` job runs this module's tests on
+        // 1.77 to catch it.
         let deadline = Instant::now() + SERVICE_IO_TIMEOUT;
         let total: usize = self.buffers.iter().map(|b| b.as_slice().len()).sum();
+        let mut frame = Vec::with_capacity(total);
+        for buf in &self.buffers {
+            frame.extend_from_slice(buf.as_slice());
+        }
         let mut written = 0usize;
         while written < total {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -393,19 +448,18 @@ impl<'a> ServiceWriter<'a> {
             // per-syscall bound, and the deadline check above still bounds
             // the total.
             let _ = conn.stream.set_write_timeout(Some(remaining));
-            // Rebuild the IoSlice list, skipping what already went out.
-            let mut skip = written;
-            let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(self.buffers.len());
-            for buf in &self.buffers {
-                let buf = buf.as_slice();
-                if skip >= buf.len() {
-                    skip -= buf.len();
-                    continue;
-                }
-                slices.push(IoSlice::new(&buf[skip..]));
-                skip = 0;
-            }
-            match conn.stream.write_vectored(&slices) {
+            // SO_SNDTIMEO expiry is EAGAIN -> `WouldBlock` (handled by
+            // `map_timeout_err`); EINTR -> `Interrupted` (retried below).
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let r = rustix::net::send(
+                &conn.stream,
+                &frame[written..],
+                rustix::net::SendFlags::NOSIGNAL,
+            )
+            .map_err(std::io::Error::from);
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let r = conn.stream.write(&frame[written..]);
+            match r {
                 Ok(0) => {
                     return Err(Error::Io(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
@@ -517,20 +571,23 @@ fn protocol_version() -> ProtocolVersion {
         return *v;
     }
 
-    let env_or_default = || match env::var("PROPERTY_SERVICE_VERSION") {
-        Ok(v) => match v.trim().parse::<u32>() {
-            Ok(n) if n >= 2 => ProtocolVersion::V2,
-            Ok(_) => ProtocolVersion::V1,
+    // `var_os`, not `var`: a present but non-UTF-8 value must take the
+    // "present but unparseable → V1" arm, not `var`'s `NotUnicode` error
+    // that is indistinguishable from "unset" in a catch-all `Err` arm.
+    let env_or_default = || match env::var_os("PROPERTY_SERVICE_VERSION") {
+        Some(v) => match v.to_str().and_then(|s| s.trim().parse::<u32>().ok()) {
+            Some(n) if n >= 2 => ProtocolVersion::V2,
+            Some(_) => ProtocolVersion::V1,
             // Present but not a number: same policy as the property path
             // (old/odd configuration → V1), and loud — silently defaulting
             // to V2 would send V2 frames to an init that may only
             // understand V1.
-            Err(_) => {
+            None => {
                 log::warn!("PROPERTY_SERVICE_VERSION={v:?} is not a number; assuming V1");
                 ProtocolVersion::V1
             }
         },
-        Err(_) => ProtocolVersion::V2,
+        None => ProtocolVersion::V2,
     };
 
     match crate::system_properties_if_initialized() {
@@ -606,7 +663,46 @@ fn wait_for_socket_close(stream: &mut UnixStream, timeout: Duration) {
     let _ = stream.set_read_timeout(original_timeout);
 }
 
-// Set a system property via local domain socket.
+/// V2 `(name, value)` length caps the client checks before connecting.
+/// Android: the peer is init, whose `RecvString` accepts up to 0xffff
+/// bytes for each. Elsewhere: this crate's service caps.
+#[cfg(target_os = "android")]
+const CLIENT_WIRE_CAPS: (usize, usize) = (
+    crate::wire::AOSP_MAX_WIRE_STRING_LEN,
+    crate::wire::AOSP_MAX_WIRE_STRING_LEN,
+);
+#[cfg(not(target_os = "android"))]
+const CLIENT_WIRE_CAPS: (usize, usize) = (
+    crate::wire::MAX_WIRE_NAME_LEN,
+    crate::wire::MAX_WIRE_VALUE_LEN,
+);
+
+/// Mirrors the server's V2 wire caps `(name, value)` so an oversized frame
+/// fails here with a clear message instead of the server's opaque error
+/// status. Takes the caps as an argument so both targets' values are
+/// testable on the host.
+fn check_wire_caps(name: &str, value: &str, (max_name, max_value): (usize, usize)) -> Result<()> {
+    if name.len() > max_name {
+        return Err(Error::InvalidArgument(format!(
+            "Property name exceeds the wire cap: {} > {max_name}",
+            name.len()
+        )));
+    }
+    if value.len() > max_value {
+        return Err(Error::InvalidArgument(format!(
+            "Property value exceeds the wire cap: {} > {max_value}",
+            value.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Sets a system property via the property service socket.
+///
+/// An `Error::Io` of kind `TimedOut` from the V2 response wait (outside
+/// Android; the message starts with "timed out waiting for property
+/// service response") does not mean the property was not set: see
+/// [`SERVICE_IO_TIMEOUT`]. On Android the response wait has no timeout.
 pub(crate) fn set(name: &str, value: &str) -> Result<()> {
     // Validate name and value up front, for BOTH protocol versions. This
     // is load-bearing for interior NUL bytes in particular: the server
@@ -664,23 +760,7 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
             // (Name/value policy is validated at the top of `set` — shared
             // with the V1 arm. Length prefixes are derived inside
             // `write_str`, so no separate truncation hazard here.)
-            // Mirror the server's wire caps so an oversized frame fails
-            // here with a clear message instead of the server's opaque
-            // error status.
-            if name.len() > crate::wire::MAX_WIRE_NAME_LEN {
-                return Err(Error::InvalidArgument(format!(
-                    "Property name exceeds the wire cap: {} > {}",
-                    name.len(),
-                    crate::wire::MAX_WIRE_NAME_LEN
-                )));
-            }
-            if value.len() > crate::wire::MAX_WIRE_VALUE_LEN {
-                return Err(Error::InvalidArgument(format!(
-                    "Property value exceeds the wire cap: {} > {}",
-                    value.len(),
-                    crate::wire::MAX_WIRE_VALUE_LEN
-                )));
-            }
+            check_wire_caps(name, value, CLIENT_WIRE_CAPS)?;
 
             let mut conn = ServiceConnection::new(name)?;
 
@@ -690,14 +770,14 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
                 .write_str(value)?
                 .send(&mut conn)?;
 
-            let res = conn.recv_i32()?;
+            let res = conn.recv_i32(RESPONSE_TIMEOUT)?;
 
             if res != PROP_SUCCESS {
                 // Do not log/report the value: property values can carry
                 // sensitive data (tokens, identifiers) — same policy as the
                 // service side's masked logging.
                 log::error!(
-                    "Property service returned error for '{name}' (<{} bytes>): 0x{res:X}",
+                    "Property service returned error for {name:?} (<{} bytes>): 0x{res:X}",
                     value.len()
                 );
                 // A protocol-level rejection, not a transport failure — the
@@ -742,7 +822,7 @@ mod tests {
         let mut conn = ServiceConnection { stream: client };
         let start = Instant::now();
         let err = conn
-            .recv_i32()
+            .recv_i32(Some(SERVICE_IO_TIMEOUT))
             .expect_err("3/4 bytes must not satisfy recv_i32");
         let elapsed = start.elapsed();
 
@@ -769,10 +849,141 @@ mod tests {
         drop(server);
 
         let mut conn = ServiceConnection { stream: client };
-        let err = conn.recv_i32().expect_err("closed socket must error");
+        let err = conn
+            .recv_i32(Some(SERVICE_IO_TIMEOUT))
+            .expect_err("closed socket must error");
         assert!(
             format!("{err}").contains("closed before"),
             "unexpected error: {err}"
+        );
+        // The unbounded (Android) mode ends on EOF the same way.
+        let (client, server) = UnixStream::pair().unwrap();
+        drop(server);
+        let mut conn = ServiceConnection { stream: client };
+        let err = conn.recv_i32(None).expect_err("closed socket must error");
+        assert!(
+            format!("{err}").contains("closed before"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The Android mode (`budget = None`) waits past SERVICE_IO_TIMEOUT,
+    /// including the static read timeout `ServiceConnection::new` arms: the
+    /// reply here arrives after ~2.5 s and must be returned, not
+    /// `TimedOut` (init applies the set regardless of the client's wait).
+    #[test]
+    fn test_recv_i32_without_budget_outlasts_service_io_timeout() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        // Same static timeout `ServiceConnection::new` sets.
+        client.set_read_timeout(Some(SERVICE_IO_TIMEOUT)).unwrap();
+
+        let feeder = std::thread::spawn(move || {
+            std::thread::sleep(SERVICE_IO_TIMEOUT + Duration::from_millis(500));
+            let _ = server.write_all(&PROP_SUCCESS.to_ne_bytes());
+            // Keep the socket open until the client has read the reply.
+            let mut b = [0u8; 1];
+            let _ = server.read(&mut b);
+        });
+
+        let mut conn = ServiceConnection { stream: client };
+        let res = conn.recv_i32(None).expect("late reply must be returned");
+        assert_eq!(res, PROP_SUCCESS);
+        drop(conn);
+        feeder.join().unwrap();
+    }
+
+    /// `check_wire_caps` is `>`, not `>=`, for both caps of both targets:
+    /// a name or value of exactly the cap is sent, one byte more is not.
+    #[test]
+    fn check_wire_caps_boundaries() {
+        let ok = |n: usize, v: usize, caps| check_wire_caps(&"n".repeat(n), &"v".repeat(v), caps);
+        for caps in [
+            (
+                crate::wire::AOSP_MAX_WIRE_STRING_LEN,
+                crate::wire::AOSP_MAX_WIRE_STRING_LEN,
+            ),
+            (
+                crate::wire::MAX_WIRE_NAME_LEN,
+                crate::wire::MAX_WIRE_VALUE_LEN,
+            ),
+        ] {
+            let (max_name, max_value) = caps;
+            assert!(ok(max_name, max_value, caps).is_ok(), "{caps:?} at cap");
+            assert!(
+                matches!(ok(max_name + 1, 1, caps), Err(Error::InvalidArgument(_))),
+                "{caps:?} name over cap"
+            );
+            assert!(
+                matches!(ok(1, max_value + 1, caps), Err(Error::InvalidArgument(_))),
+                "{caps:?} value over cap"
+            );
+        }
+        assert_eq!(crate::wire::AOSP_MAX_WIRE_STRING_LEN, 65535);
+        assert_eq!(
+            CLIENT_WIRE_CAPS,
+            (
+                crate::wire::MAX_WIRE_NAME_LEN,
+                crate::wire::MAX_WIRE_VALUE_LEN
+            )
+        );
+    }
+
+    /// Writing a frame to a peer-closed socket must surface EPIPE as an
+    /// error, not SIGPIPE, even when the host process has SIGPIPE at
+    /// SIG_DFL (C/JNI hosts). The libtest runtime ignores SIGPIPE, so the
+    /// check runs in a re-executed child that restores SIG_DFL first — a
+    /// regression kills only the child.
+    ///
+    /// Scope: this catches a regression to std's `UnixStream::write` only
+    /// on a toolchain whose std writes with plain `write(2)` (1.77 through
+    /// at least 1.86). Current stable std adds `MSG_NOSIGNAL` itself, so
+    /// the test passes there either way; the CI `msrv` job runs it on 1.77.
+    #[test]
+    fn test_send_to_closed_peer_is_epipe_not_sigpipe() {
+        const CHILD_ENV: &str = "RSPROPERTIES_SIGPIPE_CHILD";
+        const TEST_PATH: &str =
+            "system_property_set::tests::test_send_to_closed_peer_is_epipe_not_sigpipe";
+
+        if env::var_os(CHILD_ENV).is_some() {
+            // SAFETY: `libc::signal` is the libc crate's declaration of C
+            // `signal` for this target. `SIG_DFL` installs no handler, so no
+            // Rust code runs in signal context. The disposition is
+            // process-wide; this child process runs only this test
+            // (`--exact`).
+            let prev = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+            assert_ne!(prev, libc::SIG_ERR, "signal(SIGPIPE, SIG_DFL) failed");
+
+            let (client, server) = UnixStream::pair().unwrap();
+            drop(server);
+            let mut conn = ServiceConnection { stream: client };
+            let err = ServiceWriter::new()
+                .write_u32(PROP_MSG_SETPROP2)
+                .write_bytes(&[0u8; 64])
+                .send(&mut conn)
+                .expect_err("peer-closed socket must error");
+            assert!(
+                matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::BrokenPipe),
+                "unexpected error: {err}"
+            );
+            return;
+        }
+
+        let output = std::process::Command::new(env::current_exe().unwrap())
+            .args([TEST_PATH, "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed ({:?}): {stdout}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Guard against a filter that matched nothing (vacuous pass).
+        assert!(
+            stdout.contains("1 passed"),
+            "child did not run the test: {stdout}"
         );
     }
 }

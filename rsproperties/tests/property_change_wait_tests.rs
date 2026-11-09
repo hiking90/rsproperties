@@ -3,19 +3,33 @@
 
 //! Tests for property change wait functionality on Android
 //!
-//! These tests verify the ability to wait for property changes and
-//! respond to them. Since they rely on Android-specific functionality,
-//! they are conditionally compiled to run only on Android.
+//! A waiter thread reads the serial *before* it signals the main thread,
+//! then waits with that serial as `old_serial`. A change the main thread
+//! makes before the waiter enters `wait` then returns at once instead of
+//! being missed. The wait has a 10 s timeout so a lost wakeup fails the
+//! test instead of hanging it: set → futex wake takes milliseconds, so the
+//! bound is only reached on failure.
+//!
+//! Names are under `debug.`: the shell SELinux domain may set `debug.*`
+//! but not `test.*`, so the tests also pass after `adb unroot`. The pid
+//! suffix keeps concurrent runs apart. `wait_any` is not tested: it takes
+//! no `old_serial`, so no test of it can be free of the lost-wakeup race
+//! (it is `wait(None, None, None)`).
 
 #![cfg(target_os = "android")]
 
-use rsproperties;
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Duration;
+
+use rsproperties::Timespec;
 
 mod common;
 use common::init_test;
+
+const WAIT_TIMEOUT: Timespec = Timespec {
+    tv_sec: 10,
+    tv_nsec: 0,
+};
 
 /// Helper function to initialize test environment
 fn setup_android_test() {
@@ -24,186 +38,76 @@ fn setup_android_test() {
 }
 
 /// Test waiting for a property change
-///
-/// This test creates a thread that waits for a specific property to change,
-/// and then another thread sets the property to trigger the wait to complete.
-///
-/// This function is only compiled and run on Android devices.
 #[test]
 fn test_wait_for_property_change() {
     setup_android_test();
 
-    let test_prop = "test.wait.property";
+    let test_prop = format!("debug.rsproperties.wait.{}", std::process::id());
     let initial_value = "initial";
     let changed_value = "changed";
 
-    // First set the initial value
-    match rsproperties::set(test_prop, initial_value) {
-        Ok(_) => {
-            println!("✓ Set initial property value to '{}'", initial_value);
+    rsproperties::set(&test_prop, initial_value).expect("set initial value");
+    assert_eq!(
+        rsproperties::get::<String>(&test_prop).expect("get after set"),
+        initial_value
+    );
 
-            // Verify the initial value
-            match rsproperties::get::<String>(test_prop) {
-                Ok(value) => {
-                    assert_eq!(value, initial_value);
-                    println!("✓ Initial property value verified: '{}'", value);
-                }
-                Err(e) => {
-                    panic!("Failed to get property after setting: {}", e);
-                }
-            }
+    let barrier = Arc::new(Barrier::new(2));
+    let waiter = {
+        let barrier = Arc::clone(&barrier);
+        let prop_name = test_prop.clone();
+        thread::spawn(move || {
+            let system_properties = rsproperties::system_properties();
+            let index = system_properties
+                .find(&prop_name)
+                .expect("find")
+                .expect("property exists after set");
+            let old_serial = system_properties.serial(&index).expect("serial");
 
-            // Use a barrier to ensure the waiting thread is ready before we change the property
-            let barrier = Arc::new(Barrier::new(2));
-            let barrier_clone = Arc::clone(&barrier);
-
-            // Property name for threads to use
-            let prop_name = test_prop.to_string();
-
-            // Thread that waits for property change
-            let waiter_handle = thread::spawn(move || {
-                println!("Waiter thread: Starting to wait for property change...");
-
-                // Get the system_properties instance
-                let system_properties = rsproperties::system_properties();
-
-                // Find the property index
-                match system_properties.find(&prop_name).unwrap() {
-                    Some(index) => {
-                        println!("Waiter thread: Found property index");
-
-                        // Signal that we're ready to wait
-                        barrier_clone.wait();
-
-                        // Wait for property change (no timeout)
-                        println!("Waiter thread: Now waiting for property change...");
-                        match system_properties.wait(Some(&index), None, None) {
-                            Some(_serial) => {
-                                // Wait completed successfully
-                                let new_value =
-                                    rsproperties::get::<String>(&prop_name).unwrap_or_default();
-                                println!(
-                                    "Waiter thread: Property change detected! New value: '{}'",
-                                    new_value
-                                );
-                                assert_eq!(new_value, changed_value);
-                                true
-                            }
-                            None => {
-                                println!("Waiter thread: Wait failed or timed out");
-                                false
-                            }
-                        }
-                    }
-                    None => {
-                        println!("Waiter thread: Could not find property index");
-                        barrier_clone.wait(); // Make sure we don't block the test
-                        false
-                    }
-                }
-            });
-
-            // Wait for the waiter thread to be ready
             barrier.wait();
-            println!("Main thread: Waiter thread is ready, changing property...");
 
-            // Small delay to ensure waiter is actually waiting
-            thread::sleep(Duration::from_millis(100));
+            system_properties
+                .wait(Some(&index), Some(old_serial), Some(&WAIT_TIMEOUT))
+                .expect("wait timed out: the change was not observed");
+            rsproperties::get::<String>(&prop_name).expect("get after wait")
+        })
+    };
 
-            // Change the property value to trigger the waiter
-            match rsproperties::set(test_prop, changed_value) {
-                Ok(_) => {
-                    println!("Main thread: Changed property value to '{}'", changed_value);
-                }
-                Err(e) => {
-                    println!("Main thread: Failed to change property: {}", e);
-                }
-            }
+    barrier.wait();
+    rsproperties::set(&test_prop, changed_value).expect("set changed value");
 
-            // Wait for waiter thread to complete and get its result
-            let wait_succeeded = waiter_handle.join().expect("Waiter thread panicked");
-
-            // Verify final state
-            let final_value = rsproperties::get::<String>(test_prop).unwrap_or_default();
-            assert_eq!(final_value, changed_value);
-
-            assert!(wait_succeeded, "Property change wait should have succeeded");
-            println!("✓ Property change wait test passed");
-        }
-        Err(e) => {
-            println!("⚠ Initial property set failed: {}", e);
-            println!("This is expected if not running on Android");
-        }
-    }
+    let seen = waiter.join().expect("waiter thread panicked");
+    assert_eq!(seen, changed_value);
 }
 
-/// Test waiting for any property change
-///
-/// This test creates a thread that waits for any property change to occur,
-/// and then another thread sets a property to trigger the wait to complete.
-///
-/// This function is only compiled and run on Android devices.
+/// Test waiting for any property change (global serial)
 #[test]
 fn test_wait_for_any_property_change() {
     setup_android_test();
 
-    let test_prop = "test.wait.any.property";
+    let test_prop = format!("debug.rsproperties.wait.any.{}", std::process::id());
     let changed_value = "any_changed";
 
-    // Use a barrier to ensure the waiting thread is ready before we change the property
     let barrier = Arc::new(Barrier::new(2));
-    let barrier_clone = Arc::clone(&barrier);
+    let waiter = {
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            let system_properties = rsproperties::system_properties();
+            let old_serial = system_properties.context_serial();
 
-    // Thread that waits for any property change
-    let waiter_handle = thread::spawn(move || {
-        println!("Waiter thread: Starting to wait for any property change...");
+            barrier.wait();
 
-        // Get the system_properties instance
-        let system_properties = rsproperties::system_properties();
+            system_properties.wait(None, Some(old_serial), Some(&WAIT_TIMEOUT))
+        })
+    };
 
-        // Signal that we're ready to wait
-        barrier_clone.wait();
-
-        // Wait for any property change
-        println!("Waiter thread: Now waiting for any property change...");
-        system_properties.wait_any();
-
-        println!("Waiter thread: Any property change detected!");
-        true
-    });
-
-    // Wait for the waiter thread to be ready
     barrier.wait();
-    println!("Main thread: Waiter thread is ready, changing property...");
+    rsproperties::set(&test_prop, changed_value).expect("set property");
 
-    // Small delay to ensure waiter is actually waiting
-    thread::sleep(Duration::from_millis(100));
-
-    // Change a property value to trigger the waiter
-    match rsproperties::set(test_prop, changed_value) {
-        Ok(_) => {
-            println!("Main thread: Set property to '{}'", changed_value);
-        }
-        Err(e) => {
-            println!("Main thread: Failed to change property: {}", e);
-        }
-    }
-
-    // Wait for waiter thread to complete and get its result
-    let wait_succeeded = waiter_handle.join().expect("Waiter thread panicked");
-
-    // Verify the property was set
-    let final_value = rsproperties::get_or(test_prop, "not_set".to_string());
-
-    if final_value == changed_value {
-        println!("✓ Property value verified: '{}'", final_value);
-    } else {
-        println!(
-            "⚠ Property value unexpected: '{}' (expected '{}')",
-            final_value, changed_value
-        );
-    }
-
-    assert!(wait_succeeded, "Property change wait should have succeeded");
-    println!("✓ Wait for any property change test passed");
+    let woke = waiter.join().expect("waiter thread panicked");
+    assert!(woke.is_some(), "wait timed out: no global serial change");
+    assert_eq!(
+        rsproperties::get_or(&test_prop, "not_set".to_string()),
+        changed_value
+    );
 }

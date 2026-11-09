@@ -1,14 +1,12 @@
 # rsproperties-service
 
-An async, tokio-based service implementation for Android system properties with Unix domain socket support.
+Linux emulation of the Android system property service: a tokio-based daemon that serves the property socket protocol and the property area files on a Linux host. It is not usable on Android, where init owns the property service, and compiles only for Linux; use the `rsproperties` client crate on Android.
 
-[![Crates.io](https://img.shields.io/crates/v/rsproperties-service.svg)](https://crates.io/crates/rsproperties-service)
-[![Documentation](https://docs.rs/rsproperties-service/badge.svg)](https://docs.rs/rsproperties-service)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 ## Overview
 
-`rsproperties-service` provides a high-performance, async property service that mimics Android's property system. It features a Unix domain socket server that handles property operations using an actor-based architecture powered by the `rsactor` framework.
+`rsproperties-service` is an async property service that emulates the Android property service on Linux. It features a Unix domain socket server that handles property operations using an actor-based architecture powered by the `rsactor` framework.
 
 ## Key Features
 
@@ -35,24 +33,28 @@ The service consists of two main components running as separate actors:
 - Provides Unix domain socket interface
 - Handles client connections and commands
 - Implements Android-compatible property service protocol
-- Supports SETPROP2 command for property setting
+- Supports SETPROP2 (V2) and legacy SETPROP (V1) commands for property setting
 - Manages concurrent client sessions
 
 ## Installation
 
-This crate is not published on crates.io; depend on it via git:
+This crate is not published on crates.io; depend on it via git, and take
+`rsproperties` (used for `PropertyConfig` in the examples below) from the same
+git source. A crates.io `rsproperties` would be a separate crate whose
+`PropertyConfig` `run` does not accept:
 
 ```toml
 [dependencies]
+rsproperties = { git = "https://github.com/hiking90/rsproperties" }
 rsproperties-service = { git = "https://github.com/hiking90/rsproperties" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ```
 
-Or add it with the builder feature:
+`rsproperties-service` always enables `rsproperties/builder`; its own `builder` feature adds nothing.
 
-```toml
-[dependencies]
-rsproperties-service = { git = "https://github.com/hiking90/rsproperties", features = ["builder"] }
-```
+Supported platform: Linux only. On any other target (Android and macOS
+included) the crate fails to compile with a `compile_error!` that names
+the reason.
 
 ## Quick Start
 
@@ -63,7 +65,14 @@ use rsproperties_service;
 use std::path::PathBuf;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // `run` creates a missing properties dir (last component only, 0711) and
+    // socket dir (0755, parents included), both minus the umask's bits;
+    // create them yourself beforehand to choose owner and mode. These
+    // paths suit a single-user dev box only: under `/tmp` any local user
+    // can create the directories first, and `run` uses an existing
+    // directory as is (see "Socket dir contract").
+
     // Create configuration
     let config = rsproperties::PropertyConfig::with_both_dirs(
         PathBuf::from("/tmp/properties"),
@@ -107,8 +116,9 @@ use rsproperties_service;
 use std::path::PathBuf;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Setup directories
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Linux host paths laid out like an Android rootfs; the socket dir must
+    // be writable only by the service's user and root.
     let properties_dir = PathBuf::from("/system/etc/properties");
     let socket_dir = PathBuf::from("/dev/socket");
 
@@ -176,32 +186,55 @@ API. See [Protocol Compatibility](#protocol-compatibility) below.
 If you need to read or set properties from the same process that owns
 the service, use the `rsproperties` crate directly
 (`rsproperties::get_or`, `rsproperties::set`, etc.) — it talks to the
-same socket the external clients use.
+same socket the external clients use. `set` is blocking socket I/O and
+waits up to 2 s for the reply: called from a task on the runtime that
+runs the service (e.g. a `current_thread` runtime), it keeps the service
+from accepting, returns a timeout error, and the already-sent value may still be
+applied once the runtime resumes. Run the service on its own runtime/thread, or
+call `set` through `tokio::task::spawn_blocking` on a multi-thread
+runtime.
 
 ## Protocol Compatibility
 
 The socket service implements the Android property service protocol:
 
 - **Socket Names**: Uses standard Android socket names (`property_service`, `property_service_for_system`)
-- **Commands**: Supports `PROP_MSG_SETPROP2` (0x00020001) command
+- **Commands**: Supports `PROP_MSG_SETPROP2` (0x00020001) and the legacy V1 `PROP_MSG_SETPROP` (1), which gets no reply (AOSP V1 behavior)
 - **Response Codes**: Returns `PROP_SUCCESS` (0) or `PROP_ERROR` (-1)
 - **Message Format**: Compatible with Android's binary protocol
 
 ## Error Handling
 
-The service provides comprehensive error handling:
+`run` returns a `StartupError`: `stage()` names the step that failed
+(`StartupStage::Config`, `WriterLock`, `PropertiesService`,
+`SocketService`) and `source()` is the cause — `std::io::Error` from the
+properties service, `rsproperties::Error` from `try_init`, the writer
+lock or the socket service.
 
 ```rust
+use rsproperties_service::StartupStage;
+
 match rsproperties_service::run(config, contexts, props).await {
-    Ok((socket_service, properties_service)) => {
-        // Services started successfully
+    Ok((_socket_service, _properties_service)) => {
         println!("All services running");
     }
     Err(e) => {
-        eprintln!("Failed to start services: {}", e);
-        // Handle specific error types
-        if e.to_string().contains("Permission denied") {
-            eprintln!("Check directory permissions");
+        // Displays as "<stage> failed to start: <cause>".
+        eprintln!("{e}");
+        let cause = std::error::Error::source(&e);
+        if e.stage() == StartupStage::WriterLock
+            && matches!(
+                cause.and_then(|c| c.downcast_ref::<rsproperties::Error>()),
+                Some(rsproperties::Error::Lock(_))
+            )
+        {
+            eprintln!("another instance owns the properties dir");
+        }
+        // Walk the rest of the chain, e.g. down to the OS error.
+        let mut next = cause.and_then(|c| c.source());
+        while let Some(c) = next {
+            eprintln!("  caused by: {c}");
+            next = c.source();
         }
     }
 }
@@ -220,7 +253,8 @@ The service expects this directory layout:
 
 ```
 properties_dir/
-├── property_info          # Property metadata (generated)
+├── .writer_lock           # flock held by the running writer
+├── property_info          # Property metadata (generated, replaced by rename)
 ├── properties_serial      # Property versioning
 └── u:object_r:*:s0       # SELinux context files
 
@@ -231,14 +265,33 @@ socket_dir/
 
 ## Security & Hardening
 
-### Hardening highlights (0.4.0)
+### Hardening highlights
 
-- **Socket permissions**: bound Unix sockets are `chmod`ed to `0o660`
-  immediately after `bind()` so the file does not inherit the process
-  umask. Matches the AOSP init policy for the property-service sockets.
-- **Backpressure**: the connection-limit semaphore permit is acquired
-  *before* `accept()`. Saturation parks the accept loop and lets the
-  kernel backlog queue connect attempts, instead of accept-then-stall.
+- **Socket permissions**: each socket's mode is set to `0o660` on the
+  socket fd before `bind`, so the file exists only with `0o660` minus the
+  umask's bits; if the umask cleared any of those bits, the mode is
+  raised to exactly `0o660` through an `O_PATH|O_NOFOLLOW` descriptor
+  (needs `/proc`: `/proc/thread-self/fd`, or `/proc/self/fd` on kernels
+  before 3.17). Only then does the socket `listen` — a `connect`
+  before that fails with `ECONNREFUSED`. Both sockets are bound as
+  `.<name>.tmp-<pid>` and renamed onto their final names only after both
+  listen. Stricter than AOSP init, which creates `property_service` 0666
+  (relying on SELinux) and only `property_service_for_system` 0660.
+- **Backpressure**: `accept()` does not wait for a permit. Each accepted
+  connection must take a waiting-room permit with `try_acquire`
+  (`MAX_WAITING_CLIENTS` = 256); when the waiting room is full the
+  connection is closed immediately. The spawned task then waits up to
+  `CLIENT_TIMEOUT` (10 s) for one of `MAX_CONCURRENT_CLIENTS` (64)
+  handler permits and drops the connection on timeout. The accept loop
+  never parks, and accepted fds are capped at 64 + 256.
+- **`TimedOut` has an unknown outcome**: like AOSP init, the service
+  applies every request it received in full, also when the client has
+  already stopped waiting. The Linux client waits at most 2 s for the
+  reply, so a `set` that returns `TimedOut` while waiting for the reply
+  may have been applied (a `TimedOut` while connecting or sending means
+  the request was not delivered). Retrying with the same value is
+  harmless except for `ro.*`, where the retry gets `ServiceError` if the
+  first attempt was applied.
 - **`accept()` back-off**: a 100 ms sleep is inserted after an `accept()`
   error so an `EMFILE`/`ENFILE` storm cannot spin the worker and flood
   the log.
@@ -251,9 +304,11 @@ socket_dir/
   rather than silently leaving the service bound to whatever paths a
   previous instance committed.
 - **Deterministic `build.prop` apply order**: entries are collected
-  into a `BTreeMap` before apply. Earlier `HashMap` iteration meant the
-  "winning" value on a key conflict varied per run due to hash-seed
-  randomisation.
+  into a `BTreeMap` before apply, so the order in which they are added
+  to the area (and thus the trie layout) no longer varies per run with
+  `HashMap`'s hash seed. Which file wins a key conflict does not depend
+  on this: `load_properties_from_file` overwrites in call order, so the
+  later file wins.
 
 ### Size limits
 
@@ -263,8 +318,9 @@ are *transport* caps; the actual property-system policy is stricter
 and enforced after the bytes arrive:
 
 - **Names**: `validate_property_name` — ASCII alphanumeric plus
-  `_ . - @ :`, no leading `. - @ :`; `PROP_NAME_MAX = 32` bytes on the
-  V1 wire path.
+  `_ . - @ :`, no leading `.`; at most 31 bytes
+  (`PROP_NAME_MAX - 1`, the 32-byte buffer includes the NUL) on the V1
+  wire path.
 - **Values**: `validate_value_len` — `PROP_VALUE_MAX = 92` is the
   buffer size including the trailing NUL, so user content is capped
   at 91 bytes for non-`ro.*` properties. `ro.*` properties may exceed
@@ -272,8 +328,32 @@ and enforced after the bytes arrive:
 
 ### Other security features
 
-- **Path validation**: all file and directory paths are validated
-- **SELinux**: property-context files are honoured when supplied
+- **Access control**: the socket file mode (`0o660`) plus the socket
+  dir's permissions are the only access control. Any peer that can
+  connect may set any non-`ro.` property, and any `ro.` property that
+  has no value yet (the first writer fixes it).
+- **Socket dir contract**: the service opens the socket dir once at
+  startup and changes only entries directly in it named
+  `property_service`, `property_service_for_system`, or
+  `.<either name>.tmp-<pid>`, relative to that descriptor, never following
+  a symlink at those names. `bind` itself takes a path: if the socket
+  dir's path is swapped after startup opened it, the temp socket is
+  created at the new location, startup fails, and that socket is left
+  there. Any uid other than the service's and root that
+  can write to the socket dir or one of its ancestors can replace the
+  sockets with its own and so impersonate the service; that is out of
+  scope. Keep the socket dir and its ancestors writable only by the
+  service's user and root. A world-writable socket dir without the sticky
+  bit is reported with a warning at startup; this is not an access check.
+  A default ACL on the socket dir gives its named users and groups access
+  beyond the mode bits; the service does not inspect or remove ACLs.
+- **Single instance**: `run` takes the properties dir's writer lock before
+  starting either actor, so a second `run` on the same properties dir
+  fails (`StartupStage::WriterLock`) without touching `property_info` or
+  the sockets. Run one instance per socket dir: two instances with
+  different properties dirs must not share a socket dir.
+- **property_contexts**: only maps property names to areas/contexts; no
+  per-property (SELinux or `SO_PEERCRED`) authorization is performed.
 - **Permission handling**: respects file system permissions
 
 ## Logging
@@ -289,8 +369,8 @@ env_logger::Builder::from_env(
 
 Log levels:
 - **ERROR**: Service failures, connection errors
-- **WARN**: Graceful shutdowns, configuration issues
-- **INFO**: Service lifecycle, property operations
+- **WARN**: Killed (non-graceful) shutdowns, configuration issues
+- **INFO**: Service lifecycle (including graceful shutdowns), property operations
 - **DEBUG**: Client connections, message details
 - **TRACE**: Protocol-level details, fine-grained operations
 

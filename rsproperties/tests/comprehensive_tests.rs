@@ -3,25 +3,17 @@
 
 //! Comprehensive tests for rsproperties using real Android property system
 //!
-//! These tests use the existing __properties__ directory which contains
-//! real Android property system files.
+//! On a host these tests read a store this binary builds from the
+//! `tests/android` property contexts and build.prop files (see
+//! `tests/common/mod.rs`); on Android they read the device store.
 
+#[cfg(any(feature = "builder", target_os = "android"))]
+use rsproperties::Error;
 use rsproperties::{PROP_DIRNAME, PROP_VALUE_MAX};
-#[cfg(not(target_os = "android"))]
-use std::sync::Once;
 
-#[cfg(not(target_os = "android"))]
-static INIT_ONCE: Once = Once::new();
-
-fn ensure_init() {
-    #[cfg(not(target_os = "android"))]
-    INIT_ONCE.call_once(|| {
-        // Initialize with the existing __properties__ directory
-        let props_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("__properties__");
-        let config = rsproperties::PropertyConfig::with_properties_dir(props_dir);
-        rsproperties::init(config);
-    });
-}
+mod common;
+#[cfg(any(feature = "builder", target_os = "android"))]
+use common::init_test as ensure_init;
 
 #[test]
 fn test_constants_are_correct() {
@@ -37,6 +29,7 @@ fn test_constants_are_correct() {
     println!("✓ API constants are correct");
 }
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_get_with_default_functionality() {
     ensure_init();
@@ -71,6 +64,7 @@ fn test_get_with_default_functionality() {
     println!("✓ get_or functionality works correctly");
 }
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_get_nonexistent_properties() {
     ensure_init();
@@ -86,14 +80,15 @@ fn test_get_nonexistent_properties() {
     for prop in &nonexistent_props {
         let result: Result<String, _> = rsproperties::get(prop);
         assert!(
-            result.is_err(),
-            "Getting non-existent property '{prop}' should return error"
+            matches!(result, Err(Error::NotFound(_))),
+            "Getting non-existent property '{prop}' should return NotFound: {result:?}"
         );
     }
 
     println!("✓ get returns errors for non-existent properties");
 }
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_dirname_function() {
     ensure_init();
@@ -113,6 +108,7 @@ fn test_dirname_function() {
     println!("✓ dirname function returns: {dirname_str}");
 }
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_property_name_validation() {
     ensure_init();
@@ -145,14 +141,17 @@ fn test_property_name_validation() {
 
     for name in &invalid_names {
         let result: Result<String, _> = rsproperties::get(name);
-        // Most should fail, but we don't enforce strict requirements
-        // since behavior may vary by implementation
-        println!("Tested invalid name '{}': {:?}", name, result.is_err());
+        // An empty segment never names a stored property (bionic parity).
+        assert!(
+            matches!(result, Err(Error::NotFound(_))),
+            "invalid name {name:?}: {result:?}"
+        );
     }
 
     println!("✓ Property name validation tests completed");
 }
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_thread_safety() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -203,14 +202,11 @@ fn test_thread_safety() {
     println!("✓ Thread safety test completed with {final_count} operations");
 }
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_property_value_length_constraints() {
-    // Test the PROP_VALUE_MAX constant
     let max_length_value = "x".repeat(PROP_VALUE_MAX);
-    assert_eq!(max_length_value.len(), PROP_VALUE_MAX);
-
     let too_long_value = "x".repeat(PROP_VALUE_MAX + 1);
-    assert_eq!(too_long_value.len(), PROP_VALUE_MAX + 1);
 
     // Test using these values with get_with_default
     ensure_init();
@@ -224,65 +220,23 @@ fn test_property_value_length_constraints() {
     println!("✓ Property value length constraint tests passed");
 }
 
+// Successful `set` frames are checked in `set_frame_tests.rs`; these
+// inputs are rejected before `set` connects.
 #[cfg(feature = "builder")]
 mod builder_tests {
     use super::*;
 
-    #[test]
-    fn test_set_property_basic() {
-        ensure_init();
-
-        // Try to set a property
-        let result = rsproperties::set("test.basic.property", "test_value");
-
-        match result {
-            Ok(_) => {
-                println!("✓ Property set successfully");
-
-                // Try to read it back
-                let value: Result<String, _> = rsproperties::get("test.basic.property");
-                assert_eq!(value.unwrap(), "test_value");
-                println!("✓ Property read back successfully");
-            }
-            Err(e) => {
-                println!("⚠ Property set failed (expected without property service): {e}");
-                // This is expected behavior when property service is not running
-            }
-        }
-    }
-
-    #[test]
-    fn test_set_property_various_values() {
-        ensure_init();
-
-        let test_cases = [
-            ("test.empty", ""),
-            ("test.simple", "value"),
-            ("test.numbers", "12345"),
-            ("test.special", "value with spaces!@#"),
-            ("test.unicode", "üñíçødé"),
-        ];
-
-        for (prop, value) in &test_cases {
-            match rsproperties::set(prop, value) {
-                Ok(_) => println!("✓ Set property {prop} = {value}"),
-                Err(e) => println!("⚠ Failed to set property {prop}: {e}"),
-            }
-        }
-    }
-
+    /// A non-`ro.` value must be shorter than `PROP_VALUE_MAX`.
     #[test]
     fn test_set_property_max_length() {
         ensure_init();
 
-        // Test setting property with maximum allowed length
         let max_value = "x".repeat(PROP_VALUE_MAX);
         let result = rsproperties::set("test.max.length", &max_value);
-
-        match result {
-            Ok(_) => println!("✓ Successfully set property with max length"),
-            Err(e) => println!("⚠ Failed to set max length property: {e}"),
-        }
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(_))),
+            "{PROP_VALUE_MAX} byte value: {result:?}"
+        );
     }
 
     #[test]
@@ -293,125 +247,72 @@ mod builder_tests {
         let too_long_value = "x".repeat(PROP_VALUE_MAX + 1);
         let result = rsproperties::set("test.too.long", &too_long_value);
 
-        // This should fail
         assert!(
-            result.is_err(),
-            "Setting property with value too long should fail"
+            matches!(result, Err(Error::InvalidArgument(_))),
+            "Setting property with value too long should fail: {result:?}"
         );
-        println!("✓ Correctly rejected property value that is too long");
-    }
-
-    #[test]
-    fn test_property_update() {
-        ensure_init();
-
-        let prop_name = "test.update.property";
-
-        // Set initial value
-        match rsproperties::set(prop_name, "initial") {
-            Ok(_) => {
-                println!("✓ Set initial property value");
-
-                // Update the value
-                match rsproperties::set(prop_name, "updated") {
-                    Ok(_) => {
-                        println!("✓ Updated property value");
-
-                        // Verify the update
-                        let value: Result<String, _> = rsproperties::get(prop_name);
-                        assert_eq!(value.unwrap(), "updated");
-                        println!("✓ Property update verified");
-                    }
-                    Err(e) => println!("⚠ Property update failed: {e}"),
-                }
-            }
-            Err(e) => println!("⚠ Initial property set failed: {e}"),
-        }
-    }
-
-    #[test]
-    fn test_concurrent_property_operations() {
-        use std::thread;
-
-        ensure_init();
-
-        let mut handles = vec![];
-
-        // Spawn multiple threads that try to set properties
-        for i in 0..5 {
-            let handle = thread::spawn(move || {
-                let prop_name = format!("test.concurrent.{i}");
-                let prop_value = format!("value_{i}");
-
-                match rsproperties::set(&prop_name, &prop_value) {
-                    Ok(_) => {
-                        println!("Thread {i}: Set property {prop_name} = {prop_value}");
-
-                        // Try to read it back
-                        let value: Result<String, _> = rsproperties::get(&prop_name);
-                        println!("Thread {i}: Read back: {value:?}");
-                    }
-                    Err(e) => println!("Thread {i}: Set failed: {e}"),
-                }
-            });
-            handles.push(handle);
-        }
-
-        // Wait for all threads
-        for handle in handles {
-            handle.join().expect("Thread should complete");
-        }
-
-        println!("✓ Concurrent property operations completed");
     }
 }
 
+#[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_error_handling() {
     ensure_init();
 
-    // Test various error conditions
-
-    // Very long property name
+    // A 508-byte name: no length limit on the read path, just absent.
     let long_name = "test.".repeat(100) + "property";
     let result: Result<String, _> = rsproperties::get(&long_name);
-    // This may or may not fail depending on implementation limits
-    println!("Long property name test: {:?}", result.is_err());
+    assert!(
+        matches!(result, Err(Error::NotFound(_))),
+        "long name: {result:?}"
+    );
 
-    // Property name with null bytes (if we can construct one safely)
-    // Note: Rust strings are UTF-8 and don't allow null bytes normally
-
-    // Empty property name
     let result: Result<String, _> = rsproperties::get("");
-    println!("Empty property name test: {:?}", result.is_err());
-
-    println!("✓ Error handling tests completed");
+    assert!(
+        matches!(result, Err(Error::NotFound(_))),
+        "empty name: {result:?}"
+    );
 }
 
+/// Host: values from `tests/android/*.prop`, loaded by `ensure_init`.
+#[cfg(all(feature = "builder", not(target_os = "android")))]
 #[test]
 fn test_real_android_properties() {
     ensure_init();
 
-    // Test some common Android properties that might exist
-    let common_props = [
-        "ro.build.version.sdk",
-        "ro.build.version.release",
+    assert_eq!(
+        rsproperties::get::<String>("ro.build.version.sdk").unwrap(),
+        "34"
+    );
+    assert_eq!(
+        rsproperties::get::<String>("ro.build.version.release").unwrap(),
+        "14"
+    );
+    for prop in [
         "ro.product.model",
-        "ro.product.manufacturer",
         "sys.boot_completed",
         "persist.sys.timezone",
-    ];
-
-    for prop in &common_props {
-        match rsproperties::get::<String>(prop) {
-            Ok(value) => println!("Found property {prop} = {value}"),
-            Err(_) => {
-                // Use get_or to test the functionality
-                let default_value = rsproperties::get_or(prop, "not_found".to_string());
-                println!("Property {prop} not found, default: {default_value}");
-            }
-        }
+    ] {
+        let result = rsproperties::get::<String>(prop);
+        assert!(
+            matches!(result, Err(Error::NotFound(_))),
+            "{prop}: {result:?}"
+        );
+        assert_eq!(
+            rsproperties::get_or(prop, "not_found".to_string()),
+            "not_found"
+        );
     }
+}
 
-    println!("✓ Real Android properties test completed");
+/// Android: every device sets these.
+#[cfg(target_os = "android")]
+#[test]
+fn test_real_android_properties() {
+    ensure_init();
+
+    for prop in ["ro.build.version.sdk", "ro.build.version.release"] {
+        let value: String = rsproperties::get(prop).unwrap_or_else(|e| panic!("{prop}: {e}"));
+        assert!(!value.is_empty(), "{prop} is empty");
+    }
 }
