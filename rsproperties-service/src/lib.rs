@@ -128,11 +128,18 @@ impl ServiceOptions {
     /// after the build.prop files (init's `load_persist_props`).
     ///
     /// - The directory of `path` must exist; startup fails otherwise.
-    /// - Every successful set of such a name rewrites the file before the
-    ///   client is answered: a temp file `<path>.tmp` (mode 0600) is
+    /// - The service takes an exclusive `flock` on `<path>.lock` (mode
+    ///   0600) for its lifetime; a second service given the same file
+    ///   fails to start (`ErrorKind::WouldBlock`).
+    /// - The records are kept in memory. Every successful set of such a
+    ///   name updates that copy and rewrites the whole file from it before
+    ///   the client is answered: a temp file `<path>.tmp` (mode 0600) is
     ///   fsynced and renamed over `path`, then the directory is fsynced.
-    ///   A failed write is logged and the set still succeeds, as in init.
+    ///   A failed write is logged and the set still succeeds, as in init;
+    ///   the change stays in memory and goes into the next write. Do not
+    ///   edit the file while the service runs: the next write replaces it.
     /// - A file that does not parse is deleted at startup, as init does.
+    ///   Records with a repeated name are merged, keeping the last value.
     ///
     /// Without this option nothing is stored, and `persist.*` values last
     /// only as long as the property areas.

@@ -243,9 +243,33 @@ rsproperties-service는 이 값을 저장하지 않으므로, 재시작하면 �
 init과 다른 점은 다음과 같다.
 - (a) Android 8 이전의 legacy layout(`/data/property/persist.*` 파일들)은
   읽지 않는다.
-- (a) 시작 후에는 record를 메모리에 두고, 쓸 때마다 파일을 다시 읽지
-  않는다. 실행 중에 다른 program이 파일을 고치면 다음 persist set이 그
-  내용을 덮어쓴다.
+- (b) 시작 후에는 record를 메모리에 두고, set마다 메모리를 갱신한 뒤 그
+  내용 전체를 파일에 쓴다. 쓸 때마다 파일을 다시 읽지 않는다.
+  - init이 다시 읽는 이유는 소스 주석에 적힌 대로 PID 1의 상주 메모리를
+    줄이기 위해서다("we rather not keep any data in memory"). 동기화를
+    위해서가 아니다. init 안에서 이 파일을 쓰는 경로는 한 번에 하나다.
+  - 메모리 방식에서는 쓰기가 실패한 변경이 메모리에 남아 다음 쓰기에 함께
+    기록된다. init 방식은 다음 쓰기 때 파일을 다시 읽으므로, 실패한 변경이
+    파일에서 빠진다.
+  - 쓰기 순서: `PropertiesService` actor가 message를 하나씩 처리하고 파일
+    쓰기를 `handle` 안에서 await하므로, 다음 set은 이전 쓰기가 끝난 뒤에
+    시작한다.
+  - 실행 중에 다른 program이 파일을 고치면 다음 persist set이 그 내용을
+    덮어쓴다. 실행 중에는 파일을 고치지 않는다는 조건을 문서에 적었다.
+- (b) 메모리 방식에서는 같은 파일을 쓰는 instance가 둘이면 서로의 record를
+  덮어쓴다. `AreaWriterLock`은 properties dir만 보호한다. 그래서 load할 때
+  `<file>.lock`(0600, `O_NOFOLLOW`)에 `flock(LOCK_EX|LOCK_NB)`을 잡고 store가
+  살아 있는 동안 유지한다. 두 번째 instance는 시작에 실패한다
+  (`ErrorKind::WouldBlock`). init에는 lock이 없다. device에서는 init이 유일한
+  writer이기 때문이다.
+- (b) load할 때 같은 이름의 record를 첫 위치로 합치고 마지막 값을 남긴다.
+  load는 record를 순서대로 모두 적용하므로 area에 남는 값도 마지막 값이다.
+  `update`는 같은 이름의 첫 record만 고친다. 그래서 합치지 않으면 뒤쪽
+  중복 record의 이전 값이 다음 시작 때 다시 적용된다. 예를 들어 파일이
+  `[a=1, a=2]`일 때 `a=3`으로 set하면 파일은 `[a=3, a=2]`가 되고, 재시작
+  후에는 `a=2`가 된다. init이 만든 파일에는 중복이 생기지 않으므로, 이 문제는
+  외부에서 만든 파일에서만 나타난다. 합친 결과가 원본과 다르면 파일에
+  다시 쓴다.
 - (b) 파일의 디렉터리가 없으면 시작을 실패시킨다. init에서는 이 디렉터리가
   항상 있다.
 - 남은 staged record를 덧붙이는 순서는 init에서는 `unordered_map` 순서라

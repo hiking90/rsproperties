@@ -43,7 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `persistent_properties` format (protobuf, written by temp file + fsync
   + rename + directory fsync; loaded after the build.prop files, staged
   `next_boot.` values applied; an unparsable file is deleted, as init
-  does).
+  does). Records stay in memory and each write serializes that copy, so
+  a change whose write failed goes into the next one; an exclusive
+  `flock` on `<file>.lock` keeps a second service off the same file;
+  duplicate names are merged at load, keeping the last value.
 - Service: values are checked against the `property_contexts` type
   (init `CheckType`); `ctl.*` sets go to the control handler and are
   never stored; `ro.property_service.version=2` and

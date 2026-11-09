@@ -24,12 +24,25 @@
 //! set (init always sets both): field 1 then field 2, each
 //! length-delimited.
 //!
-//! Differences from init, all for a host service rather than a device:
+//! Differences from init:
 //! - The legacy layout (one `/data/property/persist.*` file per property,
 //!   Android 8 and earlier) is not read.
-//! - Records are kept in memory after the load; init re-reads the file
-//!   before every write. A file edited by another program while the
-//!   service runs is overwritten on the next persistent set.
+//! - Records are kept in memory after the load and every write serializes
+//!   that copy; init re-reads the file before every write, to keep less
+//!   memory in PID 1 (its source comment says so). Keeping the copy means
+//!   a change whose write failed is still in the next write; init's
+//!   re-read drops it from the file. A file edited by another program
+//!   while the service runs is overwritten on the next persistent set —
+//!   do not edit it then.
+//! - One service owns the file: [`PersistentStore::load`] takes an
+//!   exclusive `flock` on `<path>.lock` and holds it for the store's
+//!   lifetime, so two services given the same file do not overwrite each
+//!   other's records. init has no lock; it is the only writer on a device.
+//! - Duplicate names are merged at load, keeping the last value (the one
+//!   loading leaves in the property area). init's file never has
+//!   duplicates; one from another source would otherwise bring an old
+//!   value back on the next start, because an update changes only the
+//!   first record of a name.
 
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -52,30 +65,38 @@ pub(crate) fn is_persistent_name(name: &str) -> bool {
     name.starts_with(PERSIST_PREFIX) || name.starts_with(NEXT_BOOT_PREFIX)
 }
 
-/// The loaded file plus the records the service writes back.
+/// The loaded file plus the records the service writes back. Names are
+/// unique in `records`.
 pub(crate) struct PersistentStore {
     path: PathBuf,
     records: Vec<Record>,
+    /// `<path>.lock`, `flock`ed exclusively; released when dropped.
+    _lock: File,
 }
 
 impl PersistentStore {
     /// init `LoadPersistentProperties`, without the legacy directory:
     ///
-    /// 1. A leftover `<path>.tmp` (a write interrupted before its rename)
+    /// 1. Takes the file's lock (`<path>.lock`, see the module doc).
+    /// 2. A leftover `<path>.tmp` (a write interrupted before its rename)
     ///    is removed.
-    /// 2. A file that cannot be read — missing, unreadable, or a symlink
+    /// 3. A file that cannot be read — missing, unreadable, or a symlink
     ///    (opened with `O_NOFOLLOW`, as libbase `ReadFileToString` does) —
     ///    gives an empty set and is left as it is.
-    /// 3. A file that does not parse, or holds a name that starts with
+    /// 4. A file that does not parse, or holds a name that starts with
     ///    neither `persist.` nor `next_boot.`, is deleted and gives an empty
     ///    set, so later writes succeed (init does the same).
-    /// 4. Staged `next_boot.<name>` records replace `<name>`'s value (or
-    ///    are appended when `<name>` has no record) and are dropped; the
-    ///    result is written back.
+    /// 5. Records with the same name are merged into the first one's
+    ///    position with the last one's value.
+    /// 6. Staged `next_boot.<name>` records replace `<name>`'s value (or
+    ///    are appended when `<name>` has no record) and are dropped.
     ///
-    /// Fails only when the parent directory of `path` does not exist: every
+    /// When step 5 or 6 changed anything, the result is written back.
+    ///
+    /// Fails when the parent directory of `path` does not exist (every
     /// later write would fail, so the misconfiguration is reported at
-    /// startup instead.
+    /// startup instead), and when another process holds the lock
+    /// (`ErrorKind::WouldBlock`).
     pub(crate) fn load(path: &Path) -> std::io::Result<Self> {
         let parent = parent_dir(path);
         if !parent.is_dir() {
@@ -84,6 +105,9 @@ impl PersistentStore {
                 format!("directory of the persistent properties file {path:?} does not exist"),
             ));
         }
+        // Before the temp file is removed: a `.tmp` may belong to the
+        // service that holds the lock.
+        let lock = lock_file(path)?;
         let tmp = tmp_path(path);
         match std::fs::remove_file(&tmp) {
             Ok(()) => {
@@ -114,8 +138,10 @@ impl PersistentStore {
         let mut store = Self {
             path: path.to_path_buf(),
             records,
+            _lock: lock,
         };
-        if store.apply_staged() {
+        // Both steps run; `|` does not short-circuit.
+        if store.merge_duplicates() | store.apply_staged() {
             if let Err(e) = write_file(&store.path, &encode(&store.records)) {
                 error!(
                     "Could not store persistent properties in {:?}: {e}",
@@ -132,6 +158,28 @@ impl PersistentStore {
 
     pub(crate) fn records(&self) -> &[Record] {
         &self.records
+    }
+
+    /// Merges records with the same name into the first one's position,
+    /// with the last one's value — the value loading leaves in the area.
+    /// Returns whether any duplicate existed.
+    fn merge_duplicates(&mut self) -> bool {
+        let mut merged: Vec<Record> = Vec::with_capacity(self.records.len());
+        let mut changed = false;
+        for (name, value) in self.records.drain(..) {
+            match merged.iter_mut().find(|(n, _)| *n == name) {
+                Some(entry) => {
+                    entry.1 = value;
+                    changed = true;
+                }
+                None => merged.push((name, value)),
+            }
+        }
+        if changed {
+            warn!("Merged duplicate records in {:?}", self.path);
+        }
+        self.records = merged;
+        changed
     }
 
     /// The `next_boot.` step of init `LoadPersistentProperties`. Returns
@@ -170,10 +218,12 @@ impl PersistentStore {
         true
     }
 
-    /// init `WritePersistentProperty`, in memory: updates the first record
-    /// named `name`, or appends one. Returns the encoded file to write, or
-    /// `None` when the record already has `value` (init skips the write
-    /// then too).
+    /// init `WritePersistentProperty`, in memory: updates the record named
+    /// `name` (names are unique after `load`), or appends one. Returns the
+    /// encoded file to write, or `None` when the record already has
+    /// `value` (init skips the write then too). The memory copy changes
+    /// even if the caller's write then fails, so the next write carries
+    /// this change as well.
     pub(crate) fn update(&mut self, name: &str, value: &str) -> Option<Vec<u8>> {
         match self.records.iter_mut().find(|(n, _)| n == name.as_bytes()) {
             Some((_, stored)) if stored == value.as_bytes() => return None,
@@ -184,6 +234,37 @@ impl PersistentStore {
         }
         Some(encode(&self.records))
     }
+}
+
+/// Opens `<path>.lock` and takes an exclusive, non-blocking `flock` on it,
+/// like `rsproperties::AreaWriterLock`: `O_NOFOLLOW` so a planted symlink
+/// cannot move the lock to another inode, and mode 0600 (re-applied with
+/// `fchmod` for a file left by an older run) because `flock` works on a
+/// read-only fd and any user able to open the file could hold the lock.
+fn lock_file(path: &Path) -> std::io::Result<File> {
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as _)
+        .open(&lock_path)?;
+    rustix::fs::fchmod(&file, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR)?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+        |e| {
+            std::io::Error::new(
+                ErrorKind::WouldBlock,
+                format!(
+                    "persistent properties file {path:?} is used by another service \
+                     ({lock_path:?} is locked): {e}"
+                ),
+            )
+        },
+    )?;
+    Ok(file)
 }
 
 fn parent_dir(path: &Path) -> &Path {
@@ -524,6 +605,59 @@ mod tests {
         assert!(store.update("persist.a", "1").is_none());
         let second = store.update("persist.a", "2").expect("changed");
         assert_eq!(decode(&second).unwrap(), vec![rec("persist.a", "2")]);
+    }
+
+    /// One store per file: a second load fails while the first store
+    /// lives (also inside one process: `flock` belongs to the open file
+    /// description), and succeeds once it is dropped.
+    #[test]
+    fn second_store_on_same_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new("rsprops_persist_lock");
+        let path = tmp.0.join("persistent_properties");
+        let first = PersistentStore::load(&path).unwrap();
+        let err = PersistentStore::load(&path)
+            .err()
+            .expect("second load must fail");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock, "{err}");
+        let lock_mode = std::fs::metadata(tmp.0.join("persistent_properties.lock"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(lock_mode & 0o777, 0o600);
+        drop(first);
+        assert!(PersistentStore::load(&path).is_ok());
+    }
+
+    /// A repeated name keeps its first position and its last value, the
+    /// file is rewritten without the duplicate, and a later update is not
+    /// shadowed by a stale copy on the next load.
+    #[test]
+    fn duplicate_names_are_merged_at_load() {
+        let tmp = TempDir::new("rsprops_persist_dup");
+        let path = tmp.0.join("persistent_properties");
+        write_file(
+            &path,
+            &encode(&[
+                rec("persist.a", "1"),
+                rec("persist.b", "x"),
+                rec("persist.a", "2"),
+            ]),
+        )
+        .unwrap();
+        let mut store = PersistentStore::load(&path).unwrap();
+        let merged = vec![rec("persist.a", "2"), rec("persist.b", "x")];
+        assert_eq!(store.records(), merged.as_slice());
+        assert_eq!(decode(&std::fs::read(&path).unwrap()).unwrap(), merged);
+
+        let bytes = store.update("persist.a", "3").unwrap();
+        write_file(&path, &bytes).unwrap();
+        drop(store);
+        let reloaded = PersistentStore::load(&path).unwrap();
+        assert_eq!(
+            reloaded.records(),
+            [rec("persist.a", "3"), rec("persist.b", "x")].as_slice()
+        );
     }
 
     #[test]
