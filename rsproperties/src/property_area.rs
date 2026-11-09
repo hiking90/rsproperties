@@ -76,9 +76,9 @@
 //!   `&PropertyTrieNode` from `to_object` (the `&mut` from
 //!   `fresh_object_mut` only initializes a fresh node), so (2) reads link
 //!   words of published nodes or of nodes this writer linked. Code outside
-//!   this file gets an `EntryOffset` only from `find` — directly
-//!   (`SystemProperties::read_with`) or stored in a `PropertyIndex` — and
-//!   can copy it but not make one. The type does not record which area an
+//!   this file gets an `EntryOffset` only from `find` or `entry_offsets`
+//!   — directly (`SystemProperties::read_with`) or stored in a
+//!   `PropertyIndex` — and can copy it but not make one. The type does not record which area an
 //!   offset belongs to: a `PropertyIndex` pairs it with its
 //!   `context_index` and is accepted only by the instance whose `find`
 //!   made it (`owns_index`). Bounds and alignment are checked at every
@@ -851,6 +851,62 @@ impl PropertyAreaMap {
             )),
             None => Err(Error::NotFound(name.to_owned())),
         }
+    }
+
+    /// Offsets of every entry in this area, in bionic
+    /// `prop_area::foreach_property` order: for each node, its `left`
+    /// subtree, its `prop` entry, its `children` subtree, then its `right`
+    /// subtree. Links are loaded like `find` loads them \[R-OFF\](2), and
+    /// each entry offset is checked with `to_object` before it is returned.
+    ///
+    /// An explicit stack instead of bionic's recursion: a corrupt file can
+    /// link nodes into a cycle or a chain as deep as the area, and
+    /// recursion would overflow the thread stack before any bound fired.
+    /// A walk over distinct nodes visits at most as many nodes as fit in
+    /// the data region; more visits than that fail with
+    /// `Error::FileValidation`, which also bounds the stack (each visit
+    /// pushes at most four steps). bionic stops the area's walk silently
+    /// on a bad offset instead.
+    pub(crate) fn entry_offsets(&self) -> Result<Vec<EntryOffset>> {
+        enum Step {
+            Node(NodeOffset),
+            Entry(EntryOffset),
+        }
+        let max_nodes = self.pa_data_size / mem::size_of::<PropertyTrieNode>();
+        let mut visited = 0usize;
+        let mut entries = Vec::new();
+        let mut stack = vec![Step::Node(ROOT)];
+        while let Some(step) = stack.pop() {
+            match step {
+                Step::Entry(offset) => {
+                    self.property_info(offset)?;
+                    entries.push(offset);
+                }
+                Step::Node(offset) => {
+                    visited += 1;
+                    if visited > max_nodes {
+                        return Err(Error::FileValidation(
+                            "Trie node cycle detected (corrupt property area)".into(),
+                        ));
+                    }
+                    let node = self.mmap.to_object(offset, self.data_offset)?;
+                    // Pushed in reverse, so they pop in bionic's order.
+                    if let Some(right) = node.right_offset() {
+                        stack.push(Step::Node(right));
+                    }
+                    if let Some(children) = node.children_offset() {
+                        stack.push(Step::Node(children));
+                    }
+                    if let Some(prop) = node.prop_offset() {
+                        stack.push(Step::Entry(prop));
+                    }
+                    if let Some(left) = node.left_offset() {
+                        stack.push(Step::Node(left));
+                    }
+                }
+            }
+        }
+        Ok(entries)
     }
 
     // Add the property information with the given name and value.

@@ -10,6 +10,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `SystemProperties::foreach(|index| ...)`: the index of every property
+  the process can read, in bionic `__system_property_foreach` order;
+  areas that cannot be opened are skipped, a corrupt trie is
+  `Error::FileValidation`. The `getprop` example lists all properties
+  when run without arguments.
+- `SystemProperties::read_index_with(&index, |name, value, serial| ...)`:
+  reads by index without a name lookup and passes the serial the value
+  was read under (bionic `__system_property_read_callback`).
+- `SystemProperties::wait_for_creation(name, timeout)` and
+  `wait_for_value(name, expected, timeout)` (libbase
+  `WaitForPropertyCreation` / `WaitForProperty`), with
+  `Option<Duration>` timeouts.
+- `parse::parse_bool`, `parse::parse_int` and the global
+  `get_bool_or` / `get_int_or`: libbase `ParseBool` / `ParseInt` /
+  `ParseUint` rules (`yes`/`on`/`1`, leading whitespace, `0x` hex, no
+  trailing characters). `get<T>` keeps Rust's `FromStr`.
+- Appcompat override lookup: on Android API 37+ (and on Linux), a
+  read-only instance created while `BIONIC_APPCOMPAT_OVERRIDE` is set
+  looks up `ro.appcompat_override.<name>` first in `find` and
+  `read_with`, as bionic does.
+
 - `AreaWriterLock` (`builder` feature): the properties directory's writer
   lock (an exclusive `flock` on `<dir>/.writer_lock`) as a value.
   `AreaWriterLock::acquire(dir)` creates a missing `dir` (last component

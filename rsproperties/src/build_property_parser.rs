@@ -29,12 +29,10 @@ const MAX_IMPORT_DEPTH: u8 = 8;
 /// beyond any legitimate tree while stopping a crafted one immediately.
 const MAX_TOTAL_LOADS: u32 = 1_000;
 
-/// C `isspace` in the "C" locale — what AOSP `LoadProperties` trims.
-/// `char::is_ascii_whitespace` omits `\x0b`; `str::trim` adds Unicode
-/// whitespace such as U+00A0, which AOSP keeps.
-const fn is_c_space(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r')
-}
+// C `isspace` in the "C" locale — what AOSP `LoadProperties` trims.
+// `char::is_ascii_whitespace` omits `\x0b`; `str::trim` adds Unicode
+// whitespace such as U+00A0, which AOSP keeps.
+use crate::parse::is_c_space;
 
 /// Placeholder for future per-property SELinux permission enforcement.
 /// Currently a no-op; see TODO in caller.

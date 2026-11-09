@@ -591,6 +591,26 @@ impl ContextsSerialized {
     }
 
     pub(crate) fn prop_area_for_name(&self, name: &str) -> Result<(PropertyAreaGuard<'_>, u32)> {
+        self.prop_area_for_name_impl(name, true)
+    }
+
+    /// [`Self::prop_area_for_name`] without the `error!` line for an area
+    /// that cannot be opened. For the appcompat override probe
+    /// (`SystemProperties::probe_override`): a process that may not open
+    /// the override name's area falls back to the plain name on every
+    /// read, like bionic, and must not log an error each time.
+    pub(crate) fn prop_area_for_name_quiet(
+        &self,
+        name: &str,
+    ) -> Result<(PropertyAreaGuard<'_>, u32)> {
+        self.prop_area_for_name_impl(name, false)
+    }
+
+    fn prop_area_for_name_impl(
+        &self,
+        name: &str,
+        log_open_failure: bool,
+    ) -> Result<(PropertyAreaGuard<'_>, u32)> {
         let (index, _) = self
             .property_info_area_file
             .property_info_area()
@@ -598,10 +618,41 @@ impl ContextsSerialized {
         // `{name:?}`: read paths and `SystemProperties::set` (via `find`)
         // reach here with an unvalidated name, and log this error.
         let node = self.context_node_at(index, &format_args!("property {name:?}"), true)?;
-        let area = node
-            .property_area()
-            .inspect_err(|e| error!("Failed to get property area for {name:?}: {e}"))?;
+        let area = node.property_area().inspect_err(|e| {
+            if log_open_failure {
+                error!("Failed to get property area for {name:?}: {e}");
+            }
+        })?;
         Ok((area, index))
+    }
+
+    /// Number of context slots, including slots skipped as corrupt at
+    /// init. Fits in `u32`: `load_nodes` caps it at `MAX_CONTEXTS`.
+    pub(crate) fn context_count(&self) -> u32 {
+        self.context_nodes.len() as u32
+    }
+
+    /// Entry offsets of context `context_index`'s area
+    /// (`PropertyAreaMap::entry_offsets`), collected under the node's read
+    /// lock, which is released before this returns. `Ok(None)` for a slot
+    /// skipped as corrupt at init and for an area that cannot be opened —
+    /// bionic `ContextsSerialized::ForEach` skips an area whose
+    /// `CheckAccessAndOpen` fails (on Android, typically an SELinux denial).
+    pub(crate) fn entry_offsets_at(
+        &self,
+        context_index: u32,
+    ) -> Result<Option<Vec<crate::property_area::EntryOffset>>> {
+        let Some(Some(node)) = self.context_nodes.get(context_index as usize) else {
+            return Ok(None);
+        };
+        let guard = match node.property_area() {
+            Ok(guard) => guard,
+            Err(e) => {
+                debug!("foreach: skipping context {context_index}: {e}");
+                return Ok(None);
+            }
+        };
+        guard.property_area().entry_offsets().map(Some)
     }
 
     #[cfg(feature = "builder")]

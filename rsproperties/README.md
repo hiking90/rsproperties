@@ -306,6 +306,10 @@ rsproperties::init(PropertyConfig::with_properties_dir("/my/props"));
 
 - `get<T>(name)` — parse-typed read; `Err` on missing / parse failure
 - `get_or<T>(name, default)` — infallible read with fallback
+- `get_bool_or(name, default)` / `get_int_or::<T>(name, default)` — read
+  with AOSP libbase's `GetBoolProperty` / `GetIntProperty` rules
+  (`parse::parse_bool` / `parse::parse_int`: `yes`/`on`/`1`…, leading
+  whitespace, `0x` hex); `get<T>` uses Rust's `FromStr` instead
 - `set<T>(name, value)` — `Display`-format and send to the property
   service over the socket; V2 names and `ro.` values may be up to 65535
   bytes on Android (AOSP init's limit) and up to `wire::MAX_WIRE_NAME_LEN`
@@ -325,9 +329,21 @@ rsproperties::init(PropertyConfig::with_properties_dir("/my/props"));
   missing property or a malformed name (empty segment), `Err` for I/O /
   mmap / corruption problems. The index is valid only on the instance
   that returned it
+- `read_index_with(index, |name, value, serial| -> R)` — read by index,
+  no name lookup; name, value and serial from one seqlock-validated read
+  (bionic `__system_property_read_callback`)
+- `foreach(|index| ...)` — every readable property's index (bionic
+  `__system_property_foreach`); areas the process may not open are skipped
 - `serial(index)` / `context_serial()` — current generation counters
 - `wait_any()` — futex-wait for any property change
 - `wait(index, old_serial, timeout)` — futex-wait for a specific property
+- `wait_for_creation(name, timeout)` / `wait_for_value(name, expected,
+  timeout)` — libbase `WaitForPropertyCreation` / `WaitForProperty`;
+  a timeout is `Ok(None)` / `Ok(false)`, a failure is `Err`
+
+On Android API 37+, a process started with `BIONIC_APPCOMPAT_OVERRIDE`
+in its environment (zygote sets it) reads `ro.appcompat_override.<name>`
+first, like bionic; see `SystemProperties::read_with`.
 
 ### Wire-protocol constants & validators (`rsproperties::wire`)
 
