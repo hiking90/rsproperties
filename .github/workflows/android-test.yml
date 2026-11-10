@@ -49,19 +49,15 @@ jobs:
         echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> $GITHUB_ENV
         echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> $GITHUB_ENV
 
+    # x86_64 only: the emulator is x86_64 and REMOTE_ANDROID (below)
+    # builds for it.
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
       with:
-        targets: aarch64-linux-android,x86_64-linux-android
+        targets: x86_64-linux-android
 
     - name: Install cargo-ndk
       run: cargo install cargo-ndk
-
-    - name: Install required Rust targets
-      run: |
-        rustup target add x86_64-linux-android
-        rustup target add aarch64-linux-android
-        rustup target list --installed | grep android
 
     - name: Enable KVM group perms
       run: |
@@ -77,11 +73,11 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ runner.os }}-cargo-android-test-x86_64-api${{ matrix.api-level }}-${{ hashFiles('**/Cargo.lock') }}
+        # Only this workflow's caches: a `ci.yml` cache holds other targets'
+        # build output that this job would download and not use.
         restore-keys: |
           ${{ runner.os }}-cargo-android-test-x86_64-api${{ matrix.api-level }}-
           ${{ runner.os }}-cargo-android-test-x86_64-
-          ${{ runner.os }}-cargo-android-test-
-          ${{ runner.os }}-cargo-
 
     - name: Setup Android SDK PATH
       run: |
@@ -95,7 +91,7 @@ jobs:
         chmod 755 $HOME/.android
         export ANDROID_AVD_HOME=$HOME/.android/avd
         echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
-        echo "TARGET_ARCH=aarch64" >> $GITHUB_ENV
+        echo "TARGET_ARCH=x86_64" >> $GITHUB_ENV
         echo "EMULATOR_ARCH=x86_64" >> $GITHUB_ENV
         echo "ANDROID_API=${{ matrix.api-level }}" >> $GITHUB_ENV
 
@@ -171,7 +167,7 @@ jobs:
     - name: Verify emulator configuration
       run: |
         device_arch=$(adb shell getprop ro.product.cpu.abi)
-        target_arch="aarch64"
+        target_arch="$TARGET_ARCH"
         android_api="${{ matrix.api-level }}"
         device_sdk=$(adb shell getprop ro.build.version.sdk)
 
@@ -183,11 +179,12 @@ jobs:
         echo "Emulator SDK level: $device_sdk"
         echo "========================================"
 
-        # Note: We're using x86_64 emulator for cross-architecture testing
-        if [[ "$device_arch" == "x86_64" ]]; then
-          echo "✅ Emulator architecture is x86_64 (for cross-arch testing)"
+        # The test binaries are built for the emulator's own ABI.
+        if [[ "$device_arch" == "$target_arch" ]]; then
+          echo "✅ Emulator architecture matches the build target ($target_arch)"
         else
-          echo "⚠️  WARNING: Unexpected emulator architecture: $device_arch"
+          echo "❌ Emulator architecture $device_arch does not run $target_arch binaries"
+          exit 1
         fi
 
         # Check API level compatibility
@@ -209,10 +206,11 @@ jobs:
         source envsetup.sh
         ndk_prepare
 
+    # No `cargo clean`: ndk_build lists the binaries this build produced,
+    # so stale ones left in the cached target dir are never pushed or run.
     - name: Build for Android (ndk_build and ndk_sync)
       run: |
         source envsetup.sh
-        cargo clean
         ndk_build && ndk_sync
 
     - name: Run tests on Android device (root)
@@ -268,40 +266,10 @@ jobs:
     - name: Cleanup device and emulator
       if: always()
       run: |
-        echo "========================================"
-        echo "Cleaning up test environment..."
-        echo "========================================"
-
-        # Clean up test files from emulator
-        if [ "$DEVICE_AVAILABLE" = "true" ]; then
-          source envsetup.sh
-          read_remote_android
-
-          echo "Cleaning up test files from emulator..."
-          adb shell "rm -rf $remote_directory" 2>/dev/null || echo "Test directory cleanup completed"
-        fi
-
-        # Stop Android emulator gracefully
-        echo "Stopping Android emulator..."
-
-        # Try graceful shutdown first
+        # The runner is discarded after the job, so the device's test files
+        # need no cleanup; stopping the emulator ends its writes to the
+        # workspace (`emulator.log`).
         if adb devices | grep -q "emulator"; then
-          echo "Sending kill command to emulator..."
+          echo "Stopping Android emulator..."
           adb emu kill 2>/dev/null || echo "Emulator kill command completed"
-          sleep 5
         fi
-
-        # Force kill emulator process if still running
-        if [ -n "$EMULATOR_PID" ] && kill -0 $EMULATOR_PID 2>/dev/null; then
-          echo "Force killing emulator process (PID: $EMULATOR_PID)..."
-          kill -TERM $EMULATOR_PID 2>/dev/null || true
-          sleep 3
-
-          # If still running, use SIGKILL
-          if kill -0 $EMULATOR_PID 2>/dev/null; then
-            echo "Using SIGKILL to terminate emulator..."
-            kill -KILL $EMULATOR_PID 2>/dev/null || true
-          fi
-        fi
-
-        echo "✅ Android emulator test cleanup completed"
