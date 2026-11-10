@@ -36,121 +36,48 @@ use std::{
     sync::OnceLock,
 };
 
-/// Configuration for initializing the property system
+/// The directories [`init`] sets. A directory left out is not touched: it
+/// keeps whatever it has, or latches its default on first use.
 ///
-/// `#[non_exhaustive]`: construct via [`PropertyConfig::builder`],
-/// [`PropertyConfig::with_both_dirs`], or `From` — never a struct literal,
-/// which outside this crate is E0639 even with `..Default::default()` —
-/// so adding a field is not semver-breaking (which is the reason the
-/// builder exists at all).
+/// ```
+/// let config = rsproperties::PropertyConfig::new()
+///     .properties_dir("/custom/properties")
+///     .socket_dir("/custom/socket");
+/// ```
+///
+/// Paths are not checked here: a missing directory is reported at its
+/// first use (first property read, first `set`).
 #[derive(Debug, Clone, Default)]
-#[non_exhaustive]
 pub struct PropertyConfig {
-    /// Directory for reading system properties (default: "/dev/__properties__")
-    pub properties_dir: Option<PathBuf>,
-    /// Directory for property service sockets (default: "/dev/socket")
-    pub socket_dir: Option<PathBuf>,
-}
-
-// Implement From traits for backward compatibility and convenience
-impl From<PathBuf> for PropertyConfig {
-    fn from(path: PathBuf) -> Self {
-        Self {
-            properties_dir: Some(path),
-            socket_dir: None,
-        }
-    }
-}
-
-impl From<String> for PropertyConfig {
-    fn from(path: String) -> Self {
-        Self {
-            properties_dir: Some(PathBuf::from(path)),
-            socket_dir: None,
-        }
-    }
-}
-
-impl From<&str> for PropertyConfig {
-    fn from(path: &str) -> Self {
-        Self {
-            properties_dir: Some(PathBuf::from(path)),
-            socket_dir: None,
-        }
-    }
-}
-
-impl PropertyConfig {
-    /// Create config with only properties directory
-    pub fn with_properties_dir<P: Into<PathBuf>>(dir: P) -> Self {
-        Self {
-            properties_dir: Some(dir.into()),
-            socket_dir: None,
-        }
-    }
-
-    /// Create config with only socket directory
-    pub fn with_socket_dir<P: Into<PathBuf>>(dir: P) -> Self {
-        Self {
-            properties_dir: None,
-            socket_dir: Some(dir.into()),
-        }
-    }
-
-    /// Create config with both directories
-    pub fn with_both_dirs<P1: Into<PathBuf>, P2: Into<PathBuf>>(
-        properties_dir: P1,
-        socket_dir: P2,
-    ) -> Self {
-        Self {
-            properties_dir: Some(properties_dir.into()),
-            socket_dir: Some(socket_dir.into()),
-        }
-    }
-
-    /// Create a new builder for PropertyConfig
-    pub fn builder() -> PropertyConfigBuilder {
-        PropertyConfigBuilder::default()
-    }
-}
-
-/// Builder for [`PropertyConfig`]. Collects optional directories; `build()`
-/// is infallible — and `try_init` only claims the first-write-wins slots.
-/// Paths are actually validated at first *use* (first property access /
-/// first socket connection), so a nonexistent directory is not reported
-/// until then.
-#[derive(Debug, Clone, Default)]
-pub struct PropertyConfigBuilder {
     properties_dir: Option<PathBuf>,
     socket_dir: Option<PathBuf>,
 }
 
-impl PropertyConfigBuilder {
-    /// Set the properties directory
-    pub fn properties_dir<P: Into<PathBuf>>(mut self, dir: P) -> Self {
+impl PropertyConfig {
+    /// No directories: [`init`] with it changes nothing.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The directory the property areas are read from (default
+    /// [`PROP_DIRNAME`], `/dev/__properties__`).
+    pub fn properties_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.properties_dir = Some(dir.into());
         self
     }
 
-    /// Set the socket directory
-    pub fn socket_dir<P: Into<PathBuf>>(mut self, dir: P) -> Self {
+    /// The directory of the property service sockets (default
+    /// `/dev/socket`, or `PROPERTY_SERVICE_SOCKET_DIR`; see [`socket_dir`]).
+    pub fn socket_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.socket_dir = Some(dir.into());
         self
-    }
-
-    /// Build the PropertyConfig
-    pub fn build(self) -> PropertyConfig {
-        PropertyConfig {
-            properties_dir: self.properties_dir,
-            socket_dir: self.socket_dir,
-        }
     }
 }
 
 pub mod errors;
 pub mod parse;
 pub mod wire;
-pub use errors::{ContextWithLocation, Error, Result};
+pub use errors::{Error, Result};
 
 #[cfg(feature = "builder")]
 mod build_property_parser;
@@ -277,13 +204,8 @@ pub use build_property_parser::load_properties_from_file;
 pub use contexts_serialized::AreaWriterLock;
 #[cfg(feature = "builder")]
 pub use property_info_serializer::{build_trie, PropertyInfoEntry};
-pub use system_properties::SystemProperties;
+pub use system_properties::{PropertyIndex, SystemProperties};
 pub use system_property_set::socket_dir;
-
-/// Timeout type accepted by [`SystemProperties::wait`], re-exported so
-/// callers don't need a direct dependency on the exact `rustix` version
-/// this crate was built against.
-pub use rustix::fs::Timespec;
 
 pub use system_property_set::{
     PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME, PROPERTY_SERVICE_SOCKET_NAME,
@@ -300,7 +222,7 @@ static SYSTEM_PROPERTIES_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Serializes every commit to the first-write-wins directory cells
 /// (`SYSTEM_PROPERTIES_DIR` here and `SOCKET_DIR` in `system_property_set`).
-/// `try_init` must make its pre-check + set atomic against both concurrent
+/// `init` must make its pre-check + set atomic against both concurrent
 /// inits and the implicit env/default latch performed by the first call to
 /// `properties_dir()` / `socket_dir()` — otherwise a lost race after the
 /// pre-check leaves the globals half-applied with no way to roll back a
@@ -318,106 +240,94 @@ pub(crate) fn lock_global_dirs() -> std::sync::MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
-// Global system properties. Stores Result so initialization failure does not
-// poison the OnceLock and callers can observe the error. The error side is
-// `Arc<Error>` because the cache can only hand out references while callers
-// need an owned error — wrapping the shared original in `Error::Init`
-// preserves both the variant and the `source()` chain.
-static SYSTEM_PROPERTIES: OnceLock<
-    std::result::Result<system_properties::SystemProperties, std::sync::Arc<Error>>,
-> = OnceLock::new();
+/// The global reader, once created. Only a success is stored: a failed
+/// creation leaves the cell empty and the next access tries again, the
+/// way area files are reopened (`ContextNode::property_area`) — this
+/// crate's service can create the store after a reader started.
+/// `OnceLock::get_or_try_init` would express this but is unstable (Rust
+/// issue 109737); [`SYSTEM_PROPERTIES_INIT`] provides its serialization.
+static SYSTEM_PROPERTIES: OnceLock<system_properties::SystemProperties> = OnceLock::new();
 
-/// Initialize system properties with flexible configuration options.
+/// Serializes creating [`SYSTEM_PROPERTIES`], so concurrent first readers
+/// open and map the store once. Not `GLOBAL_DIRS_LOCK`: creation calls
+/// `properties_dir()`, which takes that lock, and `Mutex` is not
+/// reentrant. Lock order: this one, then `GLOBAL_DIRS_LOCK`.
+static SYSTEM_PROPERTIES_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Whether a creation failure was logged at `error` yet. Later failures
+/// log at `debug`, so a caller that keeps reading during an outage does
+/// not write an error line per read.
+static INIT_FAILURE_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Sets the directories `config` names. Call it before the first property
+/// access in the process.
 ///
-/// # Arguments
-/// * `config` - A [`PropertyConfig`]; only the directories present in it
-///   are applied:
-///   - `PropertyConfig::default()` - touch nothing (defaults latch on first use)
-///   - `PropertyConfig::from(PathBuf)` - set only the properties directory
-///   - a fully populated config - set both directories
-///
-/// # Examples
-///
-/// The two examples below are alternatives: call `init` once. A later call
-/// naming a directory that is already set is rejected as a whole by
-/// [`try_init`], and `init` only logs that rejection.
+/// Each directory is set once per process: by an earlier `init`, or by
+/// its first use, which latches the default (the properties directory on
+/// the first property read, the socket directory on the first `set()` or
+/// [`socket_dir`] call). So `init` returns `Ok(())` when every directory
+/// it names is unset or already holds that same path, and
+/// `Error::AlreadyInitialized` when one holds a different path — then
+/// neither directory is changed. Paths are compared with [`Path::eq`]
+/// (component-wise, not canonicalized): a symlink to the set directory is
+/// a different path. A directory `config` leaves out is not touched.
 ///
 /// ```rust,no_run
-/// use rsproperties::{init, PropertyConfig};
-/// use std::path::PathBuf;
+/// # fn main() -> rsproperties::Result<()> {
+/// use rsproperties::PropertyConfig;
 ///
-/// // Set only properties directory
-/// init(PropertyConfig::from(PathBuf::from("/custom/properties")));
+/// rsproperties::init(
+///     PropertyConfig::new()
+///         .properties_dir("/custom/properties")
+///         .socket_dir("/custom/socket"),
+/// )?;
+/// # Ok(())
+/// # }
 /// ```
-///
-/// ```rust,no_run
-/// use rsproperties::{init, PropertyConfig};
-///
-/// // Full configuration
-/// let config = PropertyConfig::with_both_dirs("/custom/properties", "/custom/socket");
-/// init(config);
-/// ```
-pub fn init(config: PropertyConfig) {
-    // The `Result` form (`try_init`) is preferred for new code; this wrapper
-    // exists for backward compatibility and logs failures instead of returning
-    // them.
-    if let Err(e) = try_init(config) {
-        log::warn!("init: {e}");
-    }
-}
-
-/// Initialize system properties, returning an error when an option cannot be
-/// applied — typically because it was already set, either explicitly by a
-/// previous `init()`/`try_init()` or implicitly: the properties directory by
-/// the first property read (`properties_dir()`), the socket directory by the
-/// first `set()` or `socket_dir()` call.
-///
-/// Only the options present in `config` are touched: a socket-only config
-/// leaves the properties directory unset (still overridable later), and
-/// vice versa.
-pub fn try_init(config: PropertyConfig) -> Result<()> {
-    // Both `SYSTEM_PROPERTIES_DIR` and the socket-dir cell are first-write-
-    // wins. Pre-check everything this call intends to set *before*
-    // committing anything, so a failed init never leaves the global state
-    // half-applied (e.g. properties_dir locked, socket_dir unset). The lock
-    // makes pre-check + set atomic against concurrent `try_init`s and the
-    // implicit latches in `properties_dir()` / `socket_dir()`.
+pub fn init(config: PropertyConfig) -> Result<()> {
+    // Pre-check both directories before setting either, so a rejected call
+    // changes nothing. The lock makes pre-check + set atomic against
+    // concurrent `init`s and the implicit latches in `properties_dir()` /
+    // `socket_dir()`.
     let _guard = lock_global_dirs();
-    if config.properties_dir.is_some() && SYSTEM_PROPERTIES_DIR.get().is_some() {
-        return Err(Error::AlreadyInitialized(
-            "system properties directory \
-             (explicitly via init() or implicitly by a prior property read)"
-                .into(),
-        ));
-    }
-    if config.socket_dir.is_some() && system_property_set::socket_dir_is_set() {
-        return Err(Error::AlreadyInitialized("socket directory".into()));
-    }
-
-    if let Some(props_dir) = config.properties_dir {
-        log::info!("Setting system properties directory to: {props_dir:?}");
-        SYSTEM_PROPERTIES_DIR
-            .set(props_dir)
-            .map_err(|_| Error::AlreadyInitialized("system properties directory".into()))?;
-    }
-
-    if let Some(socket_dir) = config.socket_dir {
-        if !system_property_set::set_socket_dir(socket_dir) {
-            // Unreachable while every committer honors `GLOBAL_DIRS_LOCK`
-            // (pre-check and set are atomic under the guard above); kept as
-            // defense in depth because a `OnceLock` cannot be un-set.
-            return Err(Error::AlreadyInitialized(
-                "socket directory (race after pre-check)".into(),
-            ));
+    let PropertyConfig {
+        properties_dir,
+        socket_dir,
+    } = config;
+    if let (Some(want), Some(have)) = (&properties_dir, SYSTEM_PROPERTIES_DIR.get()) {
+        if want != have {
+            return Err(dir_conflict("system properties directory", have, want));
         }
-        // The `set` above succeeded, so this takes `socket_dir`'s lock-free
-        // fast path and does not re-take `GLOBAL_DIRS_LOCK`.
-        log::info!(
-            "Successfully set socket directory to: {:?}",
-            system_property_set::socket_dir()
-        );
+    }
+    if let (Some(want), Some(have)) = (&socket_dir, system_property_set::socket_dir_if_set()) {
+        if want != have {
+            return Err(dir_conflict("socket directory", have, want));
+        }
+    }
+
+    if let Some(dir) = properties_dir {
+        if SYSTEM_PROPERTIES_DIR.get().is_none() {
+            log::info!("Setting system properties directory to: {dir:?}");
+            // Unset under the lock above, so this `set` succeeds.
+            let _ = SYSTEM_PROPERTIES_DIR.set(dir);
+        }
+    }
+    if let Some(dir) = socket_dir {
+        if system_property_set::socket_dir_if_set().is_none() {
+            log::info!("Setting socket directory to: {dir:?}");
+            let set = system_property_set::set_socket_dir(dir);
+            debug_assert!(set, "socket dir was unset under GLOBAL_DIRS_LOCK");
+        }
     }
     Ok(())
+}
+
+fn dir_conflict(what: &str, have: &Path, want: &Path) -> Error {
+    Error::AlreadyInitialized(format!(
+        "{what} is already {have:?} (set by an earlier init() or latched by its first use), \
+         not {want:?}"
+    ))
 }
 
 /// Get the system properties directory.
@@ -427,10 +337,10 @@ pub fn try_init(config: PropertyConfig) -> Result<()> {
 /// Unlike [`socket_dir`] (which honors `PROPERTY_SERVICE_SOCKET_DIR`),
 /// there is deliberately no environment-variable override here: the
 /// properties directory decides which mmap'd files this process trusts,
-/// so it is configured only through code (`init`/`try_init`).
+/// so it is configured only through code ([`init`]).
 pub fn properties_dir() -> &'static Path {
     // Lock-free once initialized; the first call takes `GLOBAL_DIRS_LOCK` so
-    // the default-latch cannot slip between `try_init`'s pre-check and set.
+    // the default-latch cannot slip between `init`'s pre-check and set.
     if let Some(dir) = SYSTEM_PROPERTIES_DIR.get() {
         return dir.as_path();
     }
@@ -443,51 +353,66 @@ pub fn properties_dir() -> &'static Path {
         .as_path()
 }
 
-/// The cached global instance, or `None` when it has not been initialized
-/// yet or initialization failed. Never *triggers* initialization — used by
-/// call sites (e.g. the wire-protocol version probe in
-/// `system_property_set`) that must not latch the default properties
-/// directory as a side effect.
+/// The global instance, or `None` until it has been created. Never
+/// *triggers* creation — used by call sites (e.g. the wire-protocol
+/// version probe in `system_property_set`) that must not latch the default
+/// properties directory as a side effect.
 pub(crate) fn system_properties_if_initialized(
 ) -> Option<&'static system_properties::SystemProperties> {
-    SYSTEM_PROPERTIES.get().and_then(|r| r.as_ref().ok())
+    SYSTEM_PROPERTIES.get()
 }
 
 /// Get the system properties, returning an error if initialization fails.
 ///
-/// This is the panic-free variant; `init()` should typically be called first
-/// to choose the properties directory. The initialization is cached, so
-/// subsequent calls reuse the same result — **including failure**: an error
-/// is latched for the process lifetime, so a property store that becomes
-/// available later (e.g. `/dev/__properties__` mounted after this process
-/// started) is not picked up. Early-boot callers should defer their first
-/// property access until the store is ready.
+/// This is the panic-free variant; [`init`] should be called first when
+/// the properties directory is not the default. The first successful
+/// creation is kept for the process lifetime. A failure is not kept: each
+/// call opens the store again until one succeeds, so a store that appears
+/// after this process started (this crate's service started later) is
+/// picked up. While the store is missing, each call costs the failed open
+/// (one `open` of `property_info`, or more when it exists but the areas do
+/// not yet); the properties directory itself stays the one latched by the
+/// first call. The failure is `Error::Init`, with the cause as `source()`.
 pub fn try_system_properties() -> Result<&'static system_properties::SystemProperties> {
-    SYSTEM_PROPERTIES
-        .get_or_init(|| {
-            let dir = properties_dir();
-            log::debug!("Initializing global SystemProperties instance from: {dir:?}");
-
-            system_properties::SystemProperties::new(dir)
-                .inspect_err(|e| {
-                    log::error!("Failed to initialize SystemProperties from {dir:?}: {e}");
-                })
-                .map_err(std::sync::Arc::new)
-        })
-        .as_ref()
-        // `Error::Init` shares the cached original, so both the original
-        // variant (via `source()` downcast) and the full error chain stay
-        // reachable — flattening to a Display string would lose both.
-        .map_err(|e| Error::Init(std::sync::Arc::clone(e)))
+    if let Some(props) = SYSTEM_PROPERTIES.get() {
+        return Ok(props);
+    }
+    // Poison carries no state: the guarded cell is set only on success.
+    let _guard = SYSTEM_PROPERTIES_INIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Created by the thread this one waited for.
+    if let Some(props) = SYSTEM_PROPERTIES.get() {
+        return Ok(props);
+    }
+    let dir = properties_dir();
+    log::debug!("Initializing global SystemProperties instance from: {dir:?}");
+    match system_properties::SystemProperties::new(dir) {
+        // Only a holder of `SYSTEM_PROPERTIES_INIT` sets the cell, and it
+        // was empty above, so `props` is the value stored.
+        Ok(props) => Ok(SYSTEM_PROPERTIES.get_or_init(|| props)),
+        Err(e) => {
+            if INIT_FAILURE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::debug!("SystemProperties from {dir:?} still unavailable: {e}");
+            } else {
+                log::error!(
+                    "Failed to initialize SystemProperties from {dir:?}: {e} \
+                     (retried on the next access)"
+                );
+            }
+            Err(Error::Init(Box::new(e)))
+        }
+    }
 }
 
 /// Get the system properties.
 ///
 /// Calling this without a prior `init()` does **not** panic by itself: the
 /// default directory (`/dev/__properties__`) is latched on first use, and
-/// a later `init()`/`try_init()` naming a properties directory will then
-/// fail with `AlreadyInitialized`. The panic happens only when the
-/// properties directory (configured or default) cannot be opened.
+/// a later `init()` naming a different properties directory then fails
+/// with `AlreadyInitialized`. The panic happens only when the store in the
+/// properties directory (configured or default) cannot be opened; a later
+/// call tries again (see [`try_system_properties`]).
 ///
 /// Prefer [`try_system_properties`] in code that must not panic.
 pub fn system_properties() -> &'static system_properties::SystemProperties {
@@ -546,12 +471,10 @@ pub(crate) fn bionic_align(value: usize, alignment: usize) -> usize {
 /// let sdk_version: i32 = get("ro.build.version.sdk").unwrap();
 /// let version: String = get("ro.build.version.release").unwrap();
 ///
-/// // Boolean properties are written either as "0"/"1" (`ro.debuggable`)
-/// // or as "true"/"false" (`ro.apex.updatable`), depending on the
-/// // property. `bool: FromStr` accepts only "true"/"false", so read a
-/// // "0"/"1" property as an integer:
-/// let is_debuggable: bool = get::<i32>("ro.debuggable").unwrap() != 0;
-/// let apex_updatable: bool = get("ro.apex.updatable").unwrap_or(false);
+/// // Boolean properties are written as "0"/"1" (`ro.debuggable`) or
+/// // "true"/"false" (`ro.apex.updatable`); `bool: FromStr` accepts only
+/// // "true"/"false". `get_bool_or` reads both the way Android does:
+/// let is_debuggable = rsproperties::get_bool_or("ro.debuggable", false);
 ///
 /// // With fallback
 /// let sdk_version: i32 = get("ro.build.version.sdk").unwrap_or(0);
@@ -598,11 +521,9 @@ where
 /// let sdk_version: i32 = get_or("ro.build.version.sdk", 0);
 /// let version: String = get_or("ro.build.version.release", "unknown".to_owned());
 ///
-/// // Boolean properties are written either as "0"/"1" (`ro.debuggable`)
-/// // or as "true"/"false" (`ro.apex.updatable`), depending on the
-/// // property. `bool: FromStr` accepts only "true"/"false":
-/// let is_debuggable: bool = get_or("ro.debuggable", 0) != 0;
-/// let apex_updatable: bool = get_or("ro.apex.updatable", false);
+/// // `bool: FromStr` accepts only "true"/"false"; for "0"/"1" properties
+/// // (`ro.debuggable`) use `get_bool_or`, which reads both like Android.
+/// let is_debuggable = rsproperties::get_bool_or("ro.debuggable", false);
 /// ```
 pub fn get_or<T>(name: &str, default: T) -> T
 where
@@ -615,7 +536,8 @@ where
 /// when the property is missing or empty, when its value fails to parse as
 /// `T`, or when the read fails for any other reason — a non-UTF-8 value
 /// (`Error::Utf8`), a corrupt property area, or a failed global
-/// initialization (see [`try_system_properties`]: the failure is latched).
+/// initialization (see [`try_system_properties`]; the next call tries
+/// again).
 /// Use [`get`] to tell these cases apart. The found-and-parsed hot path
 /// never pays for constructing the default.
 ///
@@ -873,16 +795,11 @@ mod tests {
 
     #[cfg(all(feature = "builder", not(target_os = "android")))]
     fn build_property_dir(dir: &str) -> SystemProperties {
-        crate::init(PropertyConfig::from(PathBuf::from(dir)));
-        // `init` is first-write-wins and swallows AlreadyInitialized with a
-        // warn — if some other test in this binary latched a *different*
-        // directory first, the `properties_dir()` cleanup below would
-        // delete that directory instead of ours. Fail loudly instead.
-        assert_eq!(
-            properties_dir(),
-            Path::new(dir),
-            "another test latched a different properties dir before this one"
-        );
+        // `init` fails if another test in this binary latched a *different*
+        // directory first; the `properties_dir()` cleanup below would then
+        // delete that directory instead of ours.
+        crate::init(PropertyConfig::new().properties_dir(dir))
+            .expect("another test latched a different properties dir before this one");
 
         let property_contexts_files = vec![
             "tests/android/plat_property_contexts",
@@ -948,9 +865,7 @@ mod tests {
         let properties = load_properties("rsprops_lib_expect");
 
         for (key, value) in properties.iter() {
-            let prop_value = system_properties
-                .get_with_result(key.as_str())
-                .unwrap_or_default();
+            let prop_value = system_properties.get(key.as_str()).unwrap_or_default();
             assert_eq!(prop_value, value.as_str());
         }
     }
@@ -975,7 +890,8 @@ mod tests {
         let wait_any_from = |old: u32| {
             std::thread::spawn(move || {
                 let system_properties = system_properties();
-                system_properties.wait(None, Some(old), None);
+                let changed = system_properties.wait(None, Some(old), None).unwrap();
+                assert!(changed.is_some(), "no timeout was given");
             })
         };
 
@@ -992,7 +908,10 @@ mod tests {
         let old_prop_serial = system_properties().serial(&index).expect("index valid");
         let handle = std::thread::spawn(move || {
             let system_properties = system_properties();
-            system_properties.wait(Some(&index), Some(old_prop_serial), None);
+            let changed = system_properties
+                .wait(Some(&index), Some(old_prop_serial), None)
+                .unwrap();
+            assert!(changed.is_some(), "no timeout was given");
         });
 
         let handle_any = wait_any_from(system_properties().context_serial());

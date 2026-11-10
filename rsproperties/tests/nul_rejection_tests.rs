@@ -63,15 +63,15 @@ fn test_interior_nul_rejected_and_area_stays_healthy() {
     // The rejections must not have consumed or corrupted area state:
     // ordinary adds/reads keep working.
     props.add("test.ok", "1").unwrap();
-    assert_eq!(props.get_with_result("test.ok").unwrap(), "1");
+    assert_eq!(props.get("test.ok").unwrap(), "1");
     props.set("test.ok", "2").unwrap();
-    assert_eq!(props.get_with_result("test.ok").unwrap(), "2");
+    assert_eq!(props.get("test.ok").unwrap(), "2");
 
     // Updating an existing entry with a NUL-carrying value must fail too
     // (the update path validates independently of add).
     assert!(props.set("test.ok", "x\0y").is_err());
     assert_eq!(
-        props.get_with_result("test.ok").unwrap(),
+        props.get("test.ok").unwrap(),
         "2",
         "failed update must not modify the stored value"
     );

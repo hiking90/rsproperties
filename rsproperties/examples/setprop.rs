@@ -53,17 +53,18 @@ fn main() {
     // Parse command line arguments
     let args = Args::parse();
 
-    // Initialize rsproperties only if custom directories are specified
-    // (PropertyConfig is #[non_exhaustive] — build it through the builder).
-    if args.properties_dir.is_some() || args.socket_dir.is_some() {
-        let mut builder = PropertyConfig::builder();
-        if let Some(dir) = args.properties_dir {
-            builder = builder.properties_dir(dir);
-        }
-        if let Some(dir) = args.socket_dir {
-            builder = builder.socket_dir(dir);
-        }
-        rsproperties::init(builder.build());
+    // A config without directories changes nothing, so `init` runs either
+    // way; it fails only when a directory was already set differently.
+    let mut config = PropertyConfig::new();
+    if let Some(dir) = args.properties_dir {
+        config = config.properties_dir(dir);
+    }
+    if let Some(dir) = args.socket_dir {
+        config = config.socket_dir(dir);
+    }
+    if let Err(e) = rsproperties::init(config) {
+        let _ = writeln!(std::io::stderr(), "Error: {e}");
+        std::process::exit(1);
     }
 
     // Validate property name and value

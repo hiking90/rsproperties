@@ -144,8 +144,12 @@ mod host {
             let dir = std::env::temp_dir().join(format!("{prefix}{}", std::process::id()));
             sweep_dead_fixtures(&prefix, &dir);
             build_store(&dir);
-            rsproperties::try_init(PropertyConfig::with_both_dirs(&dir, dir.join("sockets")))
-                .expect("init_test: try_init");
+            rsproperties::init(
+                PropertyConfig::new()
+                    .properties_dir(&dir)
+                    .socket_dir(dir.join("sockets")),
+            )
+            .expect("init_test: init");
             rsproperties::try_system_properties().expect("init_test: the store must load");
         });
     }

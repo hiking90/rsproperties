@@ -67,15 +67,16 @@ impl Deadline {
         Self(timeout.and_then(|t| Instant::now().checked_add(t)))
     }
 
-    /// Time left as a relative `Timespec` for [`SystemProperties::wait`]
-    /// (zero once expired), or `None` for no deadline.
+    /// Time left (zero once expired), or `None` for no deadline.
+    fn left(&self) -> Option<Duration> {
+        self.0.map(|d| d.saturating_duration_since(Instant::now()))
+    }
+
+    /// [`Self::left`] as the relative `Timespec` the futex takes.
     fn remaining(&self) -> Option<Timespec> {
-        self.0.map(|d| {
-            let r = d.saturating_duration_since(Instant::now());
-            Timespec {
-                tv_sec: r.as_secs() as _,
-                tv_nsec: r.subsec_nanos() as _,
-            }
+        self.left().map(|r| Timespec {
+            tv_sec: r.as_secs() as _,
+            tv_nsec: r.subsec_nanos() as _,
         })
     }
 }
@@ -96,71 +97,39 @@ fn futex_wake(_addr: &AtomicU32) -> Result<usize> {
     Ok(0)
 }
 
-/// Outcome of one [`futex_wait`] call, and of
-/// `SystemProperties::wait_outcome`. A three-way result rather than
-/// `Option`: the sliced wait loop in [`SystemProperties::wait`] must retry
-/// on an ordinary timeout but bail out on a syscall-level failure —
-/// collapsing both into `None` would turn a persistent futex error into a
-/// busy loop — and `wait_for_creation` / `wait_for_value` report a failure
-/// as an error, not as a timeout.
-#[derive(Clone, Copy, Debug)]
-// On macOS only `Failed` is ever constructed (no futex support).
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-enum FutexWaitOutcome {
-    /// The serial changed; carries the freshly-loaded value.
-    Changed(u32),
-    /// The timeout elapsed (or the caller passed an invalid/negative one).
-    TimedOut,
-    /// Unexpected futex error — or no futex support on this platform.
-    Failed,
-}
-
-/// Waits until `_serial` differs from `_value`, or the timeout elapses.
+/// Waits until `_serial` differs from `_value` — `Ok(Some(new))` — or the
+/// timeout elapses — `Ok(None)`. A futex error other than the retried ones
+/// is `Err`; the callers' wait loops stop on it instead of retrying, which
+/// would turn a persistent futex error into a busy loop.
 ///
 /// Callers compare the serial before calling: once the deadline has passed
-/// (or for an invalid timeout) this returns `TimedOut` without the
-/// syscall's value comparison.
+/// this returns `Ok(None)` without the syscall's value comparison.
+/// `_timeout` comes from [`Deadline::remaining`], so it is never negative.
 ///
-/// On macOS there is no futex; returns [`FutexWaitOutcome::Failed`]
-/// immediately — see `SystemProperties::wait`.
-fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> FutexWaitOutcome {
+/// On macOS there is no futex; fails immediately — see
+/// `SystemProperties::wait`.
+fn futex_wait(
+    _serial: &AtomicU32,
+    _value: u32,
+    _timeout: Option<&Timespec>,
+) -> Result<Option<u32>> {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     {
         use rustix::io::Errno;
         // Linux futex_wait takes a *relative* timeout. Spurious wakes restart
         // the syscall, so we track a deadline and shrink the remaining timeout
         // each iteration to keep the total wait bounded by the caller-supplied
-        // value.
-        //
-        // `Timespec.tv_sec`/`tv_nsec` are signed (i64). Negative values are
-        // not valid timeouts; treat them as immediate timeout to avoid
-        // panicking in `Instant + Duration` from a `usize::MAX`-ish wrap.
-        // A *huge* positive `tv_sec` (e.g. i64::MAX, a reasonable "wait
-        // forever") is the opposite hazard: `Instant + Duration` panics on
-        // overflow, so an unrepresentable deadline degrades to an infinite
-        // wait instead — matching bionic, which passes the value through to
-        // the futex untouched.
-        let deadline = match _timeout {
-            None => None,
-            Some(t) if t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec >= 1_000_000_000 => {
-                return FutexWaitOutcome::TimedOut;
-            }
-            Some(t) => Instant::now().checked_add(Duration::new(t.tv_sec as u64, t.tv_nsec as u32)),
-        };
+        // value. An unrepresentable deadline (`Instant + Duration` overflow)
+        // degrades to an infinite wait, like bionic, which passes the value
+        // to the futex untouched.
+        let deadline = Deadline(_timeout.and_then(|t| {
+            Instant::now().checked_add(Duration::new(t.tv_sec as u64, t.tv_nsec as u32))
+        }));
         loop {
-            let remaining_ts = match deadline {
-                None => None,
-                Some(d) => {
-                    let r = d.saturating_duration_since(Instant::now());
-                    if r.is_zero() {
-                        return FutexWaitOutcome::TimedOut;
-                    }
-                    Some(Timespec {
-                        tv_sec: r.as_secs() as _,
-                        tv_nsec: r.subsec_nanos() as _,
-                    })
-                }
-            };
+            let remaining_ts = deadline.remaining();
+            if remaining_ts.is_some_and(|t| t.tv_sec == 0 && t.tv_nsec == 0) {
+                return Ok(None);
+            }
             match futex::wait(
                 _serial,
                 futex::Flags::empty(),
@@ -170,7 +139,7 @@ fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> 
                 Ok(_) => {
                     let new_serial = load_acquire(_serial);
                     if _value != new_serial {
-                        return FutexWaitOutcome::Changed(new_serial);
+                        return Ok(Some(new_serial));
                     }
                     // Spurious wake — loop with the recomputed remaining timeout.
                 }
@@ -183,7 +152,7 @@ fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> 
                 Err(Errno::AGAIN) => {
                     let new_serial = load_acquire(_serial);
                     if _value != new_serial {
-                        return FutexWaitOutcome::Changed(new_serial);
+                        return Ok(Some(new_serial));
                     }
                     // Serial changed and wrapped back to `_value` between the
                     // syscall and the reload — vanishingly unlikely; retry.
@@ -192,10 +161,10 @@ fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> 
                 // remaining timeout so the total wait stays bounded.
                 Err(Errno::INTR) => {}
                 // Timeout is a normal outcome, not an error worth logging.
-                Err(Errno::TIMEDOUT) => return FutexWaitOutcome::TimedOut,
+                Err(Errno::TIMEDOUT) => return Ok(None),
                 Err(e) => {
                     log::error!("Failed to wait for property change: {e}");
-                    return FutexWaitOutcome::Failed;
+                    return Err(e.into());
                 }
             }
         }
@@ -203,8 +172,17 @@ fn futex_wait(_serial: &AtomicU32, _value: u32, _timeout: Option<&Timespec>) -> 
     #[cfg(target_os = "macos")]
     {
         let _ = (_serial, _value, _timeout);
-        FutexWaitOutcome::Failed
+        Err(no_futex())
     }
+}
+
+/// The error of a wait that would have to block on macOS (no futex).
+#[cfg(target_os = "macos")]
+fn no_futex() -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "property waits need futex, which macOS does not have",
+    ))
 }
 
 /// Source of [`SystemProperties`] instance ids. Starts at 1 so a zeroed
@@ -348,11 +326,12 @@ impl SystemProperties {
         Ok(Self::with_contexts(contexts, false))
     }
 
-    /// Whether `index` was returned by this instance's `find`; logs when
-    /// not.
-    fn owns_index(&self, index: &PropertyIndex) -> bool {
+    /// `Error::InvalidArgument` (logged) unless `index` was returned by this
+    /// instance's `find` or `foreach`. Every method taking an index calls
+    /// it before any lock or mmap access (property_area.rs \[SM5\]).
+    fn check_index(&self, index: &PropertyIndex) -> Result<()> {
         if index.instance == self.instance {
-            return true;
+            return Ok(());
         }
         log::error!(
             "PropertyIndex was returned by a different SystemProperties instance \
@@ -360,7 +339,9 @@ impl SystemProperties {
             index.instance,
             self.instance
         );
-        false
+        Err(Error::InvalidArgument(
+            "PropertyIndex was returned by a different SystemProperties instance".into(),
+        ))
     }
 
     /// [`Self::read_entry`] with the value validated as UTF-8 and the
@@ -625,13 +606,7 @@ impl SystemProperties {
     where
         F: FnOnce(&[u8], &[u8], u32) -> R,
     {
-        // Before any lock or mmap access, as in `update` (property_area.rs
-        // [SM5]).
-        if !self.owns_index(index) {
-            return Err(Error::InvalidArgument(
-                "PropertyIndex was returned by a different SystemProperties instance".into(),
-            ));
-        }
+        self.check_index(index)?;
         let guard = self.contexts.prop_area_with_index(index.context_index)?;
         let pa = guard.property_area();
         let name = pa
@@ -696,12 +671,15 @@ impl SystemProperties {
         Ok(())
     }
 
-    /// Get property value that returns error for missing properties.
+    /// The value of `name` — libbase `GetProperty` without its default:
+    /// `Error::NotFound` for a missing property, with the other failures of
+    /// [`Self::read_with`].
     ///
     /// Allocates a `String`; for the parse-and-discard hot path prefer
     /// [`Self::read_with`], which hands the value as `&str` without
-    /// allocating.
-    pub fn get_with_result(&self, name: &str) -> Result<String> {
+    /// allocating. The free function [`crate::get`] parses the value of
+    /// the global instance instead.
+    pub fn get(&self, name: &str) -> Result<String> {
         self.read_with(name, str::to_owned)
     }
 
@@ -789,13 +767,8 @@ impl SystemProperties {
     /// before any area is touched.
     #[cfg(feature = "builder")]
     pub fn update(&mut self, index: &PropertyIndex, value: &str) -> Result<()> {
-        // Before any lock or mmap access: another instance's offsets
-        // address an unrelated layout (property_area.rs [SM5]).
-        if !self.owns_index(index) {
-            return Err(Error::InvalidArgument(
-                "PropertyIndex was returned by a different SystemProperties instance".into(),
-            ));
-        }
+        // Another instance's offsets address an unrelated layout.
+        self.check_index(index)?;
         let mut res = match self.contexts.prop_area_mut_with_index(index.context_index) {
             Ok(res) => res,
             Err(e) => {
@@ -874,8 +847,9 @@ impl SystemProperties {
 
         // The value is fully published at this point — from here on NOTHING
         // may early-return. A failure would misreport a completed update
-        // and, worse, skip the global serial bump below, leaving `wait_any`
-        // observers permanently unaware of the change. That is why the
+        // and, worse, skip the global serial bump below, leaving
+        // global-serial waiters (`wait(None, ..)`) permanently unaware of the
+        // change. That is why the
         // re-fetch for the futex wake is non-fatal too (it re-runs checks
         // the offset just passed inside `backup_and_apply_write`, so a
         // failure here is theoretical): a missed FUTEX_WAKE only delays
@@ -963,9 +937,9 @@ impl SystemProperties {
         load_acquire(serial_pa.serial())
     }
 
-    /// Reads the per-property serial counter, or `None` if the context/property
-    /// lookup fails. `0` is a valid initial serial, so callers cannot use a
-    /// numeric sentinel — use the `Option` to distinguish absence.
+    /// Reads the per-property serial counter (bionic
+    /// `__system_property_serial`). Fails when the area or entry cannot be
+    /// reached; `0` is a valid serial.
     ///
     /// If the entry is mid-update (dirty bit set), waits for the clean
     /// serial before returning, so a caller comparing serials sees one
@@ -985,12 +959,10 @@ impl SystemProperties {
     ///
     /// An index is valid only on the instance whose `find` returned it —
     /// the global reader and a writer on the same directory are different
-    /// instances. An index from another instance returns `None` (with an
-    /// `error` log line).
-    pub fn serial(&self, idx: &PropertyIndex) -> Option<u32> {
-        if !self.owns_index(idx) {
-            return None;
-        }
+    /// instances. An index from another instance fails with
+    /// `Error::InvalidArgument`.
+    pub fn serial(&self, idx: &PropertyIndex) -> Result<u32> {
+        self.check_index(idx)?;
         #[cfg(any(target_os = "android", target_os = "linux"))]
         {
             // A dirty serial comes from a writer on another instance —
@@ -1003,29 +975,11 @@ impl SystemProperties {
             let start = Instant::now();
             loop {
                 // (Re-)acquire the node lock for this slice only.
-                let guard = self
-                    .contexts
-                    .prop_area_with_index(idx.context_index)
-                    .inspect_err(|e| {
-                        log::error!(
-                            "Failed to get PropertyArea for index {}: {e}",
-                            idx.context_index
-                        )
-                    })
-                    .ok()?;
-                let pi = guard
-                    .property_area()
-                    .property_info(idx.property_index)
-                    .inspect_err(|e| {
-                        log::error!(
-                            "Failed to get PropertyInfo for index {}: {e}",
-                            idx.property_index
-                        )
-                    })
-                    .ok()?;
+                let guard = self.contexts.prop_area_with_index(idx.context_index)?;
+                let pi = guard.property_area().property_info(idx.property_index)?;
                 let serial = load_acquire(&pi.serial);
                 if !serial_dirty(serial) {
-                    return Some(serial);
+                    return Ok(serial);
                 }
                 // Clamp the final slice so the total bound is exact, and
                 // check it BEFORE waiting so expiry never adds a slice.
@@ -1035,72 +989,42 @@ impl SystemProperties {
                         "serial: entry still dirty after {DIRTY_WAIT_TOTAL:?} \
                          (writer crashed mid-update?); returning the dirty serial"
                     );
-                    return Some(serial);
+                    return Ok(serial);
                 }
-                let slice = remaining.min(DIRTY_SLICE);
-                // Derive both fields from the Duration (like `wait`) —
-                // hardcoding `tv_sec: 0` would silently truncate whole
-                // seconds if `DIRTY_SLICE` ever grew past 1s.
-                let slice_ts = Timespec {
-                    tv_sec: slice.as_secs() as _,
-                    tv_nsec: slice.subsec_nanos() as _,
-                };
-                match futex_wait(&pi.serial, serial, Some(&slice_ts)) {
-                    FutexWaitOutcome::Changed(s) if !serial_dirty(s) => return Some(s),
+                let slice = Deadline::after(Some(remaining.min(DIRTY_SLICE)));
+                match futex_wait(&pi.serial, serial, slice.remaining().as_ref()) {
+                    Ok(Some(s)) if !serial_dirty(s) => return Ok(s),
                     // Still dirty (writer burst) or slice expired: drop the
                     // guard at the end of this iteration and re-acquire.
-                    FutexWaitOutcome::Changed(_) | FutexWaitOutcome::TimedOut => {}
-                    FutexWaitOutcome::Failed => {
+                    Ok(_) => {}
+                    Err(e) => {
                         let current = load_acquire(&pi.serial);
                         if serial_dirty(current) {
-                            log::warn!("serial: futex wait failed; returning the dirty serial");
+                            log::warn!(
+                                "serial: futex wait failed ({e}); returning the dirty serial"
+                            );
                         }
-                        return Some(current);
+                        return Ok(current);
                     }
                 }
             }
         }
         #[cfg(target_os = "macos")]
         {
-            let guard = self
-                .contexts
-                .prop_area_with_index(idx.context_index)
-                .inspect_err(|e| {
-                    log::error!(
-                        "Failed to get PropertyArea for index {}: {e}",
-                        idx.context_index
-                    )
-                })
-                .ok()?;
-            let pi = guard
-                .property_area()
-                .property_info(idx.property_index)
-                .inspect_err(|e| {
-                    log::error!(
-                        "Failed to get PropertyInfo for index {}: {e}",
-                        idx.property_index
-                    )
-                })
-                .ok()?;
-            Some(load_acquire(&pi.serial))
+            let guard = self.contexts.prop_area_with_index(idx.context_index)?;
+            let pi = guard.property_area().property_info(idx.property_index)?;
+            Ok(load_acquire(&pi.serial))
         }
     }
 
-    /// Waits for any property to change. Equivalent to
-    /// `wait(None, None, None)`; see [`Self::wait`] for the race caveat of
-    /// not passing an `old_serial`.
-    pub fn wait_any(&self) -> Option<u32> {
-        self.wait(None, None, None)
-    }
-
     /// Waits until the property at `index` (or, with `index == None`, the
-    /// global serial — i.e. any property) changes, returning the new serial.
-    /// Returns `None` on timeout, lookup failure, **or a futex syscall
-    /// failure** — the three are indistinguishable through this signature.
-    /// Consequence: do not tight-poll this method with a zero/short timeout
-    /// and treat every `None` as "timed out, retry" — a persistent futex
-    /// error would turn that loop into a busy-spin. Without a timeout, a
-    /// `None` always means an error.
+    /// global serial — i.e. any property) changes — bionic
+    /// `__system_property_wait`. Returns `Ok(Some(new_serial))` on a
+    /// change and `Ok(None)` when `timeout` expires first; `None` waits
+    /// forever (also for a timeout too large to represent). A lookup or
+    /// futex failure is `Err`, unlike bionic, whose `bool` reports it as a
+    /// timeout. `wait(None, None, None)` is bionic's deprecated
+    /// `__system_property_wait_any`.
     ///
     /// `old_serial` should be the serial observed when the caller last read
     /// the value (via [`Self::serial`] / [`Self::context_serial`]). Passing
@@ -1120,30 +1044,25 @@ impl SystemProperties {
     /// [`Self::serial`] waits (bounded) for the clean serial instead.
     ///
     /// The `old_serial` comparison happens before the timeout is applied,
-    /// so with a zero timeout this call is a non-blocking check. bionic
-    /// gets the same result from the kernel: `FUTEX_WAIT` returns `EAGAIN`
-    /// for a changed word with a zero timeout and `EINVAL` for an
-    /// out-of-range one, and bionic reloads the serial after both. A
-    /// negative or out-of-range timeout (`tv_nsec` ≥ 10^9) is compared
-    /// once and then returns `None` without waiting; bionic retries the
-    /// `EINVAL` until the serial changes. With an index the comparison
-    /// needs the context node's read lock, which even a zero-timeout call
-    /// can wait for: only when another thread of this instance started
-    /// opening that area before it was open, and then until the call that
-    /// holds the node's read lock releases it (see # Locking). `None`
-    /// still does not distinguish an unchanged serial from a lookup or
-    /// futex failure (see above).
+    /// so with a zero timeout this call is a non-blocking check
+    /// (`Ok(None)` for an unchanged serial). bionic gets the same result
+    /// from the kernel: `FUTEX_WAIT` returns `EAGAIN` for a changed word
+    /// with a zero timeout, and bionic reloads the serial after it. With an
+    /// index the comparison needs the context node's read lock, which even
+    /// a zero-timeout call can wait for: only when another thread of this
+    /// instance started opening that area before it was open, and then
+    /// until the call that holds the node's read lock releases it (see
+    /// # Locking).
     ///
     /// On macOS there is no futex, so this cannot *block*: the
     /// `old_serial` fast path still works (a serial that already differs
-    /// returns `Some` immediately — that part is a plain atomic load),
-    /// but once the serial has to be waited on, `None` is returned
-    /// immediately. Do not call it in a polling loop there.
+    /// returns `Ok(Some)` immediately — that part is a plain atomic load),
+    /// but once the serial has to be waited on, the call fails.
     ///
     /// An index is valid only on the instance whose `find` returned it —
     /// the global reader and a writer on the same directory are different
-    /// instances. An index from another instance returns `None`
-    /// immediately (with an `error` log line).
+    /// instances. An index from another instance fails with
+    /// `Error::InvalidArgument` before any lock is taken.
     ///
     /// # Locking
     ///
@@ -1166,24 +1085,19 @@ impl SystemProperties {
         &self,
         index: Option<&PropertyIndex>,
         old_serial: Option<u32>,
-        timeout: Option<&Timespec>,
-    ) -> Option<u32> {
-        match self.wait_outcome(index, old_serial, timeout) {
-            FutexWaitOutcome::Changed(s) => Some(s),
-            FutexWaitOutcome::TimedOut | FutexWaitOutcome::Failed => None,
-        }
+        timeout: Option<Duration>,
+    ) -> Result<Option<u32>> {
+        self.wait_until(index, old_serial, &Deadline::after(timeout))
     }
 
-    /// [`Self::wait`] with the three outcomes kept apart: a timeout is
-    /// `TimedOut`; a foreign index, a lookup failure and a futex failure
-    /// are `Failed`. `wait_for_creation` / `wait_for_value` need the
-    /// difference to report a failure as an error instead of a timeout.
-    fn wait_outcome(
+    /// [`Self::wait`] against an absolute deadline, so `wait_for_creation`
+    /// / `wait_for_value` can bound a whole loop of waits with one.
+    fn wait_until(
         &self,
         index: Option<&PropertyIndex>,
         old_serial: Option<u32>,
-        timeout: Option<&Timespec>,
-    ) -> FutexWaitOutcome {
+        deadline: &Deadline,
+    ) -> Result<Option<u32>> {
         // No index → wait on the global serial (lock-free, no slicing).
         let Some(idx) = index else {
             let serial_pa = self.contexts.serial_prop_area().serial();
@@ -1193,16 +1107,14 @@ impl SystemProperties {
             // it is the only thing keeping the `old_serial` contract.
             let current = load_acquire(serial_pa);
             let old = match old_serial {
-                Some(old) if old != current => return FutexWaitOutcome::Changed(current),
+                Some(old) if old != current => return Ok(Some(current)),
                 Some(old) => old,
                 None => current,
             };
-            return futex_wait(serial_pa, old, timeout);
+            return futex_wait(serial_pa, old, deadline.remaining().as_ref());
         };
         // Covers both platform branches below.
-        if !self.owns_index(idx) {
-            return FutexWaitOutcome::Failed;
-        }
+        self.check_index(idx)?;
 
         #[cfg(any(target_os = "android", target_os = "linux"))]
         {
@@ -1212,32 +1124,6 @@ impl SystemProperties {
             /// cause.
             const LOCK_SLICE: Duration = Duration::from_millis(100);
 
-            /// What the caller's timeout allows after the first comparison.
-            enum Budget {
-                Forever,
-                Until(Instant),
-                /// Compare once, then return `TimedOut`.
-                CheckOnly,
-            }
-
-            // Convert the caller timeout once, with `futex_wait`'s
-            // validation: negative/invalid → compare once (bionic's futex
-            // returns EINVAL for it and bionic retries until the serial
-            // changes, see the rustdoc); unrepresentably huge → wait
-            // forever (like bionic, which passes it to the kernel).
-            let budget = match timeout {
-                None => Budget::Forever,
-                Some(t) if t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec >= 1_000_000_000 => {
-                    Budget::CheckOnly
-                }
-                Some(t) => match Instant::now()
-                    .checked_add(Duration::new(t.tv_sec as u64, t.tv_nsec as u32))
-                {
-                    Some(d) => Budget::Until(d),
-                    None => Budget::Forever,
-                },
-            };
-
             let mut old = old_serial;
             let mut first = true;
             loop {
@@ -1245,72 +1131,41 @@ impl SystemProperties {
                 // first iteration always takes the lock and compares
                 // `old_serial` before the timeout applies, like bionic,
                 // whose FUTEX_WAIT reports a changed word for a zero
-                // (EAGAIN) or out-of-range (EINVAL) timeout and is followed
-                // by a reload. That lock wait is bounded only as the
-                // rustdoc says (another thread's first open of this area).
-                // Later iterations return without the lock once the
-                // deadline has passed: the previous comparison was the last
-                // one, as after bionic's ETIMEDOUT, and blocking on the
-                // lock after expiry would overshoot the caller's timeout.
-                let slice = match budget {
-                    Budget::Forever => Some(LOCK_SLICE),
-                    Budget::CheckOnly => None,
-                    Budget::Until(d) => match d.saturating_duration_since(Instant::now()) {
-                        r if r.is_zero() && !first => return FutexWaitOutcome::TimedOut,
-                        r if r.is_zero() => None,
-                        r => Some(r.min(LOCK_SLICE)),
-                    },
+                // timeout (EAGAIN) and is followed by a reload. That lock
+                // wait is bounded only as the rustdoc says (another
+                // thread's first open of this area). Later iterations
+                // return without the lock once the deadline has passed:
+                // the previous comparison was the last one, as after
+                // bionic's ETIMEDOUT, and blocking on the lock after
+                // expiry would overshoot the caller's timeout.
+                let slice = match deadline.left() {
+                    None => Some(LOCK_SLICE),
+                    Some(r) if r.is_zero() && !first => return Ok(None),
+                    Some(r) if r.is_zero() => None,
+                    Some(r) => Some(r.min(LOCK_SLICE)),
                 };
                 first = false;
                 // (Re-)acquire the node lock for this slice only.
-                let Ok(guard) = self
-                    .contexts
-                    .prop_area_with_index(idx.context_index)
-                    .inspect_err(|e| {
-                        log::error!(
-                            "Failed to get PropertyArea for index {}: {e}",
-                            idx.context_index
-                        )
-                    })
-                else {
-                    return FutexWaitOutcome::Failed;
-                };
-                let Ok(pi) = guard
-                    .property_area()
-                    .property_info(idx.property_index)
-                    .inspect_err(|e| {
-                        log::error!(
-                            "Failed to get PropertyInfo for index {}: {e}",
-                            idx.property_index
-                        )
-                    })
-                else {
-                    return FutexWaitOutcome::Failed;
-                };
+                let guard = self.contexts.prop_area_with_index(idx.context_index)?;
+                let pi = guard.property_area().property_info(idx.property_index)?;
                 let old_val = *old.get_or_insert_with(|| load_acquire(&pi.serial));
                 // The serial may have changed while the lock was released
                 // between slices — the futex wake fired with no waiter, so
                 // this re-check is what closes that window.
                 let current = load_acquire(&pi.serial);
                 if current != old_val {
-                    return FutexWaitOutcome::Changed(current);
+                    return Ok(Some(current));
                 }
-                // Expired or invalid timeout: the comparison above was the
-                // only one.
+                // Expired timeout: the comparison above was the only one.
                 let Some(slice) = slice else {
-                    return FutexWaitOutcome::TimedOut;
+                    return Ok(None);
                 };
-                let slice_ts = Timespec {
-                    tv_sec: slice.as_secs() as _,
-                    tv_nsec: slice.subsec_nanos() as _,
-                };
-                match futex_wait(&pi.serial, old_val, Some(&slice_ts)) {
-                    FutexWaitOutcome::Changed(s) => return FutexWaitOutcome::Changed(s),
-                    // Slice expired: fall through, dropping `guard` at the
-                    // end of the iteration so writers get a window.
-                    FutexWaitOutcome::TimedOut => {}
-                    FutexWaitOutcome::Failed => return FutexWaitOutcome::Failed,
+                let slice = Deadline::after(Some(slice));
+                if let Some(s) = futex_wait(&pi.serial, old_val, slice.remaining().as_ref())? {
+                    return Ok(Some(s));
                 }
+                // Slice expired: fall through, dropping `guard` at the end of
+                // the iteration so writers get a window.
             }
         }
         #[cfg(target_os = "macos")]
@@ -1319,14 +1174,12 @@ impl SystemProperties {
             // `old_serial` fast path is a plain load and must still hold:
             // a serial that already moved past `old_serial` returns
             // immediately instead of being misreported as a failure.
-            let _ = timeout;
-            let Some(current) = self.serial(idx) else {
-                return FutexWaitOutcome::Failed;
-            };
+            let current = self.serial(idx)?;
             if old_serial.is_some_and(|old| old != current) {
-                return FutexWaitOutcome::Changed(current);
+                return Ok(Some(current));
             }
-            FutexWaitOutcome::Failed
+            let _ = deadline;
+            Err(no_futex())
         }
     }
 
@@ -1363,10 +1216,11 @@ impl SystemProperties {
             if let Some(index) = self.find(name)? {
                 return Ok(Some(index));
             }
-            match self.wait_outcome(None, Some(serial), deadline.remaining().as_ref()) {
-                FutexWaitOutcome::Changed(_) => {}
-                FutexWaitOutcome::TimedOut => return Ok(None),
-                FutexWaitOutcome::Failed => return Err(wait_failed(name)),
+            let changed = self
+                .wait_until(None, Some(serial), deadline)
+                .with_context_location(|| format!("waiting for property {name:?}"))?;
+            if changed.is_none() {
+                return Ok(None);
             }
         }
     }
@@ -1411,21 +1265,14 @@ impl SystemProperties {
             if matches {
                 return Ok(true);
             }
-            match self.wait_outcome(Some(&index), Some(serial), deadline.remaining().as_ref()) {
-                FutexWaitOutcome::Changed(_) => {}
-                FutexWaitOutcome::TimedOut => return Ok(false),
-                FutexWaitOutcome::Failed => return Err(wait_failed(name)),
+            let changed = self
+                .wait_until(Some(&index), Some(serial), &deadline)
+                .with_context_location(|| format!("waiting for property {name:?}"))?;
+            if changed.is_none() {
+                return Ok(false);
             }
         }
     }
-}
-
-/// Error for a `Failed` wait outcome. The cause (futex errno, lookup
-/// error) was already logged where it happened.
-fn wait_failed(name: &str) -> Error {
-    Error::Io(std::io::Error::other(format!(
-        "waiting for property {name:?} failed (futex or property area failure, see log)"
-    )))
 }
 
 #[cfg(test)]
@@ -1447,9 +1294,7 @@ mod tests {
         let system_properties = SystemProperties::new(Path::new(crate::PROP_DIRNAME))?;
 
         let handle = std::thread::spawn(move || {
-            let version1 = system_properties
-                .get_with_result(VERSION_PROPERTY)
-                .unwrap_or_default();
+            let version1 = system_properties.get(VERSION_PROPERTY).unwrap_or_default();
             let version2 = AndroidSystemProperties::new()
                 .get(VERSION_PROPERTY)
                 .unwrap_or_default();
@@ -1564,10 +1409,10 @@ mod long_flag_tests {
         fx.sp.add("debug.rsp.bit16", "v32767").unwrap();
         fx.set_bit16("debug.rsp.bit16");
 
-        assert_eq!(fx.sp.get_with_result("debug.rsp.bit16").unwrap(), "v32767");
+        assert_eq!(fx.sp.get("debug.rsp.bit16").unwrap(), "v32767");
         // A read-only instance, as the global reader opens it.
         let reader = SystemProperties::new(fx.dir()).unwrap();
-        assert_eq!(reader.get_with_result("debug.rsp.bit16").unwrap(), "v32767");
+        assert_eq!(reader.get("debug.rsp.bit16").unwrap(), "v32767");
     }
 
     #[test]
@@ -1577,7 +1422,7 @@ mod long_flag_tests {
         let idx = fx.set_bit16("debug.rsp.bit16");
 
         fx.sp.update(&idx, "v32768").unwrap();
-        assert_eq!(fx.sp.get_with_result("debug.rsp.bit16").unwrap(), "v32768");
+        assert_eq!(fx.sp.get("debug.rsp.bit16").unwrap(), "v32768");
         assert_eq!(
             fx.serial_word(&idx) & LONG_FLAG,
             0,
@@ -1625,9 +1470,9 @@ mod long_flag_tests {
         let mut fx = Fixture::new("ro_long");
         let long = "x".repeat(200);
         fx.sp.add("ro.rsp.long", &long).unwrap();
-        assert_eq!(fx.sp.get_with_result("ro.rsp.long").unwrap(), long);
+        assert_eq!(fx.sp.get("ro.rsp.long").unwrap(), long);
         let reader = SystemProperties::new(fx.dir()).unwrap();
-        assert_eq!(reader.get_with_result("ro.rsp.long").unwrap(), long);
+        assert_eq!(reader.get("ro.rsp.long").unwrap(), long);
     }
 }
 
@@ -1645,8 +1490,8 @@ mod wait_tests {
         }
     }
 
-    /// With an index, a zero, negative or out-of-range timeout still
-    /// compares `old_serial` first, like the global-serial path and bionic.
+    /// With an index, a zero timeout still compares `old_serial` first,
+    /// like the global-serial path and bionic.
     #[test]
     fn index_wait_compares_before_timeout() {
         let mut fx = Fixture::new("wait_zero");
@@ -1656,24 +1501,19 @@ mod wait_tests {
         let old = reader.serial(&idx).unwrap();
         fx.sp.set("debug.rsp.zero", "1").unwrap();
 
-        let timeouts = [ts(0, 0), ts(-1, 0), ts(0, 1_000_000_000)];
-        for t in &timeouts {
-            let got = reader.wait(Some(&idx), Some(old), Some(t));
-            assert!(
-                got.is_some_and(|s| s != old),
-                "{:?}: {got:?}",
-                (t.tv_sec, t.tv_nsec)
-            );
-        }
+        let got = reader
+            .wait(Some(&idx), Some(old), Some(Duration::ZERO))
+            .unwrap();
+        assert!(got.is_some_and(|s| s != old), "{got:?}");
         let cur = reader.serial(&idx).unwrap();
-        for t in &timeouts {
-            assert_eq!(reader.wait(Some(&idx), Some(cur), Some(t)), None);
-        }
+        let unchanged = reader.wait(Some(&idx), Some(cur), Some(Duration::ZERO));
+        assert!(matches!(unchanged, Ok(None)), "{unchanged:?}");
         // Regression only (passes before the fix): the global path gives
         // the same answer for the same inputs.
         let global = reader.context_serial();
         fx.sp.set("debug.rsp.zero", "2").unwrap();
-        assert!(reader.wait(None, Some(global), Some(&ts(0, 0))).is_some());
+        let got = reader.wait(None, Some(global), Some(Duration::ZERO));
+        assert!(matches!(got, Ok(Some(_))), "{got:?}");
     }
 
     /// `update` wakes waiters on the entry's own serial word. The waiter
@@ -1807,7 +1647,7 @@ mod client_parity_tests {
             let (name, value, serial) = sp
                 .read_index_with(&idx, |n, v, s| (n.to_owned(), v.to_owned(), s))
                 .unwrap();
-            assert_eq!(sp.serial(&idx), Some(serial), "{name}");
+            assert_eq!(sp.serial(&idx).unwrap(), serial, "{name}");
             assert!(
                 all.insert(name, (value, serial)).is_none(),
                 "reported twice"
@@ -1898,17 +1738,14 @@ mod client_parity_tests {
         let on = SystemProperties::new_ro(fx.dir(), true).unwrap();
         let off = SystemProperties::new_ro(fx.dir(), false).unwrap();
 
-        assert_eq!(on.get_with_result("debug.ac").unwrap(), "ovr");
-        assert_eq!(off.get_with_result("debug.ac").unwrap(), "orig");
-        assert_eq!(fx.sp.get_with_result("debug.ac").unwrap(), "orig");
-        assert_eq!(on.get_with_result("debug.plain").unwrap(), "p");
+        assert_eq!(on.get("debug.ac").unwrap(), "ovr");
+        assert_eq!(off.get("debug.ac").unwrap(), "orig");
+        assert_eq!(fx.sp.get("debug.ac").unwrap(), "orig");
+        assert_eq!(on.get("debug.plain").unwrap(), "p");
         // The override entry is `ro.`, so it may be long although the
         // plain name is not `ro.`: the entry's own name decides.
-        assert_eq!(on.get_with_result("debug.longovr").unwrap(), long);
-        assert!(matches!(
-            on.get_with_result("debug.none"),
-            Err(Error::NotFound(_))
-        ));
+        assert_eq!(on.get("debug.longovr").unwrap(), long);
+        assert!(matches!(on.get("debug.none"), Err(Error::NotFound(_))));
         assert!(on.find("debug.none").unwrap().is_none());
 
         let idx = on.find("debug.ac").unwrap().unwrap();
@@ -1931,7 +1768,7 @@ mod client_parity_tests {
             .add(&format!("ro.appcompat_override.{name}"), "ovr")
             .unwrap();
         let on = SystemProperties::new_ro(fx.dir(), true).unwrap();
-        assert_eq!(on.get_with_result(&name).unwrap(), "ovr");
+        assert_eq!(on.get(&name).unwrap(), "ovr");
     }
 
     fn foreach_names(sp: &SystemProperties) -> Vec<String> {
@@ -1965,7 +1802,7 @@ mod client_parity_tests {
             !foreach_names(&reader).contains(&"debug.denied.a".to_owned()),
             "a denied area is not tried again by foreach"
         );
-        assert_eq!(reader.get_with_result("debug.denied.a").unwrap(), "1");
+        assert_eq!(reader.get("debug.denied.a").unwrap(), "1");
     }
 
     /// A missing area file is not recorded: `foreach` finds the area once

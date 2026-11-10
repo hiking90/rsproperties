@@ -74,10 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // directory as is (see "Socket dir contract").
 
     // Create configuration
-    let config = rsproperties::PropertyConfig::with_both_dirs(
-        PathBuf::from("/tmp/properties"),
-        PathBuf::from("/tmp/sockets")
-    );
+    let config = rsproperties::PropertyConfig::new()
+        .properties_dir(PathBuf::from("/tmp/properties"))
+        .socket_dir(PathBuf::from("/tmp/sockets"));
 
     // Start the services (no input files, no persistence)
     let (socket_service, properties_service) =
@@ -132,10 +131,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         PathBuf::from("/product/build.prop"),
     ];
 
-    let config = rsproperties::PropertyConfig::with_both_dirs(
-        properties_dir,
-        socket_dir
-    );
+    let config = rsproperties::PropertyConfig::new()
+        .properties_dir(properties_dir)
+        .socket_dir(socket_dir);
 
     // Start services with configuration files. `persist.*` properties are
     // kept in an AOSP-format persistent_properties file (its directory must
@@ -236,8 +234,8 @@ The socket service implements the Android property service protocol:
 `run` returns a `StartupError`: `stage()` names the step that failed
 (`StartupStage::Config`, `WriterLock`, `PropertiesService`,
 `SocketService`) and `source()` is the cause — `std::io::Error` from the
-properties service, `rsproperties::Error` from `try_init`, the writer
-lock or the socket service.
+properties service, `rsproperties::Error` from `rsproperties::init`, the
+writer lock or the socket service.
 
 ```rust
 use rsproperties_service::StartupStage;
@@ -329,10 +327,10 @@ socket_dir/
   output and service logs (`<N bytes>` placeholder). Property values
   may carry tokens or device identifiers; names are still logged in
   full.
-- **Panic-free init propagation**: `run()` calls `rsproperties::try_init`,
-  so a misconfigured directory or a double-init surfaces as a `Result`
-  rather than silently leaving the service bound to whatever paths a
-  previous instance committed.
+- **Init errors propagate**: `run()` calls `rsproperties::init`, so a
+  directory already set to a different path surfaces as a `Result`
+  (`StartupStage::Config`) rather than silently leaving the service bound
+  to whatever paths a previous instance committed.
 - **Deterministic `build.prop` apply order**: entries are collected
   into a `BTreeMap` before apply, so the order in which they are added
   to the area (and thus the trie layout) no longer varies per run with

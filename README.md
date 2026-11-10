@@ -91,27 +91,29 @@ if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
 }
 ```
 
-### Panic-free Initialization
+### Initialization
 
-`system_properties()` panics when initialization fails (e.g. missing
-directory, corrupt mmap); `init()` does not panic but only logs its failure
-with `log::warn!` and returns. For embedded use or where panics or silently
-ignored failures are unacceptable, use the `try_*` variants:
+`init` sets the directories before the first property access, and
+`try_system_properties` returns the global reader as a `Result`;
+`system_properties()` is the same reader but panics when the store cannot
+be opened.
 
 ```rust
-use rsproperties::{try_init, try_system_properties, PropertyConfig};
+use rsproperties::{init, try_system_properties, PropertyConfig};
 
-try_init(PropertyConfig::with_properties_dir("/dev/__properties__"))?;
+init(PropertyConfig::new().properties_dir("/dev/__properties__"))?;
 let props = try_system_properties()?;          // &'static SystemProperties
 let sdk: String = rsproperties::get_or("ro.build.version.sdk", "0".into());
 ```
 
-`try_init` fails with `Error::AlreadyInitialized` when a directory it
-names is already set — by an earlier `init`/`try_init`, or by the default
-being latched: a property read latches the properties dir, a `set()` (or
-`socket_dir()`) call latches the socket dir — without poisoning the global state. `try_system_properties` caches both
-success *and* failure in a `OnceLock`, so repeated calls observe a
-consistent result.
+Each directory is set once per process: by `init`, or by its first use,
+which latches the default (a property read latches the properties dir, a
+`set()` or `socket_dir()` call the socket dir). `init` succeeds when each
+directory it names is unset or already holds that same path, and fails
+with `Error::AlreadyInitialized` when one holds a different path — then
+it changes neither. `try_system_properties` keeps the first reader it
+opens; a failure is not kept, so a store created after the process
+started is picked up by the next call.
 
 ### Property Monitoring and Waiting
 
@@ -120,23 +122,28 @@ use rsproperties;
 
 let system_properties = rsproperties::system_properties();
 
-// Wait for any property change
+// Wait for any property change (no timeout: `Ok(Some(serial))` or `Err`)
 std::thread::spawn(|| {
-    if let Some(new_serial) = system_properties.wait_any() {
+    if let Ok(Some(new_serial)) = system_properties.wait(None, None, None) {
         println!("Properties changed, new serial: {}", new_serial);
     }
 });
 
-// Wait for specific property change
+// Wait for a specific property change, at most 30 s
 std::thread::spawn(|| {
     if let Ok(Some(prop_index)) = system_properties.find("sys.boot_completed") {
         println!("Waiting for boot completion...");
-        let old_serial = system_properties.serial(&prop_index);
-        if let Some(_) = system_properties.wait(Some(&prop_index), old_serial, None) {
+        let old_serial = system_properties.serial(&prop_index).ok();
+        let timeout = Some(std::time::Duration::from_secs(30));
+        if let Ok(Some(_)) = system_properties.wait(Some(&prop_index), old_serial, timeout) {
             println!("System boot completed!");
         }
     }
 });
+
+// Or wait for a value directly (libbase `WaitForProperty`)
+let booted = system_properties
+    .wait_for_value("sys.boot_completed", "1", Some(std::time::Duration::from_secs(30)));
 
 // Monitor multiple properties
 let monitored_props = vec![
@@ -146,7 +153,7 @@ let monitored_props = vec![
 ];
 
 for prop_name in monitored_props {
-    match system_properties.get_with_result(prop_name) {
+    match system_properties.get(prop_name) {
         Ok(value) => println!("{}: {}", prop_name, value),
         Err(_) => println!("{}: <not set>", prop_name),
     }
@@ -160,22 +167,13 @@ for prop_name in monitored_props {
 ```rust
 use rsproperties::PropertyConfig;
 
-// Alternatives — call `init` once. A later `init` naming a directory that
-// is already set is ignored as a whole (`init` only logs the rejection).
-
-// Configure custom directories
-let config = PropertyConfig::with_both_dirs("/custom/properties", "/custom/socket");
-rsproperties::init(config);
-
-// Using the builder pattern
-let config = PropertyConfig::builder()
-    .properties_dir("/my/properties")
-    .socket_dir("/my/socket")
-    .build();
-rsproperties::init(config);
-
-// Convenience methods
-rsproperties::init(PropertyConfig::with_properties_dir("/my/props"));
+// Both directories, or only the one to change. A directory already set
+// to a different path makes `init` fail with `AlreadyInitialized`.
+rsproperties::init(
+    PropertyConfig::new()
+        .properties_dir("/custom/properties")
+        .socket_dir("/custom/socket"),
+)?;
 ```
 
 ### Linux Property Service
@@ -196,7 +194,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::fs::create_dir_all("./properties")?;
 
     // Configure the service
-    let config = PropertyConfig::with_both_dirs("./properties", "./socket");
+    let config = PropertyConfig::new()
+        .properties_dir("./properties")
+        .socket_dir("./socket");
 
     // Optional: Load property contexts and build.prop files
     let property_contexts = vec![
@@ -311,13 +311,15 @@ when `property_info` has the owner-write bit set, and refuse it with the
 
 ### Error Handling
 
-`rsproperties::Error` is a `thiserror`-derived enum with `#[from]` impls
-for `std::io::Error`, `rustix::io::Errno`, and `Utf8Error`.
+`rsproperties::Error` is a `thiserror`-derived enum with `From` impls
+for `std::io::Error`, `rustix::io::Errno` (both into `Error::Io`), and
+`Utf8Error`.
 The `Error::Context` variant carries a `panic::Location` so the caller
 site is preserved across error boundaries.
 
 ```rust
-use rsproperties::{ContextWithLocation, Error, Result};
+use rsproperties::errors::ContextWithLocation;
+use rsproperties::{Error, Result};
 
 fn read_sdk() -> Result<i32> {
     // `.context_with_location("…")` attaches caller info to any error

@@ -26,7 +26,7 @@ impl PropertiesServiceArgs {
     /// downstream users spawning the actor directly (instead of via
     /// `run`) need a way to build it.
     ///
-    /// Without [`with_writer_lock`](Self::with_writer_lock), the actor's
+    /// Without [`writer_lock`](Self::writer_lock), the actor's
     /// `on_start` reads the `property_contexts` and build.prop files and
     /// then takes the writer lock of `rsproperties::properties_dir()`
     /// itself, before it writes `property_info` or any area file. A
@@ -37,7 +37,7 @@ impl PropertiesServiceArgs {
     /// lock first ([`AreaWriterLock::acquire`]) and pass it here, as
     /// `rsproperties_service::run` does.
     ///
-    /// [`SocketService`]: crate::SocketService
+    /// [`SocketService`]: crate::socket_service::SocketService
     pub fn new(property_contexts_files: Vec<PathBuf>, build_prop_files: Vec<PathBuf>) -> Self {
         Self {
             property_contexts_files,
@@ -49,7 +49,7 @@ impl PropertiesServiceArgs {
 
     /// Stores `persist.*` / `next_boot.*` properties in `path`; see
     /// [`crate::ServiceOptions::persistent_properties_file`].
-    pub fn with_persistent_properties_file(mut self, path: impl Into<PathBuf>) -> Self {
+    pub fn persistent_properties_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.persistent_properties_file = Some(path.into());
         self
     }
@@ -59,7 +59,7 @@ impl PropertiesServiceArgs {
     /// [`Path::eq`]); otherwise `on_start` fails with
     /// `std::io::ErrorKind::InvalidInput` before it writes anything. The
     /// service keeps the lock until it is dropped.
-    pub fn with_writer_lock(mut self, lock: AreaWriterLock) -> Self {
+    pub fn writer_lock(mut self, lock: AreaWriterLock) -> Self {
         self.writer_lock = Some(lock);
         self
     }
@@ -430,19 +430,6 @@ pub fn spawn(args: PropertiesServiceArgs) -> crate::ServiceContext<PropertiesSer
     }
 }
 
-/// `spawn(PropertiesServiceArgs::new(property_contexts_files,
-/// build_prop_files))`: the actor takes the writer lock itself (see
-/// [`PropertiesServiceArgs::new`]).
-pub fn run(
-    property_contexts_files: Vec<PathBuf>,
-    build_prop_files: Vec<PathBuf>,
-) -> crate::ServiceContext<PropertiesService> {
-    spawn(PropertiesServiceArgs::new(
-        property_contexts_files,
-        build_prop_files,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,8 +526,8 @@ mod tests {
         std::fs::set_permissions(&build_prop, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         let props = init_system_properties_sync(vec![], vec![build_prop], &tmp.0, None).unwrap();
-        assert_eq!(props.get_with_result("ro.ok").unwrap(), "1");
-        assert!(props.get_with_result("persist.vendor.too_long").is_err());
+        assert_eq!(props.get("ro.ok").unwrap(), "1");
+        assert!(props.get("persist.vendor.too_long").is_err());
     }
 
     /// Writes a one-entry `property_contexts` file mapping `prefix` to
@@ -675,9 +662,9 @@ mod tests {
         for &(name, value, code) in cases {
             assert_eq!(apply_set(&mut sp, name, value), code, "{name:?}");
         }
-        assert_eq!(sp.get_with_result("debug.int").unwrap(), "");
-        assert_eq!(sp.get_with_result("debug.enum").unwrap(), "b");
-        assert_eq!(sp.get_with_result("ro.once").unwrap(), "1");
+        assert_eq!(sp.get("debug.int").unwrap(), "");
+        assert_eq!(sp.get("debug.enum").unwrap(), "b");
+        assert_eq!(sp.get("ro.once").unwrap(), "1");
         assert!(
             sp.find("ctl.start").unwrap().is_none(),
             "ctl.* is never stored"
@@ -689,15 +676,8 @@ mod tests {
         let tmp = TempDir::new("rsprops_svc_startup_plain");
         let mut sp = typed_properties(&tmp);
         assert!(startup_at(&mut sp, None).unwrap().is_none());
-        assert_eq!(
-            sp.get_with_result("ro.property_service.version").unwrap(),
-            "2"
-        );
-        assert_eq!(
-            sp.get_with_result("ro.persistent_properties.ready")
-                .unwrap(),
-            "true"
-        );
+        assert_eq!(sp.get("ro.property_service.version").unwrap(), "2");
+        assert_eq!(sp.get("ro.persistent_properties.ready").unwrap(), "true");
     }
 
     /// init `load_persist_props`: staged values replace their targets, and
@@ -721,17 +701,13 @@ mod tests {
         .unwrap();
 
         let store = startup_at(&mut sp, Some(&path)).unwrap().expect("store");
-        assert_eq!(sp.get_with_result("persist.a").unwrap(), "1");
-        assert_eq!(sp.get_with_result("persist.b").unwrap(), "new");
+        assert_eq!(sp.get("persist.a").unwrap(), "1");
+        assert_eq!(sp.get("persist.b").unwrap(), "new");
         assert!(
             sp.find("persist.int").unwrap().is_none(),
             "type check applies"
         );
-        assert_eq!(
-            sp.get_with_result("ro.persistent_properties.ready")
-                .unwrap(),
-            "true"
-        );
+        assert_eq!(sp.get("ro.persistent_properties.ready").unwrap(), "true");
         // The rejected record stays in the file, as in init.
         let on_disk = decode(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(on_disk, store.records());
@@ -756,7 +732,7 @@ mod tests {
 
         let mut sp = typed_properties(&tmp);
         drop(startup_at(&mut sp, Some(&path)).unwrap());
-        assert_eq!(sp.get_with_result("debug.s").unwrap(), "v");
+        assert_eq!(sp.get("debug.s").unwrap(), "v");
         assert_eq!(
             decode(&std::fs::read(&path).unwrap()).unwrap(),
             vec![rec("persist.a", "1")]
@@ -765,7 +741,7 @@ mod tests {
         let tmp2 = TempDir::new("rsprops_svc_startup_staged_foreign_2");
         let mut sp = typed_properties(&tmp2);
         startup_at(&mut sp, Some(&path)).unwrap();
-        assert_eq!(sp.get_with_result("persist.a").unwrap(), "1");
+        assert_eq!(sp.get("persist.a").unwrap(), "1");
         assert!(sp.find("debug.s").unwrap().is_none());
     }
 
@@ -824,8 +800,8 @@ mod tests {
         let tmp2 = TempDir::new("rsprops_svc_client_persist_restart");
         let mut sp = typed_properties(&tmp2);
         startup_at(&mut sp, Some(&path)).unwrap();
-        assert_eq!(sp.get_with_result("persist.x").unwrap(), "2");
-        assert_eq!(sp.get_with_result("persist.z").unwrap(), "9");
+        assert_eq!(sp.get("persist.x").unwrap(), "2");
+        assert_eq!(sp.get("persist.z").unwrap(), "9");
         assert_eq!(
             on_disk(),
             vec![rec("persist.x", "2"), rec("persist.z", "9")]

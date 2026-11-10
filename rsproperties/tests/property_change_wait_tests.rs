@@ -12,24 +12,20 @@
 //!
 //! Names are under `debug.`: the shell SELinux domain may set `debug.*`
 //! but not `test.*`, so the tests also pass after `adb unroot`. The pid
-//! suffix keeps concurrent runs apart. `wait_any` is not tested: it takes
-//! no `old_serial`, so no test of it can be free of the lost-wakeup race
-//! (it is `wait(None, None, None)`).
+//! suffix keeps concurrent runs apart. `wait(None, None, None)` (bionic's
+//! `__system_property_wait_any`) is not tested: without an `old_serial`,
+//! no test of it can be free of the lost-wakeup race.
 
 #![cfg(target_os = "android")]
 
 use std::sync::{Arc, Barrier};
 use std::thread;
-
-use rsproperties::Timespec;
+use std::time::Duration;
 
 mod common;
 use common::init_test;
 
-const WAIT_TIMEOUT: Timespec = Timespec {
-    tv_sec: 10,
-    tv_nsec: 0,
-};
+const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Helper function to initialize test environment
 fn setup_android_test() {
@@ -67,7 +63,8 @@ fn test_wait_for_property_change() {
             barrier.wait();
 
             system_properties
-                .wait(Some(&index), Some(old_serial), Some(&WAIT_TIMEOUT))
+                .wait(Some(&index), Some(old_serial), Some(WAIT_TIMEOUT))
+                .expect("wait failed")
                 .expect("wait timed out: the change was not observed");
             rsproperties::get::<String>(&prop_name).expect("get after wait")
         })
@@ -97,7 +94,7 @@ fn test_wait_for_any_property_change() {
 
             barrier.wait();
 
-            system_properties.wait(None, Some(old_serial), Some(&WAIT_TIMEOUT))
+            system_properties.wait(None, Some(old_serial), Some(WAIT_TIMEOUT))
         })
     };
 
@@ -105,7 +102,10 @@ fn test_wait_for_any_property_change() {
     rsproperties::set(&test_prop, changed_value).expect("set property");
 
     let woke = waiter.join().expect("waiter thread panicked");
-    assert!(woke.is_some(), "wait timed out: no global serial change");
+    assert!(
+        matches!(woke, Ok(Some(_))),
+        "wait timed out or failed: {woke:?}"
+    );
     assert_eq!(
         rsproperties::get_or(&test_prop, "not_set".to_string()),
         changed_value

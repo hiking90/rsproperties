@@ -11,9 +11,11 @@
 
 use std::path::{Path, PathBuf};
 
+use std::time::Duration;
+
 use rsproperties::{
-    build_trie, AreaWriterLock, Error, PropertyConfig, PropertyInfoEntry, SystemProperties,
-    Timespec,
+    build_trie, AreaWriterLock, Error, PropertyConfig, PropertyIndex, PropertyInfoEntry,
+    SystemProperties,
 };
 
 struct Dir(PathBuf);
@@ -50,23 +52,19 @@ fn writer(dir: &Path) -> SystemProperties {
     props
 }
 
-/// `serial`/`wait` with an index from another instance return `None`.
-/// `wait` gets an `old_serial` that differs from the current one, so a
-/// missing instance check would return `Some` at once instead of timing
-/// out. (A macro: `PropertyIndex` is not nameable from outside the crate.)
-macro_rules! assert_serial_and_wait_reject {
-    ($props:expr, $foreign:expr) => {{
-        let props: &SystemProperties = $props;
-        assert_eq!(props.serial($foreign), None);
-        let short = Timespec {
-            tv_sec: 0,
-            tv_nsec: 1_000_000,
-        };
-        assert_eq!(
-            props.wait(Some($foreign), Some(u32::MAX), Some(&short)),
-            None
-        );
-    }};
+/// `serial`/`wait` with an index from another instance fail with
+/// `InvalidArgument`. `wait` gets an `old_serial` that differs from the
+/// current one, so a missing instance check would return `Ok(Some)` at
+/// once instead.
+fn assert_serial_and_wait_reject(props: &SystemProperties, foreign: &PropertyIndex) {
+    let err = props.serial(foreign).unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+    let got = props.wait(
+        Some(foreign),
+        Some(u32::MAX),
+        Some(Duration::from_millis(1)),
+    );
+    assert!(matches!(got, Err(Error::InvalidArgument(_))), "{got:?}");
 }
 
 #[test]
@@ -79,14 +77,14 @@ fn foreign_index_from_other_directory_is_rejected() {
     let index_a = a.find("test.x").unwrap().expect("test.x in a");
     let err = b.update(&index_a, "2").unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
-    assert_eq!(b.get_with_result("test.x").unwrap(), "1");
-    assert_serial_and_wait_reject!(&b, &index_a);
+    assert_eq!(b.get("test.x").unwrap(), "1");
+    assert_serial_and_wait_reject(&b, &index_a);
 
     // The instance that returned the index still accepts it.
     let index_b = b.find("test.x").unwrap().unwrap();
     b.update(&index_b, "3").unwrap();
-    assert_eq!(b.get_with_result("test.x").unwrap(), "3");
-    assert!(b.serial(&index_b).is_some());
+    assert_eq!(b.get("test.x").unwrap(), "3");
+    assert!(b.serial(&index_b).is_ok());
 }
 
 #[test]
@@ -99,8 +97,8 @@ fn index_from_before_writer_restart_is_rejected() {
     let mut new = writer(&dir.0);
     let err = new.update(&old_index, "2").unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
-    assert_eq!(new.get_with_result("test.x").unwrap(), "1");
-    assert_serial_and_wait_reject!(&new, &old_index);
+    assert_eq!(new.get("test.x").unwrap(), "1");
+    assert_serial_and_wait_reject(&new, &old_index);
 }
 
 /// The only test in this binary that initializes the global reader.
@@ -108,16 +106,16 @@ fn index_from_before_writer_restart_is_rejected() {
 fn global_reader_index_is_rejected_by_writer() {
     let dir = Dir::new("global");
     let mut w = writer(&dir.0);
-    rsproperties::try_init(PropertyConfig::with_properties_dir(dir.0.clone())).unwrap();
+    rsproperties::init(PropertyConfig::new().properties_dir(&dir.0)).unwrap();
     let reader = rsproperties::system_properties();
 
     let reader_index = reader.find("test.x").unwrap().unwrap();
     let err = w.update(&reader_index, "2").unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
-    assert_eq!(reader.get_with_result("test.x").unwrap(), "1");
-    assert_serial_and_wait_reject!(&w, &reader_index);
+    assert_eq!(reader.get("test.x").unwrap(), "1");
+    assert_serial_and_wait_reject(&w, &reader_index);
 
     // And the other way round.
     let writer_index = w.find("test.x").unwrap().unwrap();
-    assert_serial_and_wait_reject!(reader, &writer_index);
+    assert_serial_and_wait_reject(reader, &writer_index);
 }

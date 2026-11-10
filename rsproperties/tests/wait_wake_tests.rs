@@ -24,7 +24,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use rsproperties::{
-    build_trie, AreaWriterLock, PropertyConfig, PropertyInfoEntry, SystemProperties, Timespec,
+    build_trie, AreaWriterLock, PropertyConfig, PropertyInfoEntry, SystemProperties,
 };
 
 fn build_property_info(dir: &Path) {
@@ -48,13 +48,6 @@ fn build_property_info(dir: &Path) {
         .unwrap();
 }
 
-fn timespec(d: Duration) -> Timespec {
-    Timespec {
-        tv_sec: d.as_secs() as _,
-        tv_nsec: d.subsec_nanos() as _,
-    }
-}
-
 #[test]
 fn test_wait_wake_across_instances() {
     let dir = common::TempDir::new("rsprops_waitwake");
@@ -63,7 +56,7 @@ fn test_wait_wake_across_instances() {
     let mut writer = SystemProperties::new_area(dir.path()).expect("writer new_area");
     writer.add("test.wait.prop", "0").unwrap();
 
-    rsproperties::init(PropertyConfig::with_properties_dir(dir.path()));
+    rsproperties::init(PropertyConfig::new().properties_dir(dir.path())).expect("init");
     let reader = rsproperties::system_properties();
     let idx = reader
         .find("test.wait.prop")
@@ -79,31 +72,28 @@ fn test_wait_wake_across_instances() {
     let old = reader.serial(&idx).expect("initial serial");
     let waiter = std::thread::spawn(move || {
         let reader = rsproperties::system_properties();
-        reader.wait(
-            Some(&idx),
-            Some(old),
-            Some(&timespec(Duration::from_secs(10))),
-        )
+        reader.wait(Some(&idx), Some(old), Some(Duration::from_secs(10)))
     });
     std::thread::sleep(Duration::from_millis(300));
     writer.set("test.wait.prop", "1").unwrap();
     let woken = waiter.join().expect("waiter thread panicked");
-    let new_serial = woken.expect("wait must return the post-update serial, not time out");
+    let new_serial = woken
+        .expect("wait must not fail")
+        .expect("wait must return the post-update serial, not time out");
     assert_ne!(new_serial, old, "serial must advance on update");
-    assert_eq!(reader.get_with_result("test.wait.prop").unwrap(), "1");
+    assert_eq!(reader.get("test.wait.prop").unwrap(), "1");
 
     // Phase 2 — timeout: with no writer activity the wait must expire close
     // to the requested bound (deadline math, clamped final slice), not hang
     // and not return early.
     let old = reader.serial(&idx).unwrap();
     let start = Instant::now();
-    let res = reader.wait(
-        Some(&idx),
-        Some(old),
-        Some(&timespec(Duration::from_millis(300))),
-    );
+    let res = reader.wait(Some(&idx), Some(old), Some(Duration::from_millis(300)));
     let elapsed = start.elapsed();
-    assert!(res.is_none(), "nothing changed — wait must report timeout");
+    assert!(
+        matches!(res, Ok(None)),
+        "nothing changed — wait must report timeout, got {res:?}"
+    );
     assert!(
         elapsed >= Duration::from_millis(250),
         "returned before the timeout: {elapsed:?}"
@@ -119,65 +109,51 @@ fn test_wait_wake_across_instances() {
     let old = reader.serial(&idx).unwrap();
     writer.set("test.wait.prop", "2").unwrap();
     let start = Instant::now();
-    let res = reader.wait(
-        Some(&idx),
-        Some(old),
-        Some(&timespec(Duration::from_secs(10))),
-    );
+    let res = reader.wait(Some(&idx), Some(old), Some(Duration::from_secs(10)));
     let elapsed = start.elapsed();
-    let new_serial = res.expect("already-changed serial must return immediately");
+    let new_serial = res
+        .unwrap()
+        .expect("already-changed serial must return immediately");
     assert_ne!(new_serial, old);
     assert!(
         elapsed < Duration::from_secs(2),
         "wait should have returned without parking: {elapsed:?}"
     );
 
-    // Phase 4 — global serial: wait_any-style wait with an explicit
-    // old_serial from the global serial area, woken by any update.
+    // Phase 4 — global serial: a wait with an explicit old_serial from the
+    // global serial area, woken by any update.
     let old_global = reader.context_serial();
     let waiter = std::thread::spawn(move || {
         let reader = rsproperties::system_properties();
-        reader.wait(
-            None,
-            Some(old_global),
-            Some(&timespec(Duration::from_secs(10))),
-        )
+        reader.wait(None, Some(old_global), Some(Duration::from_secs(10)))
     });
     std::thread::sleep(Duration::from_millis(200));
     writer.set("test.wait.prop", "3").unwrap();
     let woken = waiter.join().expect("global waiter panicked");
     assert!(
-        woken.is_some(),
-        "global-serial wait must observe the update"
+        matches!(woken, Ok(Some(_))),
+        "global-serial wait must observe the update, got {woken:?}"
     );
 
-    // Phase 5 — an expired or invalid timeout still compares `old_serial`
-    // first. bionic gets the same answer from the kernel: FUTEX_WAIT
-    // returns EAGAIN for a changed word with a zero timeout and EINVAL for
-    // an out-of-range one, and bionic reloads the serial after both.
+    // Phase 5 — a zero timeout still compares `old_serial` first. bionic
+    // gets the same answer from the kernel: FUTEX_WAIT returns EAGAIN for a
+    // changed word with a zero timeout, and bionic reloads the serial.
     let old = reader.serial(&idx).unwrap();
     writer.set("test.wait.prop", "4").unwrap();
-    for (sec, nsec) in [(0, 0), (-1, 0), (0, 1_000_000_000)] {
-        let ts = Timespec {
-            tv_sec: sec,
-            tv_nsec: nsec as _,
-        };
-        let got = reader.wait(Some(&idx), Some(old), Some(&ts));
-        assert!(
-            got.is_some_and(|s| s != old),
-            "({sec}, {nsec}): already-changed serial must be reported, got {got:?}"
-        );
-    }
-    // An unchanged serial with a zero timeout returns `None` without waiting.
+    let got = reader.wait(Some(&idx), Some(old), Some(Duration::ZERO));
+    assert!(
+        matches!(got, Ok(Some(s)) if s != old),
+        "already-changed serial must be reported, got {got:?}"
+    );
+    // An unchanged serial with a zero timeout returns `Ok(None)` without
+    // waiting.
     let cur = reader.serial(&idx).unwrap();
-    let zero = Timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    assert_eq!(reader.wait(Some(&idx), Some(cur), Some(&zero)), None);
+    let got = reader.wait(Some(&idx), Some(cur), Some(Duration::ZERO));
+    assert!(matches!(got, Ok(None)), "{got:?}");
     // Regression only (passes before the fix): the global-serial path
     // compared before the futex already, and gives the same answer.
     let g = reader.context_serial();
     writer.set("test.wait.prop", "5").unwrap();
-    assert!(reader.wait(None, Some(g), Some(&zero)).is_some());
+    let got = reader.wait(None, Some(g), Some(Duration::ZERO));
+    assert!(matches!(got, Ok(Some(_))), "{got:?}");
 }

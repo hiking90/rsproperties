@@ -74,7 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("   Sockets: {socket_dir:?}");
 
     // Create PropertyConfig
-    let config = rsproperties::PropertyConfig::with_both_dirs(properties_dir, socket_dir);
+    let config = rsproperties::PropertyConfig::new()
+        .properties_dir(properties_dir)
+        .socket_dir(socket_dir);
 
     println!("🚀 Starting rsproperties services...");
 
