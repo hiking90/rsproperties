@@ -260,6 +260,8 @@ fn load_properties_impl(
 /// (`init/util.cpp`): `O_NOFOLLOW`, so a symlink as the last path
 /// component fails the open (`ELOOP`), and a file whose mode has the
 /// group- or other-write bit is skipped with a warning (`Ok(None)`).
+/// rsproperties-service's `persistent_properties::read_file` applies the
+/// same rule to the persistent properties file; change both together.
 ///
 /// Opens the caller's path, not the canonicalized cycle key:
 /// `O_NOFOLLOW` on the canonical path would accept a symlinked prop file,

@@ -65,10 +65,13 @@ pub(crate) type Record = (Vec<u8>, Vec<u8>);
 const PERSIST_PREFIX: &[u8] = b"persist.";
 const NEXT_BOOT_PREFIX: &[u8] = b"next_boot.";
 
-/// Whether a successful set of `name` is written to the file: init's
-/// `PropertySet` persists `persist.` and `next_boot.` names.
-pub(crate) fn is_persistent_name(name: &str) -> bool {
-    let name = name.as_bytes();
+/// Whether `name` belongs in the file: `persist.` and `next_boot.` names.
+/// One rule for three uses that must agree: a successful set of such a
+/// name is written (init `PropertySet`), `decode` refuses a file holding
+/// any other name (init `ParsePersistentPropertyFile`), and `apply_staged`
+/// keeps only staged targets that pass, so a kept record never makes the
+/// next load delete the file.
+pub(crate) fn is_persistent_name(name: &[u8]) -> bool {
     name.starts_with(PERSIST_PREFIX) || name.starts_with(NEXT_BOOT_PREFIX)
 }
 
@@ -255,9 +258,8 @@ impl PersistentStore {
         // applied at startup but not kept: `decode` rejects such a name,
         // so writing it would delete the whole file on the next load.
         // init writes it and deletes the file on the boot after.
-        let (persistent, unpersisted): (Vec<Record>, Vec<Record>) = staged
-            .into_iter()
-            .partition(|(n, _)| n.starts_with(PERSIST_PREFIX) || n.starts_with(NEXT_BOOT_PREFIX));
+        let (persistent, unpersisted): (Vec<Record>, Vec<Record>) =
+            staged.into_iter().partition(|(n, _)| is_persistent_name(n));
         for (name, _) in &unpersisted {
             warn!(
                 "Staged property {:?} is applied once and not kept in {:?}: \
@@ -462,6 +464,9 @@ fn tmp_path(path: &Path) -> PathBuf {
 
 /// init `ReadFile` (`init/util.cpp`): opened with `O_NOFOLLOW`, and a
 /// group- or world-writable file is refused ("Skipping insecure file").
+/// rsproperties' `build_property_parser::open_prop_file` applies the same
+/// rule to prop files; change both together. Not shared: it would be a
+/// public rsproperties API with this crate as its only user.
 pub(crate) fn read_file(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::os::unix::fs::PermissionsExt;
     let mut file = OpenOptions::new()
@@ -547,7 +552,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<Record>, String> {
         }
     }
     for (name, _) in &records {
-        if !name.starts_with(PERSIST_PREFIX) && !name.starts_with(NEXT_BOOT_PREFIX) {
+        if !is_persistent_name(name) {
             return Err(format!(
                 "property {:?} doesn't start with 'persist.' or 'next_boot.'",
                 String::from_utf8_lossy(name)

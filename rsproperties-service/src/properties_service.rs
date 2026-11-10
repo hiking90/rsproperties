@@ -367,7 +367,7 @@ impl PropertiesService {
     /// One set from a client: [`apply_set`], then the persistent file.
     async fn client_set(&mut self, name: &str, value: String) -> i32 {
         let code = apply_set(&mut self.system_properties, name, &value);
-        if code != PROP_SUCCESS || !is_persistent_name(name) {
+        if code != PROP_SUCCESS || !is_persistent_name(name.as_bytes()) {
             return code;
         }
         // init `PropertySet`: a client set of a `persist.` / `next_boot.`
