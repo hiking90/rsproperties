@@ -23,8 +23,8 @@ use rsproperties::errors::*;
 use rsproperties::wire::{
     validate_property_name, MAX_WIRE_NAME_LEN, MAX_WIRE_VALUE_LEN,
     PROP_ERROR_HANDLE_CONTROL_MESSAGE, PROP_ERROR_INVALID_CMD, PROP_ERROR_INVALID_NAME,
-    PROP_ERROR_INVALID_VALUE, PROP_ERROR_READ_DATA, PROP_ERROR_SET_FAILED, PROP_MSG_SETPROP,
-    PROP_MSG_SETPROP2, PROP_NAME_MAX, PROP_SUCCESS, PROP_VALUE_MAX,
+    PROP_ERROR_INVALID_VALUE, PROP_ERROR_READ_CMD, PROP_ERROR_READ_DATA, PROP_ERROR_SET_FAILED,
+    PROP_MSG_SETPROP, PROP_MSG_SETPROP2, PROP_NAME_MAX, PROP_SUCCESS, PROP_VALUE_MAX,
 };
 use rsproperties::{PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME, PROPERTY_SERVICE_SOCKET_NAME};
 
@@ -44,6 +44,18 @@ const MAX_WAITING_CLIENTS: usize = 256;
 /// clients (init, system services) complete well under this; untrusted or
 /// stuck clients are torn down rather than tying up a task indefinitely.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on control handler calls running or queued for a
+/// blocking-pool thread at once. A call that outlasts `CLIENT_TIMEOUT`
+/// keeps its blocking-pool thread after its connection (and connection
+/// permit) is gone, so `MAX_CONCURRENT_CLIENTS` does not bound them;
+/// without this cap, repeated `ctl.*` sets to a slow handler fill tokio's
+/// blocking pool, and the persistent file writes queued behind them stall
+/// every set. The permit is taken before `spawn_blocking`
+/// ([`ControlCalls`]), so a refused request uses no blocking thread. With
+/// a host runtime whose `max_blocking_threads` is at most this cap, slow
+/// calls can still fill the pool.
+const MAX_CONCURRENT_CONTROL_CALLS: usize = 16;
 
 /// Mode of both socket files: `0o660` (rw-rw----) — owner and group may
 /// connect, others may not. Stricter than AOSP init, which creates
@@ -414,7 +426,7 @@ pub struct SocketServiceArgs {
 /// The actor can be stopped by calling `actor_ref.stop()` when the service is no longer needed.
 ///
 pub fn run(args: SocketServiceArgs) -> crate::ServiceContext<SocketService> {
-    // `with_idle()` is required in 0.16: the idle-event channel is opt-in, and
+    // `with_idle()` is required: rsactor's idle-event channel is opt-in, and
     // this actor drives its accept loop through `subscribe_idle` / `on_idle`.
     // Without it `subscribe_idle` would return `IdleChannelNotEnabled` and the
     // listeners would never be polled.
@@ -482,7 +494,7 @@ pub struct SocketService {
     waiting_sem: Arc<Semaphore>,
     /// The two final socket names; unlinked when the service is dropped.
     _socket_files: SocketDirEntries,
-    control_handler: Option<crate::ControlHandler>,
+    control: Option<ControlCalls>,
 }
 
 impl Actor for SocketService {
@@ -490,8 +502,8 @@ impl Actor for SocketService {
     type Error = rsproperties::errors::Error;
     /// Each idle event is one accepted connection (or an `accept()` error)
     /// tagged with the listener it came from, so logging can name the source.
-    /// In 0.16 the accept loop is modelled as `Stream`s of connections
-    /// subscribed via `subscribe_idle`, replacing the removed `on_run`.
+    /// The accept loop is modelled as `Stream`s of connections subscribed
+    /// via `subscribe_idle` (rsactor has no `on_run` hook).
     type IdleEvent = (std::io::Result<UnixStream>, &'static str);
 
     async fn on_start(
@@ -507,7 +519,7 @@ impl Actor for SocketService {
         );
         // All filesystem work is blocking syscalls; one `spawn_blocking`
         // runs it off the runtime threads.
-        let dir = args.socket_dir.clone();
+        let dir = args.socket_dir;
         let bound = tokio::task::spawn_blocking(move || bind_service_sockets(&dir))
             .await
             .map_err(|e| std::io::Error::other(format!("socket bind task failed: {e}")))??;
@@ -543,7 +555,7 @@ impl Actor for SocketService {
             connection_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS)),
             waiting_sem: Arc::new(Semaphore::new(MAX_WAITING_CLIENTS)),
             _socket_files: entries,
-            control_handler: args.control_handler,
+            control: args.control_handler.map(ControlCalls::new),
         })
     }
 
@@ -605,20 +617,21 @@ impl Actor for SocketService {
         };
         let sem = self.connection_sem.clone();
         let connection_sender = self.properties_service.clone();
-        let control_handler = self.control_handler.clone();
+        let control = self.control.clone();
         tokio::spawn(async move {
             let permit = {
                 let _waiting = waiting; // released once a handler slot is ours
-                                        // Bounded by `CLIENT_TIMEOUT`, not by the rsproperties
-                                        // client's 2 s reply budget. The timer only limits how long
-                                        // a waiting-room slot is held; it is not meant to drop
-                                        // requests the client may have given up on. A queued
-                                        // connection's request is usually already in the socket
-                                        // buffer, and AOSP init keeps pending connections in its
-                                        // listen backlog without a timer and applies every request
-                                        // it receives in full. Dropping at the client's budget
-                                        // would also discard V1 requests whose clients (bionic:
-                                        // success after a 250 ms poll) already reported them set.
+
+                // Bounded by `CLIENT_TIMEOUT`, not by the rsproperties
+                // client's 2 s reply budget. The timer only limits how long
+                // a waiting-room slot is held; it is not meant to drop
+                // requests the client may have given up on. A queued
+                // connection's request is usually already in the socket
+                // buffer, and AOSP init keeps pending connections in its
+                // listen backlog without a timer and applies every request
+                // it receives in full. Dropping at the client's budget
+                // would also discard V1 requests whose clients (bionic:
+                // success after a 250 ms poll) already reported them set.
                 match tokio::time::timeout(CLIENT_TIMEOUT, sem.acquire_owned()).await {
                     Ok(Ok(p)) => p,
                     Ok(Err(_)) => {
@@ -636,7 +649,7 @@ impl Actor for SocketService {
             let _permit = permit; // dropped when the task ends
             match tokio::time::timeout(
                 CLIENT_TIMEOUT,
-                Self::handle_client(stream, connection_sender, control_handler),
+                Self::handle_client(stream, connection_sender, control),
             )
             .await
             {
@@ -678,6 +691,28 @@ impl rsactor::Message<crate::ReadyMessage> for SocketService {
     }
 }
 
+/// The service's control handler and the semaphore that caps its calls at
+/// `MAX_CONCURRENT_CONTROL_CALLS`. [`SocketService::handle_control`] takes
+/// a permit before `spawn_blocking` and moves it into the blocking
+/// closure, so a call counts against the cap from the moment it is queued
+/// for a blocking thread until `handler` returns or panics — not until its
+/// connection ends — and a request over the cap is refused without using a
+/// blocking thread.
+#[derive(Clone)]
+struct ControlCalls {
+    handler: crate::ControlHandler,
+    calls: Arc<Semaphore>,
+}
+
+impl ControlCalls {
+    fn new(handler: crate::ControlHandler) -> Self {
+        Self {
+            handler,
+            calls: Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_CALLS)),
+        }
+    }
+}
+
 impl SocketService {
     /// Handles a client connection. Generic over the receiving actor so
     /// tests can record forwarded requests; production passes
@@ -685,7 +720,7 @@ impl SocketService {
     async fn handle_client<A>(
         mut stream: UnixStream,
         service: ActorRef<A>,
-        control: Option<crate::ControlHandler>,
+        control: Option<ControlCalls>,
     ) -> Result<()>
     where
         A: rsactor::Message<crate::PropertyMessage, Reply = i32>,
@@ -696,6 +731,10 @@ impl SocketService {
         // Read the command (u32)
         let mut cmd_buf = [0u8; 4];
         if let Err(e) = stream.read_exact(&mut cmd_buf).await {
+            // init answers `PROP_ERROR_READ_CMD` whenever the command word
+            // cannot be read (`property_service.cpp` `RecvUint32` failure).
+            // Best-effort: a peer that already closed gets nothing (EPIPE).
+            let _ = Self::send_response(&mut stream, PROP_ERROR_READ_CMD).await;
             // Connect-then-close without writing (port probes, health
             // checks) is routine — not worth an `error!` in the caller.
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -737,7 +776,7 @@ impl SocketService {
         value: String,
         pid: Option<i32>,
         service: ActorRef<A>,
-        control: Option<crate::ControlHandler>,
+        control: Option<ControlCalls>,
     ) -> i32
     where
         A: rsactor::Message<crate::PropertyMessage, Reply = i32>,
@@ -759,27 +798,41 @@ impl SocketService {
     /// handler, or when the handler returns `false` or panics, the reply is
     /// `PROP_ERROR_HANDLE_CONTROL_MESSAGE`. The handler runs on the
     /// blocking pool; a call that outlasts the connection's `CLIENT_TIMEOUT`
-    /// still runs to completion, but its client gets no reply.
+    /// still runs to completion, but its client gets no reply. A request
+    /// beyond `MAX_CONCURRENT_CONTROL_CALLS` running or queued calls gets
+    /// `PROP_ERROR_HANDLE_CONTROL_MESSAGE` without reaching the blocking
+    /// pool ([`ControlCalls`]).
     async fn handle_control(
         name: String,
         value: String,
         pid: Option<i32>,
-        control: Option<crate::ControlHandler>,
+        control: Option<ControlCalls>,
     ) -> i32 {
         if let Err(e) = validate_property_name(&name) {
             error!("Rejected control message: {e}");
             return PROP_ERROR_INVALID_NAME;
         }
-        let Some(handler) = control else {
+        let Some(control) = control else {
             warn!("No control handler; refusing {name:?}");
             return PROP_ERROR_HANDLE_CONTROL_MESSAGE;
         };
+        let Ok(permit) = control.calls.try_acquire_owned() else {
+            warn!("{MAX_CONCURRENT_CONTROL_CALLS} control handler calls are pending; refusing {name:?}");
+            return PROP_ERROR_HANDLE_CONTROL_MESSAGE;
+        };
+        let handler = control.handler;
         let message = crate::ControlMessage {
             action: name["ctl.".len()..].to_owned(),
             target: value,
             pid,
         };
-        match tokio::task::spawn_blocking(move || handler(&message)).await {
+        match tokio::task::spawn_blocking(move || {
+            // Released when the handler returns or panics.
+            let _permit = permit;
+            handler(&message)
+        })
+        .await
+        {
             Ok(true) => {
                 info!("Control message {name:?} handled");
                 PROP_SUCCESS
@@ -795,19 +848,6 @@ impl SocketService {
         }
     }
 
-    /// Response code for a V2 field that could not be read: an I/O error
-    /// (including EOF) is `PROP_ERROR_READ_DATA` (init `RecvString`
-    /// failing); bytes that were read but are not a valid string (interior
-    /// NUL, not UTF-8) get the code init's later name/value check gives
-    /// them, `invalid`.
-    fn read_error_code(e: &Error, invalid: i32) -> i32 {
-        if matches!(e, Error::Io(_)) {
-            PROP_ERROR_READ_DATA
-        } else {
-            invalid
-        }
-    }
-
     /// Handles the legacy V1 SETPROP command: after the already-consumed
     /// command word, a fixed-size payload of `PROP_NAME_MAX` name bytes and
     /// `PROP_VALUE_MAX` value bytes, both NUL-padded.
@@ -819,7 +859,7 @@ impl SocketService {
     async fn handle_setprop_v1<A>(
         stream: &mut UnixStream,
         service: ActorRef<A>,
-        control: Option<crate::ControlHandler>,
+        control: Option<ControlCalls>,
         pid: Option<i32>,
     ) -> Result<()>
     where
@@ -873,7 +913,7 @@ impl SocketService {
     async fn handle_setprop2<A>(
         stream: &mut UnixStream,
         service: ActorRef<A>,
-        control: Option<crate::ControlHandler>,
+        control: Option<ControlCalls>,
         pid: Option<i32>,
     ) -> Result<()>
     where
@@ -907,15 +947,18 @@ impl SocketService {
             )));
         }
 
+        // init reads both fields (`RecvString` twice) before it checks
+        // either, so a field that cannot be read (`PROP_ERROR_READ_DATA`)
+        // is answered at once, while bytes that are not a valid string
+        // (interior NUL, not UTF-8) are kept until both fields are in and
+        // then checked in init's order: name first.
         let name = match Self::read_string(stream, name_len as usize).await {
-            Ok(name) => name,
-            Err(e) => {
-                let code = Self::read_error_code(&e, PROP_ERROR_INVALID_NAME);
-                let _ = Self::send_response(stream, code).await;
+            Err(e @ Error::Io(_)) => {
+                let _ = Self::send_response(stream, PROP_ERROR_READ_DATA).await;
                 return Err(e);
             }
+            name => name,
         };
-        debug!("Property name: {name:?}");
 
         // Read value length and value
         let value_len = match Self::read_u32(stream).await {
@@ -937,9 +980,29 @@ impl SocketService {
         }
 
         let value = match Self::read_string(stream, value_len as usize).await {
+            Err(e @ Error::Io(_)) => {
+                let _ = Self::send_response(stream, PROP_ERROR_READ_DATA).await;
+                return Err(e);
+            }
+            value => value,
+        };
+        let name = match name {
+            Ok(name) => name,
+            Err(e) => {
+                let _ = Self::send_response(stream, PROP_ERROR_INVALID_NAME).await;
+                return Err(e);
+            }
+        };
+        debug!("Property name: {name:?}");
+        let value = match value {
             Ok(value) => value,
             Err(e) => {
-                let code = Self::read_error_code(&e, PROP_ERROR_INVALID_VALUE);
+                // init's `IsLegalPropertyName` runs before any value check.
+                let code = if validate_property_name(&name).is_err() {
+                    PROP_ERROR_INVALID_NAME
+                } else {
+                    PROP_ERROR_INVALID_VALUE
+                };
                 let _ = Self::send_response(stream, code).await;
                 return Err(e);
             }
@@ -1441,7 +1504,7 @@ pub(crate) mod tests {
     ) -> i32 {
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(frame).await.unwrap();
-        let _ = SocketService::handle_client(server, service, control).await;
+        let _ = SocketService::handle_client(server, service, control.map(ControlCalls::new)).await;
         let mut reply = [0u8; 4];
         client.read_exact(&mut reply).await.unwrap();
         i32::from_ne_bytes(reply)
@@ -1593,6 +1656,111 @@ pub(crate) mod tests {
             0,
             "ctl.* must not be forwarded"
         );
+    }
+
+    /// At most `MAX_CONCURRENT_CONTROL_CALLS` handler calls are pending at
+    /// once; one more is refused before it reaches the blocking pool, and
+    /// the permits come back when the calls return. The runtime's pool has
+    /// exactly `MAX_CONCURRENT_CONTROL_CALLS` threads, all held by blocked
+    /// calls: a refusal that needed a blocking thread (the permit taken
+    /// inside `spawn_blocking`) would wait in the pool's queue instead of
+    /// returning.
+    #[test]
+    fn control_calls_are_capped_before_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(MAX_CONCURRENT_CONTROL_CALLS)
+            .enable_all()
+            .build()
+            .unwrap();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(std::sync::RwLock::new(()));
+        let closed = gate.write().unwrap();
+        let (counter, inner_gate) = (entered.clone(), gate.clone());
+        let calls = ControlCalls::new(Arc::new(move |msg: &crate::ControlMessage| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            if msg.target == "block" {
+                drop(inner_gate.read().unwrap());
+            }
+            true
+        }));
+        let call = |target: &'static str, calls: ControlCalls| {
+            SocketService::handle_control(
+                "ctl.start".to_owned(),
+                target.to_owned(),
+                None,
+                Some(calls),
+            )
+        };
+
+        let blocked: Vec<_> = (0..MAX_CONCURRENT_CONTROL_CALLS)
+            .map(|_| runtime.spawn(call("block", calls.clone())))
+            .collect();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while entered.load(Ordering::SeqCst) < MAX_CONCURRENT_CONTROL_CALLS {
+            assert!(std::time::Instant::now() < deadline, "calls did not start");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let over_cap = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), call("other", calls.clone())).await
+        });
+        assert_eq!(
+            over_cap.expect("a call over the cap must not wait for a blocking thread"),
+            PROP_ERROR_HANDLE_CONTROL_MESSAGE
+        );
+        assert_eq!(entered.load(Ordering::SeqCst), MAX_CONCURRENT_CONTROL_CALLS);
+
+        drop(closed);
+        for task in blocked {
+            assert_eq!(runtime.block_on(task).unwrap(), PROP_SUCCESS);
+        }
+        assert_eq!(
+            runtime.block_on(call("other", calls)),
+            PROP_SUCCESS,
+            "permits are released on return"
+        );
+    }
+
+    /// init answers `PROP_ERROR_READ_CMD` when the command word cannot be
+    /// read.
+    #[tokio::test]
+    async fn truncated_command_word_gets_read_cmd() {
+        let (service, count) = recorder();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&[0u8; 2]).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        assert!(SocketService::handle_client(server, service, None)
+            .await
+            .is_ok());
+        let mut reply = [0u8; 4];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(i32::from_ne_bytes(reply), PROP_ERROR_READ_CMD);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    /// init reads both fields before checking either, and checks the name
+    /// first: an illegal name wins over an invalid value, and a value that
+    /// cannot be read wins over an invalid name.
+    #[tokio::test]
+    async fn v2_checks_follow_init_order() {
+        let (service, count) = recorder();
+        assert_eq!(
+            exchange(&v2_frame(".bad", "a\0b"), service.clone(), None).await,
+            PROP_ERROR_INVALID_NAME
+        );
+        let mut truncated = v2_frame("a\0b", "");
+        truncated.truncate(truncated.len() - 4);
+        truncated.extend_from_slice(&5u32.to_ne_bytes());
+        truncated.extend_from_slice(b"ab");
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&truncated).await.unwrap();
+        client.shutdown().await.unwrap();
+        let _ = SocketService::handle_client(server, service, None).await;
+        let mut reply = [0u8; 4];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(i32::from_ne_bytes(reply), PROP_ERROR_READ_DATA);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
     /// A V2 frame that ends inside the name-length field gets a

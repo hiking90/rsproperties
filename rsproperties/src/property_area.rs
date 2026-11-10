@@ -80,8 +80,8 @@
 //!   — directly (`SystemProperties::read_with`) or stored in a
 //!   `PropertyIndex` — and can copy it but not make one. The type does not record which area an
 //!   offset belongs to: a `PropertyIndex` pairs it with its
-//!   `context_index` and is accepted only by the instance whose `find`
-//!   made it (`owns_index`). Bounds and alignment are checked at every
+//!   `context_index` and is accepted only by the instance whose `find` or
+//!   `foreach` made it (`owns_index`). Bounds and alignment are checked at every
 //!   access. An offset from any other source would be a bug in this file,
 //!   not the \[SM5\] residual; \[SM5\] covers only a file whose link words
 //!   or long offsets are corrupt.
@@ -377,6 +377,14 @@ impl<'a> AreaWriteAccess<'a> {
         Ok(Self {
             _map: std::marker::PhantomData,
         })
+    }
+
+    /// For `property_info` tests on a heap entry, which has no mapping.
+    #[cfg(test)]
+    pub(crate) fn for_heap_test() -> Self {
+        Self {
+            _map: std::marker::PhantomData,
+        }
     }
 }
 
@@ -828,9 +836,9 @@ impl PropertyAreaMap {
 
             // `find_prop_trie_node` only knows the segment; report the full
             // name like the other `NotFound` paths of this function.
-            current_offset = match self.find_prop_trie_node(children_offset, subname) {
-                Err(Error::NotFound(_)) => return Err(Error::NotFound(name.to_owned())),
-                r => r?,
+            current_offset = match self.find_prop_trie_node(children_offset, subname)? {
+                Some(offset) => offset,
+                None => return Err(Error::NotFound(name.to_owned())),
             };
 
             if sep.is_none() {
@@ -1182,7 +1190,13 @@ impl PropertyAreaMap {
         })
     }
 
-    fn find_prop_trie_node(&self, trie_offset: NodeOffset, name: &str) -> Result<NodeOffset> {
+    /// Searches the sibling BST at `trie_offset` for the segment `name`.
+    /// `Ok(None)`: no such segment; the caller reports the full name.
+    fn find_prop_trie_node(
+        &self,
+        trie_offset: NodeOffset,
+        name: &str,
+    ) -> Result<Option<NodeOffset>> {
         let name_bytes = name.as_bytes();
         let mut current_offset = trie_offset;
         // A corrupt file can link BST nodes into a cycle; a distinct-node
@@ -1195,11 +1209,11 @@ impl PropertyAreaMap {
             let next_offset = match cmp_prop_name(name_bytes, node_name.to_bytes()) {
                 std::cmp::Ordering::Less => current.left_offset(),
                 std::cmp::Ordering::Greater => current.right_offset(),
-                std::cmp::Ordering::Equal => return Ok(current_offset),
+                std::cmp::Ordering::Equal => return Ok(Some(current_offset)),
             };
             match next_offset {
                 Some(next_offset) => current_offset = next_offset,
-                None => return Err(Error::NotFound(name.to_owned())),
+                None => return Ok(None),
             }
         }
         Err(Error::FileValidation(
@@ -1777,10 +1791,9 @@ impl std::ops::Drop for MemoryMap {
     fn drop(&mut self) {
         // SAFETY: `self.data` was returned by `mm::mmap` with `self.size`
         // bytes in `MemoryMap::new` and has not been unmapped since.
-        unsafe {
-            if let Err(e) = mm::munmap(self.data as _, self.size) {
-                error!("Failed to unmap memory: {e:?}");
-            }
+        let result = unsafe { mm::munmap(self.data as _, self.size) };
+        if let Err(e) = result {
+            error!("Failed to unmap memory: {e:?}");
         }
     }
 }

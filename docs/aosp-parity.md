@@ -12,7 +12,8 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
   - libcutils: `system/core/libcutils/properties.cpp`
   - init: `system/core/init/property_service.cpp`
 - 지원 범위: client는 Linux와 Android, `rsproperties-service`는 Linux 전용,
-  Android 지원 API level은 28–36이다. Android에서 service를 쓰는 경로와 macOS는
+  Android 지원 API level은 28–36이다(API 37 동작은 AOSP `android-17.0.0_r1`
+  source 기준으로 구현했고 실측하지 않았다). Android에서 service를 쓰는 경로와 macOS는
   비교 대상에서 제외한다.
 - 분류
   - (a) Linux emulation이라서 생기는 차이
@@ -65,6 +66,14 @@ exit 1로 끝난다.
   `Error::FileValidation`을 반환한다.
 - area를 열 수 없는 context는 bionic처럼 건너뛴다. init 단계에서 손상으로
   빠진 context slot도 건너뛴다.
+- bionic `ContextNode::CheckAccessAndOpen`(`context_node.cpp:62-68`)은 open이
+  실패하면 `no_access_`를 기록하고, 그 뒤의 `ForEach`는 그 area를 다시 열지
+  않는다. 이름 조회 경로(`GetPropAreaForName`)는 접근마다 SELinux audit를 남기도록
+  매번 다시 연다. 이 crate도 `foreach` 전용 flag(`ContextNode` `foreach_no_access`)를
+  두고, 이름 조회는 매번 다시 연다. 다른 점(b): flag는 권한 오류(`EACCES`,
+  `EPERM`)일 때만 기록한다. Linux에서는 이 crate의 service가 reader가 시작된 뒤에
+  area 파일을 만들 수 있으므로, 파일이 없다는 오류까지 기록하면 그 instance의
+  `foreach`는 나중에 생긴 area를 끝내 보지 못한다.
 - bionic과 다른 점(b): 열린 area 안에서 trie 손상을 만나면 순회를 계속하지
   않고 `Err`를 반환한다. 이 crate는 손상과 부재를 구분한다는 정책을 따른다.
   손상된 context보다 앞서 순회한 context의 index는 이미 callback에 전달된
@@ -218,23 +227,43 @@ override가 켜진 프로세스에서는 같은 property에 대해 libc
 
 ## Service (Linux)
 
+각 절의 `**변경 전(main).**` 문단은 이 branch 이전(main) 상태를 적는다. 그
+문단이 인용하는 rsproperties 줄 번호는 main 기준이다.
+
 ### S1. `persist.*` / `next_boot.*` 영속화 — (d)
 
 init은 set이 성공하면 이름이 `persist.` 또는 `next_boot.`로 시작하는 값을
 persistent store에 기록한다(`property_service.cpp:414-423`). 부팅할 때 다시
 load하고 `ro.persistent_properties.ready=true`를 설정한다(`:1462`).
-rsproperties-service는 이 값을 저장하지 않으므로, 재시작하면 모두 잃는다.
+
+**변경 전(main).** rsproperties-service는 이 값을 저장하지 않으므로, 재시작하면
+모두 잃는다.
 
 **AOSP 세부 동작** (`persistent_properties.cpp`).
 - 형식은 proto2 `PersistentProperties { repeated PersistentPropertyRecord
   { optional string name = 1; optional string value = 2; } properties = 1; }`다.
 - 쓰기(`WritePersistentProperty`): 파일을 다시 읽고, 같은 이름의 첫 record를
-  고치거나 끝에 추가한다. 값이 같으면 쓰지 않는다. `<file>.tmp`(0600,
+  고치거나 끝에 추가한다. 값이 같으면 쓰지 않는다. 파일을 읽지 못하면(없음,
+  group/world-writable, 파싱 실패 후 삭제) "Recovering persistent properties
+  from memory"를 log하고, area에 있는 `persist.*` 값 전체를 record로 모아 같은
+  처리를 한다(`persistent_properties.cpp:208-224`, `:231-235`). `PropertySet`은
+  area 값을 먼저 바꾼 뒤 이 함수를 호출하므로(`property_service.cpp:405-422`),
+  모은 record에는 방금 set한 `persist.<name>`의 새 값이 이미 들어 있다. 그래서
+  이 경로에서 `persist.*` set은 파일을 쓰지 않고 반환하고, `next_boot.*` set은
+  area의 `persist.*` 값 전체에 그 record를 더해 파일을 쓴다. `<file>.tmp`(0600,
   `O_NOFOLLOW`)에 쓰고 fsync, rename, 디렉터리 fsync 순서로 진행한다.
   실패는 log만 남기고 set은 성공으로 응답한다.
 - 읽기(`LoadPersistentProperties`): 남은 `.tmp`를 지우고 파일을 읽는다.
-  파싱에 실패하거나 `persist.`/`next_boot.`가 아닌 이름이 있으면 파일을
-  삭제한다. `next_boot.<name>` record는 `<name>`의 값을 바꾸고 제거된 뒤
+  읽기는 `init/util.cpp`의 `ReadFile`이다. `O_NOFOLLOW`로 열고 `fstat`한 뒤
+  group 또는 other write bit가 있으면 "Skipping insecure file" error를
+  반환한다. 이 경우 `LoadPersistentPropertyFile`은 파일을 지우지 않고 실패를
+  반환한다. 파싱에 실패하거나 `persist.`/`next_boot.`가 아닌 이름이 있으면
+  파일을 삭제하고 실패를 반환한다. 실패하면 `LoadPersistentProperties`가
+  legacy 경로(`/data/property/persist.*` 파일들)를 읽고, 그 결과를
+  `WritePersistentPropertyFile`로 즉시 써서 기존 파일을 대체한다
+  (`persistent_properties.cpp:254-272`). legacy 파일이 없으면 record가 없는
+  파일이 된다. 따라서 group/world-writable 파일의 record는 그 부팅의 load
+  시점에 사라진다. `next_boot.<name>` record는 `<name>`의 값을 바꾸고 제거된 뒤
   파일에 다시 기록된다. 각 record는 `InitPropertySet`으로 설정되므로 type
   검사를 거친다. 그다음 `ro.persistent_properties.ready=true`를 설정한다.
 
@@ -242,12 +271,40 @@ rsproperties-service는 이 값을 저장하지 않으므로, 재시작하면 �
 그대로 따르며, codec은 새 dependency 없이 crate 안에 직접 구현했다(약 150줄).
 init과 다른 점은 다음과 같다.
 - (a) Android 8 이전의 legacy layout(`/data/property/persist.*` 파일들)은
-  읽지 않는다.
+  읽지 않는다. legacy 경로가 없으므로 읽지 못한 파일(symlink,
+  group/world-writable 등)은 load 때 대체되지 않고 다음 persist set 전까지
+  남는다. 그 전에 mode를 고치고 재시작하면 record가 다시 load된다. 다음
+  persist set에서 이 service는 메모리의 record, 즉 load 뒤에 set된 record만으로
+  파일을 다시 쓴다. 같은 상황에서 init은 쓰기 시점에 파일을 읽지 못하므로 area의
+  `persist.*` 값으로 record를 모은다(위 쓰기 항목). init에서 이 경로는 load
+  시점의 파일 쓰기가 실패했거나, 실행 중에 파일이 사라지거나 mode가 바뀐 경우에
+  실행된다.
+- (b) load가 일시적 오류(`EINTR`, `EIO`, `EAGAIN`, `ENOMEM`, `ENOBUFS`,
+  `EMFILE`, `ENFILE`)로 파일을 읽지 못하면, 첫 persist set이 파일을 쓰기 전에
+  다시 읽는다. 읽으면 파일의 record(중복은 load처럼 합침)에 그 run의 set을
+  덮어 쓴다. 다시 읽은 record는 area에 적용하지 않는다. init도 쓰기 때 다시 읽은
+  record를 area에 적용하지 않는다. 다시 읽어도 일시적 오류이면 그 set은
+  메모리에만 두고 파일을 쓰지 않는다. 그러면 다음 set이 다시 시도한다. 이렇게
+  하지 않으면 일시적 오류 한 번 뒤의 첫 set이 파일을 그 set 하나로 대체한다.
+  권한 오류나 mode 검사처럼 매번 같은 결과가 나는 오류는 다시 읽지 않고 위 (a)와
+  같이 처리한다.
 - (b) 시작 후에는 record를 메모리에 두고, set마다 메모리를 갱신한 뒤 그
   내용 전체를 파일에 쓴다. 쓸 때마다 파일을 다시 읽지 않는다.
   - init이 다시 읽는 이유는 소스 주석에 적힌 대로 PID 1의 상주 메모리를
-    줄이기 위해서다("we rather not keep any data in memory"). 동기화를
-    위해서가 아니다. init 안에서 이 파일을 쓰는 경로는 한 번에 하나다.
+    줄이기 위해서다("we rather not keep any data in memory"). 다시 읽기는
+    동기화 수단이 아니다. init에서 이 파일 쓰기는 두 socket thread에서 lock
+    없이 실행될 수 있다. `StartPropertyService`는 `property_service_for_system`과
+    `property_service` socket마다 `StartThread`로 thread를 하나씩 띄우고
+    (`property_service.cpp:1534-1564`), 두 thread 모두 `handle_property_set_fd`
+    → `PropertySet`을 실행한다. `ro.property_service.async_persist_writes`가
+    false(기본값, `:1566-1571`)이면 `PersistWriteThread`가 없으므로 각 thread가
+    `WritePersistentProperty`를 직접 호출하고(`:422`), 이 호출 경로에는 mutex가
+    없다. 이 값이 true이면 `PersistWriteThread` 하나가 queue의 쓰기를 순서대로
+    실행한다(`:1501-1520`). `PropertySet`의 `sys.powerctl` 주석은 두 번째
+    thread로 오는 이름이 `sys.powerctl`뿐이라는 관례를 전제하고, bionic
+    `__system_property_set`도 `sys.powerctl`만 `property_service_for_system`으로
+    보낸다. 그 밖의 client가 이 socket으로 `persist.*`를 보내 두 쓰기가 실제로
+    겹치는 경우가 있는지는 확인 필요다.
   - 메모리 방식에서는 쓰기가 실패한 변경이 메모리에 남아 다음 쓰기에 함께
     기록된다. init 방식은 다음 쓰기 때 파일을 다시 읽으므로, 실패한 변경이
     파일에서 빠진다.
@@ -259,7 +316,9 @@ init과 다른 점은 다음과 같다.
 - (b) 메모리 방식에서는 같은 파일을 쓰는 instance가 둘이면 서로의 record를
   덮어쓴다. `AreaWriterLock`은 properties dir만 보호한다. 그래서 load할 때
   `<file>.lock`(0600, `O_NOFOLLOW`)에 `flock(LOCK_EX|LOCK_NB)`을 잡고 store가
-  살아 있는 동안 유지한다. 두 번째 instance는 시작에 실패한다
+  살아 있는 동안 유지한다. store를 drop할 때 `flock(LOCK_UN)`으로 푼다. fd를
+  닫는 것만으로는 같은 process가 만드는 중인 child가 `exec` 전까지 가진 fd
+  사본 때문에 lock이 남을 수 있다. 두 번째 instance는 시작에 실패한다
   (`ErrorKind::WouldBlock`). init에는 lock이 없다. device에서는 init이 유일한
   writer이기 때문이다.
 - (b) load할 때 같은 이름의 record를 첫 위치로 합치고 마지막 값을 남긴다.
@@ -271,15 +330,38 @@ init과 다른 점은 다음과 같다.
   외부에서 만든 파일에서만 나타난다. 합친 결과가 원본과 다르면 파일에
   다시 쓴다.
 - (b) 파일의 디렉터리가 없으면 시작을 실패시킨다. init에서는 이 디렉터리가
-  항상 있다.
+  항상 있다. store load(lock, 읽기, 정리한 결과의 재기록)는 `property_info`와
+  area를 쓰기 전에 실행한다. 그래서 디렉터리가 없거나 다른 service가 lock을
+  쥐고 있으면 properties dir은 바뀌지 않은 채로 시작이 실패한다.
 - 남은 staged record를 덧붙이는 순서는 init에서는 `unordered_map` 순서라
   정해져 있지 않다. 여기서는 파일에 나온 순서를 따른다.
+- (b) 대상 이름이 `persist.`/`next_boot.`로 시작하지 않는 staged record
+  (`next_boot.foo` → `foo`)는 load할 때 area에 한 번 적용하고 파일에는 쓰지
+  않는다. init은 `foo`를 파일에 쓰고, 다음 부팅의 load가 prefix 검사에
+  실패해 파일 전체를 지운다. device에서는 `property_contexts`가
+  `next_boot.*`를 set할 수 있는 주체를 제한하지만, 이 service는
+  per-property 인가를 하지 않는다. init처럼 파일에 썼다면 socket에 접근할 수
+  있는 client는 누구나 set 한 번과 재시작 두 번으로 모든 `persist.*` 값을
+  지울 수 있었다. 여기서는 그 record를 파일에 쓰지 않으므로 그 경로가 없다.
+  area에 남는 값은 init과 같다. 이런 record를 area에도 적용하지 않는 방법도 있으나,
+  그러면 첫 재시작 후 area 결과가 init과 달라진다.
 - 손상된 파일은 owner 결정에 따라 init처럼 삭제한다.
+- V1(`PROP_MSG_SETPROP`) set도 파일에 기록한다. init의 기록 조건은
+  `socket && persistent_properties_loaded && need_persist`(`:417`)이고, V1은
+  `HandlePropertySetNoSocket`(socket 없음)을 거치므로 기록되지 않는다. 이
+  service에서는 V1과 V2가 같은 `client_set`을 거친다.
+- `run`이 반환되기 전에 도착한 `persist.*` set은 load한 값을 덮어쓰고 파일에도
+  기록된다. mailbox에서 기다린 set은 `on_start`가 persistent record까지 적용한
+  뒤(`apply_startup_properties`) 처리되기 때문이다. init은 load 전의 set을
+  파일에 쓰지 않는다(`persistent_properties_loaded`, `property_service.cpp:414-417`).
+  그 뒤 `HandleInitSocket`이 파일의 record마다 `InitPropertySet`을 호출하므로
+  (`:1447-1455`), 파일에 record가 있는 이름은 area에도 파일 값이 남는다.
 
 ### S2. type 검사 — (c)
 
-`property_contexts`의 type(`int`, `bool`, `enum ...`)은 파싱 단계에서 검증되고
-trie에도 직렬화된다(`property_info_serializer.rs:74-87`). 그런데 set
+**변경 전(main).** `property_contexts`의 type(`int`, `bool`, `enum ...`)은
+파싱 단계에서 검증되고 trie에도 직렬화된다(`property_info_serializer.rs:74-87`).
+그런데 set
 handler(`properties_service.rs:227-239`)는 이름과 길이만 검사한다. init
 `CheckPermissions`는 type이 맞지 않으면 `PROP_ERROR_INVALID_VALUE`를
 반환한다(`:530-533`). `socket_service.rs:54-63`에 문서화된 access model은
@@ -288,23 +370,37 @@ SELinux와 SO_PEERCRED 검사 생략만 다루고, type 검사 생략은 언급�
 **AOSP 규칙** (`property_type.cpp` `CheckType`): 빈 값은 항상 통과한다.
 `string`은 모두 통과, `bool`은 `true`/`false`/`1`/`0`, `int`/`uint`는 libbase
 `ParseInt`/`ParseUint`(64 bit), `double`은 `ParseDouble`(`strtod`, 문자열 전체,
-`ERANGE` 거부), `size`는 `[0-9]+[gkm]`, `enum a b`는 나열된 값 중 하나여야
+`ERANGE` 거부, 결과가 `[lowest(), max()]` 밖이면 거부하므로 `inf`는 거부하고
+NaN은 통과), `size`는 `[0-9]+[gkm]`, `enum a b`는 나열된 값 중 하나여야
 한다. 그 밖의 type은 거부한다. `bool`의 허용 집합은 `ParseBool`보다 좁다.
 
 **변경.** `rsproperties-service/src/property_type.rs`에 같은 규칙을
 구현했다. type은 새 API `SystemProperties::property_type(name)`(builder)으로
 `property_info`에서 읽는다. init과 다른 점: `double`에서 `strtod`가 받는
 hex float(`0x1p3`)와 `nan(...)`을 Rust float parser가 받지 않으므로 거부한다.
-subnormal 결과에 `strtod`가 `ERANGE`를 설정하는지는 확인 필요다(여기서는
-허용한다).
+subnormal 결과(`1e-310`)는 거부한다. bionic `strtod`(gdtoa `strtod.c`)는 십진
+지수가 -256 이하이면 `scale`을 설정하고, 마지막에 결과의 exponent field가
+0이면 `errno = ERANGE`로 둔다(`:1074-1087`). subnormal 결과는 항상 이 경로를
+거친다. device 실측은 하지 않았다.
+
+type 검사는 client set과 persistent record(`init_set` → `apply_set`)에만
+적용한다. build.prop entry는 검사하지 않는다(c). init `LoadProperties`는
+entry마다 `CheckPermissions`를 호출하고(`property_service.cpp:803`), 그 안의
+`CheckType`(`:530-533`)이 실패하면 그 entry를 버린다. `PropertyInit`은
+`property_info`를 load한 뒤(`:1415`) `PropertyLoadBootDefaults`(`:1429`)를
+실행하므로, 이 시점에 type 정보가 있다. 이 service의
+`init_system_properties_sync`는 build.prop entry를 `add`로 바로 넣는다. 그래서
+`property_contexts`가 `int`로 정한 이름에 build.prop가 `abc`를 주면, init은 그
+property를 만들지 않고 이 service는 `abc`를 저장한다.
 
 ### S3. `ctl.*` 저장 — 저장 동작은 (c), dispatch 없음은 (a)
 
 init은 `ctl.*`를 area에 저장하지 않는다. 권한을 검사한 뒤 control
-message로 처리한다(`:505-512`, `:548-549`). build.prop loader는 `ctl.*`,
-`sys.powerctl`, `selinux.restorecon_recursive`를 버린다
-(`build_property_parser.rs:424`). 하지만 runtime set 경로는 `ctl.start` 같은
-이름을 그대로 area에 기록한다.
+message로 처리한다(`:505-512`, `:548-549`).
+
+**변경 전(main).** build.prop loader는 `ctl.*`, `sys.powerctl`,
+`selinux.restorecon_recursive`를 버린다(`build_property_parser.rs:424`).
+하지만 runtime set 경로는 `ctl.start` 같은 이름을 그대로 area에 기록한다.
 
 init은 control message를 queue에 넣고 main thread의 `HandleControlMessage`가
 처리한 뒤 응답한다. 성공하면 `PROP_SUCCESS`, service가 없거나 action이
@@ -319,37 +415,91 @@ init은 control message를 queue에 넣고 main thread의 `HandleControlMessage`
   `PROP_ERROR_HANDLE_CONTROL_MESSAGE`다. properties service로는 넘기지 않으므로
   area에 저장되지 않는다.
 - handler가 없으면 `PROP_ERROR_HANDLE_CONTROL_MESSAGE`로 거부한다.
+- 실행 중이거나 blocking thread를 기다리는 handler 호출은 16개로 제한한다.
+  permit은 `spawn_blocking` 전에 잡으므로, 17번째 요청은 blocking thread를 쓰지
+  않고 `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 받는다. host runtime의
+  `max_blocking_threads`가 16 이하이면 느린 호출이 pool을 채울 수 있다. 연결의 10 s
+  timeout이 지나도 handler 호출은 끝까지 실행되므로, 상한이 없으면 오래
+  걸리는 handler에 반복해서 보낸 `ctl.*`가 tokio blocking pool을 채운다.
+  그러면 같은 pool에서 실행되는 persist 파일 쓰기가 대기하고, actor가 그
+  쓰기를 await하므로 모든 set이 멈춘다. init에도 상한이 있다.
+  `QueueControlMessage`(`init/init.cpp:613-623`)는 처리되지 않은 control
+  message를 101개까지 queue에 두고, 그 이상은 버린다. 이때
+  `SendControlMessage`(`property_service.cpp:458-463`)가 넘겨받은 fd로
+  `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 보낸다. init은 queue에서 기다리는
+  message 수를 세고, 이 service는 실행 중인 handler 호출 수를 센다.
 - init이 하는 권한 검사(`CheckControlPropertyPerms`)는 하지 않는다. 다른
   property와 같은 access model이다.
 
 ### S4. 실패 응답 코드 — (c)
 
-service는 실패하면 항상 `PROP_ERROR(-1)`를 보낸다. init은
+**변경 전(main).** service는 실패하면 항상 `PROP_ERROR(-1)`를 보낸다. init은
 `PROP_ERROR_READ_ONLY_PROPERTY`, `INVALID_NAME`, `INVALID_VALUE`,
 `PERMISSION_DENIED`, `SET_FAILED`, `HANDLE_CONTROL_MESSAGE` 등을 구분한다.
 client의 `Error::ServiceError { code }`(`errors.rs:80`)에는 Linux에서 항상
 -1만 들어온다.
 
-**변경.** `wire::PROP_ERROR_*`에 bionic의 code 값을 추가하고, init과 같은
-조건에서 같은 code를 보낸다.
-- 읽을 수 없는 field와 한도를 넘는 길이: `READ_DATA`(init `RecvString`).
+**변경.** `wire::PROP_ERROR_*`에 bionic의 code 값을 추가하고, 아래 "init과
+다른 점"을 제외하면 init과 같은 조건에서 같은 code를 보낸다.
+- command word를 읽지 못함: `READ_CMD`(`:614-617`). 연결만 하고 닫은 peer에게도
+  보내며, 이미 닫힌 peer에는 전달되지 않는다.
+- 읽을 수 없는 field와 한도를 넘는 길이: `READ_DATA`(init `RecvString`, 한도는
+  아래 "init과 다른 점" 참고).
 - 알 수 없는 command: `INVALID_CMD`.
 - 이름 검사 실패, 또는 이름에 NUL이 있거나 UTF-8이 아님: `INVALID_NAME`.
-- type 불일치, 값이 너무 길거나 NUL이 있거나 UTF-8이 아님: `INVALID_VALUE`.
+- type 불일치, 값이 너무 길거나 UTF-8이 아님: `INVALID_VALUE`.
 - 값이 이미 있는 `ro.`: `READ_ONLY_PROPERTY`.
 - 그 밖의 저장 실패: `SET_FAILED`.
 
-검사 순서는 init(`CheckPermissions` → `PropertySet`)과 같다. 이름, `ctl.`,
-type, 값 길이, 저장 순이다. 공개 `PROP_ERROR`(-1) 상수는 그대로 두었다.
+검사 순서는 init(`RecvString` 두 번 → `CheckPermissions` → `PropertySet`)과
+같다. 두 field를 모두 읽은 뒤 이름, `ctl.`, type, 값 길이, 저장 순으로 검사한다.
+V2 field의 NUL·UTF-8 오류는 읽을 때 발견하지만 두 field를 다 읽을 때까지
+보류한다. 그래서 두 번째 field를 읽지 못하면 `READ_DATA`, 이름과 값이 둘 다
+잘못되면(예: 이름 `.bad`, 값에 NUL) 이름이 먼저 걸려 `INVALID_NAME`이다
+(`property_service.cpp:500-502`). 공개 `PROP_ERROR`(-1) 상수는 그대로 두었다.
+init과 다른 점은 다음과 같다.
+- (c) `sys.powerctl`과 `selinux.restorecon_recursive`의 분기가 없다. init
+  `HandlePropertySet`은 `sys.powerctl`=`reboot,userspace`에
+  `PROP_ERROR_INVALID_VALUE`를 보내고(`:565-567`), `PropertySet`은
+  `sys.powerctl`의 값을 area에 쓰지 않는다(`:392-395`, 처리는 property 변경
+  trigger가 한다). pid가 1이 아닌 client가 `selinux.restorecon_recursive`에 빈
+  값이 아닌 값을 보내면 restorecon을 시작하고 저장 없이 `PROP_SUCCESS`를
+  보낸다(`:575-579`). 이 service는 두 이름 모두 일반 property처럼 저장하고
+  `PROP_SUCCESS`를 보낸다. reboot과 restorecon은 Linux emulation에서 수행할
+  대상이 없다(a). 다만 `get("sys.powerctl")` 결과와 `reboot,userspace` 응답
+  code는 init과 다르다. build.prop loader는 두 이름을 이미 버린다
+  (`build_property_parser.rs:424`).
+- (c) V2 값에 NUL이 있으면 `INVALID_VALUE`로 거부한다. init
+  `IsLegalPropertyValue`(`init/util.cpp:406-416`)는 `mbstowcs(nullptr,
+  value.data(), 0)`로 UTF-8을 검사하는데, 이 호출은 첫 NUL에서 멈추므로 NUL을
+  거부하지 않는다. `debug.x`=`"a\0b"`에 init은 `PROP_SUCCESS`, 이 service는
+  `INVALID_VALUE`를 보낸다. `ctl.*` 값은 init에서 `PropertySet`을 거치지 않고
+  control message로 넘어가므로(`property_service.cpp:548-549`), NUL이나 UTF-8이
+  아닌 byte가 있어도 거부되지 않는다. 이 service는 둘 다 `INVALID_VALUE`로
+  거부한다.
+- (c) 길이 한도가 다르다. init `RecvString`은 `0xffff`보다 긴 field만
+  거부한다(`:249`). 이 service는 `MAX_WIRE_NAME_LEN`(1024)보다 긴 이름과
+  `MAX_WIRE_VALUE_LEN`(8192)보다 긴 값에 `READ_DATA`를 보낸다. 1025–65535 byte
+  이름과 8193–65535 byte 값을 init은 읽은 뒤 이후 검사로 판정한다. 예를 들어
+  10000 byte 값은 `ro.` 이름이면 `IsLegalPropertyValue`의 길이 검사를
+  통과하고, 그 밖의 이름이면 `INVALID_VALUE`를 받는다. 이 service는 두 경우
+  모두 `READ_DATA`를 보낸다.
 
-### S5. `ro.property_service.version` — (c), 이 crate의 client에는 영향 없음
+### S5. `ro.property_service.version` — (c), 변경 후에는 env var로 V1을 고른 이 crate의 client도 V2를 쓴다
 
-init은 `ro.property_service.version=2`를 설정한다(`:1552`). service는 설정하지
-않는다. 이 crate의 client는 값이 없으면 V2를 기본으로 쓰므로 영향이 없다.
-영향을 받는 것은 bionic 규칙(값이 없으면 V1)을 따르는 다른 client다.
+**변경 전(main).** init은 `ro.property_service.version=2`를 설정한다(`:1552`).
+service는 설정하지 않는다. 이 crate의 client는 값이 없으면
+`PROPERTY_SERVICE_VERSION`을 보고, 그 변수도 없으면 V2를 쓴다. 영향을 받는
+것은 bionic 규칙(값이 없으면 V1)을 따르는 다른 client다.
 
 **변경.** build.prop entry를 적용한 뒤 `ro.property_service.version=2`를
 설정한다. build.prop가 이미 값을 정했다면 그 값이 남는다(`ro.`는 write-once).
+이 crate의 client(`system_property_set.rs` `protocol_version`)는 global
+reader가 초기화되어 있으면 이 property를 env var보다 먼저 읽는다. v0.6.0
+client도 순서가 같다. 그래서 `PROPERTY_SERVICE_VERSION=1`로 V1을 고르던
+client는 global reader가 먼저 초기화된 process에서 V2 frame을 보내고 4-byte
+응답을 기다린다. V1을 유지하려면 build.prop에
+`ro.property_service.version=1`을 넣는다.
 S1의 persist load 뒤에는 `ro.persistent_properties.ready=true`를 설정한다.
 persist 파일을 지정하지 않아도 설정한다. init이 항상 설정하기 때문이다.
 
@@ -362,8 +512,8 @@ init.rc trigger는 emulation 범위 밖이다. 따라서 parity 결함이 아니
 
 ## 누락으로 보지 않는 것
 
-- per-property SELinux / SO_PEERCRED 인가: (a)이며 `socket_service.rs:54-63`에
-  문서화된 의도적 단순화다.
+- per-property SELinux / SO_PEERCRED 인가: (a)이며 `socket_service.rs`
+  `SOCKET_FILE_MODE` doc의 Access model 문단에 문서화된 의도적 단순화다.
 - `ContextsSplit` / `ContextsPreSplit` layout: `property_info`가 없는 이전
   Android용 layout이다. 지원 범위(API 28–36) 밖이다.
 - deprecated API(`__system_property_find_nth`, `__system_property_read`,

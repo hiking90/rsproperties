@@ -13,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SystemProperties::foreach(|index| ...)`: the index of every property
   the process can read, in bionic `__system_property_foreach` order;
   areas that cannot be opened are skipped, a corrupt trie is
-  `Error::FileValidation`. The `getprop` example lists all properties
-  when run without arguments.
+  `Error::FileValidation`. Like bionic's `no_access_`, an area `foreach`
+  was denied (`EACCES`/`EPERM`) is not tried again by that instance; a
+  missing area file is retried. The `getprop` example lists all
+  properties when run without arguments.
 - `SystemProperties::read_index_with(&index, |name, value, serial| ...)`:
   reads by index without a name lookup and passes the serial the value
   was read under (bionic `__system_property_read_callback`).
@@ -29,7 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Appcompat override lookup: on Android API 37+ (and on Linux), a
   read-only instance created while `BIONIC_APPCOMPAT_OVERRIDE` is set
   looks up `ro.appcompat_override.<name>` first in `find` and
-  `read_with`, as bionic does.
+  `read_with`, as bionic does. API 37 is outside the supported range
+  (28–36); this follows the AOSP `android-17.0.0_r1` sources and is
+  untested.
 - `wire::PROP_ERROR_*`: AOSP init's V2 error codes (`READ_CMD`,
   `READ_DATA`, `READ_ONLY_PROPERTY`, `INVALID_NAME`, `INVALID_VALUE`,
   `PERMISSION_DENIED`, `INVALID_CMD`, `HANDLE_CONTROL_MESSAGE`,
@@ -43,14 +47,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `persistent_properties` format (protobuf, written by temp file + fsync
   + rename + directory fsync; loaded after the build.prop files, staged
   `next_boot.` values applied; an unparsable file is deleted, as init
-  does). Records stay in memory and each write serializes that copy, so
+  does, and a group- or world-writable file is skipped and not deleted;
+  init replaces it with a file without records at load).
+  Records stay in memory and each write serializes that copy, so
   a change whose write failed goes into the next one; an exclusive
-  `flock` on `<file>.lock` keeps a second service off the same file;
-  duplicate names are merged at load, keeping the last value.
+  `flock` on `<file>.lock` keeps a second service off the same file and
+  is released with `LOCK_UN` when the service stops, even while a child
+  process that has not yet `exec`ed holds a copy of the fd;
+  duplicate names are merged at load, keeping the last value; a staged
+  `next_boot.<name>` whose `<name>` is neither `persist.` nor
+  `next_boot.` is applied once and not written back (init writes it and
+  then deletes the whole file on its next load). The file is loaded and
+  locked before `property_info` is published, so a missing directory or
+  a held lock fails startup with the properties dir unchanged. After a
+  transient read error at load (`EIO`, `EMFILE`, ...), the first
+  persistent set reads the file again and keeps its records instead of
+  replacing the file with that set alone.
 - Service: values are checked against the `property_contexts` type
-  (init `CheckType`); `ctl.*` sets go to the control handler and are
-  never stored; `ro.property_service.version=2` and
-  `ro.persistent_properties.ready=true` are set at startup.
+  (init `CheckType`) for client sets and persistent records; build.prop
+  entries are not checked (init drops a mismatching entry); `ctl.*` sets
+  go to the control handler and are never stored, with at most 16
+  handler calls running or queued for a blocking thread at once (a
+  request beyond that gets `PROP_ERROR_HANDLE_CONTROL_MESSAGE` without
+  using a blocking thread); `ro.property_service.version=2` and
+  `ro.persistent_properties.ready=true` are set at startup. A command
+  word that cannot be read is answered with `PROP_ERROR_READ_CMD`, and a
+  V2 request is checked after both fields are read, name first, as init
+  does (`INVALID_NAME` wins over an invalid value; an unreadable value is
+  `READ_DATA`).
 
 - `AreaWriterLock` (`builder` feature): the properties directory's writer
   lock (an exclusive `flock` on `<dir>/.writer_lock`) as a value.
@@ -67,8 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   length AOSP init accepts.
 - Service: `StartupError` and `StartupStage`, the error type
   `rsproperties_service::run` now returns (see Changed);
-  `PropertiesServiceArgs::with_writer_lock` and `properties_service::spawn`
-  for code that spawns the actors itself.
+  `PropertiesServiceArgs::with_writer_lock`,
+  `with_persistent_properties_file` and `properties_service::spawn` for
+  code that spawns the actors itself.
 
 ### Changed
 
@@ -367,8 +392,8 @@ Service (`rsproperties-service`, git dependency only):
 - Status replies are sent with `send(MSG_NOSIGNAL)`, so a client that
   closes before reading the reply cannot kill a service built with Rust
   1.77–1.86 in a host process that leaves `SIGPIPE` at its default.
-- A V2 frame that ends inside the name-length field gets a `PROP_ERROR`
-  reply like other malformed frames.
+- A V2 frame that ends inside the name-length field gets a
+  `PROP_ERROR_READ_DATA` reply like other malformed frames.
 - Socket and `property_info` errors name the path they concern.
 - When the socket service fails to start, `run` returns only after the
   properties service has stopped. It returned while that service could
@@ -467,8 +492,12 @@ Service (`rsproperties-service`, git dependency only):
   what happens to a `set` that reaches the socket before the property
   areas exist (the socket service starts together with the properties
   service, as in 0.6.0): it waits and is applied once the areas exist,
-  after the build.prop entries. The socket service closes the connection
-  without a reply after 10 s (up to 20 s when all 64 handler slots are
+  after the build.prop entries and the persistent properties (so an early
+  `persist.*` set replaces the stored value). `ctl.*` sets are not
+  queued: they reach the control handler as soon as they are read, before
+  the areas exist, and are not undone if startup fails. The socket service closes
+  the connection without a reply after 10 s (up to 20 s when all 64
+  handler slots are
   taken); a request already queued then is still applied once the areas
   exist, like one whose client gave up on its own timeout, and one not yet
   queued (mailbox full) is dropped. A `get` in that window that is the
@@ -539,6 +568,17 @@ Service (`rsproperties-service`, git dependency only):
   - a `property_info` context name starting with `.` is skipped with a
     warning (properties of that context fail with `FileValidation`).
     Rename such contexts;
+  - service: a set whose value does not match the name's
+    `property_contexts` type (`int`, `uint`, `double`, `bool`, `size`,
+    `enum …`; init `CheckType`) is rejected with
+    `PROP_ERROR_INVALID_VALUE`, and a persistent record with such a value
+    is skipped at startup with an `error` log line (0.6.0 stored any
+    value). Fix the value, or the type in `property_contexts`;
+  - service: a `ctl.*` set is no longer stored in the area. Without a
+    control handler it gets `PROP_ERROR_HANDLE_CONTROL_MESSAGE` (0.6.0
+    stored it and replied `PROP_SUCCESS`). Pass
+    `ServiceOptions::control_handler` to act on control messages; code
+    that read `ctl.*` values back from the area must use the handler;
   - `load_properties_from_file` skips a prop file whose mode has the
     group- or other-write bit (with a warning; for the root file the call
     returns `Ok(())` with nothing loaded), and fails to open a prop file
@@ -668,12 +708,36 @@ Service (`rsproperties-service`, git dependency only):
     socket temp files are removed), and creates missing
     directories, parents included, with mode 0711 (properties dir) /
     0755 (socket dir) minus the umask's bits (0.6.0: 0777 minus the
-    umask's bits). Scripts that parse the output or rely on a clean
-    directory must change;
+    umask's bits). `examples/example_service` also refuses `ctl.*`
+    requests (`PROP_ERROR_HANDLE_CONTROL_MESSAGE`) and prints one
+    `ctl.<action> "<target>" from pid …: refused` line per request on
+    stdout (0.6.0 stored them and printed nothing). Scripts that parse
+    the output or rely on a clean directory must change;
   - Android: `set` no longer returns `TimedOut` while waiting for init's
     reply; it blocks until init replies or closes the connection, like
     bionic. Code that relied on the 2 s bound must apply its own (e.g.
     call `set` on another thread). Connect and send keep the 2 s bound;
+  - service: startup sets `ro.property_service.version=2` after the
+    build.prop files and `ro.persistent_properties.ready=true` after the
+    persistent properties, as init does (0.6.0 set neither). A client
+    `set` of either now fails with `PROP_ERROR_READ_ONLY_PROPERTY`
+    (`ro.` is write-once); put a different value in a build.prop file,
+    which is applied first. Because the property is now set, a client
+    (0.6.0 or this release) whose global reader is initialized sends V2
+    frames even with `PROPERTY_SERVICE_VERSION=1` (the property takes
+    precedence over the variable) and waits for the 4-byte reply; to
+    keep V1, put `ro.property_service.version=1` in a build.prop file;
+  - the global reader (`rsproperties::system_properties()` /
+    `try_system_properties()`, also behind `rsproperties::get` and the
+    other free functions) created while `BIONIC_APPCOMPAT_OVERRIDE` is
+    set — on Linux always, on Android only when `ro.build.version.sdk` is
+    37 or more — returns the value of `ro.appcompat_override.<name>`, when
+    that property exists, from `get`, `read_with` and `find` (0.6.0 read
+    `<name>`). Unset the variable before the reader is created to read
+    the original values;
+  - examples: `examples/getprop` without arguments prints every property
+    and exits 0 (0.6.0: printed `Listing all properties is not yet
+    implemented.` and exited 1);
   - service: code that spawns `PropertiesService` itself
     (`properties_service::run`, or `rsactor::spawn` with
     `PropertiesServiceArgs::new`) still compiles; the actor now takes the
@@ -686,6 +750,12 @@ Service (`rsproperties-service`, git dependency only):
 - **Changed API**:
   - `rsproperties_service::run` returns `Result<_, StartupError>` (see
     Changed error values);
+  - `rsproperties_service::run(config, contexts, props)` becomes
+    `run(config, options)`: call
+    `run(config, ServiceOptions::new().property_contexts_files(contexts).build_prop_files(props))`;
+  - `SocketServiceArgs` has a new public field `control_handler`, so a
+    struct literal with only `socket_dir` and `properties_service` no
+    longer compiles: add `control_handler: None` (or a handler);
   - `SocketService` has no `Drop` impl; dropping it still unlinks both
     sockets;
   - `PropertyIndex` is 16 bytes (was 8), and only the `SystemProperties`
@@ -804,10 +874,22 @@ Service (`rsproperties-service`, git dependency only):
     passed to a writer created with `new_area` — which worked in 0.6.0
     because both mapped the same files. Call `find` on the instance the
     index is passed to.
+  - service: the reply to a rejected V2 set or an unknown command carries
+    AOSP init's code instead of `PROP_ERROR` (-1): `PROP_ERROR_READ_DATA` (0x8) for a field that
+    cannot be read or a length over the limit, `PROP_ERROR_INVALID_CMD`
+    (0x1B) for an unknown command, `PROP_ERROR_INVALID_NAME` (0x10),
+    `PROP_ERROR_INVALID_VALUE` (0x14), `PROP_ERROR_READ_ONLY_PROPERTY`
+    (0xB) for a second set of an `ro.` property,
+    `PROP_ERROR_HANDLE_CONTROL_MESSAGE` (0x20) for a refused `ctl.*`, and
+    `PROP_ERROR_SET_FAILED` (0x24) for any other storage failure. The
+    client's `Error::ServiceError { code }` carries these values. Code
+    that matched `code: -1` (or `wire::PROP_ERROR`) must match the
+    `wire::PROP_ERROR_*` constants, or match the variant only.
   - service: a V2 frame that ends inside the name-length field gets the
-    4-byte `PROP_ERROR` reply before the connection is closed (0.6.0
-    closed it without a reply). A client that reads the reply after such
-    a frame gets `PROP_ERROR` instead of end-of-file.
+    4-byte `PROP_ERROR_READ_DATA` (0x8) reply before the connection is
+    closed (0.6.0 closed it without a reply). A client that reads the
+    reply after such a frame gets `PROP_ERROR_READ_DATA` instead of
+    end-of-file.
   - service: a failed start unlinks the socket names it created. A client
     that connects after binding `property_service_for_system` failed gets
     `ENOENT` (`Error::Io` of kind `NotFound`) unless an earlier run left

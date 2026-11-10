@@ -14,7 +14,8 @@ use rsproperties::parse::parse_int;
 /// - `string`: anything; `bool`: `true`, `false`, `1`, `0`;
 /// - `int` / `uint`: libbase `ParseInt` / `ParseUint` into 64 bits;
 /// - `double`: libbase `ParseDouble` (`strtod`, whole string, no
-///   overflow or underflow to zero);
+///   overflow, no underflow to zero or to a subnormal, result within
+///   `[lowest(), max()]`, so `inf` fails and `nan` passes);
 /// - `size`: one or more digits followed by exactly one of `g`, `k`, `m`;
 /// - `enum a b c`: one of the listed words;
 /// - any other type, or an empty type string, is invalid.
@@ -45,7 +46,8 @@ pub(crate) fn check_type(type_string: &str, value: &str) -> bool {
 }
 
 /// libbase `ParseDouble` with default bounds: `strtod` must consume the
-/// whole string without `ERANGE`.
+/// whole string without `ERANGE`, and the result must lie in
+/// `[f64::MIN, f64::MAX]`.
 fn parse_double(value: &str) -> bool {
     // `strtod` skips leading whitespace; trailing whitespace fails the
     // whole-string check.
@@ -54,9 +56,15 @@ fn parse_double(value: &str) -> bool {
         return false;
     };
     let unsigned = s.trim_start_matches(['+', '-']).to_ascii_lowercase();
-    let is_literal = unsigned.starts_with("inf") || unsigned.starts_with("nan");
-    // Overflow: `strtod` returns ±HUGE_VAL with ERANGE; Rust rounds to ±inf.
-    if parsed.is_infinite() && !is_literal {
+    // Overflow (ERANGE) and a literal `inf` both fail: libbase bounds the
+    // result to [lowest(), max()]. NaN passes those comparisons.
+    if parsed.is_infinite() {
+        return false;
+    }
+    // ERANGE: bionic's gdtoa `strtod` sets it for a subnormal result too
+    // (the `Avoid_Underflow` `scale` path, which every subnormal result
+    // takes: `libc/upstream-openbsd/lib/libc/gdtoa/strtod.c`).
+    if parsed.is_subnormal() {
         return false;
     }
     // Underflow to zero: ERANGE as well. A zero result from a mantissa
@@ -125,15 +133,25 @@ mod tests {
             " -2e3",
             ".5",
             "5.",
-            "inf",
-            "-Infinity",
             "nan",
             "0",
             "0.0e10",
+            "2.2250738585072014e-308",
         ] {
             assert!(check_type("double", v), "{v}");
         }
-        for v in ["1.5 ", "abc", "1e999", "-1e999", "1e-999", "0x1p3"] {
+        for v in [
+            "1.5 ",
+            "abc",
+            "1e999",
+            "-1e999",
+            "1e-999",
+            "1e-310",
+            "4.9e-324",
+            "0x1p3",
+            "inf",
+            "-Infinity",
+        ] {
             assert!(!check_type("double", v), "{v}");
         }
     }

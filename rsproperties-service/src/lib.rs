@@ -56,7 +56,11 @@ pub struct ControlMessage {
 ///
 /// Runs on tokio's blocking pool (`spawn_blocking`), one call per request,
 /// so it may block, and calls can run concurrently. A panic is reported to
-/// the client as a failure.
+/// the client as a failure. At most 16 calls are running or waiting for a
+/// blocking thread at once: a call that outlasts the client's 10 s
+/// connection timeout still holds its slot until it returns, and a request
+/// that finds all 16 slots taken gets `PROP_ERROR_HANDLE_CONTROL_MESSAGE`
+/// without the handler being called and without using a blocking thread.
 pub type ControlHandler = Arc<dyn Fn(&ControlMessage) -> bool + Send + Sync + 'static>;
 
 /// What [`run`] serves besides the directories in its
@@ -131,14 +135,25 @@ impl ServiceOptions {
     /// - The service takes an exclusive `flock` on `<path>.lock` (mode
     ///   0600) for its lifetime; a second service given the same file
     ///   fails to start (`ErrorKind::WouldBlock`).
-    /// - The records are kept in memory. Every successful set of such a
-    ///   name updates that copy and rewrites the whole file from it before
-    ///   the client is answered: a temp file `<path>.tmp` (mode 0600) is
+    /// - The file is locked and read before `property_info` is published,
+    ///   so either failure above leaves the properties dir unchanged. The
+    ///   records are applied after the build.prop entries.
+    /// - After a transient read error at startup (`EIO`, `EMFILE`, ...),
+    ///   the first persistent set reads the file again and keeps its
+    ///   records; while it still cannot be read, sets are kept in memory
+    ///   and the file is not written.
+    /// - The records are kept in memory. A successful set of such a name
+    ///   updates that copy and, when the value changed or the previous
+    ///   write failed, rewrites the whole file from it before the client
+    ///   is answered: a temp file `<path>.tmp` (mode 0600) is
     ///   fsynced and renamed over `path`, then the directory is fsynced.
     ///   A failed write is logged and the set still succeeds, as in init;
     ///   the change stays in memory and goes into the next write. Do not
     ///   edit the file while the service runs: the next write replaces it.
     /// - A file that does not parse is deleted at startup, as init does.
+    ///   A group- or world-writable file is not loaded, as init's
+    ///   `ReadFile` does; it is not deleted, but the next persistent set
+    ///   replaces it.
     ///   Records with a repeated name are merged, keeping the last value.
     ///
     /// Without this option nothing is stored, and `persist.*` values last
@@ -200,9 +215,15 @@ pub enum StartupStage {
     /// instance on the same properties dir fails here, with
     /// `rsproperties::Error::Lock` as the source.
     WriterLock,
-    /// The properties service failed to start: reading the
-    /// `property_contexts` or build.prop files, publishing `property_info`
-    /// or creating the property areas. The source is a `std::io::Error`.
+    /// The properties service failed to start: loading the persistent
+    /// properties file (its directory is missing: `NotFound`; it is used
+    /// by another service: `WouldBlock`; `<path>.lock` cannot be opened,
+    /// `fchmod`ed or `flock`ed for another reason, such as `EACCES` or
+    /// `ENOLCK`: that errno's kind, with the lock path in the message),
+    /// reading the `property_contexts` or build.prop files, publishing
+    /// `property_info`, or creating the property areas — in that order, so
+    /// a persistent-file failure leaves the properties dir unchanged. The
+    /// source is a `std::io::Error`.
     PropertiesService,
     /// The socket service failed to start (socket dir or socket files).
     /// The source is an `rsproperties::Error`.
@@ -296,12 +317,18 @@ impl std::error::Error for StartupError {
 ///
 /// # Requests that arrive before the property areas exist
 ///
+/// `ctl.*` sets are not queued: they go to the control handler as soon as
+/// they are read, before the areas exist, and are not undone if startup
+/// fails. The rest of this section is about every other set.
+///
 /// The socket service can be accepting connections while the properties
 /// service is still reading its input files and creating the areas, so a
 /// client that does not wait for `run` to return can send a `set` in that
 /// window. Such a request is not rejected: it waits (in the properties
 /// service's mailbox) and is applied once the areas exist, after the
-/// build.prop entries, and only then is the client answered. The socket
+/// build.prop entries and the persistent properties (so an early
+/// `persist.*` set replaces the stored value), and only then is the client
+/// answered. The socket
 /// service closes the connection without a reply after 10 s (up to 20 s
 /// when all 64 handler slots are taken and the connection first waits for
 /// one). A request already queued in the mailbox then is still applied once
@@ -367,8 +394,8 @@ pub async fn run(
     // `property_info`. (Spawning the socket service only after the
     // properties service is ready would also protect the sockets, but
     // would change the 0.6.0 startup order; the lock is enough.)
-    let dir = rsproperties::properties_dir().to_path_buf();
-    let lock = tokio::task::spawn_blocking(move || rsproperties::AreaWriterLock::acquire(&dir))
+    let dir = rsproperties::properties_dir();
+    let lock = tokio::task::spawn_blocking(move || rsproperties::AreaWriterLock::acquire(dir))
         .await
         .map_err(|e| StartupError::new(StartupStage::WriterLock, e))?
         .map_err(|e| StartupError::new(StartupStage::WriterLock, e))?;
@@ -836,6 +863,46 @@ mod tests {
                     "{name} must be unlinked before run returns"
                 );
             }
+        });
+    }
+
+    /// A persistent properties file whose directory is missing fails
+    /// startup before `property_info` or any area is written.
+    #[test]
+    fn missing_persistent_dir_fails_before_properties_dir_changes() {
+        const TEST: &str = "tests::missing_persistent_dir_fails_before_properties_dir_changes";
+        if !is_child(TEST) {
+            run_in_child(TEST);
+            return;
+        }
+        block_on_child(async {
+            let dir = TempDir(socket_test_dir(
+                "rsprops_svc_persist_nodir",
+                socket_suffix_len("sockets"),
+            ));
+            let _ = std::fs::remove_dir_all(&dir.0);
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let socket_dir = dir.0.join("sockets");
+            let config =
+                rsproperties::PropertyConfig::with_both_dirs(dir.0.clone(), socket_dir.clone());
+
+            let result = run(
+                config,
+                ServiceOptions::new().persistent_properties_file(
+                    dir.0.join("missing").join("persistent_properties"),
+                ),
+            )
+            .await;
+            let err = match result {
+                Ok(_) => panic!("run must fail for a missing persistent properties directory"),
+                Err(e) => e,
+            };
+            assert_eq!(err.stage(), StartupStage::PropertiesService, "{err}");
+            assert!(
+                !dir.0.join("property_info").exists(),
+                "property_info must not be published before the persistent file is loaded"
+            );
+            assert!(!dir.0.join("properties_serial").exists());
         });
     }
 }

@@ -1933,4 +1933,54 @@ mod client_parity_tests {
         let on = SystemProperties::new_ro(fx.dir(), true).unwrap();
         assert_eq!(on.get_with_result(&name).unwrap(), "ovr");
     }
+
+    fn foreach_names(sp: &SystemProperties) -> Vec<String> {
+        let mut names = Vec::new();
+        sp.foreach(|idx| {
+            names.push(sp.read_index_with(&idx, |n, _, _| n.to_owned()).unwrap());
+        })
+        .unwrap();
+        names
+    }
+
+    /// bionic `CheckAccessAndOpen`: an area `foreach` was denied is not
+    /// tried again by that instance, while name lookups still open it.
+    #[test]
+    fn foreach_does_not_retry_a_denied_area() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return; // root opens a 0000 file; nothing to observe
+        }
+        let mut fx = Fixture::new("foreach_denied");
+        fx.sp.add("debug.denied.a", "1").unwrap();
+        let area = fx.dir().join("u:object_r:debug_prop:s0");
+        let mode = std::fs::metadata(&area).unwrap().permissions().mode();
+        let reader = SystemProperties::new_ro(fx.dir(), false).unwrap();
+
+        std::fs::set_permissions(&area, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(!foreach_names(&reader).contains(&"debug.denied.a".to_owned()));
+        std::fs::set_permissions(&area, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        assert!(
+            !foreach_names(&reader).contains(&"debug.denied.a".to_owned()),
+            "a denied area is not tried again by foreach"
+        );
+        assert_eq!(reader.get_with_result("debug.denied.a").unwrap(), "1");
+    }
+
+    /// A missing area file is not recorded: `foreach` finds the area once
+    /// the file exists (the service can create it after a reader started).
+    #[test]
+    fn foreach_retries_a_missing_area() {
+        let mut fx = Fixture::new("foreach_missing");
+        fx.sp.add("debug.missing.a", "1").unwrap();
+        let area = fx.dir().join("u:object_r:debug_prop:s0");
+        let parked = fx.dir().join("parked_area");
+        let reader = SystemProperties::new_ro(fx.dir(), false).unwrap();
+
+        std::fs::rename(&area, &parked).unwrap();
+        assert!(!foreach_names(&reader).contains(&"debug.missing.a".to_owned()));
+        std::fs::rename(&parked, &area).unwrap();
+        assert!(foreach_names(&reader).contains(&"debug.missing.a".to_owned()));
+    }
 }

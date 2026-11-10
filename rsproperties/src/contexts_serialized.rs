@@ -659,8 +659,11 @@ impl ContextsSerialized {
         let Some(Some(node)) = self.context_nodes.get(context_index as usize) else {
             return Ok(None);
         };
-        let guard = match node.property_area() {
-            Ok(guard) => guard,
+        // A denied area is tried once per instance, like bionic
+        // (`ContextNode::property_area_for_foreach`).
+        let guard = match node.property_area_for_foreach() {
+            Ok(Some(guard)) => guard,
+            Ok(None) => return Ok(None),
             Err(e) => {
                 debug!("foreach: skipping context {context_index}: {e}");
                 return Ok(None);

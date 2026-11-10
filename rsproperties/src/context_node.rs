@@ -3,6 +3,7 @@
 
 use std::ffi::CString;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "builder")]
 use std::sync::RwLockWriteGuard;
 use std::sync::{RwLock, RwLockReadGuard};
@@ -28,6 +29,9 @@ pub(crate) struct ContextNode {
     /// invariant is enforced by keeping the field private and only
     /// exposing it through this module's API.
     property_area: RwLock<Option<PropertyAreaMap>>,
+    /// `foreach` was denied opening this area; it does not try again. See
+    /// [`Self::property_area_for_foreach`].
+    foreach_no_access: AtomicBool,
 }
 
 impl ContextNode {
@@ -37,6 +41,31 @@ impl ContextNode {
             context,
             filename,
             property_area: RwLock::new(None),
+            foreach_no_access: AtomicBool::new(false),
+        }
+    }
+
+    /// [`Self::property_area`] for `foreach`, which bionic lets try an
+    /// area once: `ContextNode::CheckAccessAndOpen` records a failure in
+    /// `no_access_` and `ContextsSerialized::ForEach` skips the area from
+    /// then on (name lookups keep retrying, for the SELinux audit of each
+    /// access). `Ok(None)` means skipped.
+    ///
+    /// Only a permission error (`EACCES`, `EPERM`) is recorded: on Linux
+    /// this crate's service can create an area file after a reader started,
+    /// and recording a missing file would hide that area from every later
+    /// `foreach` of this instance.
+    pub(crate) fn property_area_for_foreach(&self) -> Result<Option<PropertyAreaGuard<'_>>> {
+        if self.foreach_no_access.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        match self.property_area() {
+            Ok(guard) => Ok(Some(guard)),
+            Err(e) if is_access_denied(&e) => {
+                self.foreach_no_access.store(true, Ordering::Relaxed);
+                Err(e)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -147,6 +176,22 @@ impl ContextNode {
             )));
         }
         Ok(PropertyAreaMutGuard::from_initialized(guard))
+    }
+}
+
+/// Whether opening an area failed with `EACCES` or `EPERM`, looking
+/// through `Error::Context` wrappers (`PropertyAreaMap::new_ro` adds one).
+fn is_access_denied(e: &Error) -> bool {
+    match e {
+        Error::Context { source, .. } => is_access_denied(source),
+        Error::Io(io) => matches!(
+            rustix::io::Errno::from_io_error(io),
+            Some(rustix::io::Errno::ACCESS | rustix::io::Errno::PERM)
+        ),
+        Error::Errno(errno) => {
+            matches!(*errno, rustix::io::Errno::ACCESS | rustix::io::Errno::PERM)
+        }
+        _ => false,
     }
 }
 

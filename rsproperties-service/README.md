@@ -205,15 +205,27 @@ The socket service implements the Android property service protocol:
 - **Socket Names**: Uses standard Android socket names (`property_service`, `property_service_for_system`)
 - **Commands**: Supports `PROP_MSG_SETPROP2` (0x00020001) and the legacy V1 `PROP_MSG_SETPROP` (1), which gets no reply (AOSP V1 behavior)
 - **Response Codes**: `PROP_SUCCESS` (0) or init's error codes
-  (`rsproperties::wire::PROP_ERROR_*`): `READ_DATA` for an unreadable
-  frame, `INVALID_CMD`, `INVALID_NAME`, `INVALID_VALUE` (too long, not
-  UTF-8, or not matching the `property_contexts` type), `READ_ONLY_PROPERTY`,
-  `HANDLE_CONTROL_MESSAGE` (`ctl.*` refused or failed), `SET_FAILED`
+  (`rsproperties::wire::PROP_ERROR_*`): `READ_CMD` when the command word
+  cannot be read, `READ_DATA` for an unreadable
+  frame or a name/value length over the wire caps (see Size limits),
+  `INVALID_CMD`, `INVALID_NAME`, `INVALID_VALUE` (`PROP_VALUE_MAX` bytes
+  or more for a non-`ro.` name, an interior NUL, not UTF-8, or not
+  matching the `property_contexts` type),
+  `READ_ONLY_PROPERTY`,
+  `HANDLE_CONTROL_MESSAGE` (`ctl.*` refused or failed), `SET_FAILED`.
+  Both V2 fields are read before either is checked, and the name is
+  checked first, as in init
+- **Not mirrored**: `sys.powerctl` and `selinux.restorecon_recursive` are
+  stored like any property; init does not store `sys.powerctl`, answers
+  `reboot,userspace` with `INVALID_VALUE`, and runs a restorecon for the
+  latter instead of storing it
 - **Type check**: values are checked against the `property_contexts` type
   (`bool`, `int`, `uint`, `double`, `size`, `enum ...`) as init's
   `CheckType` does; an empty value is always accepted
 - **`ctl.*`**: never stored; passed to `ServiceOptions::control_handler`,
-  or refused without one
+  or refused without one. At most 16 handler calls are running or
+  waiting for a blocking thread at once; a request beyond that gets
+  `HANDLE_CONTROL_MESSAGE` without using a blocking thread
 - **Startup properties**: `ro.property_service.version=2`, the persistent
   properties, then `ro.persistent_properties.ready=true`, after the
   build.prop entries
@@ -307,7 +319,9 @@ socket_dir/
   may have been applied (a `TimedOut` while connecting or sending means
   the request was not delivered). Retrying with the same value is
   harmless except for `ro.*`, where the retry gets `ServiceError` if the
-  first attempt was applied.
+  first attempt was applied, and `ctl.*`, whose handler runs once per
+  request (a handler call outlives the client's `TimedOut`, so a retry
+  can run the action twice).
 - **`accept()` back-off**: a 100 ms sleep is inserted after an `accept()`
   error so an `EMFILE`/`ENFILE` storm cannot spin the worker and flood
   the log.
@@ -334,7 +348,7 @@ are *transport* caps; the actual property-system policy is stricter
 and enforced after the bytes arrive:
 
 - **Names**: `validate_property_name` — ASCII alphanumeric plus
-  `_ . - @ :`, no leading `.`; at most 31 bytes
+  `_ . - @ :`, no leading or trailing `.`, no `..`; at most 31 bytes
   (`PROP_NAME_MAX - 1`, the 32-byte buffer includes the NUL) on the V1
   wire path.
 - **Values**: `validate_value_len` — `PROP_VALUE_MAX = 92` is the
@@ -347,7 +361,8 @@ and enforced after the bytes arrive:
 - **Access control**: the socket file mode (`0o660`) plus the socket
   dir's permissions are the only access control. Any peer that can
   connect may set any non-`ro.` property, and any `ro.` property that
-  has no value yet (the first writer fixes it).
+  has no value yet (the first writer fixes it), and send any `ctl.*`
+  control message to the configured control handler.
 - **Socket dir contract**: the service opens the socket dir once at
   startup and changes only entries directly in it named
   `property_service`, `property_service_for_system`, or
@@ -368,8 +383,9 @@ and enforced after the bytes arrive:
   fails (`StartupStage::WriterLock`) without touching `property_info` or
   the sockets. Run one instance per socket dir: two instances with
   different properties dirs must not share a socket dir.
-- **property_contexts**: only maps property names to areas/contexts; no
-  per-property (SELinux or `SO_PEERCRED`) authorization is performed.
+- **property_contexts**: maps property names to contexts and types
+  (values are type-checked); no per-property (SELinux or `SO_PEERCRED`)
+  authorization is performed.
 - **Permission handling**: respects file system permissions
 
 ## Logging

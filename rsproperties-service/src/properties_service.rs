@@ -173,17 +173,22 @@ fn init_system_properties_sync(
 /// properties (`load_persist_props`, each through the same checks as a
 /// client set, without writing the file back), then
 /// `ro.persistent_properties.ready`. A failed set is logged and skipped,
-/// as init's `InitPropertySet` does. Fails only when the persistent
-/// properties file's directory does not exist.
+/// as init's `InitPropertySet` does.
+///
+/// `store` is loaded by the caller before `property_info` is published
+/// ([`PersistentStore::load`]), so a missing directory or a lock held by
+/// another service fails startup before the properties dir is changed.
 fn apply_startup_properties(
     system_properties: &mut SystemProperties,
-    persistent_properties_file: Option<&Path>,
-) -> std::io::Result<Option<PersistentStore>> {
+    store: Option<PersistentStore>,
+) -> Option<PersistentStore> {
     init_set(system_properties, "ro.property_service.version", "2");
-    let store = match persistent_properties_file {
-        Some(path) => {
-            let store = PersistentStore::load(path)?;
-            for (name, value) in store.records() {
+    let store = match store {
+        Some(mut store) => {
+            // Staged values for non-persistent names come last, where init
+            // appends the staged records it has not matched.
+            let unpersisted = store.take_unpersisted();
+            for (name, value) in store.records().iter().chain(&unpersisted) {
                 match (std::str::from_utf8(name), std::str::from_utf8(value)) {
                     (Ok(name), Ok(value)) => init_set(system_properties, name, value),
                     // init rejects such a value in `IsLegalPropertyValue`;
@@ -195,15 +200,16 @@ fn apply_startup_properties(
                 }
             }
             log::info!(
-                "Loaded {} persistent properties from {path:?}",
-                store.records().len()
+                "Loaded {} persistent properties from {:?}",
+                store.records().len(),
+                store.path()
             );
             Some(store)
         }
         None => None,
     };
     init_set(system_properties, "ro.persistent_properties.ready", "true");
-    Ok(store)
+    store
 }
 
 /// init `InitPropertySet`: [`apply_set`], logging a failure.
@@ -284,26 +290,31 @@ impl Actor for PropertiesService {
         args: Self::Args,
         _actor_ref: &rsactor::ActorRef<Self>,
     ) -> std::result::Result<Self, Self::Error> {
-        let dir = rsproperties::properties_dir().to_path_buf();
+        let dir = rsproperties::properties_dir();
         // Filesystem + mmap + trie build all block. Run them on a blocking
         // task so the tokio worker that polls this actor is free to drive
         // other tasks (notably the sibling SocketService) while
         // initialisation runs.
         let (system_properties, persistent) = tokio::task::spawn_blocking(move || {
+            // Before `property_info` and the areas are written: a missing
+            // directory or another service's lock must fail startup while
+            // the properties dir is still as it was.
+            let persistent = args
+                .persistent_properties_file
+                .as_deref()
+                .map(PersistentStore::load)
+                .transpose()?;
             let mut system_properties = init_system_properties_sync(
                 args.property_contexts_files,
                 args.build_prop_files,
-                &dir,
+                dir,
                 args.writer_lock,
             )?;
-            let persistent = apply_startup_properties(
-                &mut system_properties,
-                args.persistent_properties_file.as_deref(),
-            )?;
+            let persistent = apply_startup_properties(&mut system_properties, persistent);
             Ok::<_, std::io::Error>((system_properties, persistent))
         })
         .await
-        .map_err(|e| std::io::Error::other(format!("init join failed: {e}")))??;
+        .map_err(io_other)??;
 
         Ok(PropertiesService {
             system_properties,
@@ -348,37 +359,61 @@ impl rsactor::Message<crate::PropertyMessage> for PropertiesService {
         _actor_ref: &ActorRef<Self>,
     ) -> Self::Reply {
         log::debug!("Handling property message: {message:?}");
-        self.client_set(&message.name, &message.value).await
+        self.client_set(&message.name, message.value).await
     }
 }
 
 impl PropertiesService {
     /// One set from a client: [`apply_set`], then the persistent file.
-    async fn client_set(&mut self, name: &str, value: &str) -> i32 {
-        let code = apply_set(&mut self.system_properties, name, value);
+    async fn client_set(&mut self, name: &str, value: String) -> i32 {
+        let code = apply_set(&mut self.system_properties, name, &value);
         if code != PROP_SUCCESS || !is_persistent_name(name) {
             return code;
         }
         // init `PropertySet`: a client set of a `persist.` / `next_boot.`
-        // name is written to the file before the reply. The write runs on
+        // name is written to the file before the reply. init writes only
+        // V2 sets (`socket &&`); V1 sets come here too and are written as
+        // well (docs/aosp-parity.md S1). The write runs on
         // the blocking pool; awaiting it keeps this actor's sets, and so
         // the file writes, in order.
         let Some(store) = self.persistent.as_mut() else {
             return code;
         };
+        if store.reload_pending() {
+            let path = store.shared_path();
+            match tokio::task::spawn_blocking(move || {
+                crate::persistent_properties::read_file(&path)
+            })
+            .await
+            {
+                Ok(result) => store.finish_reload(result),
+                Err(e) => log::error!("Persistent property read task failed: {e}"),
+            }
+        }
         if let Some(bytes) = store.update(name, value) {
-            let path = store.path().to_path_buf();
+            if store.reload_pending() {
+                // The file still could not be read: writing now would
+                // replace records this run never saw. The set is kept in
+                // memory and written with a later one.
+                store.set_synced(false);
+                return code;
+            }
+            let path = store.shared_path();
             match tokio::task::spawn_blocking(move || {
                 crate::persistent_properties::write_file(&path, &bytes).map_err(|e| (path, e))
             })
             .await
             {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => store.set_synced(true),
                 // Logged, and the set still succeeds — init does the same.
                 Ok(Err((path, e))) => {
-                    log::error!("Could not store persistent property {name:?} in {path:?}: {e}")
+                    log::error!("Could not store persistent property {name:?} in {path:?}: {e}");
+                    store.set_synced(false);
                 }
-                Err(e) => log::error!("Persistent property write task failed: {e}"),
+                Err(e) => {
+                    log::error!("Persistent property write task failed: {e}");
+                    store.set_synced(false);
+                }
             }
         }
         code
@@ -593,6 +628,16 @@ mod tests {
         assert!(!other.join("property_info").exists());
     }
 
+    /// `on_start`'s persistent steps: load the store at `path` (if any),
+    /// then apply the startup properties.
+    fn startup_at(
+        sp: &mut SystemProperties,
+        path: Option<&Path>,
+    ) -> std::io::Result<Option<PersistentStore>> {
+        let store = path.map(PersistentStore::load).transpose()?;
+        Ok(apply_startup_properties(sp, store))
+    }
+
     /// A properties dir whose `property_contexts` gives some names a type.
     fn typed_properties(tmp: &TempDir) -> SystemProperties {
         let contexts = tmp.0.join("typed_property_contexts");
@@ -643,7 +688,7 @@ mod tests {
     fn startup_sets_version_and_ready_without_persistence() {
         let tmp = TempDir::new("rsprops_svc_startup_plain");
         let mut sp = typed_properties(&tmp);
-        assert!(apply_startup_properties(&mut sp, None).unwrap().is_none());
+        assert!(startup_at(&mut sp, None).unwrap().is_none());
         assert_eq!(
             sp.get_with_result("ro.property_service.version").unwrap(),
             "2"
@@ -675,9 +720,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = apply_startup_properties(&mut sp, Some(&path))
-            .unwrap()
-            .expect("store");
+        let store = startup_at(&mut sp, Some(&path)).unwrap().expect("store");
         assert_eq!(sp.get_with_result("persist.a").unwrap(), "1");
         assert_eq!(sp.get_with_result("persist.b").unwrap(), "new");
         assert!(
@@ -696,12 +739,42 @@ mod tests {
         assert!(!on_disk.iter().any(|(n, _)| n.starts_with(b"next_boot.")));
     }
 
+    /// A staged record whose target is not a persistent name is applied
+    /// once and not written back, so the next start still loads the file
+    /// instead of deleting it.
+    #[test]
+    fn staged_non_persistent_target_does_not_delete_file() {
+        use crate::persistent_properties::{decode, encode, write_file};
+        let tmp = TempDir::new("rsprops_svc_startup_staged_foreign");
+        let path = tmp.0.join("persistent_properties");
+        let rec = |n: &str, v: &str| (n.as_bytes().to_vec(), v.as_bytes().to_vec());
+        write_file(
+            &path,
+            &encode(&[rec("persist.a", "1"), rec("next_boot.debug.s", "v")]),
+        )
+        .unwrap();
+
+        let mut sp = typed_properties(&tmp);
+        drop(startup_at(&mut sp, Some(&path)).unwrap());
+        assert_eq!(sp.get_with_result("debug.s").unwrap(), "v");
+        assert_eq!(
+            decode(&std::fs::read(&path).unwrap()).unwrap(),
+            vec![rec("persist.a", "1")]
+        );
+
+        let tmp2 = TempDir::new("rsprops_svc_startup_staged_foreign_2");
+        let mut sp = typed_properties(&tmp2);
+        startup_at(&mut sp, Some(&path)).unwrap();
+        assert_eq!(sp.get_with_result("persist.a").unwrap(), "1");
+        assert!(sp.find("debug.s").unwrap().is_none());
+    }
+
     #[test]
     fn startup_fails_when_persistent_dir_is_missing() {
         let tmp = TempDir::new("rsprops_svc_startup_nodir");
         let mut sp = typed_properties(&tmp);
         let path = tmp.0.join("missing").join("persistent_properties");
-        assert!(apply_startup_properties(&mut sp, Some(&path)).is_err());
+        assert!(startup_at(&mut sp, Some(&path)).is_err());
     }
 
     /// A successful client set of a `persist.` / `next_boot.` name rewrites
@@ -712,7 +785,7 @@ mod tests {
         let tmp = TempDir::new("rsprops_svc_client_persist");
         let mut sp = typed_properties(&tmp);
         let path = tmp.0.join("persistent_properties");
-        let persistent = apply_startup_properties(&mut sp, Some(&path)).unwrap();
+        let persistent = startup_at(&mut sp, Some(&path)).unwrap();
         let mut service = PropertiesService {
             system_properties: sp,
             persistent,
@@ -720,16 +793,25 @@ mod tests {
         let on_disk = || decode(&std::fs::read(&path).unwrap_or_default()).unwrap();
         let rec = |n: &str, v: &str| (n.as_bytes().to_vec(), v.as_bytes().to_vec());
 
-        assert_eq!(service.client_set("persist.x", "1").await, PROP_SUCCESS);
-        assert_eq!(on_disk(), vec![rec("persist.x", "1")]);
-        assert_eq!(service.client_set("debug.y", "1").await, PROP_SUCCESS);
         assert_eq!(
-            service.client_set("persist.int", "bad").await,
+            service.client_set("persist.x", "1".into()).await,
+            PROP_SUCCESS
+        );
+        assert_eq!(on_disk(), vec![rec("persist.x", "1")]);
+        assert_eq!(
+            service.client_set("debug.y", "1".into()).await,
+            PROP_SUCCESS
+        );
+        assert_eq!(
+            service.client_set("persist.int", "bad".into()).await,
             PROP_ERROR_INVALID_VALUE
         );
-        assert_eq!(service.client_set("persist.x", "2").await, PROP_SUCCESS);
         assert_eq!(
-            service.client_set("next_boot.persist.z", "9").await,
+            service.client_set("persist.x", "2".into()).await,
+            PROP_SUCCESS
+        );
+        assert_eq!(
+            service.client_set("next_boot.persist.z", "9".into()).await,
             PROP_SUCCESS
         );
         assert_eq!(
@@ -741,12 +823,52 @@ mod tests {
         drop(service);
         let tmp2 = TempDir::new("rsprops_svc_client_persist_restart");
         let mut sp = typed_properties(&tmp2);
-        apply_startup_properties(&mut sp, Some(&path)).unwrap();
+        startup_at(&mut sp, Some(&path)).unwrap();
         assert_eq!(sp.get_with_result("persist.x").unwrap(), "2");
         assert_eq!(sp.get_with_result("persist.z").unwrap(), "9");
         assert_eq!(
             on_disk(),
             vec![rec("persist.x", "2"), rec("persist.z", "9")]
+        );
+    }
+
+    /// After `load` hit a transient read error, the first persistent set
+    /// reads the file again and keeps its records instead of replacing the
+    /// file with this run's set alone.
+    #[tokio::test]
+    async fn first_set_after_transient_load_failure_keeps_file_records() {
+        use crate::persistent_properties::{decode, encode, write_file};
+        let tmp = TempDir::new("rsprops_svc_reload");
+        let mut sp = typed_properties(&tmp);
+        let path = tmp.0.join("persistent_properties");
+        let rec = |n: &str, v: &str| (n.as_bytes().to_vec(), v.as_bytes().to_vec());
+        write_file(
+            &path,
+            &encode(&[rec("persist.a", "1"), rec("persist.b", "2")]),
+        )
+        .unwrap();
+        let mut store = startup_at(&mut sp, Some(&path)).unwrap().unwrap();
+        store.assume_transient_load_failure();
+        let mut service = PropertiesService {
+            system_properties: sp,
+            persistent: Some(store),
+        };
+
+        assert_eq!(
+            service.client_set("persist.b", "new".into()).await,
+            PROP_SUCCESS
+        );
+        assert_eq!(
+            service.client_set("persist.c", "3".into()).await,
+            PROP_SUCCESS
+        );
+        assert_eq!(
+            decode(&std::fs::read(&path).unwrap()).unwrap(),
+            vec![
+                rec("persist.a", "1"),
+                rec("persist.b", "new"),
+                rec("persist.c", "3")
+            ]
         );
     }
 }

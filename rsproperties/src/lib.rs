@@ -402,7 +402,7 @@ pub fn try_init(config: PropertyConfig) -> Result<()> {
     }
 
     if let Some(socket_dir) = config.socket_dir {
-        if !system_property_set::set_socket_dir(&socket_dir) {
+        if !system_property_set::set_socket_dir(socket_dir) {
             // Unreachable while every committer honors `GLOBAL_DIRS_LOCK`
             // (pre-check and set are atomic under the guard above); kept as
             // defense in depth because a `OnceLock` cannot be un-set.
@@ -410,7 +410,12 @@ pub fn try_init(config: PropertyConfig) -> Result<()> {
                 "socket directory (race after pre-check)".into(),
             ));
         }
-        log::info!("Successfully set socket directory to: {socket_dir:?}");
+        // The `set` above succeeded, so this takes `socket_dir`'s lock-free
+        // fast path and does not re-take `GLOBAL_DIRS_LOCK`.
+        log::info!(
+            "Successfully set socket directory to: {:?}",
+            system_property_set::socket_dir()
+        );
     }
     Ok(())
 }

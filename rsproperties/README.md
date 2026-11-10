@@ -9,6 +9,8 @@ A pure Rust implementation of Android's property system, providing cross-platfor
 ## Supported Android Versions
 
 This library supports Android versions from Android 9 (API level 28) to Android 16 (API level 36).
+Android 17 (API level 37) is outside that range: its appcompat-override lookup is implemented from
+the AOSP `android-17.0.0_r1` sources and has not been tested on a device or emulator.
 
 ## Features
 
@@ -343,7 +345,9 @@ rsproperties::init(PropertyConfig::with_properties_dir("/my/props"));
 
 On Android API 37+, a process started with `BIONIC_APPCOMPAT_OVERRIDE`
 in its environment (zygote sets it) reads `ro.appcompat_override.<name>`
-first, like bionic; see `SystemProperties::read_with`.
+first, like bionic; see `SystemProperties::read_with`. This follows the
+AOSP `android-17.0.0_r1` sources and is untested (API 37 is outside the
+supported range).
 
 ### Wire-protocol constants & validators (`rsproperties::wire`)
 
