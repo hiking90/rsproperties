@@ -148,6 +148,7 @@ impl PropertyConfigBuilder {
 }
 
 pub mod errors;
+pub mod parse;
 pub mod wire;
 pub use errors::{ContextWithLocation, Error, Result};
 
@@ -401,7 +402,7 @@ pub fn try_init(config: PropertyConfig) -> Result<()> {
     }
 
     if let Some(socket_dir) = config.socket_dir {
-        if !system_property_set::set_socket_dir(&socket_dir) {
+        if !system_property_set::set_socket_dir(socket_dir) {
             // Unreachable while every committer honors `GLOBAL_DIRS_LOCK`
             // (pre-check and set are atomic under the guard above); kept as
             // defense in depth because a `OnceLock` cannot be un-set.
@@ -409,7 +410,12 @@ pub fn try_init(config: PropertyConfig) -> Result<()> {
                 "socket directory (race after pre-check)".into(),
             ));
         }
-        log::info!("Successfully set socket directory to: {socket_dir:?}");
+        // The `set` above succeeded, so this takes `socket_dir`'s lock-free
+        // fast path and does not re-take `GLOBAL_DIRS_LOCK`.
+        log::info!(
+            "Successfully set socket directory to: {:?}",
+            system_property_set::socket_dir()
+        );
     }
     Ok(())
 }
@@ -528,9 +534,10 @@ pub(crate) fn bionic_align(value: usize, alignment: usize) -> usize {
 /// re-enter this crate's property API from it — every ordinary `FromStr`
 /// (ints, floats, `String`) is fine.
 ///
-/// This crate has no counterpart of AOSP's `GetBoolProperty` (which accepts
-/// `1`/`y`/`yes`/`on`/`true` and `0`/`n`/`no`/`off`/`false`); parse such
-/// values yourself.
+/// The parse is Rust's `FromStr`, not AOSP libbase's: `" 5"` and `"0x10"`
+/// fail for integers, and `bool` accepts only `true`/`false`. To read a
+/// value the way `android::base::GetBoolProperty` / `GetIntProperty` do,
+/// use [`get_bool_or`] / [`get_int_or`] or the parsers in [`parse`].
 ///
 /// # Examples
 /// ```rust,no_run
@@ -643,6 +650,47 @@ where
         Ok(Ok(v)) => v,
         _ => default(),
     }
+}
+
+/// Reads a boolean property the way AOSP libbase `GetBoolProperty` does:
+/// [`parse::parse_bool`] on the value (`1`/`y`/`yes`/`on`/`true`,
+/// `0`/`n`/`no`/`off`/`false`), and `default` for any other value, an
+/// empty or missing property, or a failed read — the same fallback
+/// conditions as [`get_or_else`].
+///
+/// ```rust,no_run
+/// let debuggable = rsproperties::get_bool_or("ro.debuggable", false);
+/// ```
+pub fn get_bool_or(name: &str, default: bool) -> bool {
+    let Ok(props) = try_system_properties() else {
+        return default;
+    };
+    props
+        .read_with(name, parse::parse_bool)
+        .ok()
+        .flatten()
+        .unwrap_or(default)
+}
+
+/// Reads an integer property the way AOSP libbase `GetIntProperty`
+/// (signed `T`) / `GetUintProperty` (unsigned `T`) do without range
+/// arguments: [`parse::parse_int`] on the value (leading whitespace
+/// skipped, `0x` for hexadecimal, no trailing characters), and `default`
+/// for a value that does not parse or is outside `T`, an empty or missing
+/// property, or a failed read.
+///
+/// ```rust,no_run
+/// let sdk: i32 = rsproperties::get_int_or("ro.build.version.sdk", 0);
+/// ```
+pub fn get_int_or<T: parse::Integer>(name: &str, default: T) -> T {
+    let Ok(props) = try_system_properties() else {
+        return default;
+    };
+    props
+        .read_with(name, parse::parse_int::<T>)
+        .ok()
+        .flatten()
+        .unwrap_or(default)
 }
 
 /// Set a value of the property with any Display type.

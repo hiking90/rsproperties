@@ -31,7 +31,7 @@ async fn inti() -> (
 
     let config = PropertyConfig::with_both_dirs(properties_dir, socket_dir);
 
-    rsproperties_service::run(config, vec![], vec![])
+    rsproperties_service::run(config, rsproperties_service::ServiceOptions::new())
         .await
         .expect("Failed to start services")
 }

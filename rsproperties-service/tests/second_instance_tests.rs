@@ -95,7 +95,9 @@ async fn second_instance() {
         common::TEST_PROPERTIES_DIR,
         Path::new(common::TEST_PROPERTIES_DIR).join("sockets"),
     );
-    let err = match rsproperties_service::run(config, vec![], vec![]).await {
+    let err = match rsproperties_service::run(config, rsproperties_service::ServiceOptions::new())
+        .await
+    {
         Ok(_) => panic!("a second instance on the same properties dir must fail"),
         Err(e) => e,
     };

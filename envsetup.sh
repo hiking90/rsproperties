@@ -19,49 +19,71 @@ if ! echo "$PATH" | grep -q -E "(^|:)$ANDROID_HOME/tools(:|$)"; then
     export PATH=$PATH:$ANDROID_HOME/tools:$ANDROID_HOME/tools/bin:$ANDROID_HOME/platform-tools
 fi
 
+# Every function below returns non-zero on the first failure, so a caller
+# can chain them with `&&` and a CI step fails even where bash's `-e` is
+# off (inside a function called from an `&&` list).
+
+# The examples ndk_sync pushes and ndk_run_tests smoke-tests.
+NDK_EXAMPLES="getprop setprop"
+
+# The test binaries of the last ndk_build, one host path per line.
+function ndk_test_manifest() {
+    echo "$source_directory/android-tests.txt"
+}
+
 function ndk_build() {
-    read_remote_android
-
-    # Build the main project first with --release and without tests
-    # Explicitly specify no features to ensure builder is not enabled
-    if cargo ndk -t $cargo_ndk_target build --no-default-features -p rsproperties && cargo ndk -t $cargo_ndk_target -- test --no-run -p rsproperties; then
-        echo "Main build successful, building examples..."
-
-        # Build examples from rsproperties package without builder feature
-        echo "Building rsproperties examples..."
-        cargo ndk -t $cargo_ndk_target build --examples -p rsproperties
-
-        echo "All builds completed successfully!"
-    else
-        echo "Main build failed, skipping examples build."
+    read_remote_android || return 1
+    if ! command -v jq >/dev/null; then
+        echo "Error: jq is required to list the test binaries."
         return 1
     fi
+
+    # No features: the Android client is built without `builder`.
+    echo "Building rsproperties..."
+    cargo ndk -t "$cargo_ndk_target" build --no-default-features -p rsproperties || return 1
+    echo "Building rsproperties examples..."
+    cargo ndk -t "$cargo_ndk_target" build --examples -p rsproperties || return 1
+
+    # The test binaries come from cargo's own artifact list, not from a
+    # search of the target directory: ndk_sync pushes exactly these and
+    # ndk_run_tests runs exactly these, so a binary that does not reach
+    # the device fails the run instead of being skipped.
+    echo "Building rsproperties tests..."
+    local manifest json
+    manifest=$(ndk_test_manifest)
+    json=$(cargo ndk -t "$cargo_ndk_target" -- test --no-run -p rsproperties --message-format=json) || return 1
+    printf '%s\n' "$json" \
+        | jq -R -r 'fromjson? | select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' \
+        >"$manifest" || return 1
+    if [ ! -s "$manifest" ]; then
+        echo "Error: cargo reported no test binaries."
+        return 1
+    fi
+    echo "Test binaries ($(wc -l <"$manifest")):"
+    sed 's|.*/|  |' "$manifest"
 }
 
 function ndk_sync() {
-    read_remote_android
+    read_remote_android || return 1
 
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        # macOS - use BSD find syntax with +111 for executable files
-        find_command="find \"$source_directory\" -maxdepth 2 -type f -perm +111"
-    else
-        # Linux - use GNU find syntax
-        find_command="find \"$source_directory\" -maxdepth 2 -type f -executable"
+    local manifest file name
+    manifest=$(ndk_test_manifest)
+    if [ ! -s "$manifest" ]; then
+        echo "Error: $manifest is missing; run 'ndk_build' first."
+        return 1
     fi
 
     echo "Syncing files from: $source_directory"
     echo "To remote directory: $remote_directory"
-
-    if [ ! -d "$source_directory" ]; then
-        echo "Error: Source directory does not exist: $source_directory"
-        echo "Please run 'ndk_build' first to build the project."
-        return 1
-    fi
-
-    eval $find_command | while read file; do
-        echo "Pushing: $(basename "$file")"
-        adb push "$file" "$remote_directory/"
+    for name in $NDK_EXAMPLES; do
+        file="$source_directory/examples/$name"
+        echo "Pushing: $name"
+        adb push "$file" "$remote_directory/" || { echo "Error: failed to push $file"; return 1; }
     done
+    while IFS= read -r file; do
+        echo "Pushing: $(basename "$file")"
+        adb push "$file" "$remote_directory/" || { echo "Error: failed to push $file"; return 1; }
+    done <"$manifest"
 }
 
 function read_remote_android() {
@@ -77,8 +99,10 @@ function read_remote_android() {
         echo "Example:"
         echo "arm64-v8a"
         echo "aarch64"
-        echo "/data/rsproperties"
-        exit 1
+        echo "/data/local/tmp/rsproperties"
+        # `return`, not `exit`: this file is sourced, and `exit` would end
+        # the caller's shell.
+        return 1
     fi
 
     {
@@ -91,16 +115,21 @@ function read_remote_android() {
 }
 
 function ndk_prepare() {
-    read_remote_android
+    read_remote_android || return 1
 
-    adb root
+    adb root || return 1
+    adb wait-for-device || return 1
     if adb shell ls $remote_directory 1>/dev/null 2>&1; then
         echo "Directory already exists: $remote_directory"
     else
         echo "Directory does not exist, creating: $remote_directory"
-        adb shell mkdir -p $remote_directory
+        adb shell mkdir -p $remote_directory || return 1
     fi
-    adb shell "rm -rf $remote_directory/*"
+    adb shell "rm -rf $remote_directory/*" || return 1
+    # ndk_test_shell runs from here as the shell user. The pushed files
+    # keep their host mode (0755 from cargo); the directory, if root made
+    # it, needs the bits for the shell user to reach them.
+    adb shell "chmod 755 $remote_directory" || return 1
 }
 
 function version_update() {
@@ -142,8 +171,10 @@ function update_cargo_lock() {
     fi
 }
 
+# Pushes the test data, then runs the smoke test and every test binary as
+# root (ndk_prepare ran `adb root`). Returns the run's exit status.
 function ndk_test() {
-    read_remote_android
+    read_remote_android || return 1
     echo "Copying test data files first..."
 
     # Copy test data files (Android property files needed by tests)
@@ -166,111 +197,72 @@ function ndk_test() {
         echo "Property info files copied successfully"
     fi
 
-    echo "Copying test executables from deps directory..."
-    deps_directory="$source_directory/deps"
-    if [ -d "$deps_directory" ]; then
-        echo "Found deps directory: $deps_directory"
-        echo "Looking for rsproperties test executables..."
-        find "$deps_directory" -name "*rsproperties*" -type f -executable | grep -E "(test|spec)" | while read test_file; do
-            echo "Copying test file: $test_file"
-            adb push "$test_file" "$remote_directory/"
-        done
-        echo "Test executable copy completed"
-    else
-        echo "deps directory not found: $deps_directory"
-        echo "Looking for test binaries in alternative locations..."
-        find "$TOP_DIR/target" -name "*rsproperties*" -type f -executable | grep -E "(test|spec)" | head -5 | while read test_file; do
-            echo "Found alternative test file: $test_file"
-            adb push "$test_file" "$remote_directory/"
-        done
+    ndk_run_tests
+}
+
+# Runs the same binaries as the shell user. adbd restarts unrooted, so the
+# tests run in the `shell` SELinux domain, where reading some property
+# areas is denied — paths a root (`su` domain) run never reaches.
+function ndk_test_shell() {
+    read_remote_android || return 1
+    adb unroot || return 1
+    adb wait-for-device || return 1
+    local uid
+    uid=$(adb shell id -u | tr -d '\r') || return 1
+    if [ "$uid" = 0 ]; then
+        echo "Error: adbd still runs as root after 'adb unroot'."
+        return 1
     fi
+    ndk_run_tests
+}
 
-    # Copy basic executables, made executable and copy getprop/setprop
-    find "$source_directory" -name "getprop" -o -name "setprop" | while read basic_file; do
-        echo "Copying basic executable: $basic_file"
-        adb push "$basic_file" "$remote_directory/"
-    done
+# Smoke-tests getprop/setprop, then runs every binary of the test manifest
+# once, as whichever user adbd runs as. A binary missing on the device
+# fails the run. `--test-threads=1` for all: the tests share the device's
+# properties (e.g. `wait(None, …)` returns on any change), so tests of one
+# binary running in parallel could wake or overwrite each other.
+function ndk_run_tests() {
+    read_remote_android || return 1
 
-    echo "Test files and executables copied to Android device"
+    local manifest names
+    manifest=$(ndk_test_manifest)
+    if [ ! -s "$manifest" ]; then
+        echo "Error: $manifest is missing; run 'ndk_build' first."
+        return 1
+    fi
+    names=$(sed 's|.*/||' "$manifest" | tr '\n' ' ')
+
     echo "Running tests on Android device..."
+    local status=0
     adb shell "
-            cd $remote_directory
-            export RUST_BACKTRACE=1
-            export RUST_LOG=debug
+        cd $remote_directory || exit 1
+        export RUST_BACKTRACE=1
+        export RUST_LOG=debug
+        echo \"Running as uid \$(id -u) (\$(id -Z 2>/dev/null)) in \$(pwd)\"
 
-            echo 'Test environment setup:'
-            echo 'Working directory: \$(pwd)'
-            echo 'Available files:'
-            ls -la
-
-            # Test getprop command
-            if [ -f \"getprop\" ] && [ -x \"getprop\" ]; then
-                echo \"✅ Testing getprop command...\"
-                chmod +x getprop
-                echo \"Running: ./getprop ro.build.version.sdk\"
-                ./getprop ro.build.version.sdk || { echo \"❌ getprop command failed\"; exit 1; }
-                echo \"---\"
-            else
-                echo \"❌ getprop executable not found\"
-                exit 1
-            fi
-
-            # Test setprop command
-            if [ -f \"setprop\" ] && [ -x \"setprop\" ]; then
-                echo \"✅ Testing setprop command...\"
-                chmod +x setprop
-                echo \"Running: ./setprop debug.test.prop test_value\"
-                ./setprop debug.test.prop test_value || { echo \"❌ setprop command failed\"; exit 1; }
-                # Verify the property was set correctly
-                if [ \"\$(./getprop debug.test.prop)\" = \"test_value\" ]; then
-                    echo \"✅ Property set successfully!\"
-                else
-                    echo \"❌ Failed to set property or verify its value\"
-                    exit 1
-                fi
-                echo \"---\"
-            else
-                echo \"❌ setprop executable not found\"
-                exit 1
-            fi
-
-            # Run all test executables except those starting with getprop or setprop
-            for test_file in *; do
-                if [ -f \"\$test_file\" ] && [ -x \"\$test_file\" ] && [[ \"\$test_file\" != getprop* ]] && [[ \"\$test_file\" != setprop* ]]; then
-                    echo \"Running executable: \$test_file\"
-                    chmod +x \"\$test_file\"
-                    if ./\"\$test_file\"; then
-                        echo \"✅ \$test_file executed successfully\"
-                    else
-                        echo \"❌ \$test_file failed with error code \$?\"
-                        exit 1
-                    fi
-                    echo \"Finished running: \$test_file\"
-                    echo \"---\"
-                fi
-            done            # Run specific tests for rsproperties executables (excluding getprop/setprop)
-            for test_file in *rsproperties*; do
-                if [ -f \"\$test_file\" ] && [ -x \"\$test_file\" ] && [[ \"\$test_file\" != getprop* ]] && [[ \"\$test_file\" != setprop* ]]; then
-                    echo \"Running rsproperties test: \$test_file\"
-                    chmod +x \"\$test_file\"
-                    if ./\"\$test_file\" --test-threads=1; then
-                        echo \"✅ Test \$test_file PASSED\"
-                    else
-                        echo \"❌ Test \$test_file FAILED\"
-                        exit 1
-                    fi
-                    echo \"Finished running: \$test_file\"
-                    echo \"---\"
-                fi
-            done
-
-            echo '✅ All tests passed!'
-        "
-        test_exit_code=$?
-        if [ $test_exit_code -ne 0 ]; then
-            echo "❌ Tests failed with exit code: $test_exit_code"
-        else
-            echo "✅ All tests passed on Android device"
+        ./getprop ro.build.version.sdk || { echo '❌ getprop failed'; exit 1; }
+        ./setprop debug.test.prop test_value || { echo '❌ setprop failed'; exit 1; }
+        if [ \"\$(./getprop debug.test.prop)\" != test_value ]; then
+            echo '❌ debug.test.prop does not read back as set'
+            exit 1
         fi
-    # No else block needed as tests always run
+        echo '---'
+
+        count=0
+        for test_file in $names; do
+            if [ ! -x \"\$test_file\" ]; then
+                echo \"❌ \$test_file is not on the device\"
+                exit 1
+            fi
+            echo \"Running: \$test_file\"
+            ./\"\$test_file\" --test-threads=1 || { echo \"❌ \$test_file failed\"; exit 1; }
+            count=\$((count + 1))
+            echo '---'
+        done
+        echo \"✅ \$count test binaries passed\"
+    " || status=$?
+    if [ $status -ne 0 ]; then
+        echo "❌ Tests failed on the device (exit $status)"
+    fi
+    return $status
 }

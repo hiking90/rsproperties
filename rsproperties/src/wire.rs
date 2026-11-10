@@ -40,8 +40,34 @@ pub const PROP_MSG_SETPROP2: u32 = 0x00020001;
 
 /// V2 success response code.
 pub const PROP_SUCCESS: i32 = 0;
-/// V2 generic error response code.
+/// V2 generic error response code. AOSP init never sends it; this crate's
+/// service no longer does either, and uses the specific codes below.
 pub const PROP_ERROR: i32 = -1;
+
+// V2 error response codes, as AOSP init sends them (bionic
+// `sys/system_properties.h`). The client reports any non-zero code as
+// `Error::ServiceError { code }`.
+
+/// Reading the command word failed.
+pub const PROP_ERROR_READ_CMD: i32 = 0x0004;
+/// Reading the name or value of a request failed (includes a length over
+/// the service's limit).
+pub const PROP_ERROR_READ_DATA: i32 = 0x0008;
+/// The `ro.` property already has a value.
+pub const PROP_ERROR_READ_ONLY_PROPERTY: i32 = 0x000B;
+/// The name is not a legal property name.
+pub const PROP_ERROR_INVALID_NAME: i32 = 0x0010;
+/// The value is too long, not UTF-8, or does not match the property's
+/// type in `property_contexts`.
+pub const PROP_ERROR_INVALID_VALUE: i32 = 0x0014;
+/// The sender may not set this property.
+pub const PROP_ERROR_PERMISSION_DENIED: i32 = 0x0018;
+/// Unknown command word.
+pub const PROP_ERROR_INVALID_CMD: i32 = 0x001B;
+/// A `ctl.*` control message was refused or failed.
+pub const PROP_ERROR_HANDLE_CONTROL_MESSAGE: i32 = 0x0020;
+/// Storing the property failed (e.g. the property area is full).
+pub const PROP_ERROR_SET_FAILED: i32 = 0x0024;
 
 /// Sanity cap on a V2 wire property-name length. The wire format is
 /// length-prefixed, so this only exists to bound the server's upfront

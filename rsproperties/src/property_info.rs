@@ -81,6 +81,15 @@ union Union {
 #[repr(C, align(4))]
 pub(crate) struct PropertyInfo {
     pub(crate) serial: AtomicU32,
+    /// `UnsafeCell` although every variant store is atomic: the `value`
+    /// variant's `AtomicU8` stores through `&PropertyInfo` overlap
+    /// `error_message`, which has no `UnsafeCell` of its own. Whether a
+    /// union byte counts as inside an `UnsafeCell` when only another
+    /// variant puts it there is not settled in the reference
+    /// (unsafe-code-guidelines#236); the outer cell makes all 92 bytes
+    /// interior mutable under any reading. Miri accepts both forms (it
+    /// treats a non-`Freeze` union as one cell), and the codegen is the
+    /// same, since `serial` already makes `PropertyInfo` non-`Freeze`.
     data: UnsafeCell<Union>,
 }
 
@@ -105,17 +114,16 @@ impl PropertyInfo {
 
         self.serial.store(serial_value, Ordering::Relaxed);
 
-        // SAFETY: [SM3] — `&mut self` comes from `fresh_object_mut`, so the
-        // entry is unlinked and no other access to these bytes exists. The
-        // variant written (`long_property`) matches the LONG flag set above,
-        // which this crate's writer sets only on `ro.` names
-        // (`wire::validate_value_len` in `PropertyAreaMap::add`, [R-UNION]).
-        unsafe {
-            let long_property = &mut *(*self.data.get()).long_property;
-            long_property.error_message =
-                error_bytes_padded::<LONG_LEGACY_ERROR_BUFFER_SIZE>(error_bytes);
-            *long_property.offset.get_mut() = offset;
-        }
+        // [SM3]: `&mut self` comes from `fresh_object_mut`, so the entry is
+        // unlinked and a plain write through `get_mut` is the only access.
+        // The variant written (`long_property`, all 60 bytes) matches the
+        // LONG flag set above, which this crate's writer sets only on `ro.`
+        // names (`wire::validate_value_len` in `PropertyAreaMap::add`,
+        // [R-UNION]).
+        self.data.get_mut().long_property = mem::ManuallyDrop::new(LongProperty {
+            error_message: error_bytes_padded::<LONG_LEGACY_ERROR_BUFFER_SIZE>(error_bytes),
+            offset: AtomicU32::new(offset),
+        });
     }
 
     /// Initializes the header and short value. See `init_with_long_offset`
@@ -134,20 +142,23 @@ impl PropertyInfo {
         );
         // Derive the serial's length field from the length that will
         // actually be stored, so a release-build contract violation cannot
-        // desync the two: `init_value_bytes` clamps to the slot, and a
-        // len >= 256 would otherwise shift bits clean out of the length
-        // field. A bionic-compatible reader trusts `serial >> 24` verbatim.
+        // desync the two: the slot below holds at most `PROP_VALUE_MAX - 1`
+        // bytes plus the NUL, and a len >= 256 would otherwise shift bits
+        // clean out of the length field. A bionic-compatible reader trusts
+        // `serial >> 24` verbatim.
         let stored_len = value.len().min(PROP_VALUE_MAX - 1);
         let serial_value = (stored_len as u32) << 24;
         self.serial.store(serial_value, Ordering::Relaxed);
 
-        // SAFETY: [SM3] — `&mut self` comes from `fresh_object_mut`, so the
-        // entry is unlinked; the `value` variant matches the non-LONG
-        // serial set above.
-        unsafe {
-            let slot = &mut *(*self.data.get()).value;
-            init_value_bytes(slot, value.as_bytes());
-        }
+        // [SM3]: `&mut self` comes from `fresh_object_mut`, so the entry is
+        // unlinked and a plain write through `get_mut` is the only access.
+        // The `value` variant matches the non-LONG serial set above. All
+        // 92 bytes are written: the value, its NUL, and zeros after it
+        // (fresh area bytes are already zero, `create_unpublished`).
+        let bytes = value.as_bytes();
+        self.data.get_mut().value = mem::ManuallyDrop::new(std::array::from_fn(|i| {
+            AtomicU8::new(if i < stored_len { bytes[i] } else { 0 })
+        }));
     }
 
     /// Snapshots the short-variant value into `buf` (byte-wise atomic, no
@@ -173,10 +184,8 @@ impl PropertyInfo {
         // writer [SM4]); the only other-width access, the `u32` long
         // `offset` load, is made only on entries without stores [R-UNION].
         // Foreign writers: [R-INIT]; corrupt offsets: [SM5].
-        unsafe {
-            let slot = &*(*self.data.get()).value;
-            read_value_atomic(slot, buf)
-        }
+        let slot = unsafe { &*(*self.data.get()).value };
+        read_value_atomic(slot, buf)
     }
 
     /// Reads the long-variant relative offset (from the start of this entry
@@ -328,10 +337,8 @@ impl PropertyInfoWriter<'_> {
         // sole caller `backup_and_apply_write` refused `ro.` trailing
         // names), so no access of another width overlaps these stores, and
         // the writer is single [SM4]. Corrupt offsets: [SM5].
-        unsafe {
-            let slot = &*(*self.0.data.get()).value;
-            write_value_atomic(slot, value.as_bytes());
-        }
+        let slot = unsafe { &*(*self.0.data.get()).value };
+        write_value_atomic(slot, value.as_bytes());
         self.0.serial.store(new_serial, Ordering::Release);
         Ok(new_serial)
     }
@@ -381,14 +388,72 @@ fn write_value_atomic(slot: &[AtomicU8; PROP_VALUE_MAX], bytes: &[u8]) {
     slot[copy_len].store(0, Ordering::Relaxed);
 }
 
-/// Init-only variant for `init_with_value`. Uses `get_mut()` (plain
-/// non-atomic assignment) since the property has not yet been published to
-/// readers \[SM3\].
-#[cfg(feature = "builder")]
-fn init_value_bytes(slot: &mut [AtomicU8; PROP_VALUE_MAX], bytes: &[u8]) {
-    let copy_len = bytes.len().min(PROP_VALUE_MAX - 1);
-    for (i, &b) in bytes[..copy_len].iter().enumerate() {
-        *slot[i].get_mut() = b;
+/// Every access to the union bytes \[R-UNION\], on a heap entry so Miri can
+/// run them: the mmap-backed tests call syscalls Miri does not support
+/// (`fchmod`, file-backed `mmap`). Run with
+/// `cargo +nightly miri test -p rsproperties --features builder --lib union_access`
+/// (add `MIRIFLAGS=-Zmiri-tree-borrows` for Tree Borrows).
+#[cfg(all(test, feature = "builder"))]
+mod union_access_tests {
+    use super::*;
+    use crate::property_area::AreaWriteAccess;
+
+    /// A zeroed entry, like a fresh area allocation.
+    fn fresh_entry() -> Box<PropertyInfo> {
+        // SAFETY: every field is an atomic or a `u8` array, for which the
+        // all-zero bit pattern is valid.
+        Box::new(unsafe { mem::zeroed() })
     }
-    *slot[copy_len].get_mut() = 0;
+
+    /// `&PropertyInfo` readers race the writer's byte stores through the
+    /// `value` variant, which overlap the `long_property` variant's
+    /// non-atomic `error_message` bytes.
+    #[test]
+    fn short_entry_reads_race_value_stores() {
+        let mut entry = fresh_entry();
+        entry.init_with_value("init");
+        let entry: &PropertyInfo = &entry;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for value in ["a", "bbbbbbbb", "cc", "final"] {
+                    entry
+                        .writer(AreaWriteAccess::for_heap_test())
+                        .apply_write(value)
+                        .unwrap();
+                }
+            });
+            for _ in 0..2 {
+                s.spawn(|| {
+                    let mut buf = [0u8; PROP_VALUE_MAX];
+                    for _ in 0..4 {
+                        // Without the seqlock retry a read may be torn;
+                        // only the access itself is under test.
+                        let _ = entry.short_value_bytes(&mut buf);
+                    }
+                });
+            }
+        });
+        let mut buf = [0u8; PROP_VALUE_MAX];
+        assert_eq!(entry.short_value_bytes(&mut buf), b"final");
+    }
+
+    /// A long entry is read through both variants at once: `long_offset`
+    /// loads the `AtomicU32`, and a short read (the corrupt-trie case of
+    /// `short_value_bytes`) loads the header bytes as `AtomicU8`s.
+    #[test]
+    fn long_entry_reads_through_both_variants() {
+        let mut entry = fresh_entry();
+        entry.init_with_long_offset(0x1234);
+        let entry: &PropertyInfo = &entry;
+        std::thread::scope(|s| {
+            s.spawn(|| assert_eq!(entry.long_offset().unwrap(), 0x1234));
+            s.spawn(|| {
+                let mut buf = [0u8; PROP_VALUE_MAX];
+                assert_eq!(
+                    entry.short_value_bytes(&mut buf),
+                    LONG_LEGACY_ERROR.as_bytes()
+                );
+            });
+        });
+    }
 }

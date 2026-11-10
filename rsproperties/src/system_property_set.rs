@@ -40,10 +40,8 @@ static SOCKET_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// # Returns
 /// * `true` if the directory was successfully set (first call)
 /// * `false` if the directory was already set (subsequent calls)
-pub(crate) fn set_socket_dir<P: AsRef<Path>>(dir: P) -> bool {
-    let dir_path = dir.as_ref().to_path_buf();
-
-    SOCKET_DIR.set(dir_path).is_ok()
+pub(crate) fn set_socket_dir(dir: PathBuf) -> bool {
+    SOCKET_DIR.set(dir).is_ok()
 }
 
 /// `true` once `set_socket_dir` has succeeded (or `socket_dir()` was called

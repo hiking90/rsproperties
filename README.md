@@ -16,6 +16,8 @@ The library implements Android's property system semantics, including property c
 ## Supported Android Versions
 
 This library supports Android versions from Android 9 (API level 28) to Android 16 (API level 36).
+Android 17 (API level 37) is outside that range: its appcompat-override lookup is implemented from
+the AOSP `android-17.0.0_r1` sources and has not been tested on a device or emulator.
 
 ## Features
 
@@ -208,11 +210,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ];
 
     // Start the property service
-    let (_socket_service, _properties_service) = rsproperties_service::run(
-        config,
-        property_contexts,
-        build_props
-    ).await?;
+    let options = rsproperties_service::ServiceOptions::new()
+        .property_contexts_files(property_contexts)
+        .build_prop_files(build_props);
+    let (_socket_service, _properties_service) =
+        rsproperties_service::run(config, options).await?;
 
     println!("Property service running...");
 

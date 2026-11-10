@@ -2,14 +2,23 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use rsactor::{Actor, ActorRef, ActorWeak};
+use rsproperties::wire::{
+    validate_property_name, validate_value_len, PROP_ERROR_HANDLE_CONTROL_MESSAGE,
+    PROP_ERROR_INVALID_NAME, PROP_ERROR_INVALID_VALUE, PROP_ERROR_READ_ONLY_PROPERTY,
+    PROP_ERROR_SET_FAILED, PROP_SUCCESS,
+};
 use rsproperties::{
     build_trie, load_properties_from_file, AreaWriterLock, PropertyInfoEntry, SystemProperties,
 };
+
+use crate::persistent_properties::{is_persistent_name, PersistentStore};
+use crate::property_type::check_type;
 
 pub struct PropertiesServiceArgs {
     property_contexts_files: Vec<PathBuf>,
     build_prop_files: Vec<PathBuf>,
     writer_lock: Option<AreaWriterLock>,
+    persistent_properties_file: Option<PathBuf>,
 }
 
 impl PropertiesServiceArgs {
@@ -34,7 +43,15 @@ impl PropertiesServiceArgs {
             property_contexts_files,
             build_prop_files,
             writer_lock: None,
+            persistent_properties_file: None,
         }
+    }
+
+    /// Stores `persist.*` / `next_boot.*` properties in `path`; see
+    /// [`crate::ServiceOptions::persistent_properties_file`].
+    pub fn with_persistent_properties_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.persistent_properties_file = Some(path.into());
+        self
     }
 
     /// Hands the actor a writer lock the caller already holds. The lock
@@ -50,6 +67,7 @@ impl PropertiesServiceArgs {
 
 pub struct PropertiesService {
     system_properties: SystemProperties,
+    persistent: Option<PersistentStore>,
 }
 
 /// Wrap any error implementing the standard `Error` trait into an
@@ -150,6 +168,116 @@ fn init_system_properties_sync(
     Ok(system_properties)
 }
 
+/// The properties AOSP init sets after the build.prop files, in its order:
+/// `ro.property_service.version` (`StartPropertyService`), the persistent
+/// properties (`load_persist_props`, each through the same checks as a
+/// client set, without writing the file back), then
+/// `ro.persistent_properties.ready`. A failed set is logged and skipped,
+/// as init's `InitPropertySet` does.
+///
+/// `store` is loaded by the caller before `property_info` is published
+/// ([`PersistentStore::load`]), so a missing directory or a lock held by
+/// another service fails startup before the properties dir is changed.
+fn apply_startup_properties(
+    system_properties: &mut SystemProperties,
+    store: Option<PersistentStore>,
+) -> Option<PersistentStore> {
+    init_set(system_properties, "ro.property_service.version", "2");
+    let store = match store {
+        Some(mut store) => {
+            // Staged values for non-persistent names come last, where init
+            // appends the staged records it has not matched.
+            let unpersisted = store.take_unpersisted();
+            for (name, value) in store.records().iter().chain(&unpersisted) {
+                match (std::str::from_utf8(name), std::str::from_utf8(value)) {
+                    (Ok(name), Ok(value)) => init_set(system_properties, name, value),
+                    // init rejects such a value in `IsLegalPropertyValue`;
+                    // the record stays in the file.
+                    _ => log::error!(
+                        "Skipping persistent property {:?}: not UTF-8",
+                        String::from_utf8_lossy(name)
+                    ),
+                }
+            }
+            log::info!(
+                "Loaded {} persistent properties from {:?}",
+                store.records().len(),
+                store.path()
+            );
+            Some(store)
+        }
+        None => None,
+    };
+    init_set(system_properties, "ro.persistent_properties.ready", "true");
+    store
+}
+
+/// init `InitPropertySet`: [`apply_set`], logging a failure.
+fn init_set(system_properties: &mut SystemProperties, name: &str, value: &str) {
+    let code = apply_set(system_properties, name, value);
+    if code != PROP_SUCCESS {
+        log::error!("Cannot set {name:?} at startup: error code {code:#x}");
+    }
+}
+
+/// Checks and stores one set, returning the V2 response code AOSP init
+/// sends for it, in init's order (`CheckPermissions`, then `PropertySet`):
+///
+/// 1. illegal name → `PROP_ERROR_INVALID_NAME`;
+/// 2. `ctl.*` → `PROP_ERROR_HANDLE_CONTROL_MESSAGE` (the socket service
+///    handles control messages before they reach this actor; they are
+///    never stored);
+/// 3. value not matching the `property_contexts` type
+///    ([`check_type`]) → `PROP_ERROR_INVALID_VALUE`;
+/// 4. value too long or containing NUL → `PROP_ERROR_INVALID_VALUE`;
+/// 5. `ro.` property that already has a value →
+///    `PROP_ERROR_READ_ONLY_PROPERTY`;
+/// 6. any other storage failure (e.g. a full area) →
+///    `PROP_ERROR_SET_FAILED`.
+///
+/// No per-property access check: see the access model on the socket
+/// service.
+fn apply_set(system_properties: &mut SystemProperties, name: &str, value: &str) -> i32 {
+    if let Err(e) = validate_property_name(name) {
+        log::error!("Rejected setprop: {e}");
+        return PROP_ERROR_INVALID_NAME;
+    }
+    if name.starts_with("ctl.") {
+        log::error!("Rejected setprop {name:?}: control messages are not stored");
+        return PROP_ERROR_HANDLE_CONTROL_MESSAGE;
+    }
+    match system_properties.property_type(name) {
+        Ok(Some(property_type)) if !check_type(property_type, value) => {
+            log::error!("Rejected setprop {name:?}: value does not match type {property_type:?}");
+            return PROP_ERROR_INVALID_VALUE;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log::error!("Rejected setprop {name:?}: cannot read its type: {e}");
+            return PROP_ERROR_SET_FAILED;
+        }
+    }
+    if let Err(e) = validate_value_len(name, value) {
+        log::error!("Rejected setprop: {e}");
+        return PROP_ERROR_INVALID_VALUE;
+    }
+    // `set` encapsulates find → update-or-add, including the `ro.`
+    // rejection (`PermissionDenied`).
+    match system_properties.set(name, value) {
+        // Mask the value (same policy as `PropertyMessage`'s Debug impl
+        // and the socket layer).
+        Ok(()) => {
+            log::info!("Set property: {name:?} (<{} bytes>)", value.len());
+            PROP_SUCCESS
+        }
+        Err(rsproperties::Error::PermissionDenied(_)) => PROP_ERROR_READ_ONLY_PROPERTY,
+        Err(e) => {
+            log::error!("Failed to set property {name:?}: {e}");
+            PROP_ERROR_SET_FAILED
+        }
+    }
+}
+
 impl Actor for PropertiesService {
     type Args = PropertiesServiceArgs;
     type Error = std::io::Error;
@@ -162,23 +290,36 @@ impl Actor for PropertiesService {
         args: Self::Args,
         _actor_ref: &rsactor::ActorRef<Self>,
     ) -> std::result::Result<Self, Self::Error> {
-        let dir = rsproperties::properties_dir().to_path_buf();
+        let dir = rsproperties::properties_dir();
         // Filesystem + mmap + trie build all block. Run them on a blocking
         // task so the tokio worker that polls this actor is free to drive
         // other tasks (notably the sibling SocketService) while
         // initialisation runs.
-        let system_properties = tokio::task::spawn_blocking(move || {
-            init_system_properties_sync(
+        let (system_properties, persistent) = tokio::task::spawn_blocking(move || {
+            // Before `property_info` and the areas are written: a missing
+            // directory or another service's lock must fail startup while
+            // the properties dir is still as it was.
+            let persistent = args
+                .persistent_properties_file
+                .as_deref()
+                .map(PersistentStore::load)
+                .transpose()?;
+            let mut system_properties = init_system_properties_sync(
                 args.property_contexts_files,
                 args.build_prop_files,
-                &dir,
+                dir,
                 args.writer_lock,
-            )
+            )?;
+            let persistent = apply_startup_properties(&mut system_properties, persistent);
+            Ok::<_, std::io::Error>((system_properties, persistent))
         })
         .await
-        .map_err(|e| std::io::Error::other(format!("init join failed: {e}")))??;
+        .map_err(io_other)??;
 
-        Ok(PropertiesService { system_properties })
+        Ok(PropertiesService {
+            system_properties,
+            persistent,
+        })
     }
 
     async fn on_stop(
@@ -207,10 +348,10 @@ impl rsactor::Message<crate::ReadyMessage> for PropertiesService {
     }
 }
 
-use rsproperties::wire::{validate_property_name, validate_value_len};
-
 impl rsactor::Message<crate::PropertyMessage> for PropertiesService {
-    type Reply = bool;
+    /// The V2 response code: `PROP_SUCCESS` or one of init's
+    /// `PROP_ERROR_*` codes.
+    type Reply = i32;
 
     async fn handle(
         &mut self,
@@ -218,38 +359,64 @@ impl rsactor::Message<crate::PropertyMessage> for PropertiesService {
         _actor_ref: &ActorRef<Self>,
     ) -> Self::Reply {
         log::debug!("Handling property message: {message:?}");
-        let name = message.name;
-        let value = message.value;
+        self.client_set(&message.name, message.value).await
+    }
+}
 
-        // Single source-of-truth for name + length policy — client and
-        // server use the same `rsproperties::wire` functions so policy
-        // drift (e.g. `>` vs `>=`) cannot reappear.
-        if let Err(e) = validate_property_name(&name) {
-            log::error!("Rejected setprop: {e}");
-            return false;
+impl PropertiesService {
+    /// One set from a client: [`apply_set`], then the persistent file.
+    async fn client_set(&mut self, name: &str, value: String) -> i32 {
+        let code = apply_set(&mut self.system_properties, name, &value);
+        if code != PROP_SUCCESS || !is_persistent_name(name.as_bytes()) {
+            return code;
         }
-        if let Err(e) = validate_value_len(&name, &value) {
-            log::error!("Rejected setprop: {e}");
-            return false;
-        }
-
-        // Delegate to `set`, which already encapsulates the find →
-        // update-or-add sequence (plus the `ro.` rejection) — duplicating
-        // that logic here invited policy drift between the two copies.
-        match self.system_properties.set(&name, &value) {
-            Ok(()) => {
-                // Mask the value (same policy as `PropertyMessage`'s Debug
-                // impl and the socket layer): values may carry sensitive
-                // payloads, and logging them here would defeat the masking
-                // everywhere upstream.
-                log::info!("Set property: {name:?} (<{} bytes>)", value.len());
-                true
-            }
-            Err(e) => {
-                log::error!("Failed to set property {name:?}: {e}");
-                false
+        // init `PropertySet`: a client set of a `persist.` / `next_boot.`
+        // name is written to the file before the reply. init writes only
+        // V2 sets (`socket &&`); V1 sets come here too and are written as
+        // well (docs/aosp-parity.md S1). The write runs on
+        // the blocking pool; awaiting it keeps this actor's sets, and so
+        // the file writes, in order.
+        let Some(store) = self.persistent.as_mut() else {
+            return code;
+        };
+        if store.reload_pending() {
+            let path = store.shared_path();
+            match tokio::task::spawn_blocking(move || {
+                crate::persistent_properties::read_file(&path)
+            })
+            .await
+            {
+                Ok(result) => store.finish_reload(result),
+                Err(e) => log::error!("Persistent property read task failed: {e}"),
             }
         }
+        if let Some(bytes) = store.update(name, value) {
+            if store.reload_pending() {
+                // The file still could not be read: writing now would
+                // replace records this run never saw. The set is kept in
+                // memory and written with a later one.
+                store.set_synced(false);
+                return code;
+            }
+            let path = store.shared_path();
+            match tokio::task::spawn_blocking(move || {
+                crate::persistent_properties::write_file(&path, &bytes).map_err(|e| (path, e))
+            })
+            .await
+            {
+                Ok(Ok(())) => store.set_synced(true),
+                // Logged, and the set still succeeds — init does the same.
+                Ok(Err((path, e))) => {
+                    log::error!("Could not store persistent property {name:?} in {path:?}: {e}");
+                    store.set_synced(false);
+                }
+                Err(e) => {
+                    log::error!("Persistent property write task failed: {e}");
+                    store.set_synced(false);
+                }
+            }
+        }
+        code
     }
 }
 
@@ -459,5 +626,249 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
         assert!(!props.join("property_info").exists());
         assert!(!other.join("property_info").exists());
+    }
+
+    /// `on_start`'s persistent steps: load the store at `path` (if any),
+    /// then apply the startup properties.
+    fn startup_at(
+        sp: &mut SystemProperties,
+        path: Option<&Path>,
+    ) -> std::io::Result<Option<PersistentStore>> {
+        let store = path.map(PersistentStore::load).transpose()?;
+        Ok(apply_startup_properties(sp, store))
+    }
+
+    /// A properties dir whose `property_contexts` gives some names a type.
+    fn typed_properties(tmp: &TempDir) -> SystemProperties {
+        let contexts = tmp.0.join("typed_property_contexts");
+        std::fs::write(
+            &contexts,
+            "debug. u:object_r:debug_prop:s0 prefix string\n\
+             debug.int u:object_r:debug_prop:s0 exact int\n\
+             debug.enum u:object_r:debug_prop:s0 exact enum a b\n\
+             persist. u:object_r:persist_prop:s0 prefix string\n\
+             persist.int u:object_r:persist_prop:s0 exact int\n\
+             next_boot. u:object_r:persist_prop:s0 prefix string\n\
+             ro. u:object_r:ro_prop:s0 prefix string\n",
+        )
+        .unwrap();
+        init_system_properties_sync(vec![contexts], vec![], &tmp.0.join("props"), None).unwrap()
+    }
+
+    /// init's codes, in init's order of checks.
+    #[test]
+    fn apply_set_returns_init_codes() {
+        let tmp = TempDir::new("rsprops_svc_apply_codes");
+        let mut sp = typed_properties(&tmp);
+        let cases: &[(&str, &str, i32)] = &[
+            ("debug.int", "12", PROP_SUCCESS),
+            ("debug.int", "x", PROP_ERROR_INVALID_VALUE),
+            ("debug.int", "", PROP_SUCCESS),
+            ("debug.enum", "b", PROP_SUCCESS),
+            ("debug.enum", "c", PROP_ERROR_INVALID_VALUE),
+            (".bad", "1", PROP_ERROR_INVALID_NAME),
+            ("ctl.start", "svc", PROP_ERROR_HANDLE_CONTROL_MESSAGE),
+            ("debug.long", &"x".repeat(100), PROP_ERROR_INVALID_VALUE),
+            ("ro.once", "1", PROP_SUCCESS),
+            ("ro.once", "2", PROP_ERROR_READ_ONLY_PROPERTY),
+        ];
+        for &(name, value, code) in cases {
+            assert_eq!(apply_set(&mut sp, name, value), code, "{name:?}");
+        }
+        assert_eq!(sp.get_with_result("debug.int").unwrap(), "");
+        assert_eq!(sp.get_with_result("debug.enum").unwrap(), "b");
+        assert_eq!(sp.get_with_result("ro.once").unwrap(), "1");
+        assert!(
+            sp.find("ctl.start").unwrap().is_none(),
+            "ctl.* is never stored"
+        );
+    }
+
+    #[test]
+    fn startup_sets_version_and_ready_without_persistence() {
+        let tmp = TempDir::new("rsprops_svc_startup_plain");
+        let mut sp = typed_properties(&tmp);
+        assert!(startup_at(&mut sp, None).unwrap().is_none());
+        assert_eq!(
+            sp.get_with_result("ro.property_service.version").unwrap(),
+            "2"
+        );
+        assert_eq!(
+            sp.get_with_result("ro.persistent_properties.ready")
+                .unwrap(),
+            "true"
+        );
+    }
+
+    /// init `load_persist_props`: staged values replace their targets, and
+    /// each record is checked like a client set.
+    #[test]
+    fn startup_loads_persistent_properties() {
+        use crate::persistent_properties::{decode, encode, write_file};
+        let tmp = TempDir::new("rsprops_svc_startup_persist");
+        let mut sp = typed_properties(&tmp);
+        let path = tmp.0.join("persistent_properties");
+        let rec = |n: &str, v: &str| (n.as_bytes().to_vec(), v.as_bytes().to_vec());
+        write_file(
+            &path,
+            &encode(&[
+                rec("persist.a", "1"),
+                rec("persist.int", "not-int"),
+                rec("persist.b", "old"),
+                rec("next_boot.persist.b", "new"),
+            ]),
+        )
+        .unwrap();
+
+        let store = startup_at(&mut sp, Some(&path)).unwrap().expect("store");
+        assert_eq!(sp.get_with_result("persist.a").unwrap(), "1");
+        assert_eq!(sp.get_with_result("persist.b").unwrap(), "new");
+        assert!(
+            sp.find("persist.int").unwrap().is_none(),
+            "type check applies"
+        );
+        assert_eq!(
+            sp.get_with_result("ro.persistent_properties.ready")
+                .unwrap(),
+            "true"
+        );
+        // The rejected record stays in the file, as in init.
+        let on_disk = decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk, store.records());
+        assert!(on_disk.contains(&rec("persist.int", "not-int")));
+        assert!(!on_disk.iter().any(|(n, _)| n.starts_with(b"next_boot.")));
+    }
+
+    /// A staged record whose target is not a persistent name is applied
+    /// once and not written back, so the next start still loads the file
+    /// instead of deleting it.
+    #[test]
+    fn staged_non_persistent_target_does_not_delete_file() {
+        use crate::persistent_properties::{decode, encode, write_file};
+        let tmp = TempDir::new("rsprops_svc_startup_staged_foreign");
+        let path = tmp.0.join("persistent_properties");
+        let rec = |n: &str, v: &str| (n.as_bytes().to_vec(), v.as_bytes().to_vec());
+        write_file(
+            &path,
+            &encode(&[rec("persist.a", "1"), rec("next_boot.debug.s", "v")]),
+        )
+        .unwrap();
+
+        let mut sp = typed_properties(&tmp);
+        drop(startup_at(&mut sp, Some(&path)).unwrap());
+        assert_eq!(sp.get_with_result("debug.s").unwrap(), "v");
+        assert_eq!(
+            decode(&std::fs::read(&path).unwrap()).unwrap(),
+            vec![rec("persist.a", "1")]
+        );
+
+        let tmp2 = TempDir::new("rsprops_svc_startup_staged_foreign_2");
+        let mut sp = typed_properties(&tmp2);
+        startup_at(&mut sp, Some(&path)).unwrap();
+        assert_eq!(sp.get_with_result("persist.a").unwrap(), "1");
+        assert!(sp.find("debug.s").unwrap().is_none());
+    }
+
+    #[test]
+    fn startup_fails_when_persistent_dir_is_missing() {
+        let tmp = TempDir::new("rsprops_svc_startup_nodir");
+        let mut sp = typed_properties(&tmp);
+        let path = tmp.0.join("missing").join("persistent_properties");
+        assert!(startup_at(&mut sp, Some(&path)).is_err());
+    }
+
+    /// A successful client set of a `persist.` / `next_boot.` name rewrites
+    /// the file; a rejected set or another name does not.
+    #[tokio::test]
+    async fn client_set_writes_persistent_file() {
+        use crate::persistent_properties::decode;
+        let tmp = TempDir::new("rsprops_svc_client_persist");
+        let mut sp = typed_properties(&tmp);
+        let path = tmp.0.join("persistent_properties");
+        let persistent = startup_at(&mut sp, Some(&path)).unwrap();
+        let mut service = PropertiesService {
+            system_properties: sp,
+            persistent,
+        };
+        let on_disk = || decode(&std::fs::read(&path).unwrap_or_default()).unwrap();
+        let rec = |n: &str, v: &str| (n.as_bytes().to_vec(), v.as_bytes().to_vec());
+
+        assert_eq!(
+            service.client_set("persist.x", "1".into()).await,
+            PROP_SUCCESS
+        );
+        assert_eq!(on_disk(), vec![rec("persist.x", "1")]);
+        assert_eq!(
+            service.client_set("debug.y", "1".into()).await,
+            PROP_SUCCESS
+        );
+        assert_eq!(
+            service.client_set("persist.int", "bad".into()).await,
+            PROP_ERROR_INVALID_VALUE
+        );
+        assert_eq!(
+            service.client_set("persist.x", "2".into()).await,
+            PROP_SUCCESS
+        );
+        assert_eq!(
+            service.client_set("next_boot.persist.z", "9".into()).await,
+            PROP_SUCCESS
+        );
+        assert_eq!(
+            on_disk(),
+            vec![rec("persist.x", "2"), rec("next_boot.persist.z", "9")]
+        );
+
+        // The next start applies the staged value.
+        drop(service);
+        let tmp2 = TempDir::new("rsprops_svc_client_persist_restart");
+        let mut sp = typed_properties(&tmp2);
+        startup_at(&mut sp, Some(&path)).unwrap();
+        assert_eq!(sp.get_with_result("persist.x").unwrap(), "2");
+        assert_eq!(sp.get_with_result("persist.z").unwrap(), "9");
+        assert_eq!(
+            on_disk(),
+            vec![rec("persist.x", "2"), rec("persist.z", "9")]
+        );
+    }
+
+    /// After `load` hit a transient read error, the first persistent set
+    /// reads the file again and keeps its records instead of replacing the
+    /// file with this run's set alone.
+    #[tokio::test]
+    async fn first_set_after_transient_load_failure_keeps_file_records() {
+        use crate::persistent_properties::{decode, encode, write_file};
+        let tmp = TempDir::new("rsprops_svc_reload");
+        let mut sp = typed_properties(&tmp);
+        let path = tmp.0.join("persistent_properties");
+        let rec = |n: &str, v: &str| (n.as_bytes().to_vec(), v.as_bytes().to_vec());
+        write_file(
+            &path,
+            &encode(&[rec("persist.a", "1"), rec("persist.b", "2")]),
+        )
+        .unwrap();
+        let mut store = startup_at(&mut sp, Some(&path)).unwrap().unwrap();
+        store.assume_transient_load_failure();
+        let mut service = PropertiesService {
+            system_properties: sp,
+            persistent: Some(store),
+        };
+
+        assert_eq!(
+            service.client_set("persist.b", "new".into()).await,
+            PROP_SUCCESS
+        );
+        assert_eq!(
+            service.client_set("persist.c", "3".into()).await,
+            PROP_SUCCESS
+        );
+        assert_eq!(
+            decode(&std::fs::read(&path).unwrap()).unwrap(),
+            vec![
+                rec("persist.a", "1"),
+                rec("persist.b", "new"),
+                rec("persist.c", "3")
+            ]
+        );
     }
 }

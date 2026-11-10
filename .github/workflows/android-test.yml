@@ -153,7 +153,7 @@ jobs:
         cat > REMOTE_ANDROID << EOF
         x86_64
         x86_64
-        /data/rsproperties
+        /data/local/tmp/rsproperties
         EOF
         echo "Created REMOTE_ANDROID configuration file:"
         cat REMOTE_ANDROID
@@ -166,7 +166,7 @@ jobs:
         timeout 10 adb shell "getprop ro.build.version.release" || echo "Property check failed"
         timeout 10 adb shell "whoami" || echo "User check failed"
         echo "Creating test directory on device..."
-        adb shell "mkdir -p /data/rsproperties" || echo "Directory creation completed"
+        adb shell "mkdir -p /data/local/tmp/rsproperties" || echo "Directory creation completed"
 
     - name: Verify emulator configuration
       run: |
@@ -215,12 +215,36 @@ jobs:
         cargo clean
         ndk_build && ndk_sync
 
-    - name: Run tests on Android device
+    - name: Run tests on Android device (root)
       run: |
         source envsetup.sh
         ndk_test
 
-    - name: Collect device logs
+    # The root run is in the `su` SELinux domain, which can read every
+    # property area; the shell user's denials are reached only here.
+    - name: Run tests on Android device (shell user)
+      run: |
+        source envsetup.sh
+        ndk_test_shell
+
+    # Before the summary below and before cleanup stops the emulator.
+    - name: Save device logs
+      if: always()
+      run: |
+        mkdir -p android-logs
+        adb logcat -d > android-logs/logcat.txt 2>&1 || echo "logcat not available"
+        cp emulator.log android-logs/ 2>/dev/null || echo "emulator.log not found"
+        ls -la android-logs
+
+    - name: Upload device logs
+      if: failure()
+      uses: actions/upload-artifact@v7
+      with:
+        name: android-logs-api${{ matrix.api-level }}
+        path: android-logs/
+        retention-days: 14
+
+    - name: Print device summary
       if: always()
       run: |
         echo "========================================"

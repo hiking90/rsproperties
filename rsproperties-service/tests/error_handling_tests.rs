@@ -529,3 +529,43 @@ async fn test_type_conversion_boundaries() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// The service replies with init's codes, which the client reports as
+/// `ServiceError { code }`; `ctl.*` is refused (no control handler in the
+/// test service) and never stored.
+#[tokio::test]
+async fn test_service_rejections_carry_init_codes() -> anyhow::Result<()> {
+    use rsproperties::wire::{PROP_ERROR_HANDLE_CONTROL_MESSAGE, PROP_ERROR_READ_ONLY_PROPERTY};
+    setup_test_env().await;
+
+    let code_of = |result: rsproperties::Result<()>| match result {
+        Err(rsproperties::Error::ServiceError { code, .. }) => Some(code),
+        _ => None,
+    };
+
+    assert_eq!(
+        code_of(rsproperties::set("ctl.start", "some_service")),
+        Some(PROP_ERROR_HANDLE_CONTROL_MESSAGE)
+    );
+    assert!(matches!(
+        rsproperties::get::<String>("ctl.start"),
+        Err(rsproperties::Error::NotFound(_))
+    ));
+
+    rsproperties::set("ro.test.codes.once", "1")?;
+    assert_eq!(
+        code_of(rsproperties::set("ro.test.codes.once", "2")),
+        Some(PROP_ERROR_READ_ONLY_PROPERTY)
+    );
+
+    // Set by the service at startup, like init.
+    assert_eq!(
+        rsproperties::get::<String>("ro.property_service.version")?,
+        "2"
+    );
+    assert_eq!(
+        rsproperties::get::<String>("ro.persistent_properties.ready")?,
+        "true"
+    );
+    Ok(())
+}

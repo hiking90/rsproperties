@@ -74,13 +74,35 @@ fn main() {
             let _ = writeln!(std::io::stdout(), "{value}");
         }
         None => {
-            // List all properties (simplified implementation)
-            let _ = writeln!(
-                std::io::stdout(),
-                "Listing all properties is not yet implemented.\n\
-                 Use 'getprop <property_name>' to get a specific property."
-            );
-            std::process::exit(1);
+            // List all readable properties, sorted by name like toybox
+            // getprop: `foreach` reports them in trie order.
+            let props = match rsproperties::try_system_properties() {
+                Ok(props) => props,
+                Err(e) => {
+                    eprintln!("getprop: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let mut all = std::collections::BTreeMap::new();
+            let walk = props.foreach(|index| {
+                match props.read_index_with(&index, |name, value, _serial| {
+                    (name.to_owned(), value.to_owned())
+                }) {
+                    Ok((name, value)) => {
+                        all.insert(name, value);
+                    }
+                    // e.g. a non-UTF-8 value: skip it, keep listing.
+                    Err(e) => log::warn!("skipping a property: {e}"),
+                }
+            });
+            let mut out = std::io::stdout().lock();
+            for (name, value) in &all {
+                let _ = writeln!(out, "[{name}]: [{value}]");
+            }
+            if let Err(e) = walk {
+                eprintln!("getprop: {e}");
+                std::process::exit(1);
+            }
         }
     }
 }
