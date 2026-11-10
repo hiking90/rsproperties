@@ -8,8 +8,10 @@
 //! client must not reject what init accepts with this crate's service caps
 //! (`MAX_WIRE_NAME_LEN` 1024, `MAX_WIRE_VALUE_LEN` 8192).
 //!
-//! Run as root (`adb root`): whether the shell domain may set `ro.*`
-//! properties depends on the SELinux policy. Run once on a freshly booted
+//! The `ro.` test needs root (`adb root`): whether the shell domain may set
+//! `ro.*` properties depends on the SELinux policy (on API 36 init answers
+//! `PROP_ERROR_PERMISSION_DENIED`), so as another user it is skipped. The
+//! other tests run as any user (`ndk_test_shell`). Run once on a freshly booted
 //! emulator and reboot afterwards: `ro.` values are write-once and the
 //! long value and long name stay in the property areas (tmpfs) until the
 //! next boot. `--test-threads=1`.
@@ -22,6 +24,10 @@ use rsproperties::Error;
 /// and stored as a long property.
 #[test]
 fn long_ro_value_above_service_cap_is_set() {
+    if !rustix::process::geteuid().is_root() {
+        eprintln!("skipped: setting ro.* needs root (see the module doc)");
+        return;
+    }
     let name = format!("ro.rsproperties.test.long{}", std::process::id());
     let value = "v".repeat(10_000);
     rsproperties::set(&name, &value).expect("init accepts a 10000-byte ro. value");
