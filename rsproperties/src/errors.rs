@@ -11,11 +11,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// An OS error, from `std` or from a `rustix` call (`Errno` converts
+    /// into this variant, so one `match` arm sees every errno). Match the
+    /// errno with `rustix::io::Errno::from_io_error` or
+    /// `std::io::Error::raw_os_error`.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("System error: {0}")]
-    Errno(#[from] rustix::io::Errno),
 
     #[error("Property not found: {0}")]
     NotFound(String),
@@ -55,9 +56,10 @@ pub enum Error {
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
 
-    /// A first-write-wins global (properties/socket directory) was already
-    /// initialized — explicitly via `init()`/`try_init()` or implicitly by
-    /// the first property access latching the default. Also used for
+    /// A first-write-wins global (properties/socket directory) already
+    /// holds a different directory — set by an earlier `init()`, or
+    /// implicitly by the first property access latching the default. Also
+    /// used for
     /// initialization-order conflicts of the same shape, e.g. a property
     /// area already mapped read-only when a writable mapping is requested.
     #[error("Already initialized: {0}")]
@@ -98,17 +100,15 @@ pub enum Error {
     #[error("Lock error: {0}")]
     Lock(String),
 
-    /// Cached global-initialization failure (see `try_system_properties`).
-    /// Wraps the original in `Arc` because the `OnceLock` cache can only
-    /// hand out references while callers need an owned value — the
-    /// original variant stays reachable via `source()`/`Arc` and its own
-    /// chain is preserved.
+    /// The global reader could not be created (see `try_system_properties`).
+    /// Not cached: the next access tries again. The original error is the
+    /// `source()`.
     ///
     /// Like `Context` below, the source appears in `Display` *and* via
     /// `#[source]` (duplicated text under chain-walking reporters) so that
     /// bare `{e}` log sites still show the root cause.
     #[error("SystemProperties initialization failed: {0}")]
-    Init(#[source] std::sync::Arc<Error>),
+    Init(#[source] Box<Error>),
 
     /// A wrapped error with caller-supplied context and the source error
     /// preserved for `Error::source()` chain traversal.
@@ -126,6 +126,14 @@ pub enum Error {
         #[source]
         source: Box<Error>,
     },
+}
+
+/// `rustix` calls report `Errno`; it becomes [`Error::Io`], so the public
+/// error type carries no `rustix` type and has one variant per OS error.
+impl From<rustix::io::Errno> for Error {
+    fn from(errno: rustix::io::Errno) -> Self {
+        Error::Io(errno.into())
+    }
 }
 
 pub trait ContextWithLocation<T> {
@@ -186,6 +194,18 @@ mod tests {
         assert!(msg.contains("opening test file"));
         assert!(msg.contains("non-existent-file") || msg.contains("No such"));
         assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn errno_converts_into_io() {
+        let err: Error = rustix::io::Errno::ACCESS.into();
+        match err {
+            Error::Io(io) => assert_eq!(
+                rustix::io::Errno::from_io_error(&io),
+                Some(rustix::io::Errno::ACCESS)
+            ),
+            other => panic!("expected Error::Io, got {other:?}"),
+        }
     }
 
     fn try_open_file() -> Result<()> {

@@ -79,7 +79,7 @@ fn test_new_area_restart_over_existing_dir() {
     {
         let mut props = SystemProperties::new_area(dir).expect("first new_area");
         props.add("test.restart", "1").unwrap();
-        assert_eq!(props.get_with_result("test.restart").unwrap(), "1");
+        assert_eq!(props.get("test.restart").unwrap(), "1");
     }
 
     // Simulates a service restart: the dir still holds the context area
@@ -91,7 +91,7 @@ fn test_new_area_restart_over_existing_dir() {
     // new add must land in the new mapping.
     assert!(props.find("test.restart").unwrap().is_none());
     props.add("test.restart", "2").unwrap();
-    assert_eq!(props.get_with_result("test.restart").unwrap(), "2");
+    assert_eq!(props.get("test.restart").unwrap(), "2");
 }
 
 /// The second writer fails on the lock before it replaces any file.
@@ -128,7 +128,7 @@ fn test_concurrent_writer_rejected_by_lock() {
     drop(second);
     let mut first = first;
     first.add("test.lock", "alive").unwrap();
-    assert_eq!(first.get_with_result("test.lock").unwrap(), "alive");
+    assert_eq!(first.get("test.lock").unwrap(), "alive");
 
     // Releasing the first writer releases the flock; a new writer succeeds.
     drop(first);
@@ -156,7 +156,7 @@ fn leading_dot_context_is_skipped() {
     );
     // Other contexts still work.
     props.add("test.dot", "1").unwrap();
-    assert_eq!(props.get_with_result("test.dot").unwrap(), "1");
+    assert_eq!(props.get("test.dot").unwrap(), "1");
 
     // `add` looks up the area before it validates the name; the error for
     // the skipped context must print the name escaped, so a name with a
@@ -175,7 +175,7 @@ fn leading_dot_context_is_skipped() {
         .set("hidden.x\nFAKE: forged", "1")
         .expect_err("a skipped context has no area");
     let get_err = props
-        .get_with_result("hidden.x\nFAKE: forged")
+        .get("hidden.x\nFAKE: forged")
         .expect_err("a skipped context has no area");
     for err in [set_err, get_err] {
         let shown = err.to_string();

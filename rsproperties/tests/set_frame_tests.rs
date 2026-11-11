@@ -109,7 +109,7 @@ fn test_v2_set_frames() {
 
     let dir = common::socket_test_dir("rsprops_setframe", 1 + PROPERTY_SERVICE_SOCKET_NAME.len());
     std::fs::create_dir_all(dir.path()).unwrap();
-    rsproperties::try_init(PropertyConfig::with_socket_dir(dir.path())).expect("try_init");
+    rsproperties::init(PropertyConfig::new().socket_dir(dir.path())).expect("init");
 
     let listener = UnixListener::bind(dir.path().join(PROPERTY_SERVICE_SOCKET_NAME)).unwrap();
     listener.set_nonblocking(true).unwrap();

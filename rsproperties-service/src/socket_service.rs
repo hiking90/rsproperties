@@ -28,6 +28,8 @@ use rsproperties::wire::{
 };
 use rsproperties::{PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME, PROPERTY_SERVICE_SOCKET_NAME};
 
+use crate::properties_service::PropertiesService;
+
 /// Upper bound on simultaneously *serviced* client connections. Each
 /// handler task holds one permit for the duration of the exchange.
 const MAX_CONCURRENT_CLIENTS: usize = 64;
@@ -403,16 +405,43 @@ fn bind_service_sockets_at(dir: &Path, dirfd: OwnedFd) -> Result<BoundSockets> {
     })
 }
 
+/// What [`spawn`] serves: the socket dir and the properties service the
+/// sets are forwarded to. Built with [`SocketServiceArgs::new`], so a
+/// field added later does not break callers.
 pub struct SocketServiceArgs {
-    pub socket_dir: PathBuf,
-    pub properties_service: ActorRef<crate::PropertiesService>,
-    /// Handles `ctl.*` sets; `None` refuses them. See
-    /// [`crate::ServiceOptions::control_handler`].
-    pub control_handler: Option<crate::ControlHandler>,
+    pub(crate) socket_dir: PathBuf,
+    pub(crate) properties_service: ActorRef<PropertiesService>,
+    /// Handles `ctl.*` sets; `None` refuses them.
+    pub(crate) control_handler: Option<crate::ControlHandler>,
 }
 
-// Run the service in a separate task
-/// This function runs the socket service by spawning a new actor with the provided arguments.
+impl SocketServiceArgs {
+    /// Serves the sockets in `socket_dir` and forwards sets to
+    /// `properties_service`. `ctl.*` sets are refused until
+    /// [`control_handler`](Self::control_handler) is given.
+    pub fn new(
+        socket_dir: impl Into<PathBuf>,
+        properties_service: ActorRef<PropertiesService>,
+    ) -> Self {
+        Self {
+            socket_dir: socket_dir.into(),
+            properties_service,
+            control_handler: None,
+        }
+    }
+
+    /// Handles `ctl.*` sets; see
+    /// [`crate::ServiceOptions::control_handler`] for how it is called.
+    pub fn control_handler<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&crate::ControlMessage) -> bool + Send + Sync + 'static,
+    {
+        self.control_handler = Some(Arc::new(handler));
+        self
+    }
+}
+
+/// Spawns the socket service actor with `args`.
 ///
 /// Spawn this only while the properties dir's writer lock
 /// (`rsproperties::AreaWriterLock`) is held — `rsproperties_service::run`
@@ -425,7 +454,7 @@ pub struct SocketServiceArgs {
 /// A reference to the spawned actor that can be used to interact with the socket service.
 /// The actor can be stopped by calling `actor_ref.stop()` when the service is no longer needed.
 ///
-pub fn run(args: SocketServiceArgs) -> crate::ServiceContext<SocketService> {
+pub fn spawn(args: SocketServiceArgs) -> crate::ServiceContext<SocketService> {
     // `with_idle()` is required: rsactor's idle-event channel is opt-in, and
     // this actor drives its accept loop through `subscribe_idle` / `on_idle`.
     // Without it `subscribe_idle` would return `IdleChannelNotEnabled` and the
@@ -486,7 +515,7 @@ pub fn run(args: SocketServiceArgs) -> crate::ServiceContext<SocketService> {
 /// access beyond the 0660 mode bits; the service does not inspect or
 /// remove ACLs. One service instance per socket dir.
 pub struct SocketService {
-    properties_service: ActorRef<crate::PropertiesService>,
+    properties_service: ActorRef<PropertiesService>,
     /// Limits concurrently in-flight client tasks.
     connection_sem: Arc<Semaphore>,
     /// Limits accepted-but-not-yet-serviced connections (fd backpressure);

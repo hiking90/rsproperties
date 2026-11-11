@@ -27,17 +27,17 @@ pub mod properties_service;
 mod property_type;
 pub mod socket_service;
 
-pub use socket_service::{SocketService, SocketServiceArgs};
-
-pub use properties_service::PropertiesService;
-
-use properties_service::PropertiesServiceArgs;
+// The actors and their arguments are reached through their modules only
+// (`properties_service::PropertiesService`, `socket_service::SocketService`,
+// ...): one path per item. These imports are for this file.
+use properties_service::{PropertiesService, PropertiesServiceArgs};
+use socket_service::{SocketService, SocketServiceArgs};
 
 /// A `ctl.*` set, which AOSP init handles as a control message instead of
 /// storing it: `ctl.<action>` = `<target>`, e.g. `ctl.start` =
 /// `my_service` (init `HandleControlMessage`). The service passes it to the
-/// [`ControlHandler`] given in [`ServiceOptions::control_handler`] and
-/// never writes it to a property area.
+/// handler given in [`ServiceOptions::control_handler`] and never writes it
+/// to a property area.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ControlMessage {
@@ -50,18 +50,27 @@ pub struct ControlMessage {
     pub pid: Option<i32>,
 }
 
-/// Handles a [`ControlMessage`]; `true` reports success to the client
-/// (`PROP_SUCCESS`), `false` reports `PROP_ERROR_HANDLE_CONTROL_MESSAGE`,
-/// as init does when the service is unknown or the action fails.
-///
-/// Runs on tokio's blocking pool (`spawn_blocking`), one call per request,
-/// so it may block, and calls can run concurrently. A panic is reported to
-/// the client as a failure. At most 16 calls are running or waiting for a
-/// blocking thread at once: a call that outlasts the client's 10 s
-/// connection timeout still holds its slot until it returns, and a request
-/// that finds all 16 slots taken gets `PROP_ERROR_HANDLE_CONTROL_MESSAGE`
-/// without the handler being called and without using a blocking thread.
-pub type ControlHandler = Arc<dyn Fn(&ControlMessage) -> bool + Send + Sync + 'static>;
+impl ControlMessage {
+    /// A message as the service builds it, e.g. to test a handler.
+    ///
+    /// ```
+    /// use rsproperties_service::ControlMessage;
+    ///
+    /// let handler = |msg: &ControlMessage| msg.action == "start";
+    /// assert!(handler(&ControlMessage::new("start", "my_service", None)));
+    /// ```
+    pub fn new(action: impl Into<String>, target: impl Into<String>, pid: Option<i32>) -> Self {
+        Self {
+            action: action.into(),
+            target: target.into(),
+            pid,
+        }
+    }
+}
+
+/// The stored form of a `control_handler` (see
+/// [`ServiceOptions::control_handler`]).
+pub(crate) type ControlHandler = Arc<dyn Fn(&ControlMessage) -> bool + Send + Sync + 'static>;
 
 /// What [`run`] serves besides the directories in its
 /// `rsproperties::PropertyConfig`.
@@ -163,10 +172,21 @@ impl ServiceOptions {
         self
     }
 
-    /// Handles `ctl.*` sets (see [`ControlHandler`]). Without a handler
-    /// every `ctl.*` set is refused with
-    /// `PROP_ERROR_HANDLE_CONTROL_MESSAGE`. Either way, `ctl.*` names are
-    /// never stored.
+    /// Handles `ctl.*` sets. `handler` returning `true` reports success to
+    /// the client (`PROP_SUCCESS`); `false` reports
+    /// `PROP_ERROR_HANDLE_CONTROL_MESSAGE`, as init does when the service is
+    /// unknown or the action fails. Without a handler every `ctl.*` set is
+    /// refused with `PROP_ERROR_HANDLE_CONTROL_MESSAGE`. Either way, `ctl.*`
+    /// names are never stored.
+    ///
+    /// The handler runs on tokio's blocking pool (`spawn_blocking`), one
+    /// call per request, so it may block, and calls can run concurrently. A
+    /// panic is reported to the client as a failure. At most 16 calls are
+    /// running or waiting for a blocking thread at once: a call that
+    /// outlasts the client's 10 s connection timeout still holds its slot
+    /// until it returns, and a request that finds all 16 slots taken gets
+    /// `PROP_ERROR_HANDLE_CONTROL_MESSAGE` without the handler being called
+    /// and without using a blocking thread.
     pub fn control_handler<F>(mut self, handler: F) -> Self
     where
         F: Fn(&ControlMessage) -> bool + Send + Sync + 'static,
@@ -207,8 +227,8 @@ pub struct ServiceContext<T: Actor> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StartupStage {
-    /// `rsproperties::try_init` rejected the config (for example, the
-    /// process-global directories were already set).
+    /// `rsproperties::init` rejected the config: a process-global directory
+    /// was already set to a different path.
     Config,
     /// Taking the properties dir's writer lock
     /// ([`rsproperties::AreaWriterLock::acquire`]) failed. A second
@@ -233,7 +253,7 @@ pub enum StartupStage {
 impl std::fmt::Display for StartupStage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Config => "configuration (try_init)",
+            Self::Config => "configuration (init)",
             Self::WriterLock => "properties dir writer lock",
             Self::PropertiesService => "properties service",
             Self::SocketService => "socket service",
@@ -295,7 +315,7 @@ impl std::error::Error for StartupError {
 ///
 /// # Startup order
 ///
-/// 1. `rsproperties::try_init(config)`.
+/// 1. `rsproperties::init(config)`.
 /// 2. The properties dir's writer lock
 ///    ([`rsproperties::AreaWriterLock::acquire`]); this creates a missing
 ///    properties dir (the last component only). A second instance on the
@@ -340,10 +360,11 @@ impl std::error::Error for StartupError {
 /// was already accepted gets an error reply; one that connected after the
 /// socket service's last accept sees the connection reset or refused
 /// instead. A `get` in that window opens whatever is in the properties dir
-/// at that moment (nothing, or a previous run's files), and a process's
-/// first `get` fixes its reader for the process lifetime: if
-/// `property_info` or `properties_serial` does not exist yet, every later
-/// `get` in that process fails (see `rsproperties::try_system_properties`).
+/// at that moment (nothing, or a previous run's files). The first `get`
+/// that opens the store fixes that process's reader for the process
+/// lifetime; a `get` that finds no `property_info` or `properties_serial`
+/// fails, and the next one tries again (see
+/// `rsproperties::try_system_properties`).
 ///
 /// # Requirements
 /// The parent of the properties dir must exist: only the properties dir's
@@ -352,11 +373,11 @@ impl std::error::Error for StartupError {
 /// umask's bits); see [`SocketService`].
 ///
 /// # Failure semantics
-/// `rsproperties::try_init` commits process-global, first-write-wins
-/// state. If a later startup step fails, that state stays committed (a
-/// `OnceLock` cannot be un-set), so retrying `run` in the same process
-/// with a *different* config will fail with "already initialized" —
-/// treat a startup failure as fatal for the process.
+/// `rsproperties::init` commits process-global, first-write-wins state. If
+/// a later startup step fails, that state stays committed (a `OnceLock`
+/// cannot be un-set): retrying `run` in the same process with the same
+/// directories passes [`StartupStage::Config`], and with *different*
+/// directories fails there with "already initialized".
 ///
 /// [`StartupError`] is `Send + Sync` so the returned future can be
 /// `tokio::spawn`ed and the error converted into `anyhow::Error` or
@@ -379,14 +400,12 @@ pub async fn run(
     ),
     StartupError,
 > {
-    // Use `try_init` rather than `init`: if the global properties_dir /
-    // socket_dir cells were already committed (e.g. earlier service
-    // instance, double-init, hostile race), the silent `init` swallow
-    // would let the service start with the *previous* directories while
-    // the caller believes their new config took effect. `?`-propagating
-    // surfaces that drift at startup instead of producing a service bound
-    // to wrong paths.
-    rsproperties::try_init(config).map_err(|e| StartupError::new(StartupStage::Config, e))?;
+    // `init` fails when a global directory already holds a *different*
+    // path (earlier service instance, a property read that latched the
+    // default first): starting anyway would bind the service to the
+    // previous directories while the caller believes the config took
+    // effect.
+    rsproperties::init(config).map_err(|e| StartupError::new(StartupStage::Config, e))?;
 
     // The writer lock is taken before either actor is spawned: a second
     // instance on the same properties dir fails here, before it can rename
@@ -406,19 +425,20 @@ pub async fn run(
         persistent_properties_file,
         control_handler,
     } = options;
-    let mut properties_args = PropertiesServiceArgs::new(property_contexts_files, build_prop_files)
-        .with_writer_lock(lock);
+    let mut properties_args =
+        PropertiesServiceArgs::new(property_contexts_files, build_prop_files).writer_lock(lock);
     if let Some(path) = persistent_properties_file {
-        properties_args = properties_args.with_persistent_properties_file(path);
+        properties_args = properties_args.persistent_properties_file(path);
     }
     let properties_service = properties_service::spawn(properties_args);
 
     // Initialize the socket service
-    let socket_service = socket_service::run(SocketServiceArgs {
-        socket_dir: rsproperties::socket_dir().to_path_buf(),
-        properties_service: properties_service.actor_ref.clone(),
-        control_handler,
-    });
+    let mut socket_args = SocketServiceArgs::new(
+        rsproperties::socket_dir(),
+        properties_service.actor_ref.clone(),
+    );
+    socket_args.control_handler = control_handler;
+    let socket_service = socket_service::spawn(socket_args);
 
     // Sequential readiness checks: the socket service is checked first, so
     // when both fail the socket failure is the one reported. Either failure
@@ -516,7 +536,7 @@ mod tests {
 
     /// `run` must return the actor's own `on_start` error, not rsactor's
     /// generic mailbox error, tagged with the stage that failed. The only
-    /// test that calls `run` in this process (`try_init` is
+    /// test that calls `run` in this process (`init` is
     /// process-global); the early-request tests below call it in a child
     /// process.
     #[tokio::test]
@@ -527,7 +547,9 @@ mod tests {
         std::fs::create_dir_all(&socket_dir).unwrap();
         let missing = dir.join("missing_property_contexts");
 
-        let config = rsproperties::PropertyConfig::with_both_dirs(dir.clone(), socket_dir);
+        let config = rsproperties::PropertyConfig::new()
+            .properties_dir(dir.clone())
+            .socket_dir(socket_dir);
         let result = run(
             config,
             ServiceOptions::new().property_contexts_files([missing]),
@@ -567,7 +589,7 @@ mod tests {
     }
 
     /// Runs `test` (its full path in this binary) in a new process of this
-    /// test binary, so it can call `run`, and thus `try_init`, with its own
+    /// test binary, so it can call `run`, and thus `init`, with its own
     /// dirs. Panics unless the child ran exactly that test and it passed.
     fn run_in_child(test: &str) {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
@@ -651,8 +673,9 @@ mod tests {
         )
         .unwrap();
         let socket_dir = dir.0.join("sockets");
-        let config =
-            rsproperties::PropertyConfig::with_both_dirs(dir.0.clone(), socket_dir.clone());
+        let config = rsproperties::PropertyConfig::new()
+            .properties_dir(dir.0.clone())
+            .socket_dir(socket_dir.clone());
         let run_task = tokio::spawn(run(
             config,
             ServiceOptions::new()
@@ -839,8 +862,9 @@ mod tests {
             let contexts = dir.0.join("property_contexts");
             std::fs::write(&contexts, "").unwrap();
             let socket_dir = dir.0.join("sockets");
-            let config =
-                rsproperties::PropertyConfig::with_both_dirs(dir.0.clone(), socket_dir.clone());
+            let config = rsproperties::PropertyConfig::new()
+                .properties_dir(dir.0.clone())
+                .socket_dir(socket_dir.clone());
 
             let result = run(
                 config,
@@ -883,8 +907,9 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir.0);
             std::fs::create_dir_all(&dir.0).unwrap();
             let socket_dir = dir.0.join("sockets");
-            let config =
-                rsproperties::PropertyConfig::with_both_dirs(dir.0.clone(), socket_dir.clone());
+            let config = rsproperties::PropertyConfig::new()
+                .properties_dir(dir.0.clone())
+                .socket_dir(socket_dir.clone());
 
             let result = run(
                 config,

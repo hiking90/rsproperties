@@ -30,7 +30,7 @@ static SOCKET_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// Set the global socket directory for property services (internal use only).
 /// This function can only be called once. Subsequent calls will be ignored.
 ///
-/// Callers must hold `crate::GLOBAL_DIRS_LOCK` (see `lib::try_init`) so the
+/// Callers must hold `crate::GLOBAL_DIRS_LOCK` (see `lib::init`) so the
 /// pre-check + set sequence stays atomic against the implicit latch in
 /// [`socket_dir`].
 ///
@@ -44,11 +44,11 @@ pub(crate) fn set_socket_dir(dir: PathBuf) -> bool {
     SOCKET_DIR.set(dir).is_ok()
 }
 
-/// `true` once `set_socket_dir` has succeeded (or `socket_dir()` was called
-/// and populated the cell via env/default). Used by `lib::try_init` for
-/// pre-flight checks before committing other globals.
-pub(crate) fn socket_dir_is_set() -> bool {
-    SOCKET_DIR.get().is_some()
+/// The socket directory once `set_socket_dir` has succeeded or
+/// `socket_dir()` latched env/default; `None` before. Never latches. Used
+/// by `lib::init` to compare a requested directory with the set one.
+pub(crate) fn socket_dir_if_set() -> Option<&'static Path> {
+    SOCKET_DIR.get().map(PathBuf::as_path)
 }
 
 /// Get the current socket directory.
@@ -60,7 +60,7 @@ pub(crate) fn socket_dir_is_set() -> bool {
 /// 3. Default directory: `/dev/socket`
 pub fn socket_dir() -> &'static Path {
     // Lock-free once initialized; the first call takes `GLOBAL_DIRS_LOCK` so
-    // the env/default latch cannot slip between `try_init`'s pre-check and
+    // the env/default latch cannot slip between `init`'s pre-check and
     // its `set_socket_dir` commit.
     if let Some(dir) = SOCKET_DIR.get() {
         return dir.as_path();

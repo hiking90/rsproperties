@@ -89,7 +89,7 @@ fn test_v1_sys_powerctl_routes_to_for_system_socket() {
         1 + PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME.len(),
     );
     std::fs::create_dir_all(dir.path()).unwrap();
-    rsproperties::init(PropertyConfig::with_socket_dir(dir.path()));
+    rsproperties::init(PropertyConfig::new().socket_dir(dir.path())).expect("init");
 
     let plain_path = dir.path().join(PROPERTY_SERVICE_SOCKET_NAME);
     let system_path = dir.path().join(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);

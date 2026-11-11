@@ -30,6 +30,7 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
 | C3 | client | appcompat override 조회(API 35+) | (c) | 이 branch에서 수정 |
 | C4 | client | `WaitForProperty` / `WaitForPropertyCreation` | (d) | 이 branch에서 추가 |
 | C5 | client | `GetBoolProperty` / `GetIntProperty` 파싱 규칙 | (d), (c) | 이 branch에서 추가 |
+| C6 | client | global reader 초기화 실패를 process 수명 동안 유지 | (c), 재시도 방식은 (a) | 이 branch에서 수정 |
 | S1 | service | `persist.*` / `next_boot.*` 영속화 | (d) | 이 branch에서 추가 |
 | S2 | service | property type 검사(`CheckType`) | (c) | 이 branch에서 수정 |
 | S3 | service | `ctl.*`를 일반 property로 저장 | (c) | 이 branch에서 수정 |
@@ -185,9 +186,11 @@ override가 켜진 프로세스에서는 같은 property에 대해 libc
   된다.
 - libbase는 timeout과 futex 실패를 구분하지 않는다. 이 crate는 futex 실패와
   lookup 실패를 `Err`로 반환하고, timeout만 `Ok(None)` / `Ok(false)`로
-  반환한다(b). 공개 API `wait`의 `Option`은 이 둘을 구분하지 못하므로, 내부
-  wait 결과를 세 갈래(변경, timeout, 실패)로 나눈다. `wait`의 공개 signature는
-  바꾸지 않는다.
+  반환한다(b). `wait`도 같은 형태로 바꾼다. timeout은 `Option<Duration>`이고
+  결과는 `Result<Option<u32>>`다. bionic `__system_property_wait`의 `bool`도
+  실패를 timeout과 구분하지 않는다. bionic이 deprecated로 둔
+  `__system_property_wait_any`(`system_properties.h:124`)에 대응하던
+  `wait_any`는 삭제하고, `wait(None, None, None)`으로 대신한다.
 - 값 비교는 byte 단위로 한다. 값이 UTF-8이 아니면 `expected`와 같지 않은
   것으로 보고 계속 기다린다.
 
@@ -224,6 +227,36 @@ override가 켜진 프로세스에서는 같은 property에 대해 libc
   호출자의 결과가 달라진다.
 - libcutils 규칙(8진수, 뒤에 남은 문자 허용)은 따르지 않는다. libbase가 더
   나중에 나온 API이고, libcutils 소스도 8진수 허용을 결함으로 적는다.
+
+### C6. global reader 초기화 실패 — (c), 재시도 방식은 (a)
+
+**AOSP.** bionic `SystemProperties::Init`(`system_properties.cpp:65-86`)은
+이미 초기화되어 있으면 `ResetAccess()` 후 `true`를 반환한다. 초기화에
+실패하면 `initialized_`를 거짓으로 남기므로 다음 `Init` 호출이 다시
+시도한다. read 경로는 다시 시도하지 않는다. Android에서는 libc가 process
+시작 시 `Init`을 호출하고, 그 시점에 property area가 이미 있다.
+
+**rsproperties.** global reader(`try_system_properties`)는 첫 시도의 결과를
+`OnceLock<Result<..>>`에 저장했다. 실패도 저장되므로, service보다 먼저
+시작한 client는 첫 read가 실패하면 process가 끝날 때까지 모든 read가
+실패했다. 원인은 `OnceLock::get_or_try_init`(Rust issue 109737)이 unstable이라
+결과 전체를 저장한 데 있다. 실패를 유지하는 동작을 목표로 고른 commit은 없다.
+그 결과 이 상태의 client는 `ro.property_service.version`도 읽지 못해, protocol
+version을 env var나 기본값으로만 골랐다.
+
+**변경.**
+- 성공한 reader만 `OnceLock`에 저장하고, 생성 구간은 별도 `Mutex`로 막아 한
+  thread만 open과 mmap을 한다. 실패하면 cell이 빈 채로 남으므로 다음 접근이
+  다시 연다(a: 이 crate의 service는 client보다 늦게 시작할 수 있다). area
+  파일이 없을 때 다음 접근에서 다시 여는 기존 정책(`ContextNode::property_area`)과
+  같다.
+- 실패 상태에서는 호출마다 `property_info` open이 한 번 이상 일어난다. 첫
+  실패만 `error`로, 이후는 `debug`로 log를 남긴다.
+- bionic처럼 명시적 호출에서만 다시 시도하는 방식은 택하지 않았다. 그러려면
+  API(`reload` 등)가 늘고, caller가 그 호출 시점을 알아야 한다.
+- `init`도 이미 설정된 것과 같은 경로를 다시 받으면 성공한다. bionic `Init`이
+  재호출을 성공으로 처리하는 것과 같다. 다른 경로는 `AlreadyInitialized`다.
+  bionic은 경로를 바꿀 수 없으므로 이 경우에 대응하는 동작이 없다.
 
 ## Service (Linux)
 

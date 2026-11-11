@@ -5,7 +5,8 @@
 //! on the writer lock without touching the running service's
 //! `property_info` or sockets.
 //!
-//! `run` calls the process-global `try_init`, so the second instance runs in
+//! `run` calls the process-global `rsproperties::init`, so the second
+//! instance (with its own directories) runs in
 //! a child process: this test binary re-executed with
 //! [`CHILD_ENV`] set, running only this test.
 
@@ -91,10 +92,9 @@ async fn second_instance_leaves_running_service_intact() {
 /// waiting for the socket service first, this test can stop detecting that
 /// regression.
 async fn second_instance() {
-    let config = rsproperties::PropertyConfig::with_both_dirs(
-        common::TEST_PROPERTIES_DIR,
-        Path::new(common::TEST_PROPERTIES_DIR).join("sockets"),
-    );
+    let config = rsproperties::PropertyConfig::new()
+        .properties_dir(common::TEST_PROPERTIES_DIR)
+        .socket_dir(Path::new(common::TEST_PROPERTIES_DIR).join("sockets"));
     let err = match rsproperties_service::run(config, rsproperties_service::ServiceOptions::new())
         .await
     {

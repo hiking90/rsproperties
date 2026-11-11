@@ -184,13 +184,11 @@ impl ContextNode {
 fn is_access_denied(e: &Error) -> bool {
     match e {
         Error::Context { source, .. } => is_access_denied(source),
+        // rustix `Errno`s arrive here as `Error::Io` too (errors.rs).
         Error::Io(io) => matches!(
             rustix::io::Errno::from_io_error(io),
             Some(rustix::io::Errno::ACCESS | rustix::io::Errno::PERM)
         ),
-        Error::Errno(errno) => {
-            matches!(*errno, rustix::io::Errno::ACCESS | rustix::io::Errno::PERM)
-        }
         _ => false,
     }
 }

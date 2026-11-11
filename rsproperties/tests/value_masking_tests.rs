@@ -146,7 +146,7 @@ fn add_does_not_log_value() {
     {
         let mut props = SystemProperties::new_area(dir.path()).expect("new_area");
         props.add("test.token", SECRET).unwrap();
-        assert_eq!(props.get_with_result("test.token").unwrap(), SECRET);
+        assert_eq!(props.get("test.token").unwrap(), SECRET);
     }
 
     // Copied out: asserting under the guard would poison the lock on

@@ -9,10 +9,13 @@ else
     echo "TOP_DIR is already set to $TOP_DIR."
 fi
 
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    export ANDROID_HOME=$HOME/Library/Android/sdk
-elif [ "$OSTYPE" = "linux"* ]; then
-    export ANDROID_HOME=$HOME/Android/Sdk
+# The Android Studio default SDK location, only when ANDROID_HOME is unset:
+# CI (setup-android) and custom installs set it themselves.
+if [ -z "$ANDROID_HOME" ]; then
+    case "$OSTYPE" in
+    darwin*) export ANDROID_HOME=$HOME/Library/Android/sdk ;;
+    linux*) export ANDROID_HOME=$HOME/Android/Sdk ;;
+    esac
 fi
 
 if ! echo "$PATH" | grep -q -E "(^|:)$ANDROID_HOME/tools(:|$)"; then
@@ -171,32 +174,11 @@ function update_cargo_lock() {
     fi
 }
 
-# Pushes the test data, then runs the smoke test and every test binary as
-# root (ndk_prepare ran `adb root`). Returns the run's exit status.
+# Runs the smoke test and every test binary as root (ndk_prepare ran
+# `adb root`). Returns the run's exit status. No test data is pushed: the
+# tests that read `tests/android` or `__properties__` are builder tests,
+# which the Android build (no `builder` feature) does not include.
 function ndk_test() {
-    read_remote_android || return 1
-    echo "Copying test data files first..."
-
-    # Copy test data files (Android property files needed by tests)
-    if [ -d "$TOP_DIR/rsproperties/tests/android" ]; then
-        echo "Creating test data directory on device..."
-        adb shell "mkdir -p $remote_directory/rsproperties/tests"
-        echo "Copying Android test data files..."
-        adb push "$TOP_DIR/rsproperties/tests/android" "$remote_directory/rsproperties/tests/"
-        echo "Test data files copied successfully"
-    else
-        echo "Warning: rsproperties/tests/android directory not found"
-    fi
-
-    # Copy property info files from __properties__ directory
-    if [ -d "$TOP_DIR/rsproperties/__properties__" ]; then
-        echo "Creating properties directory on device..."
-        adb shell "mkdir -p $remote_directory/rsproperties"
-        echo "Copying property info files..."
-        adb push "$TOP_DIR/rsproperties/__properties__" "$remote_directory/rsproperties/"
-        echo "Property info files copied successfully"
-    fi
-
     ndk_run_tests
 }
 

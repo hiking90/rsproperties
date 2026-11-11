@@ -40,8 +40,10 @@ pub const PROP_MSG_SETPROP2: u32 = 0x00020001;
 
 /// V2 success response code.
 pub const PROP_SUCCESS: i32 = 0;
-/// V2 generic error response code. AOSP init never sends it; this crate's
-/// service no longer does either, and uses the specific codes below.
+/// V2 generic error response code. AOSP init never sends it, and this
+/// crate's service sends the specific codes below instead; the 0.6.0
+/// service answered every rejected set with it, so a client talking to
+/// that version still receives it.
 pub const PROP_ERROR: i32 = -1;
 
 // V2 error response codes, as AOSP init sends them (bionic

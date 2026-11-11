@@ -63,32 +63,33 @@ if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
 }
 ```
 
-### Panic-free Initialization
+### Initialization
 
-`system_properties()` panics when initialization fails (e.g. missing
-properties directory, corrupt mmap); `init()` does not panic but only logs
-its failure with `log::warn!` and returns. The `try_*` variants surface
-those errors as `Result` instead — preferable for embedded use, tests,
-and any code that must not unwind through `OnceLock` initialization.
+`init` sets the directories before the first property access, and
+`try_system_properties` returns the global reader as a `Result`;
+`system_properties()` is the same reader but panics when the store cannot
+be opened.
 
 ```rust
-use rsproperties::{try_init, try_system_properties, PropertyConfig};
+use rsproperties::{init, try_system_properties, PropertyConfig};
 
 fn boot() -> rsproperties::Result<()> {
-    try_init(PropertyConfig::with_properties_dir("/dev/__properties__"))?;
+    init(PropertyConfig::new().properties_dir("/dev/__properties__"))?;
     let props = try_system_properties()?;             // &'static SystemProperties
     let sdk: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
     Ok(())
 }
 ```
 
-`try_init` fails with `Error::AlreadyInitialized` when a directory it
-names is already set — by an earlier `init`/`try_init`, or by the
-default being latched: a property read latches the properties dir, a
-`set()` (or `socket_dir()`) call latches the socket dir — without
-poisoning the global state. Options absent from the config are left untouched.
-`try_system_properties` caches both the success and the failure in a
-`OnceLock`, so every later call observes the same outcome.
+Each directory is set once per process: by `init`, or by its first use,
+which latches the default (a property read latches the properties dir, a
+`set()` or `socket_dir()` call the socket dir). `init` succeeds when each
+directory it names is unset or already holds that same path, and fails
+with `Error::AlreadyInitialized` when one holds a different path — then
+it changes neither. Directories absent from the config are left
+untouched. `try_system_properties` keeps the first reader it opens; a
+failure is not kept, so a store created after the process started (a
+service started later) is picked up by the next call.
 
 ### Zero-Allocation Reads (`read_with`)
 
@@ -119,23 +120,28 @@ use rsproperties;
 
 let system_properties = rsproperties::system_properties();
 
-// Wait for any property change
+// Wait for any property change (no timeout: `Ok(Some(serial))` or `Err`)
 std::thread::spawn(|| {
-    if let Some(new_serial) = system_properties.wait_any() {
+    if let Ok(Some(new_serial)) = system_properties.wait(None, None, None) {
         println!("Properties changed, new serial: {}", new_serial);
     }
 });
 
-// Wait for specific property change
+// Wait for a specific property change, at most 30 s
 std::thread::spawn(|| {
     if let Ok(Some(prop_index)) = system_properties.find("sys.boot_completed") {
         println!("Waiting for boot completion...");
-        let old_serial = system_properties.serial(&prop_index);
-        if let Some(_) = system_properties.wait(Some(&prop_index), old_serial, None) {
+        let old_serial = system_properties.serial(&prop_index).ok();
+        let timeout = Some(std::time::Duration::from_secs(30));
+        if let Ok(Some(_)) = system_properties.wait(Some(&prop_index), old_serial, timeout) {
             println!("System boot completed!");
         }
     }
 });
+
+// Or wait for a value directly (libbase `WaitForProperty`)
+let booted = system_properties
+    .wait_for_value("sys.boot_completed", "1", Some(std::time::Duration::from_secs(30)));
 
 // Monitor multiple properties
 let monitored_props = vec![
@@ -145,7 +151,7 @@ let monitored_props = vec![
 ];
 
 for prop_name in monitored_props {
-    match system_properties.get_with_result(prop_name) {
+    match system_properties.get(prop_name) {
         Ok(value) => println!("{}: {}", prop_name, value),
         Err(_) => println!("{}: <not set>", prop_name),
     }
@@ -209,15 +215,17 @@ rsproperties::set("sys.my_service.pid", "1234")?;
 
 ### Error Handling
 
-`Error` is a `thiserror`-derived enum with `#[from]` conversions for
-`std::io::Error`, `rustix::io::Errno`, and `Utf8Error`.
+`Error` is a `thiserror`-derived enum with `From` conversions for
+`std::io::Error`, `rustix::io::Errno` (both into `Error::Io`), and
+`Utf8Error`.
 The `Error::Context` variant carries a `panic::Location` so the failing
-call site is preserved across error boundaries, and `ContextWithLocation`
-attaches that context to any `Result` whose `Err` implements
-`Into<Error>`.
+call site is preserved across error boundaries, and
+`errors::ContextWithLocation` attaches that context to any `Result` whose
+`Err` implements `Into<Error>`.
 
 ```rust
-use rsproperties::{ContextWithLocation, Error, Result};
+use rsproperties::errors::ContextWithLocation;
+use rsproperties::{Error, Result};
 
 fn read_sdk() -> Result<i32> {
     rsproperties::get::<i32>("ro.build.version.sdk")
@@ -249,22 +257,13 @@ fn set_app_config() -> Result<()> {
 ```rust
 use rsproperties::PropertyConfig;
 
-// Alternatives — call `init` once. A later `init` naming a directory that
-// is already set is ignored as a whole (`init` only logs the rejection).
-
-// Configure custom directories
-let config = PropertyConfig::with_both_dirs("/custom/properties", "/custom/socket");
-rsproperties::init(config);
-
-// Using the builder pattern
-let config = PropertyConfig::builder()
-    .properties_dir("/my/properties")
-    .socket_dir("/my/socket")
-    .build();
-rsproperties::init(config);
-
-// Convenience methods
-rsproperties::init(PropertyConfig::with_properties_dir("/my/props"));
+// Both directories, or only the one to change. A directory already set
+// to a different path makes `init` fail with `AlreadyInitialized`.
+rsproperties::init(
+    PropertyConfig::new()
+        .properties_dir("/custom/properties")
+        .socket_dir("/custom/socket"),
+)?;
 ```
 
 ## Platform Support
@@ -293,15 +292,13 @@ rsproperties::init(PropertyConfig::with_properties_dir("/my/props"));
 
 ### Configuration
 
-- `PropertyConfig` — public-fields struct describing the properties &
-  socket directories
-- `PropertyConfig::builder()` / `with_properties_dir()` /
-  `with_socket_dir()` / `with_both_dirs()` — construction helpers
-- `init(config)` — initialize globals; logs and swallows failures
-- `try_init(config)` — initialize globals, returning `Result`
+- `PropertyConfig::new().properties_dir(dir).socket_dir(dir)` — the
+  directories to set; either may be left out
+- `init(config)` — set them once per process; `Ok` again for the same
+  paths, `Err(AlreadyInitialized)` for a different one
 - `properties_dir()` — currently-configured properties directory
 - `socket_dir()` — currently-configured socket directory.
-  Priority: `PropertyConfig.socket_dir` (via `init`/`try_init`) >
+  Priority: `PropertyConfig::socket_dir` (via `init`) >
   `PROPERTY_SERVICE_SOCKET_DIR` env var > `/dev/socket`
 
 ### Property Operations
@@ -322,11 +319,12 @@ rsproperties::init(PropertyConfig::with_properties_dir("/my/props"));
   sending keep the 2 s bound (bionic has none)
 - `system_properties()` — `&'static SystemProperties` or **panic**
 - `try_system_properties()` — `&'static SystemProperties` or `Err`
+  (`Error::Init`); a failure is retried by the next call
 
 ### `SystemProperties` (read side)
 
 - `read_with(name, |&str| -> R)` — zero-alloc callback reader
-- `get_with_result(name)` — `String`-allocating convenience wrapper
+- `get(name)` — the value as a `String`; `Err(NotFound)` when missing
 - `find(name)` — `Result<Option<PropertyIndex>>`; `Ok(None)` for a
   missing property or a malformed name (empty segment), `Err` for I/O /
   mmap / corruption problems. The index is valid only on the instance
@@ -337,11 +335,14 @@ rsproperties::init(PropertyConfig::with_properties_dir("/my/props"));
 - `foreach(|index| ...)` — every readable property's index (bionic
   `__system_property_foreach`); areas the process may not open are skipped
 - `serial(index)` / `context_serial()` — current generation counters
-- `wait_any()` — futex-wait for any property change
 - `wait(index, old_serial, timeout)` — futex-wait for a specific property
+  (`index: None`: any property, bionic `__system_property_wait`);
+  `timeout: Option<Duration>`; `Ok(Some(serial))` on a change, `Ok(None)`
+  on timeout, `Err` on failure
 - `wait_for_creation(name, timeout)` / `wait_for_value(name, expected,
   timeout)` — libbase `WaitForPropertyCreation` / `WaitForProperty`;
   a timeout is `Ok(None)` / `Ok(false)`, a failure is `Err`
+- `PropertyIndex` — the handle `find` / `foreach` return
 
 On Android API 37+, a process started with `BIONIC_APPCOMPAT_OVERRIDE`
 in its environment (zygote sets it) reads `ro.appcompat_override.<name>`
@@ -370,13 +371,13 @@ clients that want to point at a custom socket directory:
 
 ### Errors
 
-- `Error` — non-exhaustive enum (`Io`, `Errno`, `NotFound`, `Encoding`,
+- `Error` — non-exhaustive enum (`Io`, `NotFound`, `Encoding`,
   `Utf8`, `Parse`, `FileValidation`, `InvalidArgument`,
   `AlreadyInitialized`, `LimitExceeded`, `ServiceError`,
   `PermissionDenied`, `FileSize`, `AreaFull`, `FileOwnership`, `Lock`,
   `Init`, `Context`)
 - `Result<T>` = `Result<T, Error>`
-- `ContextWithLocation::context_with_location(msg)` — attach
+- `errors::ContextWithLocation::context_with_location(msg)` — attach
   `panic::Location` to any `Result<_, impl Into<Error>>`
 
 ### `SystemProperties` write side (`builder` feature)
@@ -468,7 +469,7 @@ for (key, value) in properties {
 
 // Point the global reader at the same directory (before any read),
 // then properties can be read normally
-rsproperties::init(PropertyConfig::with_properties_dir("./test_props"));
+rsproperties::init(PropertyConfig::new().properties_dir("./test_props"))?;
 let sdk_version: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
 ```
 

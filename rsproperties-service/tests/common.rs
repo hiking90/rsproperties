@@ -5,7 +5,9 @@ use tokio::sync::OnceCell;
 
 use rsproperties::PropertyConfig;
 
-use rsproperties_service::{PropertiesService, ServiceContext, SocketService};
+use rsproperties_service::properties_service::PropertiesService;
+use rsproperties_service::socket_service::SocketService;
+use rsproperties_service::ServiceContext;
 
 use rsactor::ActorRef;
 
@@ -29,7 +31,9 @@ async fn inti() -> (
     create_dir_all(&properties_dir).expect("Failed to create properties directory");
     create_dir_all(&socket_dir).expect("Failed to create socket directory");
 
-    let config = PropertyConfig::with_both_dirs(properties_dir, socket_dir);
+    let config = PropertyConfig::new()
+        .properties_dir(properties_dir)
+        .socket_dir(socket_dir);
 
     rsproperties_service::run(config, rsproperties_service::ServiceOptions::new())
         .await

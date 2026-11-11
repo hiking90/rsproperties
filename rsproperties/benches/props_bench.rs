@@ -72,22 +72,22 @@ fn bench_lookups(c: &mut Criterion) {
 
     // Deep name, ~9-byte value: the common get() shape.
     c.bench_function("get_hit_deep", |b| {
-        b.iter(|| props.get_with_result(std::hint::black_box("bench.prop.number.42")))
+        b.iter(|| props.get(std::hint::black_box("bench.prop.number.42")))
     });
 
     // Short name, 1-byte value: dominated by per-lookup overhead.
     c.bench_function("get_hit_short", |b| {
-        b.iter(|| props.get_with_result(std::hint::black_box("sys.short")))
+        b.iter(|| props.get(std::hint::black_box("sys.short")))
     });
 
     // Long-ish value (~44 bytes): weights the value NUL-scan/copy.
     c.bench_function("get_hit_long_value", |b| {
-        b.iter(|| props.get_with_result(std::hint::black_box("ro.build.fingerprint.bench")))
+        b.iter(|| props.get(std::hint::black_box("ro.build.fingerprint.bench")))
     });
 
     // Known context, absent property: trie walk + area miss.
     c.bench_function("get_miss", |b| {
-        b.iter(|| props.get_with_result(std::hint::black_box("bench.prop.number.9999")))
+        b.iter(|| props.get(std::hint::black_box("bench.prop.number.9999")))
     });
 
     // Index lookup only (no value read).
