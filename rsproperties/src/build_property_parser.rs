@@ -34,12 +34,6 @@ const MAX_TOTAL_LOADS: u32 = 1_000;
 // whitespace such as U+00A0, which AOSP keeps.
 use crate::parse::is_c_space;
 
-/// Placeholder for future per-property SELinux permission enforcement.
-/// Currently a no-op; see TODO in caller.
-fn check_permissions(_key: &str, _value: &str, _context: &str) {
-    // TODO: Implement proper permission checking
-}
-
 /// Bound on one line's in-memory size. Real prop-file lines are a few
 /// hundred bytes; the cap exists so a crafted newline-less file cannot
 /// grow a single `read_until` buffer without bound — the same threat
@@ -117,23 +111,20 @@ pub(crate) fn read_bounded_line(
 /// `MAX_TOTAL_LOADS` file loads across the whole pass), entries parsed
 /// before the failure remain in `properties` — the map is an accumulator,
 /// not a transaction.
+///
+/// No SELinux context is involved. AOSP's `LoadProperties` picks one from
+/// the file's path (`u:r:init:s0`, or the vendor context under `/vendor`
+/// and `/odm`) and drops the keys `CheckPermissions` denies it; this crate
+/// has no SELinux policy to ask, so of `CheckPermissions` only the
+/// property-name check applies.
 pub fn load_properties_from_file(
     filename: &Path,
     filter: Option<&str>,
-    context: &str,
     properties: &mut HashMap<String, String>,
 ) -> Result<()> {
     let mut visited = HashSet::new();
     let mut loads = 0u32;
-    load_properties_impl(
-        filename,
-        filter,
-        context,
-        properties,
-        0,
-        &mut visited,
-        &mut loads,
-    )
+    load_properties_impl(filename, filter, properties, 0, &mut visited, &mut loads)
 }
 
 /// Expands property references in an import path against the entries
@@ -196,11 +187,9 @@ fn expand_import_path(raw: &str, properties: &HashMap<String, String>) -> Option
 // Recursion state (depth/visited/loads) travels with every call; a params
 // struct would be re-destructured at each of the three call sites for no
 // clarity gain.
-#[allow(clippy::too_many_arguments)]
 fn load_properties_impl(
     filename: &Path,
     filter: Option<&str>,
-    context: &str,
     properties: &mut HashMap<String, String>,
     depth: u8,
     visited: &mut HashSet<PathBuf>,
@@ -249,7 +238,7 @@ fn load_properties_impl(
     }
     // From here on every exit must pop the stack entry; wrap the body so
     // one removal covers all paths.
-    let result = load_properties_body(filename, filter, context, properties, depth, visited, loads);
+    let result = load_properties_body(filename, filter, properties, depth, visited, loads);
     if !filtered {
         visited.remove(&canonical);
     }
@@ -293,12 +282,9 @@ fn open_prop_file(filename: &Path) -> Result<Option<File>> {
     Ok(Some(file))
 }
 
-// See `load_properties_impl` for the arguments-count rationale.
-#[allow(clippy::too_many_arguments)]
 fn load_properties_body(
     filename: &Path,
     filter: Option<&str>,
-    context: &str,
     properties: &mut HashMap<String, String>,
     depth: u8,
     visited: &mut HashSet<PathBuf>,
@@ -363,7 +349,6 @@ fn load_properties_body(
                         if let Err(e) = load_properties_impl(
                             Path::new(&expanded),
                             import_filter,
-                            context,
                             properties,
                             depth + 1,
                             visited,
@@ -434,7 +419,6 @@ fn load_properties_body(
             continue;
         }
 
-        check_permissions(key, value, context);
         // Values stay out of the log, like every other log site that sees
         // one (they may carry tokens or device identifiers). Warn only when
         // the value actually changes, like AOSP `LoadProperties`: a
@@ -465,7 +449,7 @@ mod tests {
         let tmp = TempDir::new("rsprops_fixture_test");
         let file = crate::test_support::copy_android_fixture("system_build.prop", &tmp.0);
         let mut properties = HashMap::new();
-        load_properties_from_file(&file, None, "u:r:init:s0", &mut properties).unwrap();
+        load_properties_from_file(&file, None, &mut properties).unwrap();
         assert_eq!(
             properties.get("persist.sys.usb.config"),
             Some(&"adb".to_string())
@@ -529,7 +513,7 @@ mod tests {
         }
 
         let mut properties = HashMap::new();
-        load_properties_from_file(&path, None, "u:r:init:s0", &mut properties).unwrap();
+        load_properties_from_file(&path, None, &mut properties).unwrap();
         assert_eq!(
             properties.get("ro.nbsp.value").map(String::as_str),
             Some("foo\u{a0}")
@@ -565,7 +549,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         let mut properties = HashMap::new();
-        let err = load_properties_from_file(&link, None, "u:r:init:s0", &mut properties)
+        let err = load_properties_from_file(&link, None, &mut properties)
             .expect_err("symlinked root file must not be opened");
         assert!(format!("{err:?}").contains("Failed to open"), "{err:?}");
         assert!(properties.is_empty());
@@ -577,7 +561,7 @@ mod tests {
             link.display()
         )
         .unwrap();
-        load_properties_from_file(&root, None, "u:r:init:s0", &mut properties).unwrap();
+        load_properties_from_file(&root, None, &mut properties).unwrap();
         assert_eq!(properties.get("from.target"), None);
         assert_eq!(
             properties.get("after.import").map(String::as_str),
@@ -615,7 +599,7 @@ mod tests {
         set_mode(&other_w, 0o646);
 
         let mut properties = HashMap::new();
-        load_properties_from_file(&root, None, "u:r:init:s0", &mut properties).unwrap();
+        load_properties_from_file(&root, None, &mut properties).unwrap();
         assert_eq!(
             properties.keys().map(String::as_str).collect::<Vec<_>>(),
             ["in.root"]
@@ -623,7 +607,7 @@ mod tests {
 
         set_mode(&root, 0o620);
         properties.clear();
-        load_properties_from_file(&root, None, "u:r:init:s0", &mut properties)
+        load_properties_from_file(&root, None, &mut properties)
             .expect("an insecure root file is skipped, not an error");
         assert!(properties.is_empty(), "{properties:?}");
     }
@@ -649,7 +633,7 @@ mod tests {
         }
 
         let mut properties = HashMap::new();
-        load_properties_from_file(&root, None, "u:r:init:s0", &mut properties).unwrap();
+        load_properties_from_file(&root, None, &mut properties).unwrap();
         assert_eq!(properties.get("from.import"), Some(&"1".to_string()));
         assert_eq!(properties.get("after.import"), Some(&"2".to_string()));
     }
@@ -679,7 +663,7 @@ mod tests {
         }
 
         let mut properties = HashMap::new();
-        load_properties_from_file(&root, None, "u:r:init:s0", &mut properties).unwrap();
+        load_properties_from_file(&root, None, &mut properties).unwrap();
         assert_eq!(properties.get("key"), Some(&"from_overlay".to_string()));
     }
 
@@ -745,7 +729,7 @@ mod tests {
         }
 
         let mut properties = HashMap::new();
-        load_properties_from_file(&root, None, "u:r:init:s0", &mut properties).unwrap();
+        load_properties_from_file(&root, None, &mut properties).unwrap();
         assert_eq!(properties.get("ro.vendor.a"), Some(&"1".to_string()));
         assert_eq!(properties.get("ro.vendor.b"), Some(&"2".to_string()));
         assert_eq!(properties.get("exact.key"), Some(&"4".to_string()));
@@ -790,7 +774,7 @@ mod tests {
         // The cycle is cut by the visited set at first re-entry (logged +
         // skipped), and the rest of each file still loads.
         let mut properties = HashMap::new();
-        load_properties_from_file(&a, None, "u:r:init:s0", &mut properties).unwrap();
+        load_properties_from_file(&a, None, &mut properties).unwrap();
         assert_eq!(properties.get("key"), Some(&"v".to_string()));
     }
 
@@ -809,7 +793,7 @@ mod tests {
         writeln!(create_prop(&b).unwrap(), "k=2\nimport {} k", a.display()).unwrap();
 
         let mut properties = HashMap::new();
-        load_properties_from_file(&a, None, "u:r:init:s0", &mut properties).unwrap();
+        load_properties_from_file(&a, None, &mut properties).unwrap();
         assert_eq!(properties.get("k"), Some(&"1".to_string()));
     }
 }

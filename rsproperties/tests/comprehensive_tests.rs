@@ -9,7 +9,7 @@
 
 #[cfg(any(feature = "builder", target_os = "android"))]
 use rsproperties::Error;
-use rsproperties::{PROP_DIRNAME, PROP_VALUE_MAX};
+use rsproperties::{wire::PROP_VALUE_MAX, PROP_DIRNAME};
 
 mod common;
 #[cfg(any(feature = "builder", target_os = "android"))]

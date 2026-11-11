@@ -10,7 +10,8 @@ A pure Rust implementation of Android's property system, providing cross-platfor
 
 This library supports Android versions from Android 9 (API level 28) to Android 16 (API level 36).
 Android 17 (API level 37) is outside that range: its appcompat-override lookup is implemented from
-the AOSP `android-17.0.0_r1` sources and has not been tested on a device or emulator.
+the AOSP `android-17.0.0_r1` sources and was compared with `getprop` on an API 37 emulator, but the
+test suite has not been run there.
 
 ## Features
 
@@ -47,9 +48,9 @@ println!("SDK Version: {}", sdk_version);
 
 // Get property with type parsing and default fallback
 let sdk_version: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
-// ro.debuggable is "0"/"1"; other boolean properties (e.g. ro.apex.updatable)
-// use "true"/"false" — read those with get_or(.., false).
-let is_debuggable: bool = rsproperties::get_or("ro.debuggable", 0) != 0;
+// Boolean properties, by libbase's `GetBoolProperty` rules: "1"/"0",
+// "true"/"false", "y"/"n", "yes"/"no", "on"/"off".
+let is_debuggable: bool = rsproperties::get_bool_or("ro.debuggable", false);
 
 // Get property with error handling
 match rsproperties::get::<String>("ro.build.version.release") {
@@ -66,16 +67,15 @@ if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
 ### Initialization
 
 `init` sets the directories before the first property access, and
-`try_system_properties` returns the global reader as a `Result`;
-`system_properties()` is the same reader but panics when the store cannot
-be opened.
+`system_properties` returns the global reader, or `Error::Init` when the
+store cannot be opened.
 
 ```rust
-use rsproperties::{init, try_system_properties, PropertyConfig};
+use rsproperties::{init, system_properties, PropertyConfig};
 
 fn boot() -> rsproperties::Result<()> {
     init(PropertyConfig::new().properties_dir("/dev/__properties__"))?;
-    let props = try_system_properties()?;             // &'static SystemProperties
+    let props = system_properties()?;                 // &'static SystemProperties
     let sdk: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
     Ok(())
 }
@@ -87,9 +87,9 @@ which latches the default (a property read latches the properties dir, a
 directory it names is unset or already holds that same path, and fails
 with `Error::AlreadyInitialized` when one holds a different path — then
 it changes neither. Directories absent from the config are left
-untouched. `try_system_properties` keeps the first reader it opens; a
-failure is not kept, so a store created after the process started (a
-service started later) is picked up by the next call.
+untouched. `system_properties` keeps the first reader it opens; a failure
+is not kept, so a store created after the process started (a service
+started later) is picked up by the next call.
 
 ### Zero-Allocation Reads (`read_with`)
 
@@ -99,7 +99,7 @@ but if you want raw access to the validated value without parsing,
 seqlock-protected mmap buffer:
 
 ```rust
-let props = rsproperties::system_properties();
+let props = rsproperties::system_properties()?;
 
 // Compute over the value without ever allocating a String.
 let prefix_len: rsproperties::Result<usize> =
@@ -118,22 +118,27 @@ This mirrors bionic's `__system_property_read_callback` pattern.
 ```rust
 use rsproperties;
 
-let system_properties = rsproperties::system_properties();
+let system_properties = rsproperties::system_properties()?;
 
-// Wait for any property change (no timeout: `Ok(Some(serial))` or `Err`)
-std::thread::spawn(|| {
-    if let Ok(Some(new_serial)) = system_properties.wait(None, None, None) {
+// Wait for any property change (no timeout: `Ok(Some(serial))` or `Err`).
+// `old_serial` is the serial the caller last saw: a change made between
+// `area_serial()` and `wait` returns at once instead of being missed.
+std::thread::spawn(move || {
+    let old_serial = system_properties.area_serial();
+    if let Ok(Some(new_serial)) = system_properties.wait(None, old_serial, None) {
         println!("Properties changed, new serial: {}", new_serial);
     }
 });
 
 // Wait for a specific property change, at most 30 s
-std::thread::spawn(|| {
+std::thread::spawn(move || {
     if let Ok(Some(prop_index)) = system_properties.find("sys.boot_completed") {
         println!("Waiting for boot completion...");
-        let old_serial = system_properties.serial(&prop_index).ok();
+        let Ok(old_serial) = system_properties.serial(prop_index) else {
+            return;
+        };
         let timeout = Some(std::time::Duration::from_secs(30));
-        if let Ok(Some(_)) = system_properties.wait(Some(&prop_index), old_serial, timeout) {
+        if let Ok(Some(_)) = system_properties.wait(Some(prop_index), old_serial, timeout) {
             println!("System boot completed!");
         }
     }
@@ -215,22 +220,17 @@ rsproperties::set("sys.my_service.pid", "1234")?;
 
 ### Error Handling
 
-`Error` is a `thiserror`-derived enum with `From` conversions for
-`std::io::Error`, `rustix::io::Errno` (both into `Error::Io`), and
+`Error` is a `thiserror`-derived, non-exhaustive enum with `From`
+conversions for `std::io::Error` (every OS error is `Error::Io`) and
 `Utf8Error`.
-The `Error::Context` variant carries a `panic::Location` so the failing
-call site is preserved across error boundaries, and
-`errors::ContextWithLocation` attaches that context to any `Result` whose
-`Err` implements `Into<Error>`.
+Some paths wrap the failure: `Error::Context` adds a message and the
+`panic::Location` of the failing call, and `Error::Init` marks a failed
+creation of the global reader. `Error::root_cause()` returns the error
+under those layers, so one `match` covers both the wrapped and the
+unwrapped form.
 
 ```rust
-use rsproperties::errors::ContextWithLocation;
 use rsproperties::{Error, Result};
-
-fn read_sdk() -> Result<i32> {
-    rsproperties::get::<i32>("ro.build.version.sdk")
-        .context_with_location("reading ro.build.version.sdk")
-}
 
 // Batch property operations with error handling
 fn set_app_config() -> Result<()> {
@@ -239,12 +239,17 @@ fn set_app_config() -> Result<()> {
         ("debug.my_app.log_level", "info"),
         ("debug.my_app.trace", "disabled"),
     ] {
-        match rsproperties::set(key, value) {
-            Ok(_)                            => println!("set {key}: {value}"),
-            Err(e @ Error::ServiceError { .. }) => return Err(e), // rejected by the service
-            Err(Error::Io(e))                => return Err(Error::Io(e)),
-            Err(e)                           => return Err(e),
+        if let Err(e) = rsproperties::set(key, value) {
+            match e.root_cause() {
+                // Rejected by the service: `code` is a `wire::PROP_ERROR_*`.
+                Error::ServiceError { code, .. } => eprintln!("{key} rejected: {code:#x}"),
+                // No service socket, a closed connection, a timeout.
+                Error::Io(io) => eprintln!("{key}: I/O failure: {io}"),
+                _ => eprintln!("{key}: {e}"),
+            }
+            return Err(e);
         }
+        println!("set {key}: {value}");
     }
     Ok(())
 }
@@ -309,16 +314,16 @@ rsproperties::init(
   with AOSP libbase's `GetBoolProperty` / `GetIntProperty` rules
   (`parse::parse_bool` / `parse::parse_int`: `yes`/`on`/`1`…, leading
   whitespace, `0x` hex); `get<T>` uses Rust's `FromStr` instead
-- `set<T>(name, value)` — `Display`-format and send to the property
-  service over the socket; V2 names and `ro.` values may be up to 65535
+- `set(name, value)` — `value: impl Display` (`set("a.b", 42)`,
+  `set("a.b", "text")`, `set("a.b", &owned)`); the formatted value is
+  sent to the property service over the socket; V2 names and `ro.` values may be up to 65535
   bytes on Android (AOSP init's limit) and up to `wire::MAX_WIRE_NAME_LEN`
   / `MAX_WIRE_VALUE_LEN` elsewhere (non-`ro.` values: at most 91 bytes).
   On Linux it waits at most 2 s for the reply, and a `TimedOut` from that
   wait does not mean the property was not set; on Android it waits for
   init's reply without a timeout, like bionic, while connecting and
   sending keep the 2 s bound (bionic has none)
-- `system_properties()` — `&'static SystemProperties` or **panic**
-- `try_system_properties()` — `&'static SystemProperties` or `Err`
+- `system_properties()` — `&'static SystemProperties` or `Err`
   (`Error::Init`); a failure is retried by the next call
 
 ### `SystemProperties` (read side)
@@ -334,21 +339,28 @@ rsproperties::init(
   (bionic `__system_property_read_callback`)
 - `foreach(|index| ...)` — every readable property's index (bionic
   `__system_property_foreach`); areas the process may not open are skipped
-- `serial(index)` / `context_serial()` — current generation counters
-- `wait(index, old_serial, timeout)` — futex-wait for a specific property
-  (`index: None`: any property, bionic `__system_property_wait`);
-  `timeout: Option<Duration>`; `Ok(Some(serial))` on a change, `Ok(None)`
-  on timeout, `Err` on failure
+- `serial(index)` / `area_serial()` — a property's serial / the global
+  serial that any change advances (bionic `__system_property_area_serial`)
+- `wait(index, old_serial, timeout)` — futex-wait until the serial
+  differs from `old_serial` (bionic `__system_property_wait`).
+  `index: Some(i)` waits on that property, with `old_serial` from
+  `serial(i)`; `index: None` waits on any property, with `old_serial`
+  from `area_serial()`. `timeout: Option<Duration>`; `Ok(Some(serial))`
+  on a change, `Ok(None)` on timeout, `Err` on failure
 - `wait_for_creation(name, timeout)` / `wait_for_value(name, expected,
   timeout)` — libbase `WaitForPropertyCreation` / `WaitForProperty`;
   a timeout is `Ok(None)` / `Ok(false)`, a failure is `Err`
-- `PropertyIndex` — the handle `find` / `foreach` return
+- `PropertyIndex` — the handle `find` / `foreach` return; `Copy`, `Eq`
+  and `Hash`. Two indexes are equal when the same instance returned them
+  for the same entry, so an index can be a `HashMap` key
 
 On Android API 37+, a process started with `BIONIC_APPCOMPAT_OVERRIDE`
 in its environment (zygote sets it) reads `ro.appcompat_override.<name>`
 first, like bionic; see `SystemProperties::read_with`. This follows the
-AOSP `android-17.0.0_r1` sources and is untested (API 37 is outside the
-supported range).
+AOSP `android-17.0.0_r1` sources and returned the same values as
+`getprop` on an API 37 emulator (API 37 is outside the supported range).
+On API 35–36 the override is a bind mount over `/dev/__properties__`,
+which a reader created in that process follows without extra code.
 
 ### Wire-protocol constants & validators (`rsproperties::wire`)
 
@@ -371,14 +383,12 @@ clients that want to point at a custom socket directory:
 
 ### Errors
 
-- `Error` — non-exhaustive enum (`Io`, `NotFound`, `Encoding`,
-  `Utf8`, `Parse`, `FileValidation`, `InvalidArgument`,
-  `AlreadyInitialized`, `LimitExceeded`, `ServiceError`,
-  `PermissionDenied`, `FileSize`, `AreaFull`, `FileOwnership`, `Lock`,
-  `Init`, `Context`)
+- `Error` — non-exhaustive enum (`Io`, `NotFound`, `Utf8`, `Parse`,
+  `FileValidation`, `InvalidArgument`, `AlreadyInitialized`,
+  `LimitExceeded`, `ServiceError`, `PermissionDenied`, `FileSize`,
+  `AreaFull`, `FileOwnership`, `Lock`, `Init`, `Context`)
+- `Error::root_cause()` — the error under the `Context` / `Init` layers
 - `Result<T>` = `Result<T, Error>`
-- `errors::ContextWithLocation::context_with_location(msg)` — attach
-  `panic::Location` to any `Result<_, impl Into<Error>>`
 
 ### `SystemProperties` write side (`builder` feature)
 
@@ -386,7 +396,10 @@ clients that want to point at a custom socket directory:
   `SystemProperties::new_area_locked(lock)` — take the directory's
   writer lock, publish `property_info` (0444, temp + rename) and create
   the areas under it; prefer this over writing `property_info` yourself.
-  `lock.dir()` returns the directory the lock guards
+  `lock.dir()` returns the directory the lock guards. Dropping the lock,
+  or the `SystemProperties` that holds it, releases it with
+  `flock(LOCK_UN)`, so the next `acquire` succeeds even while a child
+  process that has not yet `exec`ed holds a copy of the fd
 - `SystemProperties::new_area(dir)` — create the areas for an existing
   `<dir>/property_info`; it takes the writer lock before it reads that
   file, and without the file it fails before `dir` or `.writer_lock` is
@@ -395,14 +408,20 @@ clients that want to point at a custom socket directory:
 - `SystemProperties::update(index, value)` — overwrite an existing
   entry (seqlock-guarded)
 - `SystemProperties::set(name, value)` — add-or-update
-- `load_properties_from_file(path, filter, context, &mut HashMap)` —
+- `load_properties_from_file(path, filter, &mut HashMap)` —
   parse build.prop entries; like AOSP init it opens each file with
   `O_NOFOLLOW` and skips (with a warning) a file writable by group or
   others
-- `PropertyInfoEntry::parse_from_file(path, require_prefix_or_exact)` —
+- `PropertyInfoEntry::parse_from_file(path, MatchKeyword)` —
   parse a `property_contexts`-format file into
   `(Vec<PropertyInfoEntry>, Vec<Error>)` (the entries that survived
-  and the per-line errors)
+  and the per-line errors). A line without a third token is a prefix
+  match. `MatchKeyword::Checked` rejects a third token other than
+  `prefix` / `exact` (AOSP `require_prefix_or_exact = true`);
+  `MatchKeyword::Unchecked` takes such a line as a prefix match
+- `PropertyInfoEntry::exact(name, context, type_str)` /
+  `PropertyInfoEntry::prefix(name, context, type_str)` — build an entry
+  without a file
 - `build_trie(entries, default_context, default_type)` — serialize a
   property-info trie
 
@@ -432,8 +451,8 @@ for handle in handles {
 ```rust
 #[cfg(feature = "builder")]
 use rsproperties::{
-    build_trie, load_properties_from_file, AreaWriterLock, PropertyConfig, PropertyInfoEntry,
-    SystemProperties,
+    build_trie, load_properties_from_file, AreaWriterLock, MatchKeyword, PropertyConfig,
+    PropertyInfoEntry, SystemProperties,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -443,7 +462,6 @@ let mut properties = HashMap::new();
 load_properties_from_file(
     Path::new("system_build.prop"),
     None,
-    "u:r:init:s0",
     &mut properties
 )?;
 
@@ -453,8 +471,10 @@ load_properties_from_file(
 // replaced by rename (see below). Release builds (no `debug-assertions`)
 // and the `strict-file-validation` feature require `property_info` to be
 // owned by root (uid 0, gid 0).
-let (entries, _errors) =
-    PropertyInfoEntry::parse_from_file(Path::new("property_contexts"), false)?;
+let (entries, _errors) = PropertyInfoEntry::parse_from_file(
+    Path::new("property_contexts"),
+    MatchKeyword::Unchecked,
+)?;
 let trie_data = build_trie(&entries, "u:object_r:build_prop:s0", "string")?;
 let lock = AreaWriterLock::acquire(Path::new("./test_props"))?;
 lock.publish_property_info(&trie_data)?;
@@ -496,15 +516,15 @@ until that file is renamed into place. Start readers after `new_area` /
 
 ## Constants
 
-The library exposes Android-compatible constants. `PROP_VALUE_MAX` is
-re-exported at the crate root for source-compatibility; the canonical
-home (along with the wire-protocol opcodes and validators) is the
-`wire` module:
+The library exposes Android-compatible constants. `PROP_DIRNAME` is at
+the crate root; the size limits, wire-protocol opcodes and validators
+are in the `wire` module:
 
 ```rust
-use rsproperties::{PROP_DIRNAME, PROP_VALUE_MAX};
+use rsproperties::PROP_DIRNAME;
 use rsproperties::wire::{
-    PROP_NAME_MAX, PROP_MSG_SETPROP2, validate_property_name, validate_value_len,
+    PROP_NAME_MAX, PROP_VALUE_MAX, PROP_MSG_SETPROP2, validate_property_name,
+    validate_value_len,
 };
 
 assert_eq!(PROP_VALUE_MAX, 92);              // buffer size including NUL; content cap = 91 bytes

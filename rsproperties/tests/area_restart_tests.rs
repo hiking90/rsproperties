@@ -22,7 +22,9 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
-use rsproperties::{build_trie, AreaWriterLock, Error, PropertyInfoEntry, SystemProperties};
+use rsproperties::{
+    build_trie, AreaWriterLock, Error, MatchKeyword, PropertyInfoEntry, SystemProperties,
+};
 
 fn trie_for(dir: &Path, contexts: &[u8]) -> Vec<u8> {
     std::fs::create_dir_all(dir).unwrap();
@@ -33,7 +35,8 @@ fn trie_for(dir: &Path, contexts: &[u8]) -> Vec<u8> {
         .write_all(contexts)
         .unwrap();
 
-    let (entries, errors) = PropertyInfoEntry::parse_from_file(&contexts_path, false).unwrap();
+    let (entries, errors) =
+        PropertyInfoEntry::parse_from_file(&contexts_path, MatchKeyword::Unchecked).unwrap();
     assert!(errors.is_empty(), "parse errors: {errors:?}");
 
     build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap()
@@ -232,17 +235,13 @@ fn new_area_locks_before_reading_property_info() {
         .unwrap()
         .write_all(b"not a trie")
         .unwrap();
-    // `SystemProperties` has no `Debug`, hence `.err()`.
-    let err = SystemProperties::new_area(dir)
-        .err()
-        .expect("the lock is held by another instance");
+    let err = SystemProperties::new_area(dir).expect_err("the lock is held by another instance");
     assert!(matches!(err, Error::Lock(_)), "{err:?}");
     drop(held);
 }
 
 fn is_not_found(err: &Error) -> bool {
-    matches!(err, Error::Context { source, .. }
-        if matches!(&**source, Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound))
+    matches!(err.root_cause(), Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Without `property_info`, `new_area` returns the loader's error and
@@ -253,16 +252,12 @@ fn new_area_without_property_info_creates_nothing() {
     let guard = common::TempDir::new("rsprops_noinfo"); // not created
 
     let missing = guard.path();
-    let err = SystemProperties::new_area(missing)
-        .err()
-        .expect("no property_info");
+    let err = SystemProperties::new_area(missing).expect_err("no property_info");
     assert!(is_not_found(&err), "{err:?}");
     assert!(!missing.exists(), "{missing:?} must not be created");
 
     std::fs::create_dir(missing).unwrap();
-    let err = SystemProperties::new_area(missing)
-        .err()
-        .expect("no property_info");
+    let err = SystemProperties::new_area(missing).expect_err("no property_info");
     assert!(is_not_found(&err), "{err:?}");
     assert!(
         !missing.join(".writer_lock").exists(),
@@ -280,9 +275,7 @@ fn new_area_dangling_property_info_takes_lock() {
     std::fs::create_dir_all(dir).unwrap();
     std::os::unix::fs::symlink(dir.join("missing"), dir.join("property_info")).unwrap();
 
-    let err = SystemProperties::new_area(dir)
-        .err()
-        .expect("a dangling property_info does not load");
+    let err = SystemProperties::new_area(dir).expect_err("a dangling property_info does not load");
     assert!(
         !matches!(err, Error::Lock(_)) && !is_not_found(&err),
         "must be the O_NOFOLLOW load error: {err:?}"

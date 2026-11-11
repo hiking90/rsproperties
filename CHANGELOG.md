@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was denied (`EACCES`/`EPERM`) is not tried again by that instance; a
   missing area file is retried. The `getprop` example lists all
   properties when run without arguments.
-- `SystemProperties::read_index_with(&index, |name, value, serial| ...)`:
+- `SystemProperties::read_index_with(index, |name, value, serial| ...)`:
   reads by index without a name lookup and passes the serial the value
   was read under (bionic `__system_property_read_callback`).
 - `SystemProperties::wait_for_creation(name, timeout)` and
@@ -32,8 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read-only instance created while `BIONIC_APPCOMPAT_OVERRIDE` is set
   looks up `ro.appcompat_override.<name>` first in `find` and
   `read_with`, as bionic does. API 37 is outside the supported range
-  (28–36); this follows the AOSP `android-17.0.0_r1` sources and is
-  untested.
+  (28–36); this follows the AOSP `android-17.0.0_r1` sources and
+  returned the same values as `getprop` on an API 37 emulator. The test
+  suite has not been run on API 37.
+- `Error::root_cause()`: the error under every `Error::Context` and
+  `Error::Init` layer, so a `match` on it sees `Error::Io`,
+  `Error::Lock`, … whether or not the failing path added context.
 - `wire::PROP_ERROR_*`: AOSP init's V2 error codes (`READ_CMD`,
   `READ_DATA`, `READ_ONLY_PROPERTY`, `INVALID_NAME`, `INVALID_VALUE`,
   `PERMISSION_DENIED`, `INVALID_CMD`, `HANDLE_CONTROL_MESSAGE`,
@@ -57,7 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a change whose write failed goes into the next one; an exclusive
   `flock` on `<file>.lock` keeps a second service off the same file and
   is released with `LOCK_UN` when the service stops, even while a child
-  process that has not yet `exec`ed holds a copy of the fd;
+  process that has not yet `exec`ed holds a copy of the fd (a `fork`
+  child that drops the service's state does not unlock: the lock stays
+  with the process that loaded the file);
   duplicate names are merged at load, keeping the last value; a staged
   `next_boot.<name>` whose `<name>` is neither `persist.` nor
   `next_boot.` is applied once and not written back (init writes it and
@@ -94,11 +100,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `wire::AOSP_MAX_WIRE_STRING_LEN` (65535): the largest V2 name or value
   length AOSP init accepts.
 - Service: `StartupError` and `StartupStage`, the error type
-  `rsproperties_service::run` now returns (see Changed);
-  `PropertiesServiceArgs::writer_lock`, `persistent_properties_file`,
-  `SocketServiceArgs::new` / `control_handler`, and
-  `properties_service::spawn` / `socket_service::spawn` for code that
-  spawns the actors itself.
+  `rsproperties_service::run` now returns (see Changed).
+- Service: `ServiceHandle`, the value `run` now returns (see Changed).
+  `join()` waits until the service has ended by itself and is
+  cancel-safe; `shutdown()` stops the socket service, then the properties
+  service, and returns after both socket files are unlinked and the
+  writer lock is released; dropping the handle stops the service without
+  waiting. Both methods return `Result<(), ServiceError>`. `ServiceError`
+  displays as `<part> failed: <cause>` and `source()` is the cause — in
+  this version a panic in that part's task, since neither part returns an
+  error once it has started.
+- `SystemProperties` implements `Debug`. The output holds the instance id
+  and the lookup mode, and no property name or value.
+- `PropertyIndex` implements `PartialEq`, `Eq` and `Hash`. Two indexes
+  are equal when the same `SystemProperties` instance returned them for
+  the same entry, as two `const prop_info*` are in bionic: `find` on one
+  name twice, or `find` and `foreach`, give equal indexes, and an entry
+  keeps its index across updates and later adds. Indexes from different
+  instances are never equal. An index can be a `HashMap` key, for example
+  to keep the serial last seen per property.
+- `PropertyConfig` implements `PartialEq` and `Eq`.
+- `MatchKeyword` (`builder` feature): `Checked` / `Unchecked`, the second
+  argument of `PropertyInfoEntry::parse_from_file` (see Changed).
+- `PropertyInfoEntry::exact(name, context, type_str)` and
+  `PropertyInfoEntry::prefix(name, context, type_str)` (`builder`
+  feature), which replace `PropertyInfoEntry::new` (see Changed).
 
 ### Changed
 
@@ -120,34 +146,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `SystemProperties::wait` takes `Option<Duration>` and returns
     `Result<Option<u32>>`: `Ok(Some(serial))` on a change, `Ok(None)` on
     timeout, `Err` on a lookup or futex failure (0.6.0: `None` for all
-    three). `wait_any()` is removed (`wait(None, None, None)`, bionic's
-    deprecated `__system_property_wait_any`), and so is the
-    `rsproperties::Timespec` re-export.
+    three). `old_serial` is a `u32`, as in bionic's
+    `__system_property_wait`, not an `Option<u32>`: 0.6.0's `None` read
+    the serial inside `wait`, so a change made before the call was
+    missed. `wait_any()` is removed: `wait(None, old_serial, None)` is
+    bionic's deprecated `__system_property_wait_any(old_serial)`. The
+    `rsproperties::Timespec` re-export is removed too.
   - `SystemProperties::serial` returns `Result<u32>` (0.6.0: `None` for a
     foreign index or a failed lookup).
+  - `SystemProperties::context_serial` is renamed `area_serial` (bionic
+    `__system_property_area_serial`): it is the `old_serial` of a
+    `wait(None, ..)`.
+  - `PropertyIndex` is passed by value (it is `Copy`): `serial(index)`,
+    `update(index, value)`, `wait(Some(index), ..)`.
+  - `system_properties()` returns `Result<&'static SystemProperties>`
+    and `try_system_properties` is removed, as `init` / `try_init` above
+    (0.6.0 `system_properties()` panicked when the store could not be
+    opened).
+  - The crate-root re-export `rsproperties::PROP_VALUE_MAX` is removed;
+    the constant is `rsproperties::wire::PROP_VALUE_MAX`.
   - `SystemProperties::get_with_result` is renamed `get`.
   - `Error::Errno` is removed: `rustix` errors become `Error::Io`, so one
     arm matches every OS error. `Error::Init` holds `Box<Error>` (was
-    `Arc<Error>`).
-  - `ContextWithLocation` is no longer re-exported at the crate root; use
-    `rsproperties::errors::ContextWithLocation`.
-- **Breaking (service API):** `properties_service::run(contexts, props)`
-  is removed (`spawn(PropertiesServiceArgs::new(contexts, props))`);
-  `socket_service::run` is renamed `spawn`. `SocketServiceArgs` has
-  private fields and is built with `SocketServiceArgs::new(socket_dir,
-  properties_service)` and `.control_handler(f)`.
-  `PropertiesServiceArgs::with_writer_lock` /
-  `with_persistent_properties_file` are renamed `writer_lock` /
-  `persistent_properties_file`. `SocketService`, `SocketServiceArgs` and
-  `PropertiesService` are reached through their modules only
-  (`socket_service::`, `properties_service::`), and the `ControlHandler`
-  type alias is no longer public. `StartupStage::Config` displays as
-  `configuration (init)`.
-- Service: `SocketService`, `SocketServiceArgs` and `ServiceOptions` no
-  longer implement `UnwindSafe` / `RefUnwindSafe` (they hold the control
-  handler, a `dyn Fn`); 0.6.0's `SocketService` and `SocketServiceArgs`
-  did. Code that moves them into a `catch_unwind` closure needs
-  `AssertUnwindSafe`.
+    `Arc<Error>`). `impl From<rustix::io::Errno> for Error` is removed
+    too; it was the last `rustix` type in the public API.
+  - `Error::Encoding` is removed: the client never returned it.
+  - `ContextWithLocation` is no longer public, and the `errors` module is
+    private: `Error` and `Result` are reached at the crate root only
+    (`rsproperties::errors::Error` no longer resolves). To match on a
+    wrapped error use `Error::root_cause()` (see Added).
+  - `load_properties_from_file(path, filter, properties)` loses its
+    `context` argument, which was checked against nothing: on Linux no
+    SELinux context is available to compare with.
+  - `PropertyInfoEntry::parse_from_file(path, MatchKeyword)` takes an
+    enum instead of `require_prefix_or_exact: bool`:
+    `MatchKeyword::Checked` is `true`, `MatchKeyword::Unchecked` is
+    `false`. A call site now states whether a third token other than
+    `prefix` / `exact` is rejected. Behaviour is that of 0.6.0 and of
+    AOSP `ParsePropertyInfoLine`: a two-token `<property> <context>`
+    line is a prefix match in both modes.
+  - `PropertyInfoEntry::new(name, context, type_str, exact_match)` is
+    replaced by `PropertyInfoEntry::exact(name, context, type_str)` and
+    `PropertyInfoEntry::prefix(name, context, type_str)`. The
+    `exact_match()` accessor is unchanged.
+  - `set(name, value)` takes `value: impl Display` (0.6.0:
+    `value: &T` with `T: Display + ?Sized`), so `set("a.b", 42)` compiles.
+    A reference to a `Display` value is `Display`, so `set(name, &value)`
+    and `set(name, "text")` compile unchanged; only a call that names the
+    type parameter (`set::<str>(..)`) does not.
+- **Breaking (service API):** `run` is the only way to start the service,
+  and no rsactor or tokio type is left in the public API:
+  - `run` returns a `ServiceHandle` (see Added) instead of the tuple
+    `(ServiceContext<SocketService>, ServiceContext<PropertiesService>)`.
+    `ServiceContext`, with its public `actor_ref` and `join_handle`
+    fields, is removed. Dropping the handle stops the service without
+    waiting for it, so the handle is `#[must_use]`: keep it for as long
+    as the service must run.
+  - The `socket_service` and `properties_service` modules are private:
+    `SocketService`, `SocketServiceArgs`, `PropertiesService`,
+    `PropertiesServiceArgs`,
+    `socket_service::run` and `properties_service::run` are removed from
+    the public API, together with the crate-root re-exports of the three
+    types. Their messages were already crate-private, so an actor spawned
+    by hand could be neither asked whether it was ready nor sent a set;
+    and a socket service spawned without the properties dir's writer lock
+    replaced a running instance's sockets.
+  - The `ControlHandler` type alias is no longer public.
+  - The crate's `builder` feature is removed. It only forwarded to
+    `rsproperties/builder`, which the crate always enables.
+  - `StartupStage::Config` displays as `configuration (init)`.
+- Service: `ServiceOptions` does not implement `UnwindSafe` /
+  `RefUnwindSafe` (it holds the control handler, a `dyn Fn`), and neither
+  does `ServiceHandle`. Code that moves either into a `catch_unwind`
+  closure needs `AssertUnwindSafe`.
 - Service: V2 replies carry init's error codes instead of `PROP_ERROR`
   (-1), so a client's `Error::ServiceError { code }` names the reason
   (e.g. `PROP_ERROR_READ_ONLY_PROPERTY` for a second set of a `ro.`
@@ -175,9 +246,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rsproperties-service` target Linux hosts (on Android, init creates the
   property areas). macOS is not supported: the client crate still
   compiles for it, but CI neither builds nor tests it.
-- `SocketService` no longer implements `Drop`. Dropping it still unlinks
-  both socket files (a private field does that now); only code that
-  names `SocketService: Drop` in a bound is affected.
 - `PropertyIndex` records which `SystemProperties` instance returned it;
   it grows from 8 to 16 bytes and its `Debug` output gains an `instance`
   field (see Fixed).
@@ -194,7 +262,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The global reader (`try_system_properties`, and `get` / `set` / the
+- The global reader (`system_properties`, and `get` / `set` / the
   other free functions through it) no longer keeps a failure for the
   process lifetime. 0.6.0 cached the first result, so a client started
   before the store existed (`rsproperties-service` started later) failed
@@ -214,11 +282,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cases: a trailing lone `$` is dropped (was an error), and a
   zero-length name (`${:-d}`) or an empty default (`${x:-}`) for a
   missing/empty property is an error (was expanded).
-- `PropertyInfoEntry::parse_from_file(path, true)` again rejects a
-  two-token `<property> <context>` line (missing match operation), as
-  AOSP `ParsePropertyInfoLine` does. 0.6.0 accepted it as a prefix match
-  under a wrong parity claim. With `false` (what every in-repo caller
-  passes) the line is still accepted.
+- The properties directory's writer lock is released with
+  `flock(LOCK_UN)` when the writer (`AreaWriterLock`, or the
+  `SystemProperties` that holds it) is dropped. 0.6.0 released it only by
+  closing the fd, and an `flock` stays held until every copy of the fd is
+  closed: a child process that `std::process::Command` had forked and
+  that had not yet `exec`ed kept a copy, so a writer started right after
+  the drop — `rsproperties_service::run` after
+  `ServiceHandle::shutdown().await` in a process that spawns children,
+  or another process — could fail with `Error::Lock`. Measured with four
+  threads spawning `/bin/true` in a loop: 1,696 and 1,649 of 20,000
+  drop-then-acquire rounds failed before the change, none after. A drop
+  in a process other than the one that acquired the lock (a `fork` child
+  that never calls `exec`) closes its copy without unlocking, so it does
+  not release the parent's lock.
 - A set but non-UTF-8 `PROPERTY_SERVICE_VERSION` now selects V1 with a
   warning, as documented, instead of being treated as unset (V2).
 - `wire::validate_property_name` error messages print the name
@@ -237,8 +314,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot parse, to the `Error::PermissionDenied` that
   `SystemProperties::update` (and `set` on an existing `ro.` name)
   returns and logs, and to the `build_trie` errors and log lines that
-  name a property and the invalid-type error of `PropertyInfoEntry::new`
-  (the former quoted the name, the latter the type string, with `'…'`).
+  name a property and the invalid-type error of
+  `PropertyInfoEntry::exact` / `prefix` (0.6.0: `new`; the former quoted
+  the name, the latter the type string, with `'…'`).
 - `load_properties_from_file` no longer logs the old and new values when
   a key is overridden (it logs the `Debug`-escaped key only), and logs
   the override only when the value changes, like AOSP `LoadProperties`
@@ -270,7 +348,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which gives the same ordering. std defines only small `Relaxed` atomic
   loads on read-only memory (`core::sync::atomic`, "Atomic accesses to
   read-only memory"), so the `Acquire` loads of `get`, `find`,
-  `read_with`, `serial`, `context_serial` and `wait`, also in 0.6.0, were
+  `read_with`, `serial`, `context_serial` (now `area_serial`) and `wait`,
+  also in 0.6.0, were
   undefined behavior under that contract. The code generated for the
   supported targets makes no store there, so no misbehavior was
   observed (no layout or API change).
@@ -466,11 +545,23 @@ Service (`rsproperties-service`, git dependency only):
 
 ### Documentation
 
+- Every public item has rustdoc, and both crates set
+  `#![warn(missing_docs)]`. Newly documented: `PropertyInfoEntry`,
+  `PropertyInfoEntry::parse_from_file` (line format, and that a rejected
+  line is returned in the second vector instead of failing the call),
+  `build_trie` (its errors), `PROPERTY_SERVICE_SOCKET_NAME` and
+  `PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME`. The `socket_dir` rustdoc
+  names `init` / `PropertyConfig::socket_dir` instead of a private
+  function, and states that the first call fixes the directory.
+- docs.rs builds `rsproperties` with all features and labels each item
+  with the feature it needs (`[package.metadata.docs.rs]`, `doc_cfg`);
+  before, the `builder` API was missing from docs.rs.
+- CI also builds the `rsproperties` rustdoc with default features and
+  `-D warnings`.
 - The 0.6.0 notes are amended: the missing `From<ParseIntError>`
   removal is added to Changed, the Migration section gains the omitted
   breaking changes, an error-variant mapping table, newly rejected
-  inputs, and changed protocol defaults, and the two-token
-  `property_contexts` parity claim is marked as wrong.
+  inputs, and changed protocol defaults.
 - The `SystemProperties::wait` rustdoc states that with an index the
   returned serial can carry the dirty bit while a writer is mid-update,
   as in 0.6.0 and bionic `__system_property_wait`; `serial` waits (up to
@@ -571,9 +662,8 @@ Service (`rsproperties-service`, git dependency only):
   there); any
   other uid that can write the socket dir or one of its ancestors can
   impersonate the service, which is out of scope; default ACLs are not
-  managed; one instance per socket dir. The `SocketService` /
-  `socket_service::run` rustdoc states that the socket service must be
-  spawned only while the properties dir's writer lock is held.
+  managed; one instance per socket dir. This text is in the `run`
+  rustdoc ("Socket files").
 - The service README states that a `set` returning `TimedOut` has an
   unknown outcome: like AOSP init, the service applies every request it
   received in full, also when the client already gave up.
@@ -596,11 +686,6 @@ Service (`rsproperties-service`, git dependency only):
     zero-length name with a default (`${:-d}`) now make the import be
     skipped with a warning (AOSP `ExpandProps`; 0.6.0 expanded them to an
     empty string and to `d`);
-  - `PropertyInfoEntry::parse_from_file(path, true)` reports two-token
-    `<property> <context>` lines (no match operation) in the error `Vec`
-    instead of returning them as prefix entries, so a trie built from the
-    returned entries classifies those names under the default context.
-    Pass `false`, or add `prefix` to the lines;
   - with `PROPERTY_SERVICE_VERSION` set to a non-UTF-8 value, `set`
     rejects names of 32 bytes or more and values of 92 bytes or more
     (`InvalidArgument`), because that environment now selects V1 (see
@@ -782,9 +867,8 @@ Service (`rsproperties-service`, git dependency only):
     frames even with `PROPERTY_SERVICE_VERSION=1` (the property takes
     precedence over the variable) and waits for the 4-byte reply; to
     keep V1, put `ro.property_service.version=1` in a build.prop file;
-  - the global reader (`rsproperties::system_properties()` /
-    `try_system_properties()`, also behind `rsproperties::get` and the
-    other free functions) created while `BIONIC_APPCOMPAT_OVERRIDE` is
+  - the global reader (`rsproperties::system_properties()`, also behind
+    `rsproperties::get` and the other free functions) created while `BIONIC_APPCOMPAT_OVERRIDE` is
     set — on Linux always, on Android only when `ro.build.version.sdk` is
     37 or more — returns the value of `ro.appcompat_override.<name>`, when
     that property exists, from `get`, `read_with` and `find` (0.6.0 read
@@ -793,33 +877,34 @@ Service (`rsproperties-service`, git dependency only):
   - examples: `examples/getprop` without arguments prints every property
     and exits 0 (0.6.0: printed `Listing all properties is not yet
     implemented.` and exited 1);
-  - service: code that spawns `PropertiesService` itself
-    (`properties_service::spawn`, or `rsactor::spawn` with
-    `PropertiesServiceArgs::new`; `properties_service::run` is removed,
-    see Changed API) gets an actor that takes the
-    properties dir's writer lock after reading its input files and before
-    writing `property_info`. To keep a second instance from touching a
-    running instance's sockets, take the lock first
-    (`AreaWriterLock::acquire`), pass it with
-    `PropertiesServiceArgs::writer_lock`, and spawn the socket
-    service only after that, as `run` does.
+  - service: dropping the `ServiceHandle` that `run` returns stops the
+    service. A `let _ = run(..).await?;` therefore stops it at once;
+    bind the handle to a name.
 - **Changed API**:
   - `rsproperties_service::run` returns `Result<_, StartupError>` (see
     Changed error values);
   - `rsproperties_service::run(config, contexts, props)` becomes
     `run(config, options)`: call
     `run(config, ServiceOptions::new().property_contexts_files(contexts).build_prop_files(props))`;
-  - `SocketServiceArgs { socket_dir, properties_service }` becomes
-    `SocketServiceArgs::new(socket_dir, properties_service)` (add
-    `.control_handler(f)` to handle `ctl.*` sets), and
-    `socket_service::run(args)` becomes `socket_service::spawn(args)`;
-    `properties_service::run(contexts, props)` becomes
-    `properties_service::spawn(PropertiesServiceArgs::new(contexts, props))`;
-    `rsproperties_service::{SocketService, SocketServiceArgs,
-    PropertiesService}` become `socket_service::SocketService`,
-    `socket_service::SocketServiceArgs`, `properties_service::PropertiesService`;
-  - `SocketService` has no `Drop` impl; dropping it still unlinks both
-    sockets;
+  - `let (socket, properties) = run(..).await?` becomes
+    `let mut service = run(..).await?`. A `select!` over
+    `socket.join_handle` and `properties.join_handle` becomes
+    `service.join()`; `tokio::join!` of the two handles becomes
+    `service.join().await`; `actor_ref.stop()` (or `kill()`) on both
+    followed by awaiting both join handles becomes
+    `service.shutdown().await`. A `JoinError` or actor error read from a
+    join handle is now the `source()` of the `ServiceError` those two
+    methods return;
+  - `socket_service::run(SocketServiceArgs { .. })` and
+    `properties_service::run(contexts, props)` have no replacement: call
+    `run(config, options)`, which starts both. `SocketService`,
+    `SocketServiceArgs` and `PropertiesService` can no longer be named;
+    code that only named them in the type of the tuple `run` returned
+    uses `ServiceHandle`. An `ActorRef` to either actor is no longer
+    available: set properties through the socket (`rsproperties::set`);
+  - `features = ["builder"]` on the `rsproperties-service` dependency is
+    deleted (cargo otherwise fails to resolve the dependency:
+    the package has no such feature);
   - `init(config)` returns `Result<()>`: handle or `?` it (a bare
     `init(config);` warns `unused_must_use`); `try_init(config)` becomes
     `init(config)`. An `init` that 0.6.0 logged as rejected — a directory
@@ -838,23 +923,55 @@ Service (`rsproperties-service`, git dependency only):
     `wait(index, old, Some(Duration::..))`, and its result
     `Option<u32>` becomes `Result<Option<u32>>`: `Some(s)` →
     `Ok(Some(s))`, a timeout → `Ok(None)`, a failure → `Err` (0.6.0
-    returned `None` for both); `wait_any()` becomes
-    `wait(None, None, None)`; `rsproperties::Timespec` is gone;
-  - `serial(&index)` returns `Result<u32>`: `.expect(..)` and `?` keep
+    returned `None` for both); `rsproperties::Timespec` is gone;
+  - `wait`'s `old_serial` is a `u32`: `wait(index, Some(old), t)` becomes
+    `wait(index, old, t)`. `wait(Some(&index), None, t)` becomes
+    `wait(Some(index), props.serial(index)?, t)`, and
+    `wait(None, None, t)` or `wait_any()` becomes
+    `wait(None, props.area_serial(), t)` (`t = None` for `wait_any`).
+    Read the serial before the check that decides to wait, not right
+    before `wait`: a change made between the two then returns at once;
+  - `context_serial()` becomes `area_serial()`;
+  - `&index` arguments become `index`: `serial(&index)` →
+    `serial(index)`, `update(&index, v)` → `update(index, v)`,
+    `wait(Some(&index), ..)` → `wait(Some(index), ..)`;
+  - `serial(index)` returns `Result<u32>`: `.expect(..)` and `?` keep
     working on the success path; `== None` / `.is_some()` checks become
     `.is_err()` / `.is_ok()`;
+  - `system_properties()` returns a `Result`: add `?`, or `.expect(..)`
+    to keep the panic; `try_system_properties()` becomes
+    `system_properties()`;
+  - `rsproperties::PROP_VALUE_MAX` becomes
+    `rsproperties::wire::PROP_VALUE_MAX`;
   - `SystemProperties::get_with_result(name)` becomes
     `SystemProperties::get(name)`;
   - `Error::Errno(e)` arms become `Error::Io(io)` with
     `rustix::io::Errno::from_io_error(&io)`; `Error::Init(arc)` holds a
     `Box<Error>`;
-  - `use rsproperties::ContextWithLocation` becomes
-    `use rsproperties::errors::ContextWithLocation`;
-  - service: `PropertiesServiceArgs::with_writer_lock` /
-    `with_persistent_properties_file` become `writer_lock` /
-    `persistent_properties_file`; the `ControlHandler` alias is gone
-    (pass the closure to `ServiceOptions::control_handler` or
-    `SocketServiceArgs::control_handler`);
+  - `ContextWithLocation` is gone: wrap errors with your own error type
+    (or `anyhow::Context`); `rsproperties::errors::{Error, Result}`
+    become `rsproperties::{Error, Result}`;
+  - `Error::from(errno)` for a `rustix::io::Errno` becomes
+    `Error::Io(errno.into())`; an `Error::Encoding(_)` arm is deleted;
+  - a match on `Error::Context { source, .. }` or `Error::Init(inner)`
+    that only looks for the cause becomes a match on `err.root_cause()`;
+  - `load_properties_from_file(path, filter, context, &mut map)` becomes
+    `load_properties_from_file(path, filter, &mut map)`;
+  - `PropertyInfoEntry::parse_from_file(path, false)` becomes
+    `parse_from_file(path, MatchKeyword::Unchecked)`, and `(path, true)`
+    becomes `(path, MatchKeyword::Checked)`;
+  - `PropertyInfoEntry::new(name, context, type_str, true)` becomes
+    `PropertyInfoEntry::exact(name, context, type_str)`, and `false`
+    becomes `PropertyInfoEntry::prefix(name, context, type_str)`. For a
+    `bool` known only at run time, branch on it;
+  - `set(name, &value)` keeps compiling. Where the borrowed value is a
+    `Copy` value or a temporary (`set(name, &42)`,
+    `set(name, &n.to_string())`), clippy's
+    `needless_borrows_for_generic_args` now fires; `cargo clippy --fix`
+    removes the `&` (56 such calls in this repository's tests). A
+    `set::<T>(..)` call drops the type argument;
+  - service: the `ControlHandler` alias is gone (pass the closure to
+    `ServiceOptions::control_handler`);
   - `PropertyIndex` is 16 bytes (was 8), and only the `SystemProperties`
     instance that returned it accepts it (see Changed error values).
 - **Changed error values**:
@@ -899,7 +1016,8 @@ Service (`rsproperties-service`, git dependency only):
     `Parse` of `SystemProperties::add` (and of `set` on such a name); the
     `Parse` and `FileValidation` of `build_trie` (empty segment, no name
     parts, duplicate exact or prefix entry, string-table invariant); the
-    invalid-type `InvalidArgument` of `PropertyInfoEntry::new`; and the
+    invalid-type `InvalidArgument` of `PropertyInfoEntry::exact` /
+    `prefix` (0.6.0: `new`); and the
     per-line `Parse` errors of `PropertyInfoEntry::parse_from_file`
     (missing property or context entry, invalid match operation or type).
     The `Parse` of `get::<T>` reads `Failed to parse property "<name>"
@@ -964,10 +1082,10 @@ Service (`rsproperties-service`, git dependency only):
     skipped at init, these calls return `Error::FileValidation` instead
     (`add` only after its value-length check; see the empty-names entry
     above).
-  - `SystemProperties::update` with a `PropertyIndex` from another
-    instance returns `Error::InvalidArgument`, and `serial` / `wait`
-    return `None`. This includes an index from another instance on the
-    same directory — e.g. `rsproperties::system_properties().find(..)`
+  - `SystemProperties::update`, `serial`, `wait` and `read_index_with`
+    with a `PropertyIndex` from another instance return
+    `Error::InvalidArgument`. This includes an index from another instance on the
+    same directory — e.g. `rsproperties::system_properties()?.find(..)`
     passed to a writer created with `new_area` — which worked in 0.6.0
     because both mapped the same files. Call `find` on the instance the
     index is passed to.
@@ -1189,9 +1307,7 @@ build.prop loading:
 - **AOSP parity — legacy two-token property_contexts lines**: a *missing*
   match operation is accepted (defaults to prefix match) even with
   `require_prefix_or_exact`, matching `ParsePropertyInfoLine`; only a
-  present-but-invalid token is an error. **Correction:** this parity
-  claim was wrong — AOSP rejects a missing operation when
-  `require_prefix_or_exact` is set; reverted under Unreleased.
+  present-but-invalid token is an error.
 - Prop-file line length is bounded (64 KiB, skip-with-warn): a crafted
   newline-less file can no longer grow a single read buffer without
   bound.

@@ -9,7 +9,7 @@
 
 extern crate rsproperties;
 
-use rsproperties::{PROP_DIRNAME, PROP_VALUE_MAX};
+use rsproperties::{wire::PROP_VALUE_MAX, PROP_DIRNAME};
 
 #[path = "common.rs"]
 mod common;
@@ -354,7 +354,7 @@ mod builder_tests {
         assert_eq!(read, longest_value);
 
         for len in [PROP_VALUE_MAX, PROP_VALUE_MAX + 1] {
-            let result = rsproperties::set("test.too.long.set", &"x".repeat(len));
+            let result = rsproperties::set("test.too.long.set", "x".repeat(len));
             assert!(
                 matches!(result, Err(rsproperties::Error::InvalidArgument(_))),
                 "a {len}-byte value must be InvalidArgument, got {result:?}"

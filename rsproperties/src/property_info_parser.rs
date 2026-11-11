@@ -758,11 +758,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
 
-        let entries = vec![PropertyInfoEntry::new(
+        let entries = vec![PropertyInfoEntry::prefix(
             "test.".to_owned(),
             "u:object_r:test_prop:s0".to_owned(),
             "string",
-            false,
         )
         .unwrap()];
         let trie = build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap();

@@ -8,64 +8,31 @@ use rsproperties::wire::{
     PROP_ERROR_SET_FAILED, PROP_SUCCESS,
 };
 use rsproperties::{
-    build_trie, load_properties_from_file, AreaWriterLock, PropertyInfoEntry, SystemProperties,
+    build_trie, load_properties_from_file, AreaWriterLock, MatchKeyword, PropertyInfoEntry,
+    SystemProperties,
 };
 
 use crate::persistent_properties::{is_persistent_name, PersistentStore};
 use crate::property_type::check_type;
 
-pub struct PropertiesServiceArgs {
-    property_contexts_files: Vec<PathBuf>,
-    build_prop_files: Vec<PathBuf>,
-    writer_lock: Option<AreaWriterLock>,
-    persistent_properties_file: Option<PathBuf>,
-}
-
-impl PropertiesServiceArgs {
-    /// Public constructor: the type is exposed through `Actor::Args`, so
-    /// downstream users spawning the actor directly (instead of via
-    /// `run`) need a way to build it.
-    ///
-    /// Without [`writer_lock`](Self::writer_lock), the actor's
-    /// `on_start` reads the `property_contexts` and build.prop files and
-    /// then takes the writer lock of `rsproperties::properties_dir()`
-    /// itself, before it writes `property_info` or any area file. A
-    /// [`SocketService`] spawned
-    /// next to it must not start before that lock is held: spawned earlier,
-    /// a second instance renames its sockets over a running instance's
-    /// sockets before its properties service fails on the lock. Take the
-    /// lock first ([`AreaWriterLock::acquire`]) and pass it here, as
-    /// `rsproperties_service::run` does.
-    ///
-    /// [`SocketService`]: crate::socket_service::SocketService
-    pub fn new(property_contexts_files: Vec<PathBuf>, build_prop_files: Vec<PathBuf>) -> Self {
-        Self {
-            property_contexts_files,
-            build_prop_files,
-            writer_lock: None,
-            persistent_properties_file: None,
-        }
-    }
-
-    /// Stores `persist.*` / `next_boot.*` properties in `path`; see
-    /// [`crate::ServiceOptions::persistent_properties_file`].
-    pub fn persistent_properties_file(mut self, path: impl Into<PathBuf>) -> Self {
-        self.persistent_properties_file = Some(path.into());
-        self
-    }
-
-    /// Hands the actor a writer lock the caller already holds. The lock
-    /// must be for `rsproperties::properties_dir()` (compared as paths with
-    /// [`Path::eq`]); otherwise `on_start` fails with
+/// What [`spawn`] starts the properties service with.
+pub(crate) struct PropertiesServiceArgs {
+    pub(crate) property_contexts_files: Vec<PathBuf>,
+    pub(crate) build_prop_files: Vec<PathBuf>,
+    /// The writer lock of `rsproperties::properties_dir()`, taken by `run`
+    /// before either actor is spawned: the socket service must not bind
+    /// while another instance holds the lock, or it renames its sockets
+    /// over that instance's sockets. A lock for another directory
+    /// (compared as paths with [`Path::eq`]) makes `on_start` fail with
     /// `std::io::ErrorKind::InvalidInput` before it writes anything. The
     /// service keeps the lock until it is dropped.
-    pub fn writer_lock(mut self, lock: AreaWriterLock) -> Self {
-        self.writer_lock = Some(lock);
-        self
-    }
+    pub(crate) writer_lock: AreaWriterLock,
+    /// Stores `persist.*` / `next_boot.*` properties in this file; see
+    /// [`crate::ServiceOptions::persistent_properties_file`].
+    pub(crate) persistent_properties_file: Option<PathBuf>,
 }
 
-pub struct PropertiesService {
+pub(crate) struct PropertiesService {
     system_properties: SystemProperties,
     persistent: Option<PersistentStore>,
 }
@@ -81,15 +48,13 @@ where
 }
 
 /// Synchronous initialisation: parses property_contexts files, builds the
-/// trie, loads build.prop files, takes the writer lock (unless `lock` is
-/// given), publishes the trie as `property_info`, and applies the build.prop
-/// entries to freshly created areas.
+/// trie, loads build.prop files, publishes the trie as `property_info`
+/// under `lock`, and applies the build.prop entries to freshly created
+/// areas.
 ///
 /// Every input file is read before `property_info` or any area file in
-/// `dir` is written, and the writer lock is held before `property_info` is
-/// replaced: a failed input
-/// file or a second instance (which fails on the lock) leaves the running
-/// instance's `property_info` untouched.
+/// `dir` is written, so a failed input file leaves the previous
+/// `property_info` untouched. `lock` must be the writer lock of `dir`.
 ///
 /// Kept synchronous on purpose — every step is blocking I/O against the
 /// filesystem and we don't want to scatter `spawn_blocking` calls through
@@ -105,12 +70,12 @@ fn init_system_properties_sync(
     property_contexts_files: Vec<PathBuf>,
     build_prop_files: Vec<PathBuf>,
     dir: &Path,
-    lock: Option<AreaWriterLock>,
+    lock: AreaWriterLock,
 ) -> std::io::Result<SystemProperties> {
     let mut property_infos = Vec::new();
     for file in property_contexts_files {
         let (mut property_info, errors) =
-            PropertyInfoEntry::parse_from_file(&file, false).map_err(io_other)?;
+            PropertyInfoEntry::parse_from_file(&file, MatchKeyword::Unchecked).map_err(io_other)?;
         if !errors.is_empty() {
             log::error!("{errors:?}");
         }
@@ -126,28 +91,21 @@ fn init_system_properties_sync(
     // by the keys, not by HashMap's randomised hash seed.
     let mut properties_unordered: HashMap<String, String> = HashMap::new();
     for file in build_prop_files {
-        load_properties_from_file(&file, None, "u:r:init:s0", &mut properties_unordered)
-            .map_err(io_other)?;
+        load_properties_from_file(&file, None, &mut properties_unordered).map_err(io_other)?;
     }
     let properties: BTreeMap<String, String> = properties_unordered.into_iter().collect();
 
-    // First write to `dir` (unless the caller already took the lock, which
-    // created `.writer_lock`): everything above only read files. The lock
-    // comes before `publish_property_info`, so a losing second instance
-    // fails here without replacing the running instance's `property_info`.
-    let lock = match lock {
-        Some(lock) if lock.dir() == dir => lock,
-        Some(lock) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "writer lock is for {:?}, properties dir is {dir:?}",
-                    lock.dir()
-                ),
-            ))
-        }
-        None => AreaWriterLock::acquire(dir).map_err(io_other)?,
-    };
+    // First write to `dir` since the lock was taken (which created
+    // `.writer_lock`): everything above only read files.
+    if lock.dir() != dir {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "writer lock is for {:?}, properties dir is {dir:?}",
+                lock.dir()
+            ),
+        ));
+    }
     lock.publish_property_info(&data).map_err(io_other)?;
     let mut system_properties = SystemProperties::new_area_locked(lock).map_err(io_other)?;
     // `new_area_locked` starts from a freshly-created, empty area and the
@@ -420,14 +378,14 @@ impl PropertiesService {
     }
 }
 
-/// Spawns the properties service actor with `args`. See
-/// [`PropertiesServiceArgs::new`] for when the writer lock is taken.
-pub fn spawn(args: PropertiesServiceArgs) -> crate::ServiceContext<PropertiesService> {
-    let (actor_ref, join_handle) = rsactor::spawn(args);
-    crate::ServiceContext {
-        actor_ref,
-        join_handle,
-    }
+/// Spawns the properties service actor with `args`.
+pub(crate) fn spawn(
+    args: PropertiesServiceArgs,
+) -> (
+    ActorRef<PropertiesService>,
+    tokio::task::JoinHandle<rsactor::ActorResult<PropertiesService>>,
+) {
+    rsactor::spawn(args)
 }
 
 #[cfg(test)]
@@ -457,6 +415,17 @@ mod tests {
         }
     }
 
+    /// [`init_system_properties_sync`] with the writer lock of `dir`, taken
+    /// first as `run` does.
+    fn init_locked(
+        property_contexts_files: Vec<PathBuf>,
+        build_prop_files: Vec<PathBuf>,
+        dir: &Path,
+    ) -> std::io::Result<SystemProperties> {
+        let lock = AreaWriterLock::acquire(dir).map_err(io_other)?;
+        init_system_properties_sync(property_contexts_files, build_prop_files, dir, lock)
+    }
+
     /// A reader that already holds the previous `property_info` must keep
     /// seeing its bytes: the new trie is published on a new inode.
     #[test]
@@ -472,7 +441,7 @@ mod tests {
         let mut old_reader = std::fs::File::open(&info_path).unwrap();
         let old_ino = old_reader.metadata().unwrap().ino();
 
-        drop(init_system_properties_sync(vec![], vec![], &tmp.0, None).unwrap());
+        drop(init_locked(vec![], vec![], &tmp.0).unwrap());
 
         let new_meta = std::fs::metadata(&info_path).unwrap();
         assert_ne!(new_meta.ino(), old_ino);
@@ -492,7 +461,7 @@ mod tests {
         std::fs::write(&info_path, b"stale").unwrap();
         std::fs::set_permissions(&info_path, std::fs::Permissions::from_mode(0o664)).unwrap();
 
-        drop(init_system_properties_sync(vec![], vec![], &tmp.0, None).unwrap());
+        drop(init_locked(vec![], vec![], &tmp.0).unwrap());
 
         let mode = std::fs::metadata(&info_path).unwrap().mode() & 0o777;
         assert_eq!(mode, PROPERTY_INFO_MODE);
@@ -505,7 +474,7 @@ mod tests {
         let stale = tmp.0.join(".property_info.tmp-4294967295");
         std::fs::write(&stale, b"half-written trie").unwrap();
 
-        drop(init_system_properties_sync(vec![], vec![], &tmp.0, None).unwrap());
+        drop(init_locked(vec![], vec![], &tmp.0).unwrap());
 
         assert!(!stale.exists());
     }
@@ -525,7 +494,7 @@ mod tests {
         // group-writable prop file is skipped like AOSP init does.
         std::fs::set_permissions(&build_prop, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        let props = init_system_properties_sync(vec![], vec![build_prop], &tmp.0, None).unwrap();
+        let props = init_locked(vec![], vec![build_prop], &tmp.0).unwrap();
         assert_eq!(props.get("ro.ok").unwrap(), "1");
         assert!(props.get("persist.vendor.too_long").is_err());
     }
@@ -540,40 +509,28 @@ mod tests {
         path
     }
 
-    /// Whether `e` wraps `rsproperties::Error::Lock`.
-    fn is_lock_error(e: &std::io::Error) -> bool {
-        matches!(
-            e.get_ref()
-                .and_then(|inner| inner.downcast_ref::<rsproperties::Error>()),
-            Some(rsproperties::Error::Lock(_))
-        )
-    }
-
-    /// A second init on a properties dir whose writer lock is held fails
-    /// on the lock before it replaces the running instance's
-    /// `property_info`.
+    /// The service holds the writer lock it was given for as long as its
+    /// `SystemProperties` lives, so a second instance's `acquire` (the
+    /// first step of `run`) fails until then.
     #[test]
-    fn second_init_fails_before_replacing_property_info() {
+    fn writer_lock_is_held_while_properties_live() {
         let tmp = TempDir::new("rsprops_svc_second_init");
         let props = tmp.0.join("props");
-        let info = props.join("property_info");
-        let contexts_a = contexts_file(&tmp, "a", "debug.a.", "u:object_r:debug_a_prop:s0");
-        let contexts_b = contexts_file(&tmp, "b", "debug.b.", "u:object_r:debug_b_prop:s0");
+        let contexts = contexts_file(&tmp, "a", "debug.a.", "u:object_r:debug_a_prop:s0");
 
-        let first = init_system_properties_sync(vec![contexts_a], vec![], &props, None).unwrap();
-        let before = std::fs::read(&info).unwrap();
-
-        let err = init_system_properties_sync(vec![contexts_b], vec![], &props, None)
-            .err()
-            .expect("the writer lock is held by `first`");
-        assert!(is_lock_error(&err), "expected Error::Lock, got: {err}");
-        assert_eq!(
-            std::fs::read(&info).unwrap(),
-            before,
-            "the losing instance replaced property_info"
-        );
-        assert!(!props.join("u:object_r:debug_b_prop:s0").exists());
+        let first = init_locked(vec![contexts], vec![], &props).unwrap();
+        assert!(matches!(
+            AreaWriterLock::acquire(&props),
+            Err(rsproperties::Error::Lock(_))
+        ));
         drop(first);
+        // At once, with no retry: other tests of this binary start child
+        // processes, and a child between its clone and its `exec` holds a
+        // copy of the lock's descriptor. `AreaWriterLock`'s `Drop` unlocks
+        // instead of relying on the last close.
+        if let Err(e) = AreaWriterLock::acquire(&props) {
+            panic!("the lock must be released with the properties: {e}");
+        }
     }
 
     /// A build.prop file that cannot be read fails init before
@@ -583,15 +540,14 @@ mod tests {
         let tmp = TempDir::new("rsprops_svc_bad_build_prop");
         let props = tmp.0.join("props");
         let info = props.join("property_info");
-        drop(init_system_properties_sync(vec![], vec![], &props, None).unwrap());
+        drop(init_locked(vec![], vec![], &props).unwrap());
         let before = std::fs::read(&info).unwrap();
         let before_ino = std::fs::metadata(&info).unwrap().ino();
 
         let contexts = contexts_file(&tmp, "c", "debug.c.", "u:object_r:debug_c_prop:s0");
         let missing = tmp.0.join("inputs").join("missing_build.prop");
-        let err = init_system_properties_sync(vec![contexts], vec![missing], &props, None)
-            .err()
-            .expect("a missing build.prop must fail init");
+        let err = init_locked(vec![contexts], vec![missing], &props)
+            .expect_err("a missing build.prop must fail init");
         assert!(err.to_string().contains("missing_build.prop"), "{err}");
         assert_eq!(std::fs::metadata(&info).unwrap().ino(), before_ino);
         assert_eq!(std::fs::read(&info).unwrap(), before);
@@ -607,9 +563,8 @@ mod tests {
         std::fs::create_dir_all(&props).unwrap();
         let lock = AreaWriterLock::acquire(&other).unwrap();
 
-        let err = init_system_properties_sync(vec![], vec![], &props, Some(lock))
-            .err()
-            .expect("a lock for another dir must be refused");
+        let err = init_system_properties_sync(vec![], vec![], &props, lock)
+            .expect_err("a lock for another dir must be refused");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
         assert!(!props.join("property_info").exists());
         assert!(!other.join("property_info").exists());
@@ -639,7 +594,7 @@ mod tests {
              ro. u:object_r:ro_prop:s0 prefix string\n",
         )
         .unwrap();
-        init_system_properties_sync(vec![contexts], vec![], &tmp.0.join("props"), None).unwrap()
+        init_locked(vec![contexts], vec![], &tmp.0.join("props")).unwrap()
     }
 
     /// init's codes, in init's order of checks.

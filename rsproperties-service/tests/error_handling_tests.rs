@@ -280,7 +280,7 @@ async fn test_property_value_size_limits() -> anyhow::Result<()> {
 
         let set_result = rsproperties::set(&prop_name, test_value);
 
-        if test_value.len() < rsproperties::PROP_VALUE_MAX {
+        if test_value.len() < rsproperties::wire::PROP_VALUE_MAX {
             set_result?;
             let retrieved: String = rsproperties::get(&prop_name)?;
             assert_eq!(retrieved, *test_value, "value read back for {test_name}");
@@ -408,15 +408,15 @@ async fn test_memory_usage_patterns() -> anyhow::Result<()> {
         let prop_name = format!("test.memory.iteration_{i}");
 
         // Create and destroy many property values
-        rsproperties::set(&prop_name, &i)?;
+        rsproperties::set(&prop_name, i)?;
         let _retrieved: String = rsproperties::get(&prop_name)?;
         let _parsed: i32 = rsproperties::get(&prop_name)?;
 
         // Overwrite with different types
-        rsproperties::set(&prop_name, &(i as f64 * 1.5))?;
+        rsproperties::set(&prop_name, i as f64 * 1.5)?;
         let _as_float: f64 = rsproperties::get(&prop_name)?;
 
-        rsproperties::set(&prop_name, &format!("string_{i}"))?;
+        rsproperties::set(&prop_name, format!("string_{i}"))?;
         let _as_string: String = rsproperties::get(&prop_name)?;
     }
 

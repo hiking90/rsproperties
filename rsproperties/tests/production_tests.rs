@@ -11,7 +11,7 @@ extern crate rsproperties;
 
 #[cfg(any(feature = "builder", target_os = "android"))]
 use rsproperties::Error;
-use rsproperties::{PROP_DIRNAME, PROP_VALUE_MAX};
+use rsproperties::{wire::PROP_VALUE_MAX, PROP_DIRNAME};
 
 mod common;
 #[cfg(any(feature = "builder", target_os = "android"))]
@@ -262,7 +262,7 @@ mod builder_tests {
             ("test.set.max", PROP_VALUE_MAX),
             ("test.set.long", PROP_VALUE_MAX + 1),
         ] {
-            let result = rsproperties::set(prop, &"x".repeat(len));
+            let result = rsproperties::set(prop, "x".repeat(len));
             assert!(
                 matches!(result, Err(Error::InvalidArgument(_))),
                 "{len} byte value: {result:?}"

@@ -142,17 +142,17 @@ async fn test_property_type_overwriting() -> anyhow::Result<()> {
     let prop_name = "test.type_overwriting.mixed";
 
     // Start with integer
-    rsproperties::set(prop_name, &42i32)?;
+    rsproperties::set(prop_name, 42i32)?;
     let as_int: i32 = rsproperties::get(prop_name)?;
     assert_eq!(as_int, 42);
 
     // Overwrite with float
-    rsproperties::set(prop_name, &3.14f64)?;
+    rsproperties::set(prop_name, 3.14f64)?;
     let as_float: f64 = rsproperties::get(prop_name)?;
     assert!((as_float - 3.14).abs() < f64::EPSILON);
 
     // Overwrite with boolean
-    rsproperties::set(prop_name, &true)?;
+    rsproperties::set(prop_name, true)?;
     let as_string: String = rsproperties::get(prop_name)?;
     assert_eq!(as_string, "true");
 
@@ -232,14 +232,14 @@ async fn test_concurrent_mixed_operations() -> anyhow::Result<()> {
                         0 => {
                             // Set and parse integer
                             let value = task_id * 1000 + op_id;
-                            rsproperties::set(&prop_name, &value)?;
+                            rsproperties::set(&prop_name, value)?;
                             let parsed: i32 = rsproperties::get(&prop_name)?;
                             assert_eq!(parsed, value);
                         }
                         1 => {
                             // Set and parse float
                             let value = (task_id as f64) + (op_id as f64) * 0.1;
-                            rsproperties::set(&prop_name, &value)?;
+                            rsproperties::set(&prop_name, value)?;
                             let parsed: f64 = rsproperties::get(&prop_name)?;
                             assert!((parsed - value).abs() < f64::EPSILON);
                         }
@@ -253,7 +253,7 @@ async fn test_concurrent_mixed_operations() -> anyhow::Result<()> {
                         3 => {
                             // Set boolean and parse
                             let value = (task_id + op_id) % 2 == 0;
-                            rsproperties::set(&prop_name, &value)?;
+                            rsproperties::set(&prop_name, value)?;
                             let as_string: String = rsproperties::get(&prop_name)?;
                             assert_eq!(as_string, value.to_string());
                         }
@@ -466,7 +466,7 @@ async fn test_performance_characteristics() -> anyhow::Result<()> {
         let prop_name = format!("test.perf_reduced.prop_{i}");
 
         // Set operation
-        rsproperties::set(&prop_name, &i)?;
+        rsproperties::set(&prop_name, i)?;
 
         // Get operation
         let _retrieved: String = rsproperties::get(&prop_name)?;

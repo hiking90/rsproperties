@@ -188,7 +188,7 @@ jobs:
     - name: Lib unit tests on MSRV
       run: |
         cargo test --locked --lib -p rsproperties --features builder
-        cargo test --locked --lib -p rsproperties-service --features builder
+        cargo test --locked --lib -p rsproperties-service
 
   security:
     name: Security audit
@@ -329,3 +329,11 @@ jobs:
       env:
         RUSTDOCFLAGS: -D warnings
       run: cargo doc --all-features --no-deps --document-private-items
+
+    # Without the `builder` feature its items do not exist, so an intra-doc
+    # link to one from an always-present item resolves only above. This is
+    # the build a crates.io user with default features gets.
+    - name: Check documentation (default features, public items)
+      env:
+        RUSTDOCFLAGS: -D warnings
+      run: cargo doc -p rsproperties --no-deps

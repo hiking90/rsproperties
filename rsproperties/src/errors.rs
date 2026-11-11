@@ -1,6 +1,9 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+//! The crate's error type.
+
+/// `Result` with this crate's [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Crate-wide error type.
@@ -11,22 +14,19 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// An OS error, from `std` or from a `rustix` call (`Errno` converts
-    /// into this variant, so one `match` arm sees every errno). Match the
-    /// errno with `rustix::io::Errno::from_io_error` or
-    /// `std::io::Error::raw_os_error`.
+    /// An OS error. Every failed syscall is reported through this variant,
+    /// so one `match` arm sees every errno; read it with
+    /// `std::io::Error::raw_os_error` or `kind`.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// No property with this name (the payload) exists.
     #[error("Property not found: {0}")]
     NotFound(String),
 
-    #[error("Encoding error: {0}")]
-    Encoding(String),
-
-    /// UTF-8 decode failure. A dedicated `#[from]` variant (rather than
-    /// stringifying into [`Error::Encoding`]) so `source()` still reaches
-    /// the original [`std::str::Utf8Error`].
+    /// UTF-8 decode failure. A dedicated `#[from]` variant (rather than a
+    /// message string) so `source()` still reaches the original
+    /// [`std::str::Utf8Error`].
     ///
     /// Deliberately NOT mirrored by a `String::from_utf8` variant:
     /// [`std::string::FromUtf8Error`] owns the failed byte buffer, and
@@ -47,6 +47,8 @@ pub enum Error {
     #[error("Parse error: {0}")]
     Parse(String),
 
+    /// A file of the property store (an area file, `property_info`) or a
+    /// prop file has content, a type or a mode this crate refuses to use.
     #[error("File validation error: {0}")]
     FileValidation(String),
 
@@ -79,11 +81,19 @@ pub enum Error {
     /// request at the protocol level — the socket itself is healthy, so
     /// this is deliberately not an [`Error::Io`].
     #[error("Property service rejected \"{name}\": error code {code:#x}")]
-    ServiceError { name: String, code: i32 },
+    ServiceError {
+        /// The property name of the rejected request.
+        name: String,
+        /// The service's reply code: one of `wire::PROP_ERROR_*`.
+        code: i32,
+    },
 
+    /// The property service refused the request for this sender.
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
 
+    /// A file of the property store is smaller or larger than its format
+    /// allows.
     #[error("File size error: {0}")]
     FileSize(String),
 
@@ -94,13 +104,17 @@ pub enum Error {
     #[error("Property area full: {0}")]
     AreaFull(String),
 
+    /// A file of the property store is not owned by root
+    /// (`strict-file-validation` feature).
     #[error("File ownership error: {0}")]
     FileOwnership(String),
 
+    /// Another instance holds the writer lock of the properties directory
+    /// (`AreaWriterLock::acquire`).
     #[error("Lock error: {0}")]
     Lock(String),
 
-    /// The global reader could not be created (see `try_system_properties`).
+    /// The global reader could not be created (see `system_properties`).
     /// Not cached: the next access tries again. The original error is the
     /// `source()`.
     ///
@@ -121,22 +135,69 @@ pub enum Error {
     /// reporter walks the chain (anyhow-style "caused by" output).
     #[error("{msg} (at {location}): {source}")]
     Context {
+        /// What the failed step was doing.
         msg: String,
+        /// The source location that added the context.
         location: &'static std::panic::Location<'static>,
+        /// The error the step failed with.
         #[source]
         source: Box<Error>,
     },
 }
 
-/// `rustix` calls report `Errno`; it becomes [`Error::Io`], so the public
-/// error type carries no `rustix` type and has one variant per OS error.
-impl From<rustix::io::Errno> for Error {
-    fn from(errno: rustix::io::Errno) -> Self {
-        Error::Io(errno.into())
+impl Error {
+    /// The error under every [`Error::Context`] and [`Error::Init`] layer;
+    /// `self` when it is neither.
+    ///
+    /// Which calls add a layer is not part of the API contract, so match
+    /// on this instead of on the returned value when the cause decides
+    /// what to do:
+    ///
+    /// ```
+    /// use rsproperties::Error;
+    ///
+    /// fn store_is_missing(err: &Error) -> bool {
+    ///     matches!(err.root_cause(),
+    ///         Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound)
+    /// }
+    /// ```
+    pub fn root_cause(&self) -> &Error {
+        let mut err = self;
+        while let Error::Context { source, .. } | Error::Init(source) = err {
+            err = source;
+        }
+        err
     }
 }
 
-pub trait ContextWithLocation<T> {
+/// What [`ContextWithLocation`] accepts as the wrapped error. `rustix`
+/// calls report `Errno`; it becomes [`Error::Io`] here instead of through a
+/// public `From` impl, which would put a `rustix` type (and its major
+/// version) into this crate's public API.
+pub(crate) trait IntoError {
+    fn into_error(self) -> Error;
+}
+
+impl IntoError for Error {
+    fn into_error(self) -> Error {
+        self
+    }
+}
+
+impl IntoError for std::io::Error {
+    fn into_error(self) -> Error {
+        Error::Io(self)
+    }
+}
+
+impl IntoError for rustix::io::Errno {
+    fn into_error(self) -> Error {
+        Error::Io(self.into())
+    }
+}
+
+/// Wraps the error of a `Result` in [`Error::Context`].
+pub(crate) trait ContextWithLocation<T> {
     #[track_caller]
     fn context_with_location(self, msg: impl Into<String>) -> Result<T>;
 
@@ -150,7 +211,7 @@ pub trait ContextWithLocation<T> {
 
 impl<T, E> ContextWithLocation<T> for std::result::Result<T, E>
 where
-    E: Into<Error>,
+    E: IntoError,
 {
     #[track_caller]
     fn context_with_location(self, msg: impl Into<String>) -> Result<T> {
@@ -158,7 +219,7 @@ where
         self.map_err(|e| Error::Context {
             msg: msg.into(),
             location,
-            source: Box::new(e.into()),
+            source: Box::new(e.into_error()),
         })
     }
 
@@ -168,7 +229,7 @@ where
         self.map_err(|e| Error::Context {
             msg: f(),
             location,
-            source: Box::new(e.into()),
+            source: Box::new(e.into_error()),
         })
     }
 }
@@ -198,7 +259,7 @@ mod tests {
 
     #[test]
     fn errno_converts_into_io() {
-        let err: Error = rustix::io::Errno::ACCESS.into();
+        let err = rustix::io::Errno::ACCESS.into_error();
         match err {
             Error::Io(io) => assert_eq!(
                 rustix::io::Errno::from_io_error(&io),
@@ -206,6 +267,22 @@ mod tests {
             ),
             other => panic!("expected Error::Io, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn root_cause_strips_context_and_init() {
+        let plain = Error::NotFound("a.b".into());
+        assert!(matches!(plain.root_cause(), Error::NotFound(_)));
+
+        let wrapped: Error = Err::<(), _>(rustix::io::Errno::NOENT)
+            .context_with_location("inner")
+            .context_with_location("outer")
+            .unwrap_err();
+        let wrapped = Error::Init(Box::new(wrapped));
+        assert!(matches!(
+            wrapped.root_cause(),
+            Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound
+        ));
     }
 
     fn try_open_file() -> Result<()> {

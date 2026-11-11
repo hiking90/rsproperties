@@ -243,7 +243,7 @@ async fn example_property_monitoring() {
 
     // In a real application, you might:
     // 1. Set up a monitoring thread
-    // 2. Use system_properties().wait() to wait for changes
+    // 2. Use system_properties()?.wait() to wait for changes
     // 3. React to property changes
 
     println!("In a real app, you would set up listeners for these properties...");

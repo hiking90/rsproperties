@@ -353,7 +353,7 @@ impl PropertyArea {
         self.version = version;
         self.reserved = [0; 28];
         *self.bytes_used.get_mut() = mem::size_of::<PropertyTrieNode>() as u32
-            + crate::bionic_align(crate::PROP_VALUE_MAX, mem::size_of::<u32>()) as u32;
+            + crate::bionic_align(crate::wire::PROP_VALUE_MAX, mem::size_of::<u32>()) as u32;
     }
 
     pub(crate) fn serial(&self) -> &AtomicU32 {
@@ -441,6 +441,22 @@ mod offset {
     }
 
     impl<K> Copy for AreaOffset<K> {}
+
+    // By number. Two offsets of one kind are comparable only within one
+    // area; `PropertyIndex` pairs the offset with its context and instance.
+    impl<K> PartialEq for AreaOffset<K> {
+        fn eq(&self, other: &Self) -> bool {
+            self.raw == other.raw
+        }
+    }
+
+    impl<K> Eq for AreaOffset<K> {}
+
+    impl<K> std::hash::Hash for AreaOffset<K> {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.raw.hash(state);
+        }
+    }
 
     impl<K> fmt::Debug for AreaOffset<K> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -704,11 +720,9 @@ impl PropertyAreaMap {
         // uids need all three, like `publish_property_info` (AOSP init runs
         // with umask 0).
         fs::fchmod(&file, fs::Mode::RUSR | fs::Mode::RGRP | fs::Mode::ROTH)
-            .map_err(Error::from)
             .context_with_location(format!("Failed to set mode of {tmp:?}"))?;
 
         fs::ftruncate(&file, PA_SIZE)
-            .map_err(Error::from)
             .context_with_location(format!("Failed to size property area {tmp:?}"))?;
 
         let pa_size = PA_SIZE as usize;
@@ -1003,7 +1017,7 @@ impl PropertyAreaMap {
     pub(crate) fn read_dirty_backup(&self, dst: &mut [u8]) -> Result<()> {
         // Mirror the write side's bound: reads past the reserved slot
         // would return bytes of the first allocated object as "backup".
-        let reserved = crate::bionic_align(crate::PROP_VALUE_MAX, mem::size_of::<u32>());
+        let reserved = crate::bionic_align(crate::wire::PROP_VALUE_MAX, mem::size_of::<u32>());
         if dst.len() >= reserved {
             return Err(Error::InvalidArgument(format!(
                 "Backup read too long: {} (max: {})",
@@ -1089,7 +1103,7 @@ impl PropertyAreaMap {
         // Bound against the *reserved* backup slot (see `PropertyArea::init`),
         // not the whole data region — a longer value would silently overwrite
         // the first allocated object right after the slot.
-        let reserved = crate::bionic_align(crate::PROP_VALUE_MAX, mem::size_of::<u32>());
+        let reserved = crate::bionic_align(crate::wire::PROP_VALUE_MAX, mem::size_of::<u32>());
         if total_len > reserved {
             error!("Backup value overflows the reserved slot: {total_len} > {reserved}");
             return Err(Error::InvalidArgument(format!(
@@ -1351,7 +1365,7 @@ impl PropertyAreaMap {
         // bionic draws the same boundary (`valuelen >= PROP_VALUE_MAX` is
         // long); with `>` the 92-byte case was silently truncated to 91
         // bytes while the serial recorded a length of 92.
-        if value.len() >= crate::PROP_VALUE_MAX {
+        if value.len() >= crate::wire::PROP_VALUE_MAX {
             let long = self.allocate_obj::<WriteOnceStr>(value.len() + 1)?;
 
             let target = self.fresh_bytes_mut(&long, 0, value.len() + 1)?;
@@ -1402,7 +1416,7 @@ impl PropertyAreaMap {
         &'a self,
         pi_offset: EntryOffset,
         name: &[u8],
-        buf: &'a mut [u8; crate::PROP_VALUE_MAX],
+        buf: &'a mut [u8; crate::wire::PROP_VALUE_MAX],
     ) -> Result<&'a [u8]> {
         let pi = self.property_info(pi_offset)?;
         if pi.is_long_for(name) {
@@ -1550,7 +1564,7 @@ impl MemoryMap {
                 0,
             )
         }
-        .map_err(Error::from)? as *mut u8;
+        .map_err(IntoError::into_error)? as *mut u8;
 
         Ok(Self {
             data: memory_area,
@@ -1764,7 +1778,7 @@ impl MemoryMap {
         // The slot's length (`PropertyArea::init` reserves it): a longer
         // view would reach the first allocated object, whose write-once
         // bytes are read non-atomically.
-        let slot_len = crate::bionic_align(crate::PROP_VALUE_MAX, mem::size_of::<u32>());
+        let slot_len = crate::bionic_align(crate::wire::PROP_VALUE_MAX, mem::size_of::<u32>());
         if size > slot_len {
             return Err(Error::InvalidArgument(format!(
                 "Backup slot access too long: {size} (max: {slot_len})"
@@ -1885,7 +1899,7 @@ mod tests {
     fn atomic_data_stays_in_backup_slot() {
         let tmp = TempDir::new("slot");
         let area = PropertyAreaMap::new_rw(&tmp.0.join("ctx"), None).unwrap();
-        let slot = crate::bionic_align(crate::PROP_VALUE_MAX, mem::size_of::<u32>());
+        let slot = crate::bionic_align(crate::wire::PROP_VALUE_MAX, mem::size_of::<u32>());
         assert!(area
             .mmap
             .atomic_data(BACKUP_SLOT, area.data_offset, slot)

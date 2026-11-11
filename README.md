@@ -17,7 +17,8 @@ The library implements Android's property system semantics, including property c
 
 This library supports Android versions from Android 9 (API level 28) to Android 16 (API level 36).
 Android 17 (API level 37) is outside that range: its appcompat-override lookup is implemented from
-the AOSP `android-17.0.0_r1` sources and has not been tested on a device or emulator.
+the AOSP `android-17.0.0_r1` sources and was compared with `getprop` on an API 37 emulator, but the
+test suite has not been run there.
 
 ## Features
 
@@ -69,9 +70,9 @@ println!("SDK Version: {}", sdk_version);
 
 // Get property with type parsing and default fallback
 let sdk_version: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
-// ro.debuggable is "0"/"1"; other boolean properties (e.g. ro.apex.updatable)
-// use "true"/"false" — read those with get_or(.., false).
-let is_debuggable: bool = rsproperties::get_or("ro.debuggable", 0) != 0;
+// Boolean properties, by libbase's `GetBoolProperty` rules: "1"/"0",
+// "true"/"false", "y"/"n", "yes"/"no", "on"/"off".
+let is_debuggable: bool = rsproperties::get_bool_or("ro.debuggable", false);
 
 // Get property with error handling
 match rsproperties::get::<String>("ro.build.version.release") {
@@ -82,8 +83,8 @@ match rsproperties::get::<String>("ro.build.version.release") {
 // Zero-allocation read: borrow the value as `&str` without
 // materializing a `String` (read_with returns an error if the
 // property is missing).
-let len: rsproperties::Result<usize> =
-    rsproperties::system_properties().read_with("ro.build.version.sdk", |v| v.len());
+let len: usize =
+    rsproperties::system_properties()?.read_with("ro.build.version.sdk", |v| v.len())?;
 
 // Set property (requires property service to be running)
 if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
@@ -94,15 +95,14 @@ if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
 ### Initialization
 
 `init` sets the directories before the first property access, and
-`try_system_properties` returns the global reader as a `Result`;
-`system_properties()` is the same reader but panics when the store cannot
-be opened.
+`system_properties` returns the global reader, or `Error::Init` when the
+store cannot be opened.
 
 ```rust
-use rsproperties::{init, try_system_properties, PropertyConfig};
+use rsproperties::{init, system_properties, PropertyConfig};
 
 init(PropertyConfig::new().properties_dir("/dev/__properties__"))?;
-let props = try_system_properties()?;          // &'static SystemProperties
+let props = system_properties()?;              // &'static SystemProperties
 let sdk: String = rsproperties::get_or("ro.build.version.sdk", "0".into());
 ```
 
@@ -111,31 +111,36 @@ which latches the default (a property read latches the properties dir, a
 `set()` or `socket_dir()` call the socket dir). `init` succeeds when each
 directory it names is unset or already holds that same path, and fails
 with `Error::AlreadyInitialized` when one holds a different path — then
-it changes neither. `try_system_properties` keeps the first reader it
-opens; a failure is not kept, so a store created after the process
-started is picked up by the next call.
+it changes neither. `system_properties` keeps the first reader it opens;
+a failure is not kept, so a store created after the process started is
+picked up by the next call.
 
 ### Property Monitoring and Waiting
 
 ```rust
 use rsproperties;
 
-let system_properties = rsproperties::system_properties();
+let system_properties = rsproperties::system_properties()?;
 
-// Wait for any property change (no timeout: `Ok(Some(serial))` or `Err`)
-std::thread::spawn(|| {
-    if let Ok(Some(new_serial)) = system_properties.wait(None, None, None) {
+// Wait for any property change (no timeout: `Ok(Some(serial))` or `Err`).
+// `old_serial` is the serial the caller last saw: a change made between
+// `area_serial()` and `wait` returns at once instead of being missed.
+std::thread::spawn(move || {
+    let old_serial = system_properties.area_serial();
+    if let Ok(Some(new_serial)) = system_properties.wait(None, old_serial, None) {
         println!("Properties changed, new serial: {}", new_serial);
     }
 });
 
 // Wait for a specific property change, at most 30 s
-std::thread::spawn(|| {
+std::thread::spawn(move || {
     if let Ok(Some(prop_index)) = system_properties.find("sys.boot_completed") {
         println!("Waiting for boot completion...");
-        let old_serial = system_properties.serial(&prop_index).ok();
+        let Ok(old_serial) = system_properties.serial(prop_index) else {
+            return;
+        };
         let timeout = Some(std::time::Duration::from_secs(30));
-        if let Ok(Some(_)) = system_properties.wait(Some(&prop_index), old_serial, timeout) {
+        if let Ok(Some(_)) = system_properties.wait(Some(prop_index), old_serial, timeout) {
             println!("System boot completed!");
         }
     }
@@ -213,14 +218,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let options = rsproperties_service::ServiceOptions::new()
         .property_contexts_files(property_contexts)
         .build_prop_files(build_props);
-    let (_socket_service, _properties_service) =
-        rsproperties_service::run(config, options).await?;
+    let service = rsproperties_service::run(config, options).await?;
 
     println!("Property service running...");
 
     // Keep running until interrupted
     tokio::signal::ctrl_c().await?;
     println!("Property service shutting down...");
+
+    // Unlinks the sockets and releases the properties dir's writer lock.
+    service.shutdown().await?;
 
     Ok(())
 }
@@ -269,7 +276,6 @@ let mut properties = HashMap::new();
 load_properties_from_file(
     Path::new("system_build.prop"),
     None,                       // optional name filter (e.g. "ro.*")
-    "u:r:init:s0",              // SELinux context to tag entries with
     &mut properties,
 )?;
 
@@ -311,29 +317,26 @@ when `property_info` has the owner-write bit set, and refuse it with the
 
 ### Error Handling
 
-`rsproperties::Error` is a `thiserror`-derived enum with `From` impls
-for `std::io::Error`, `rustix::io::Errno` (both into `Error::Io`), and
+`rsproperties::Error` is a `thiserror`-derived, non-exhaustive enum with
+`From` impls for `std::io::Error` (every OS error is `Error::Io`) and
 `Utf8Error`.
-The `Error::Context` variant carries a `panic::Location` so the caller
-site is preserved across error boundaries.
+Some paths wrap the failure: `Error::Context` adds a message and the
+`panic::Location` of the failing call, and `Error::Init` marks a failed
+creation of the global reader. `Error::root_cause()` returns the error
+under those layers, so one `match` covers both the wrapped and the
+unwrapped form.
 
 ```rust
-use rsproperties::errors::ContextWithLocation;
-use rsproperties::{Error, Result};
-
-fn read_sdk() -> Result<i32> {
-    // `.context_with_location("…")` attaches caller info to any error
-    // whose type implements `Into<Error>`.
-    rsproperties::get::<i32>("ro.build.version.sdk")
-        .context_with_location("reading ro.build.version.sdk")
-}
+use rsproperties::Error;
 
 fn handle_property_operation() {
     match rsproperties::set("debug.my_app.config", "value") {
         Ok(_) => println!("Property set"),
-        Err(Error::Io(e))            => eprintln!("I/O failure: {e}"),
-        Err(Error::ServiceError { name, code }) => eprintln!("{name} rejected: {code:#x}"),
-        Err(e)                       => eprintln!("other: {e}"),
+        Err(e) => match e.root_cause() {
+            Error::Io(io) => eprintln!("I/O failure: {io}"),
+            Error::ServiceError { name, code } => eprintln!("{name} rejected: {code:#x}"),
+            _ => eprintln!("other: {e}"),
+        },
     }
 }
 ```

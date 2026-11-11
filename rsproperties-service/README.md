@@ -20,16 +20,18 @@ Linux emulation of the Android system property service: a tokio-based daemon tha
 
 ## Architecture
 
-The service consists of two main components running as separate actors:
+The service consists of two main components running as separate actors.
+Both are internal: the public API is `run`, `ServiceOptions` and the
+`ServiceHandle` that `run` returns.
 
-### PropertiesService
+### Properties service
 - Manages the actual property storage and retrieval
 - Loads property contexts from files
 - Processes build.prop files
 - Handles property addition, updates, and lookups
 - Maintains system property state
 
-### SocketService
+### Socket service
 - Provides Unix domain socket interface
 - Handles client connections and commands
 - Implements Android-compatible property service protocol
@@ -50,7 +52,8 @@ rsproperties-service = { git = "https://github.com/hiking90/rsproperties" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ```
 
-`rsproperties-service` always enables `rsproperties/builder`; its own `builder` feature adds nothing.
+`rsproperties-service` has no Cargo features. It always enables
+`rsproperties/builder`.
 
 Supported platform: Linux only. On any other target (Android and macOS
 included) the crate fails to compile with a `compile_error!` that names
@@ -78,28 +81,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .properties_dir(PathBuf::from("/tmp/properties"))
         .socket_dir(PathBuf::from("/tmp/sockets"));
 
-    // Start the services (no input files, no persistence)
-    let (socket_service, properties_service) =
+    // Start the service (no input files, no persistence). `run` returns
+    // once the service is ready for clients.
+    let mut service =
         rsproperties_service::run(config, rsproperties_service::ServiceOptions::new()).await?;
 
-    println!("Services started successfully!");
+    println!("Service started successfully!");
 
-    // Keep services running
+    // Run until Ctrl+C, or until the service ends by itself.
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             println!("Shutdown signal received");
         }
-        result = socket_service.join_handle => {
-            if let Err(e) = result {
-                eprintln!("Socket service error: {}", e);
-            }
-        }
-        result = properties_service.join_handle => {
-            if let Err(e) = result {
-                eprintln!("Properties service error: {}", e);
-            }
-        }
+        // `shutdown` below returns the same result.
+        _ = service.join() => {}
     }
+
+    // Stops the service and waits until the sockets are unlinked and the
+    // properties dir's writer lock is released.
+    service.shutdown().await?;
 
     Ok(())
 }
@@ -146,14 +146,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             eprintln!("ctl.{} {} from pid {:?}", msg.action, msg.target, msg.pid);
             false // no services to control: report failure
         });
-    let (socket_service, properties_service) =
-        rsproperties_service::run(config, options).await?;
+    let mut service = rsproperties_service::run(config, options).await?;
 
-    // Services are now running with full Android-compatible configuration
-    tokio::join!(
-        socket_service.join_handle,
-        properties_service.join_handle
-    );
+    // The service runs with the given files. Nothing ends it in normal
+    // operation, so `join` returns only if it fails.
+    service.join().await?;
 
     Ok(())
 }
@@ -161,29 +158,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 ## Service Components
 
-### ServiceContext
+### ServiceHandle
 
-Each service returns a `ServiceContext` containing:
+`run` returns a `ServiceHandle`. The service runs on the tokio runtime
+that called `run` until the handle stops it:
 
-```rust
-use rsactor::{Actor, ActorRef, ActorResult};
-use tokio::task::JoinHandle;
+| Call | Effect |
+|---|---|
+| `service.join().await` | Waits until the service has ended by itself (a failure after startup). Takes `&mut self` and is cancel-safe, so it can be an arm of `tokio::select!`. By the time it returns, both socket files are unlinked and the writer lock is released. |
+| `service.shutdown().await` | Stops the socket service, then the properties service, and waits for both. Sets already queued are applied first. Returns the failure the service had ended with, if any. |
+| dropping the handle | Stops the service without waiting: the sockets are unlinked and the lock is released later, by tasks on the runtime. Call `shutdown` when the next step depends on them (starting the service again on the same directories, for example). |
 
-pub struct ServiceContext<T: Actor> {
-    pub actor_ref: ActorRef<T>,                  // send messages to the actor
-    pub join_handle: JoinHandle<ActorResult<T>>, // await actor termination
-}
-```
+`join` and `shutdown` return `Result<(), ServiceError>`. `ServiceError`
+displays as `<part> failed: <cause>` (`socket service` or
+`properties service`), and `source()` is the cause. Neither part returns
+an error once it has started, so in this version the cause is a panic in
+that part's task.
 
-### Message Types
+The property area files and `property_info` stay in the properties dir
+after the service has ended; readers that mapped them keep working and
+see no further changes.
 
-`PropertyMessage` and `ReadyMessage` are crate-private — the
-ready-handshake and property-update message round-trips are performed
-by `run()` itself and by the socket-server task respectively. External
+### No in-process actor API
+
+The two actors (socket service, properties service), their argument
+types and their messages are crate-private; `ServiceHandle` exposes no
+rsactor or tokio type. `run` is the only way to start them: it takes the
+properties dir's writer lock before either actor exists, so a second
+instance fails before it replaces a running instance's sockets. External
 callers drive property updates by **connecting to the Unix socket and
-sending an AOSP `SETPROP2` frame**, exactly as the Android client does;
-the in-process actor surface is intentionally not part of the public
-API. See [Protocol Compatibility](#protocol-compatibility) below.
+sending an AOSP `SETPROP2` frame**, exactly as the Android client does.
+See [Protocol Compatibility](#protocol-compatibility) below.
 
 If you need to read or set properties from the same process that owns
 the service, use the `rsproperties` crate directly
@@ -241,8 +246,10 @@ writer lock or the socket service.
 use rsproperties_service::StartupStage;
 
 match rsproperties_service::run(config, options).await {
-    Ok((_socket_service, _properties_service)) => {
-        println!("All services running");
+    Ok(service) => {
+        println!("Service running");
+        // Keep `service`: dropping the handle stops the service.
+        service.shutdown().await?;
     }
     Err(e) => {
         // Displays as "<stage> failed to start: <cause>".

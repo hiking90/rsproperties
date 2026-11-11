@@ -163,16 +163,31 @@ const PROPERTIES_SERIAL_CONTEXT: &CStr = c"u:object_r:properties_serial:s0";
 /// `.property_info.tmp-<pid>`); it does so only after taking the lock, so
 /// it never removes a live writer's temp file.
 ///
+/// Dropping the value unlocks with `flock(LOCK_UN)`; it does not wait for
+/// the descriptor's last close. A child process this program is starting
+/// (`std::process::Command`) has a copy of every descriptor from its clone
+/// until its `exec`, and with a close alone the directory would stay
+/// locked for that long, so an `acquire` right after the drop could fail.
+///
+/// A `fork` child that keeps running without `exec` shares the lock but
+/// does not own it: dropping the value in the child closes the child's
+/// descriptor and unlocks nothing, and once the acquiring process drops
+/// its value the directory is unlocked for both.
+///
 /// Take the lock *before* writing `property_info`, so a second writer
 /// fails before it replaces anything the first one published:
 ///
 /// ```rust,no_run
 /// # fn main() -> rsproperties::Result<()> {
-/// use rsproperties::{build_trie, AreaWriterLock, PropertyInfoEntry, SystemProperties};
+/// use rsproperties::{
+///     build_trie, AreaWriterLock, MatchKeyword, PropertyInfoEntry, SystemProperties,
+/// };
 /// use std::path::Path;
 ///
-/// let (entries, _errors) =
-///     PropertyInfoEntry::parse_from_file(Path::new("property_contexts"), false)?;
+/// let (entries, _errors) = PropertyInfoEntry::parse_from_file(
+///     Path::new("property_contexts"),
+///     MatchKeyword::Unchecked,
+/// )?;
 /// let trie = build_trie(&entries, "u:object_r:default_prop:s0", "string")?;
 ///
 /// let lock = AreaWriterLock::acquire(Path::new("/run/my_properties"))?;
@@ -187,8 +202,35 @@ const PROPERTIES_SERIAL_CONTEXT: &CStr = c"u:object_r:properties_serial:s0";
 #[must_use = "dropping the lock releases the properties directory"]
 pub struct AreaWriterLock {
     dir: PathBuf,
-    /// Holds the flock; never read.
-    _file: std::fs::File,
+    /// Holds the flock; unlocked in `Drop`.
+    file: std::fs::File,
+    /// Process that called `acquire`. `Drop` unlocks only there.
+    owner_pid: u32,
+}
+
+#[cfg(feature = "builder")]
+impl Drop for AreaWriterLock {
+    /// Unlocks before the descriptor is closed. A close releases a `flock`
+    /// only when no other descriptor refers to the open file description,
+    /// and a child being spawned holds a copy until its `exec` closes the
+    /// `O_CLOEXEC` descriptors; `LOCK_UN` releases it regardless.
+    ///
+    /// Not in a `fork` child (pid differs from the acquiring process):
+    /// `LOCK_UN` there would unlock the parent's directory while the
+    /// parent still writes to it.
+    fn drop(&mut self) {
+        if std::process::id() != self.owner_pid {
+            return;
+        }
+        if let Err(e) = fs::flock(&self.file, fs::FlockOperation::Unlock) {
+            // The close that follows still releases it, once every copy of
+            // the descriptor is closed.
+            warn!(
+                "Failed to unlock {:?}: {e}",
+                self.dir.join(WRITER_LOCK_FILENAME)
+            );
+        }
+    }
 }
 
 #[cfg(feature = "builder")]
@@ -222,10 +264,7 @@ impl AreaWriterLock {
                 // path is a real configuration error and deferring it would
                 // surface later as a confusing ENOTDIR.
                 Err(rustix::io::Errno::EXIST) if dir.is_dir() => {}
-                Err(e) => {
-                    return Err(Error::from(e))
-                        .context_with_location(format!("Failed to create {dir:?}"))
-                }
+                Err(e) => return Err(e).context_with_location(format!("Failed to create {dir:?}")),
             }
         }
 
@@ -267,7 +306,8 @@ impl AreaWriterLock {
         sweep_writer_temps(dir);
         Ok(Self {
             dir: dir.to_path_buf(),
-            _file: lock_file,
+            file: lock_file,
+            owner_pid: std::process::id(),
         })
     }
 
@@ -834,6 +874,44 @@ mod tests {
             "the loser must not sweep the winner's temp file"
         );
         drop(first);
+    }
+
+    /// A copy of the lock fd that outlives the lock, like the one a child
+    /// holds between its clone and its `exec`, does not keep the directory
+    /// locked.
+    #[test]
+    fn dropped_lock_unlocks_while_fd_copy_is_open() {
+        let tmp = TempDir::new("fd_copy");
+        let lock = AreaWriterLock::acquire(&tmp.0).unwrap();
+        // Same open file description, as in a child's fd table.
+        let copy = lock.file.try_clone().unwrap();
+        drop(lock);
+        let again = AreaWriterLock::acquire(&tmp.0);
+        drop(copy);
+        if let Err(e) = again {
+            panic!("acquire after drop failed: {e}");
+        }
+    }
+
+    /// A value dropped in another process than the one that acquired it (a
+    /// `fork` child) does not unlock. (Not asserted: that the last close
+    /// then releases it. Other tests of this binary start child processes,
+    /// whose descriptor copies would delay that close.)
+    #[test]
+    fn drop_in_another_process_does_not_unlock() {
+        let tmp = TempDir::new("fork_child");
+        let mut lock = AreaWriterLock::acquire(&tmp.0).unwrap();
+        // The parent's descriptor, still open after the child's drop.
+        let parent = lock.file.try_clone().unwrap();
+        // What the child sees: `acquire` ran under another pid.
+        lock.owner_pid = lock.owner_pid.wrapping_add(1);
+        drop(lock);
+        let while_parent_holds = AreaWriterLock::acquire(&tmp.0);
+        assert!(
+            matches!(while_parent_holds, Err(Error::Lock(_))),
+            "the child's drop must not unlock: {while_parent_holds:?}"
+        );
+        drop(parent);
     }
 
     fn new_rw_err(dir: &Path) -> Error {

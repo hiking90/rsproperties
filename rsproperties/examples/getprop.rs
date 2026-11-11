@@ -75,7 +75,7 @@ fn main() {
         None => {
             // List all readable properties, sorted by name like toybox
             // getprop: `foreach` reports them in trie order.
-            let props = match rsproperties::try_system_properties() {
+            let props = match rsproperties::system_properties() {
                 Ok(props) => props,
                 Err(e) => {
                     eprintln!("getprop: {e}");
@@ -84,7 +84,7 @@ fn main() {
             };
             let mut all = std::collections::BTreeMap::new();
             let walk = props.foreach(|index| {
-                match props.read_index_with(&index, |name, value, _serial| {
+                match props.read_index_with(index, |name, value, _serial| {
                     (name.to_owned(), value.to_owned())
                 }) {
                     Ok((name, value)) => {
