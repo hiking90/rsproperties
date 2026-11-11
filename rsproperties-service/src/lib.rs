@@ -166,6 +166,10 @@ impl ServiceOptions {
     ///   A failed write is logged and the set still succeeds, as in init;
     ///   the change stays in memory and goes into the next write. Do not
     ///   edit the file while the service runs: the next write replaces it.
+    /// - Only a V2 (`PROP_MSG_SETPROP2`) set is stored, as in init. A V1
+    ///   (`PROP_MSG_SETPROP`) set of such a name changes the property
+    ///   area and neither the in-memory records nor the file, so the
+    ///   value is gone after a restart; the service logs a warning.
     /// - A file that does not parse is deleted at startup, as init does.
     ///   A group- or world-writable file is not loaded, as init's
     ///   `ReadFile` does; it is not deleted, but the next persistent set
@@ -205,10 +209,22 @@ impl ServiceOptions {
 
 pub(crate) struct ReadyMessage;
 
+/// The frame a client set arrived in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SetProtocol {
+    /// `PROP_MSG_SETPROP`: the client gets no result code, and a
+    /// `persist.` / `next_boot.` name is set in the property area only
+    /// (init writes the persistent file for V2 sets alone).
+    V1,
+    /// `PROP_MSG_SETPROP2`.
+    V2,
+}
+
 #[derive(Clone)]
 pub(crate) struct PropertyMessage {
     pub name: String,
     pub value: String,
+    pub protocol: SetProtocol,
 }
 
 // Mask `value` in `Debug` output so log-level captures don't spill
@@ -221,6 +237,7 @@ impl std::fmt::Debug for PropertyMessage {
         f.debug_struct("PropertyMessage")
             .field("name", &self.name)
             .field("value", &format_args!("<{} bytes>", self.value.len()))
+            .field("protocol", &self.protocol)
             .finish()
     }
 }
@@ -765,6 +782,7 @@ mod tests {
         let msg = PropertyMessage {
             name: "test.key".to_string(),
             value: "test.value".to_string(),
+            protocol: SetProtocol::V2,
         };
         let debug = format!("{msg:?}");
         assert!(!debug.contains("test.value"), "value leaked: {debug}");
@@ -1159,6 +1177,72 @@ mod tests {
                 "property_info must not be published before the persistent file is loaded"
             );
             assert!(!dir.0.join("properties_serial").exists());
+        });
+    }
+
+    /// A `persist.*` set sent as a V1 frame reaches the property area and
+    /// not the persistent properties file; the same set as a V2 frame
+    /// reaches both (init: `HandlePropertySetNoSocket` for
+    /// `PROP_MSG_SETPROP`).
+    #[test]
+    fn v1_persistent_set_is_applied_and_not_stored() {
+        use rsproperties::wire::{PROP_MSG_SETPROP, PROP_NAME_MAX, PROP_VALUE_MAX};
+
+        const TEST: &str = "tests::v1_persistent_set_is_applied_and_not_stored";
+        if !is_child(TEST) {
+            run_in_child(TEST);
+            return;
+        }
+        block_on_child(async {
+            let dir = TempDir(socket_test_dir(
+                "rsprops_svc_persist_v1",
+                socket_suffix_len("sockets"),
+            ));
+            let _ = std::fs::remove_dir_all(&dir.0);
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let socket_dir = dir.0.join("sockets");
+            let file = dir.0.join("persistent_properties");
+            let config = rsproperties::PropertyConfig::new()
+                .properties_dir(dir.0.join("props"))
+                .socket_dir(socket_dir.clone());
+            let service = run(
+                config,
+                ServiceOptions::new().persistent_properties_file(file.clone()),
+            )
+            .await
+            .unwrap();
+            let socket = socket_dir.join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
+
+            let mut v1 = PROP_MSG_SETPROP.to_ne_bytes().to_vec();
+            for (field, len) in [("persist.v1.name", PROP_NAME_MAX), ("a", PROP_VALUE_MAX)] {
+                let mut buf = vec![0u8; len];
+                buf[..field.len()].copy_from_slice(field.as_bytes());
+                v1.extend_from_slice(&buf);
+            }
+            let mut stream = UnixStream::connect(&socket).await.unwrap();
+            stream.write_all(&v1).await.unwrap();
+            // V1 has no reply: the service closes the connection once the
+            // set has been handled.
+            assert_eq!(read_reply(&mut stream).await, None);
+
+            let (name, value) = ("persist.v2.name", "b");
+            let mut v2 = PROP_MSG_SETPROP2.to_ne_bytes().to_vec();
+            v2.extend_from_slice(&(name.len() as u32).to_ne_bytes());
+            v2.extend_from_slice(name.as_bytes());
+            v2.extend_from_slice(&(value.len() as u32).to_ne_bytes());
+            v2.extend_from_slice(value.as_bytes());
+            let mut stream = UnixStream::connect(&socket).await.unwrap();
+            stream.write_all(&v2).await.unwrap();
+            assert_eq!(read_reply(&mut stream).await, Some(PROP_SUCCESS));
+
+            assert_eq!(rsproperties::get::<String>("persist.v1.name").unwrap(), "a");
+            assert_eq!(rsproperties::get::<String>("persist.v2.name").unwrap(), "b");
+            assert_eq!(
+                crate::persistent_properties::decode(&std::fs::read(&file).unwrap()).unwrap(),
+                vec![(b"persist.v2.name".to_vec(), b"b".to_vec())],
+                "only the V2 set may be in the file"
+            );
+            service.shutdown().await.unwrap();
         });
     }
 

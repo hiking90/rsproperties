@@ -30,6 +30,7 @@ use rsproperties::{
 };
 
 use crate::properties_service::PropertiesService;
+use crate::SetProtocol;
 
 /// The error types [`ContextWithLocation`] wraps: `rustix`'s `Errno`, a
 /// `std::io::Error` (both become `Error::Io`) or an `Error`.
@@ -782,9 +783,12 @@ impl SocketService {
     /// never stored (init: `HandlePropertySet` sends it to
     /// `SendControlMessage`); any other name goes to the properties
     /// service, whose reply is the code ([`crate::PropertiesService`]).
+    /// `protocol` is the command the set arrived in; the properties
+    /// service stores a persistent name for V2 only.
     async fn dispatch<A>(
         name: String,
         value: String,
+        protocol: SetProtocol,
         pid: Option<i32>,
         service: ActorRef<A>,
         control: Option<ControlCalls>,
@@ -795,7 +799,12 @@ impl SocketService {
         if name.starts_with("ctl.") {
             return Self::handle_control(name, value, pid, control).await;
         }
-        match service.ask(crate::PropertyMessage { name, value }).await {
+        let message = crate::PropertyMessage {
+            name,
+            value,
+            protocol,
+        };
+        match service.ask(message).await {
             Ok(code) => code,
             Err(e) => {
                 error!("Failed to send property message through channel: {e}");
@@ -867,6 +876,14 @@ impl SocketService {
     /// connection is the implicit ack — so failures are logged and the
     /// connection is closed without a response. Validation still happens in
     /// `PropertiesService::handle`, identical to the V2 path.
+    ///
+    /// Every V1 request is logged at `warn!`: init sets
+    /// `ro.property_service.version` to 2 and so does this service, so a
+    /// client that follows bionic's rule sends V2. A V1 frame comes from a
+    /// client that does not read that property, and such a client cannot
+    /// learn that its set was rejected, nor that a `persist.` /
+    /// `next_boot.` value was not stored ([`SetProtocol::V1`]). init does
+    /// not log an accepted V1 set.
     async fn handle_setprop_v1<A>(
         stream: &mut UnixStream,
         service: ActorRef<A>,
@@ -891,10 +908,16 @@ impl SocketService {
 
         let name = Self::string_from_fixed(&name_buf)?;
         let value = Self::string_from_fixed(&value_buf)?;
-        info!("Forwarding V1 property: {name:?} ({} bytes)", value.len());
+        let peer = pid.map_or_else(|| "an unknown pid".to_owned(), |pid| format!("pid {pid}"));
+        warn!(
+            "V1 set request (PROP_MSG_SETPROP) for {name:?} ({} bytes) from {peer}: this legacy \
+             command gives the client no result code, and a persist. / next_boot. value set \
+             with it is not stored. The client should send PROP_MSG_SETPROP2",
+            value.len()
+        );
 
-        // The property name was already logged by the `info!` above.
-        let code = Self::dispatch(name, value, pid, service, control).await;
+        // The property name was already logged by the `warn!` above.
+        let code = Self::dispatch(name, value, SetProtocol::V1, pid, service, control).await;
         if code != PROP_SUCCESS {
             warn!("V1 property was rejected: error code {code:#x}");
         }
@@ -1029,7 +1052,7 @@ impl SocketService {
         // result of sending the reply. A client that gave up waiting
         // (`TimedOut`) may therefore find its set applied; checking the
         // peer here would narrow that window, not close it.
-        let code = Self::dispatch(name, value, pid, service, control).await;
+        let code = Self::dispatch(name, value, SetProtocol::V2, pid, service, control).await;
         if code != PROP_SUCCESS {
             warn!("Property set was rejected: error code {code:#x}");
         }

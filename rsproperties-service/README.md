@@ -207,6 +207,10 @@ The socket service implements the Android property service protocol:
 
 - **Socket Names**: Uses standard Android socket names (`property_service`, `property_service_for_system`)
 - **Commands**: Supports `PROP_MSG_SETPROP2` (0x00020001) and the legacy V1 `PROP_MSG_SETPROP` (1), which gets no reply (AOSP V1 behavior)
+- **V1 sets**: a V1 set of a `persist.` / `next_boot.` name changes the
+  property area and is not written to the persistent properties file, as
+  in init, so the value is gone after a restart. Every V1 request is
+  logged at `warn`; clients should send V2
 - **Response Codes**: `PROP_SUCCESS` (0) or init's error codes
   (`rsproperties::wire::PROP_ERROR_*`): `READ_CMD` when the command word
   cannot be read, `READ_DATA` for an unreadable

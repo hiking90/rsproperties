@@ -72,7 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a held lock fails startup with the properties dir unchanged. After a
   transient read error at load (`EIO`, `EMFILE`, ...), the first
   persistent set reads the file again and keeps its records instead of
-  replacing the file with that set alone.
+  replacing the file with that set alone. Only a V2
+  (`PROP_MSG_SETPROP2`) set is stored, as in init: a V1
+  (`PROP_MSG_SETPROP`) set of such a name changes the property area
+  alone, and the service logs a warning that names the file.
 - Service: values are checked against the `property_contexts` type
   (init `CheckType`) for client sets and persistent records; build.prop
   entries are not checked (init drops a mismatching entry); `ctl.*` sets
@@ -219,6 +222,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RefUnwindSafe` (it holds the control handler, a `dyn Fn`), and neither
   does `ServiceHandle`. Code that moves either into a `catch_unwind`
   closure needs `AssertUnwindSafe`.
+- Service: every V1 (`PROP_MSG_SETPROP`) set request is logged at `warn`
+  with the property name, the value length and the peer pid (0.6.0:
+  `info`, without the pid). The service sets
+  `ro.property_service.version=2`, so a client that follows bionic's
+  rule sends V2; a V1 client gets no result code and its `persist.*`
+  sets are not stored (see Added).
 - Service: V2 replies carry init's error codes instead of `PROP_ERROR`
   (-1), so a client's `Error::ServiceError { code }` names the reason
   (e.g. `PROP_ERROR_READ_ONLY_PROPERTY` for a second set of a `ro.`

@@ -518,18 +518,32 @@ init과 다른 점은 다음과 같다.
   area에 남는 값은 init과 같다. 이런 record를 area에도 적용하지 않는 방법도 있으나,
   그러면 첫 재시작 후 area 결과가 init과 달라진다.
 - 손상된 파일은 owner 결정에 따라 init처럼 삭제한다.
-- (b) V1(`PROP_MSG_SETPROP`) set도 파일에 기록한다. init의 기록 조건은
+- V1(`PROP_MSG_SETPROP`) set은 init과 같이 area에만 반영하고 파일에는 기록하지
+  않는다. init의 기록 조건은
   `socket && persistent_properties_loaded && need_persist`(`:417`)이고, V1은
   `HandlePropertySetNoSocket`(socket 없음)을 거치므로 기록되지 않는다. API 36
   emulator에서 V1 frame으로 `persist.*`를 set하면 area 값은 바뀌고 파일에는
-  record가 생기지 않는다. 조건에 `socket &&`가 들어간 것은 `0af9ab330`
-  (2022-10-07, "init: Allow persistent properties to be written
-  asynchronously")부터다. V1 호출부는 그 전에도 socket 없이 호출했으므로, 그
-  이전 init은 V1 `persist.*`도 파일에 기록했다. commit message에는 V1에 대한
-  언급이 없어서, V1을 제외한 것이 의도인지는 확인할 수 없다. 이 service에서는
-  V1과 V2가 같은 `client_set`을 거치고, area에 반영된 `persist.*` set은
-  protocol version과 무관하게 파일에 남는다.
-- `run`이 반환되기 전에 도착한 `persist.*` set은 load한 값을 덮어쓰고 파일에도
+  record가 생기지 않는다. 이 service에서는 socket service가 frame의 command를
+  `SetProtocol`로 넘기고, `client_set`은 `SetProtocol::V1`이면 `apply_set` 뒤에
+  바로 반환한다. `PersistentStore`의 record도 고치지 않는다. init의 다음 쓰기는
+  파일을 다시 읽은 내용에서 시작하므로 V1 값이 들어가지 않는데, 메모리 방식에서
+  같은 결과를 내려면 record에 V1 값이 없어야 한다. V1로 set한 값을 그 뒤에 V2로
+  다시 set하면 파일에 기록된다. `update`가 area가 아니라 record의 값과 비교해서
+  변경 여부를 정하기 때문이다(init도 이 경우 파일에 쓴다).
+  - init의 조건에 `socket &&`가 들어간 것은 `0af9ab330`(2022-10-07, "init:
+    Allow persistent properties to be written asynchronously")부터다. V1
+    호출부는 그 전에도 socket 없이 호출했으므로, 그 이전 init은 V1
+    `persist.*`도 파일에 기록했다. commit message에는 V1에 대한 언급이 없다.
+    이 service는 현재 init의 동작을 따른다.
+- (b) V1 요청을 받을 때마다 `warn` level로 log를 남긴다. init은 수락한 V1 set을
+  log에 남기지 않는다. socket service가 요청마다 이름, value 길이, peer pid를
+  기록한다. persistent properties file이 설정된 상태에서 `persist.`/`next_boot.`
+  이름이 V1로 set되면, properties service가 그 값이 area에만 있고 파일에
+  기록되지 않았다는 log를 파일 경로와 함께 한 번 더 남긴다. 이 service가
+  `ro.property_service.version=2`를 set하므로(S5) bionic 규칙을 따르는 client는
+  V1을 보내지 않는다. V1을 보내는 client는 응답을 받지 않으므로, set이
+  거부되었는지와 값이 파일에 기록되지 않았는지를 알 방법이 service의 log뿐이다.
+- `run`이 반환되기 전에 도착한 V2 `persist.*` set은 load한 값을 덮어쓰고 파일에도
   기록된다. mailbox에서 기다린 set은 `on_start`가 persistent record까지 적용한
   뒤(`apply_startup_properties`) 처리되기 때문이다. init은 load 전의 set을
   파일에 쓰지 않는다(`persistent_properties_loaded`, `property_service.cpp:414-417`).

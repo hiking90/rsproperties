@@ -14,6 +14,7 @@ use rsproperties::{
 
 use crate::persistent_properties::{is_persistent_name, PersistentStore};
 use crate::property_type::check_type;
+use crate::SetProtocol;
 
 /// What [`spawn`] starts the properties service with.
 pub(crate) struct PropertiesServiceArgs {
@@ -317,26 +318,41 @@ impl rsactor::Message<crate::PropertyMessage> for PropertiesService {
         _actor_ref: &ActorRef<Self>,
     ) -> Self::Reply {
         log::debug!("Handling property message: {message:?}");
-        self.client_set(&message.name, message.value).await
+        self.client_set(&message.name, message.value, message.protocol)
+            .await
     }
 }
 
 impl PropertiesService {
-    /// One set from a client: [`apply_set`], then the persistent file.
-    async fn client_set(&mut self, name: &str, value: String) -> i32 {
+    /// One set from a client: [`apply_set`], then, for a V2 set, the
+    /// persistent file.
+    async fn client_set(&mut self, name: &str, value: String, protocol: SetProtocol) -> i32 {
         let code = apply_set(&mut self.system_properties, name, &value);
         if code != PROP_SUCCESS || !is_persistent_name(name.as_bytes()) {
             return code;
         }
-        // init `PropertySet`: a client set of a `persist.` / `next_boot.`
-        // name is written to the file before the reply. init writes only
-        // V2 sets (`socket &&`); V1 sets come here too and are written as
-        // well (docs/aosp-parity.md S1). The write runs on
-        // the blocking pool; awaiting it keeps this actor's sets, and so
-        // the file writes, in order.
         let Some(store) = self.persistent.as_mut() else {
             return code;
         };
+        // init `PropertySet` writes the file only when the set came with a
+        // socket to answer on (`socket && persistent_properties_loaded &&
+        // need_persist`), and the V1 command calls it without one
+        // (`HandlePropertySetNoSocket`). The store's records are left as
+        // they are too: init's next write starts from the file, which does
+        // not hold this value (docs/aosp-parity.md S1).
+        if protocol == SetProtocol::V1 {
+            log::warn!(
+                "{name:?} was set with the V1 command (PROP_MSG_SETPROP): the value is in the \
+                 property area only and is not written to {:?}, as in init; it is lost when the \
+                 service restarts. Set it with PROP_MSG_SETPROP2 to store it",
+                store.path()
+            );
+            return code;
+        }
+        // A V2 set of a `persist.` / `next_boot.` name is written to the
+        // file before the reply. The write runs on the blocking pool;
+        // awaiting it keeps this actor's sets, and so the file writes, in
+        // order.
         if store.reload_pending() {
             let path = store.shared_path();
             match tokio::task::spawn_blocking(move || {
@@ -708,8 +724,15 @@ mod tests {
         assert!(startup_at(&mut sp, Some(&path)).is_err());
     }
 
-    /// A successful client set of a `persist.` / `next_boot.` name rewrites
-    /// the file; a rejected set or another name does not.
+    impl PropertiesService {
+        /// A set that arrived as `PROP_MSG_SETPROP2`.
+        async fn set_v2(&mut self, name: &str, value: &str) -> i32 {
+            self.client_set(name, value.into(), SetProtocol::V2).await
+        }
+    }
+
+    /// A successful V2 client set of a `persist.` / `next_boot.` name
+    /// rewrites the file; a rejected set or another name does not.
     #[tokio::test]
     async fn client_set_writes_persistent_file() {
         use crate::persistent_properties::decode;
@@ -724,25 +747,16 @@ mod tests {
         let on_disk = || decode(&std::fs::read(&path).unwrap_or_default()).unwrap();
         let rec = |n: &str, v: &str| (n.as_bytes().to_vec(), v.as_bytes().to_vec());
 
-        assert_eq!(
-            service.client_set("persist.x", "1".into()).await,
-            PROP_SUCCESS
-        );
+        assert_eq!(service.set_v2("persist.x", "1").await, PROP_SUCCESS);
         assert_eq!(on_disk(), vec![rec("persist.x", "1")]);
+        assert_eq!(service.set_v2("debug.y", "1").await, PROP_SUCCESS);
         assert_eq!(
-            service.client_set("debug.y", "1".into()).await,
-            PROP_SUCCESS
-        );
-        assert_eq!(
-            service.client_set("persist.int", "bad".into()).await,
+            service.set_v2("persist.int", "bad").await,
             PROP_ERROR_INVALID_VALUE
         );
+        assert_eq!(service.set_v2("persist.x", "2").await, PROP_SUCCESS);
         assert_eq!(
-            service.client_set("persist.x", "2".into()).await,
-            PROP_SUCCESS
-        );
-        assert_eq!(
-            service.client_set("next_boot.persist.z", "9".into()).await,
+            service.set_v2("next_boot.persist.z", "9").await,
             PROP_SUCCESS
         );
         assert_eq!(
@@ -761,6 +775,72 @@ mod tests {
             on_disk(),
             vec![rec("persist.x", "2"), rec("persist.z", "9")]
         );
+    }
+
+    /// init `PropertySet` writes the file for a V2 set only (`socket &&`):
+    /// a V1 set of a `persist.` / `next_boot.` name changes the area and
+    /// neither the file nor the records a later V2 write starts from.
+    #[tokio::test]
+    async fn v1_set_is_not_written_to_persistent_file() {
+        use crate::persistent_properties::decode;
+        let tmp = TempDir::new("rsprops_svc_client_persist_v1");
+        let mut sp = typed_properties(&tmp);
+        let path = tmp.0.join("persistent_properties");
+        let persistent = startup_at(&mut sp, Some(&path)).unwrap();
+        let mut service = PropertiesService {
+            system_properties: sp,
+            persistent,
+        };
+        let on_disk = || decode(&std::fs::read(&path).unwrap_or_default()).unwrap();
+        let rec = |n: &str, v: &str| (n.as_bytes().to_vec(), v.as_bytes().to_vec());
+
+        assert_eq!(service.set_v2("persist.x", "1").await, PROP_SUCCESS);
+        for (name, value) in [
+            ("persist.x", "2"),
+            ("persist.v1only", "a"),
+            ("next_boot.persist.s", "5"),
+        ] {
+            assert_eq!(
+                service
+                    .client_set(name, value.into(), SetProtocol::V1)
+                    .await,
+                PROP_SUCCESS,
+                "{name}"
+            );
+            assert_eq!(service.system_properties.get(name).unwrap(), value);
+        }
+        assert_eq!(on_disk(), vec![rec("persist.x", "1")]);
+        // A type mismatch is rejected for V1 as for V2.
+        assert_eq!(
+            service
+                .client_set("persist.int", "bad".into(), SetProtocol::V1)
+                .await,
+            PROP_ERROR_INVALID_VALUE
+        );
+
+        // A V2 write of another name does not carry the V1 values along.
+        assert_eq!(service.set_v2("persist.y", "1").await, PROP_SUCCESS);
+        assert_eq!(
+            on_disk(),
+            vec![rec("persist.x", "1"), rec("persist.y", "1")]
+        );
+        // A V2 set of the value the area already has (from V1) is written:
+        // the file's record, not the area, decides whether it changed.
+        assert_eq!(service.set_v2("persist.x", "2").await, PROP_SUCCESS);
+        assert_eq!(
+            on_disk(),
+            vec![rec("persist.x", "2"), rec("persist.y", "1")]
+        );
+
+        // The V1-only values are gone after a restart.
+        drop(service);
+        let tmp2 = TempDir::new("rsprops_svc_client_persist_v1_restart");
+        let mut sp = typed_properties(&tmp2);
+        startup_at(&mut sp, Some(&path)).unwrap();
+        assert_eq!(sp.get("persist.x").unwrap(), "2");
+        assert!(sp.find("persist.v1only").unwrap().is_none());
+        assert!(sp.find("persist.s").unwrap().is_none());
+        assert!(sp.find("next_boot.persist.s").unwrap().is_none());
     }
 
     /// After `load` hit a transient read error, the first persistent set
@@ -785,14 +865,8 @@ mod tests {
             persistent: Some(store),
         };
 
-        assert_eq!(
-            service.client_set("persist.b", "new".into()).await,
-            PROP_SUCCESS
-        );
-        assert_eq!(
-            service.client_set("persist.c", "3".into()).await,
-            PROP_SUCCESS
-        );
+        assert_eq!(service.set_v2("persist.b", "new").await, PROP_SUCCESS);
+        assert_eq!(service.set_v2("persist.c", "3").await, PROP_SUCCESS);
         assert_eq!(
             decode(&std::fs::read(&path).unwrap()).unwrap(),
             vec![
