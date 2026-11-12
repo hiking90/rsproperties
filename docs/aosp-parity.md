@@ -234,10 +234,14 @@ override가 켜진 프로세스에서는 같은 property에 대해 libc
   (`u:r:shell:s0`) 실행에서 모두 통과했다. `android-test.yml`의 절차대로 만든
   AVD(`avdmanager create avd -k "system-images;android-37.0;google_apis;x86_64"`,
   emulator option `-wipe-data -memory 4096 -partition-size 2048`)에서도 결과가
-  같다. 로컬 조건은 system image revision 6, emulator 36.5.11, NDK r28b이고,
-  workflow는 `sdkmanager`가 받는 최신 revision과 NDK 27.2를 쓴다. GitHub
-  runner에서 API 37 job을 실행한 결과는 확인 필요다(workflow는
-  `workflow_dispatch`로만 시작한다).
+  같다. 로컬 조건은 system image revision 6, emulator 36.5.11, NDK r28b이다.
+- GitHub runner의 API 37 job: `android-test.yml` run 43214204108(2026-11-12,
+  commit `56e7286`)에서 API 28, 30, 34, 36, 37 job이 모두 통과했다. 각 job에서
+  test binary 18개의 test 74개가 root와 shell user 실행에서 통과했다. API 37
+  job의 조건은 system image revision 8(`CE2A.260420.051.A3`), emulator
+  37.2.13, NDK 27.2.12479018이다. workflow는 `workflow_dispatch`로만 시작하고
+  `sdkmanager`가 받는 최신 revision을 쓰므로, 이후 run의 image revision은
+  이 값과 다를 수 있다.
   - `sdkmanager`에는 `android-37` package가 없고 `android-37.0`이 있다.
     `ro.build.version.sdk`는 37이다. workflow의 matrix는 `api-level: 37`에
     `platform: android-37.0`을 따로 지정한다.

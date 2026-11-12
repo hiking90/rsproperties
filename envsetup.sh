@@ -34,6 +34,50 @@ function ndk_test_manifest() {
     echo "$source_directory/android-tests.txt"
 }
 
+# The API level in the name of the NDK clang wrapper that links the build
+# (`<triple>21-clang`). 21 is the lowest level the Rust Android targets
+# and NDK r26 and later support.
+NDK_API_LEVEL=21
+
+# Runs `cargo "$@" --target <triple>` for the target REMOTE_ANDROID names
+# (call read_remote_android first), with the NDK's clang as the linker and
+# as the C compiler of build scripts. Its own messages go to stderr:
+# ndk_build reads cargo's stdout.
+#
+# cargo is run directly, not through `cargo ndk`: ndk_build takes the test
+# binaries from the JSON messages on cargo's stdout, and cargo-ndk 4 reads
+# that stdout itself and prints none of the artifact messages (cargo-ndk 3
+# passed it through). `cargo ndk-env` does not help either: neither
+# version exports all the variables its own linker wrapper needs.
+function ndk_cargo() {
+    local ndk bin clang found="" env_triple linker_var
+    ndk=${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-$NDK_HOME}}
+    if [ -z "$ndk" ]; then
+        echo "Error: ANDROID_NDK_HOME is not set (the NDK directory)." >&2
+        return 1
+    fi
+    clang="$ndk_triple$NDK_API_LEVEL-clang"
+    # One directory per host OS, e.g. `prebuilt/linux-x86_64/bin`.
+    for bin in "$ndk"/toolchains/llvm/prebuilt/*/bin; do
+        if [ -x "$bin/$clang" ]; then
+            found=1
+            break
+        fi
+    done
+    if [ -z "$found" ]; then
+        echo "Error: $clang is not in $ndk/toolchains/llvm/prebuilt/*/bin." >&2
+        return 1
+    fi
+
+    env_triple=${ndk_triple//-/_}
+    linker_var="CARGO_TARGET_$(echo "$env_triple" | tr '[:lower:]' '[:upper:]')_LINKER"
+    env \
+        "$linker_var=$bin/$clang" \
+        "CC_$env_triple=$bin/$clang" \
+        "AR_$env_triple=$bin/llvm-ar" \
+        cargo "$@" --target "$ndk_triple"
+}
+
 function ndk_build() {
     read_remote_android || return 1
     if ! command -v jq >/dev/null; then
@@ -43,9 +87,9 @@ function ndk_build() {
 
     # No features: the Android client is built without `builder`.
     echo "Building rsproperties..."
-    cargo ndk -t "$cargo_ndk_target" build --no-default-features -p rsproperties || return 1
+    ndk_cargo build --no-default-features -p rsproperties || return 1
     echo "Building rsproperties examples..."
-    cargo ndk -t "$cargo_ndk_target" build --examples -p rsproperties || return 1
+    ndk_cargo build --examples -p rsproperties || return 1
 
     # The test binaries come from cargo's own artifact list, not from a
     # search of the target directory: ndk_sync pushes exactly these and
@@ -54,7 +98,7 @@ function ndk_build() {
     echo "Building rsproperties tests..."
     local manifest json
     manifest=$(ndk_test_manifest)
-    json=$(cargo ndk -t "$cargo_ndk_target" -- test --no-run -p rsproperties --message-format=json) || return 1
+    json=$(ndk_cargo test --no-run -p rsproperties --message-format=json) || return 1
     printf '%s\n' "$json" \
         | jq -R -r 'fromjson? | select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' \
         >"$manifest" || return 1
@@ -96,8 +140,9 @@ function read_remote_android() {
         echo "The file '$file' does not exist."
         echo "Please create the '$file' file with the following format:"
         echo
-        echo "Please use the cargo ndk target information on the first line"
-        echo "and the remote directory information on the second line."
+        echo "Line 1: the Android ABI of the device (not read by the build)."
+        echo "Line 2: the arch of the Rust target, <arch>-linux-android."
+        echo "Line 3: the directory on the device to push to."
         echo
         echo "Example:"
         echo "arm64-v8a"
@@ -108,13 +153,16 @@ function read_remote_android() {
         return 1
     fi
 
+    # The first line was the `cargo ndk -t` argument. It stays in the file
+    # format so existing files keep working; nothing reads it now.
     {
-        read cargo_ndk_target
+        read android_abi
         read ndk_target
         read remote_directory
     } <"$file"
 
-    source_directory="$TOP_DIR/target/$ndk_target-linux-android/debug"
+    ndk_triple="$ndk_target-linux-android"
+    source_directory="$TOP_DIR/target/$ndk_triple/debug"
 }
 
 function ndk_prepare() {
