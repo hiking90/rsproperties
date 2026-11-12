@@ -131,6 +131,13 @@ mod trie_node_arena;
 #[cfg(feature = "builder")]
 mod trie_serializer;
 
+// Compiles the crate README's Rust blocks as doctests, so an example that
+// no longer matches the API fails `cargo test`. One block uses the
+// `builder` API, hence the feature gate.
+#[cfg(all(doctest, feature = "builder"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 /// Unit-test fixtures shared by `tests` below and `build_property_parser`.
 #[cfg(all(test, feature = "builder", not(target_os = "android")))]
 pub(crate) mod test_support {

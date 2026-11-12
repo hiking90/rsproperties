@@ -32,6 +32,18 @@ mod properties_service;
 mod property_type;
 mod socket_service;
 
+// Compiles the Rust blocks of this crate's README and of the workspace
+// README as doctests. The workspace README is attached here and not to
+// `rsproperties` because its service example needs this crate and tokio,
+// and because a path outside the package would break the doctests of the
+// published `rsproperties` crate (this crate is `publish = false`).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+#[cfg(doctest)]
+#[doc = include_str!("../../README.md")]
+struct WorkspaceReadmeDoctests;
+
 // The two actors are private: their messages are crate-private, so code
 // outside this crate could spawn them but not wait for readiness or send
 // a set, and spawning the socket service without the writer lock lets a

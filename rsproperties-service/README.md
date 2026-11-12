@@ -63,8 +63,7 @@ the reason.
 
 ### Basic Service Setup
 
-```rust
-use rsproperties_service;
+```rust,no_run
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -107,8 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 ### Advanced Configuration with Files
 
-```rust
-use rsproperties_service;
+```rust,no_run
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -248,34 +246,42 @@ The socket service implements the Android property service protocol:
 properties service, `rsproperties::Error` from `rsproperties::init`, the
 writer lock or the socket service.
 
-```rust
-use rsproperties_service::StartupStage;
+```rust,no_run
+use rsproperties_service::{ServiceOptions, StartupStage};
 
-match rsproperties_service::run(config, options).await {
-    Ok(service) => {
-        println!("Service running");
-        // Keep `service`: dropping the handle stops the service.
-        service.shutdown().await?;
-    }
-    Err(e) => {
-        // Displays as "<stage> failed to start: <cause>".
-        eprintln!("{e}");
-        let cause = std::error::Error::source(&e);
-        if e.stage() == StartupStage::WriterLock
-            && matches!(
-                cause.and_then(|c| c.downcast_ref::<rsproperties::Error>()),
-                Some(rsproperties::Error::Lock(_))
-            )
-        {
-            eprintln!("another instance owns the properties dir");
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config = rsproperties::PropertyConfig::new()
+        .properties_dir("/tmp/properties")
+        .socket_dir("/tmp/sockets");
+
+    match rsproperties_service::run(config, ServiceOptions::new()).await {
+        Ok(service) => {
+            println!("Service running");
+            // Keep `service`: dropping the handle stops the service.
+            service.shutdown().await?;
         }
-        // Walk the rest of the chain, e.g. down to the OS error.
-        let mut next = cause.and_then(|c| c.source());
-        while let Some(c) = next {
-            eprintln!("  caused by: {c}");
-            next = c.source();
+        Err(e) => {
+            // Displays as "<stage> failed to start: <cause>".
+            eprintln!("{e}");
+            let cause = std::error::Error::source(&e);
+            if e.stage() == StartupStage::WriterLock
+                && matches!(
+                    cause.and_then(|c| c.downcast_ref::<rsproperties::Error>()),
+                    Some(rsproperties::Error::Lock(_))
+                )
+            {
+                eprintln!("another instance owns the properties dir");
+            }
+            // Walk the rest of the chain, e.g. down to the OS error.
+            let mut next = cause.and_then(|c| c.source());
+            while let Some(c) = next {
+                eprintln!("  caused by: {c}");
+                next = c.source();
+            }
         }
     }
+    Ok(())
 }
 ```
 
@@ -290,7 +296,7 @@ match rsproperties_service::run(config, options).await {
 
 The service expects this directory layout:
 
-```
+```text
 properties_dir/
 ├── .writer_lock           # flock held by the running writer
 ├── property_info          # Property metadata (generated, replaced by rename)

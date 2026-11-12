@@ -644,6 +644,22 @@ Service (`rsproperties-service`, git dependency only):
   200 ms) for the clean serial. The `serial` rustdoc lists the cases that
   return a dirty serial: the 200 ms bound expiring, a failed futex wait
   (returned at once), and macOS (no wait).
+- The Rust blocks of the three READMEs are compiled by `cargo test`:
+  `rsproperties/README.md` as a doctest of `rsproperties` (with the
+  `builder` feature), the workspace `README.md` and
+  `rsproperties-service/README.md` as doctests of `rsproperties-service`.
+  Each block is now a complete program; the ones that read the property
+  store, set a property or start the service are `no_run`. Two examples
+  did not compile as written and are corrected: the service example
+  passed `vec!["…".into()]` to `property_contexts_files` /
+  `build_prop_files` (no type to infer), and the service README's
+  error-handling block used undefined `config` / `options`. The
+  `builder` example builds its entries with `PropertyInfoEntry::prefix` /
+  `exact` instead of an empty `Vec`, and no longer gates one `use` on
+  `#[cfg(feature = "builder")]`.
+- Both READMEs told the reader to enable `builder` with a `[features]`
+  table that forwards to `rsproperties/builder`; they now show
+  `rsproperties = { version = "0.6", features = ["builder"] }`.
 - README fixes:
   - `wait` argument list, boolean parsing, `PropertyConfig`
     construction, `init`/`try_init` error contract, error-variant list,

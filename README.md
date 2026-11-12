@@ -37,10 +37,14 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 rsproperties = "0.6"
+```
 
-# Optional features
-[features]
-builder = ["rsproperties/builder"]  # Enable property database building
+Creating property areas (`SystemProperties::new_area`, `build_trie`,
+`load_properties_from_file`; Linux hosts) needs the `builder` feature:
+
+```toml
+[dependencies]
+rsproperties = { version = "0.6", features = ["builder"] }
 ```
 
 To also run the Linux property service daemon (`rsproperties-service`, not
@@ -60,35 +64,38 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 
 ### Basic Property Operations
 
-```rust
-use rsproperties;
+```rust,no_run
+fn main() -> rsproperties::Result<()> {
+    // Get property with default value (no initialization needed for default configuration)
+    let sdk_version: String = rsproperties::get_or("ro.build.version.sdk", "0".to_string());
+    println!("SDK Version: {sdk_version}");
 
-// Get property with default value (no initialization needed for default configuration)
-let sdk_version: String = rsproperties::get_or("ro.build.version.sdk", "0".to_string());
-println!("SDK Version: {}", sdk_version);
+    // Get property with type parsing and default fallback
+    let sdk_version: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
+    // `bool` and the integers are read by libbase's rules: "1"/"0",
+    // "true"/"false", "y"/"n", "yes"/"no", "on"/"off" for a `bool`, and
+    // leading whitespace or a `0x` prefix for an integer.
+    let is_debuggable: bool = rsproperties::get_or("ro.debuggable", false);
+    println!("SDK {sdk_version}, debuggable: {is_debuggable}");
 
-// Get property with type parsing and default fallback
-let sdk_version: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
-// `bool` and the integers are read by libbase's rules: "1"/"0",
-// "true"/"false", "y"/"n", "yes"/"no", "on"/"off" for a `bool`, and
-// leading whitespace or a `0x` prefix for an integer.
-let is_debuggable: bool = rsproperties::get_or("ro.debuggable", false);
+    // Get property with error handling
+    match rsproperties::get::<String>("ro.build.version.release") {
+        Ok(version) => println!("Android Version: {version}"),
+        Err(e) => eprintln!("Failed to get version: {e}"),
+    }
 
-// Get property with error handling
-match rsproperties::get::<String>("ro.build.version.release") {
-    Ok(version) => println!("Android Version: {}", version),
-    Err(e) => eprintln!("Failed to get version: {}", e),
-}
+    // Zero-allocation read: borrow the value as `&str` without
+    // materializing a `String` (read_with returns an error if the
+    // property is missing).
+    let len: usize =
+        rsproperties::system_properties()?.read_with("ro.build.version.sdk", |v| v.len())?;
+    println!("the SDK version is {len} bytes long");
 
-// Zero-allocation read: borrow the value as `&str` without
-// materializing a `String` (read_with returns an error if the
-// property is missing).
-let len: usize =
-    rsproperties::system_properties()?.read_with("ro.build.version.sdk", |v| v.len())?;
-
-// Set property (requires property service to be running)
-if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
-    eprintln!("Failed to set property: {}", e);
+    // Set property (requires property service to be running)
+    if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
+        eprintln!("Failed to set property: {e}");
+    }
+    Ok(())
 }
 ```
 
@@ -98,12 +105,18 @@ if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
 `system_properties` returns the global reader, or `Error::Init` when the
 store cannot be opened.
 
-```rust
+```rust,no_run
 use rsproperties::{init, system_properties, PropertyConfig};
 
-init(PropertyConfig::new().properties_dir("/dev/__properties__"))?;
-let props = system_properties()?;              // &'static SystemProperties
-let sdk: String = rsproperties::get_or("ro.build.version.sdk", "0".into());
+fn main() -> rsproperties::Result<()> {
+    init(PropertyConfig::new().properties_dir("/dev/__properties__"))?;
+    let props = system_properties()?; // &'static SystemProperties
+    let sdk: String = props.get("ro.build.version.sdk")?;
+    // The free functions read through the same global reader.
+    let sdk_or_zero: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
+    println!("SDK {sdk} ({sdk_or_zero})");
+    Ok(())
+}
 ```
 
 Each directory is set once per process: by `init`, or by its first use,
@@ -186,17 +199,24 @@ that keeps its own index and serial.
 
 > **Warning**: Do not use custom configuration on Android devices. Custom configuration is only intended for Linux environments or development/testing purposes.
 
-```rust
+```rust,no_run
 use rsproperties::PropertyConfig;
 
-// Both directories, or only the one to change. A directory already set
-// to a different path makes `init` fail with `AlreadyInitialized`.
-rsproperties::init(
-    PropertyConfig::new()
-        .properties_dir("/custom/properties")
-        .socket_dir("/custom/socket"),
-)?;
+fn main() -> rsproperties::Result<()> {
+    // Both directories, or only the one to change. A directory already set
+    // to a different path makes `init` fail with `AlreadyInitialized`.
+    rsproperties::init(
+        PropertyConfig::new()
+            .properties_dir("/custom/properties")
+            .socket_dir("/custom/socket"),
+    )?;
+    Ok(())
+}
 ```
+
+A library that must not set the process-wide directories, or a process
+that reads a second properties directory, opens its own reader with
+`SystemProperties::open(dir)` instead; it is independent of `init`.
 
 ### Linux Property Service
 
@@ -204,8 +224,7 @@ On a Linux host, `rsproperties-service` emulates the Android property
 service (it compiles only for Linux; on Android, init owns the property
 service):
 
-```rust
-use rsproperties_service;
+```rust,no_run
 use rsproperties::PropertyConfig;
 
 #[tokio::main]
@@ -220,16 +239,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .properties_dir("./properties")
         .socket_dir("./socket");
 
-    // Optional: Load property contexts and build.prop files
-    let property_contexts = vec![
-        "plat_property_contexts".into(),
-        "vendor_property_contexts".into(),
-    ];
-
-    let build_props = vec![
-        "system_build.prop".into(),
-        "vendor_build.prop".into(),
-    ];
+    // Optional: Load property contexts and build.prop files. Both setters
+    // take any iterator of `impl Into<PathBuf>`.
+    let property_contexts = ["plat_property_contexts", "vendor_property_contexts"];
+    let build_props = ["system_build.prop", "vendor_build.prop"];
 
     // Start the property service
     let options = rsproperties_service::ServiceOptions::new()
@@ -281,48 +294,55 @@ The library includes Android-compatible command line tools:
 
 With the `builder` feature enabled, you can create property databases:
 
-```rust
-#[cfg(feature = "builder")]
+```rust,no_run
 use rsproperties::{
     build_trie, load_properties_from_file, AreaWriterLock, PropFileOutcome, PropertyInfoEntry,
     SystemProperties,
 };
 use std::{collections::HashMap, path::Path};
 
-// Load build.prop-format entries (key=value) into a HashMap. A file
-// writable by group or others (0664 from a umask 002 checkout) is not
-// read: the call then returns `PropFileOutcome::SkippedWritable { mode }`.
-let mut properties = HashMap::new();
-let outcome = load_properties_from_file(
-    Path::new("system_build.prop"),
-    None,                       // optional name filter (e.g. "ro.*")
-    &mut properties,
-)?;
-assert_eq!(outcome, PropFileOutcome::Loaded);
+fn main() -> rsproperties::Result<()> {
+    // Load build.prop-format entries (key=value) into a HashMap. A file
+    // writable by group or others (0664 from a umask 002 checkout) is not
+    // read: the call then returns `PropFileOutcome::SkippedWritable { mode }`.
+    let mut properties = HashMap::new();
+    let outcome = load_properties_from_file(
+        Path::new("system_build.prop"),
+        None, // optional name filter (e.g. "ro.*")
+        &mut properties,
+    )?;
+    assert_eq!(outcome, PropFileOutcome::Loaded);
 
-// Serialize a property-info trie from `property_contexts`-style entries.
-let property_infos: Vec<PropertyInfoEntry> = vec![/* parsed entries */];
-let trie_data = build_trie(
-    &property_infos,
-    "u:object_r:build_prop:s0", // default context
-    "string",                    // default type
-)?;
+    // Serialize a property-info trie from `property_contexts`-style entries
+    // (`PropertyInfoEntry::parse_from_file` reads them from a file).
+    let property_infos = [
+        PropertyInfoEntry::prefix("ro.", "u:object_r:build_prop:s0", "string")?,
+        PropertyInfoEntry::exact("sys.boot_completed", "u:object_r:boot_status_prop:s0", "bool")?,
+    ];
+    let trie_data = build_trie(
+        &property_infos,
+        "u:object_r:default_prop:s0", // default context
+        "string",                     // default type
+    )?;
 
-// Take the directory's writer lock first (this creates a missing
-// `./properties`, last component only), then publish the trie as
-// `<dir>/property_info` and create the areas under that lock. Writing
-// `property_info` yourself and then calling `new_area` lets another writer
-// replace it between your write and `new_area`'s lock, and rewriting it in
-// place breaks readers that still map it. Release builds (no `debug-assertions`) and the
-// `strict-file-validation` feature require `property_info` to be owned by
-// root (uid 0, gid 0), so run this as root there.
-let lock = AreaWriterLock::acquire(Path::new("./properties"))?;
-lock.publish_property_info(&trie_data)?;
+    // Take the directory's writer lock first (this creates a missing
+    // `./properties`, last component only), then publish the trie as
+    // `<dir>/property_info` and create the areas under that lock. Writing
+    // `property_info` yourself and then calling `new_area` lets another writer
+    // replace it between your write and `new_area`'s lock, and rewriting it in
+    // place breaks readers that still map it. Release builds (no
+    // `debug-assertions`) and the `strict-file-validation` feature require
+    // `property_info` to be owned by root (uid 0, gid 0), so run this as
+    // root there.
+    let lock = AreaWriterLock::acquire(Path::new("./properties"))?;
+    lock.publish_property_info(&trie_data)?;
 
-// Create the on-disk property area and populate it.
-let mut system_properties = SystemProperties::new_area_locked(lock)?;
-for (key, value) in properties {
-    system_properties.add(&key, &value)?;
+    // Create the on-disk property area and populate it.
+    let mut system_properties = SystemProperties::new_area_locked(lock)?;
+    for (key, value) in properties {
+        system_properties.add(&key, &value)?;
+    }
+    Ok(())
 }
 ```
 
@@ -366,20 +386,24 @@ fn handle_property_operation() {
 
 All operations are thread-safe and can be used concurrently:
 
-```rust
+```rust,no_run
 use std::thread;
 
-// Multiple threads can safely access properties
-let handles: Vec<_> = (0..10).map(|i| {
-    thread::spawn(move || {
-        let prop_name = format!("debug.thread.{}", i);
-        let value: String = rsproperties::get_or(&prop_name, "default".to_string());
-        println!("Thread {}: {} = {}", i, prop_name, value);
-    })
-}).collect();
+fn main() {
+    // Multiple threads can safely access properties
+    let handles: Vec<_> = (0..10)
+        .map(|i| {
+            thread::spawn(move || {
+                let prop_name = format!("debug.thread.{i}");
+                let value: String = rsproperties::get_or(&prop_name, "default".to_string());
+                println!("Thread {i}: {prop_name} = {value}");
+            })
+        })
+        .collect();
 
-for handle in handles {
-    handle.join().unwrap();
+    for handle in handles {
+        handle.join().unwrap();
+    }
 }
 ```
 
