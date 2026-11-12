@@ -59,14 +59,12 @@ jobs:
         echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> $GITHUB_ENV
 
     # x86_64 only: the emulator is x86_64 and REMOTE_ANDROID (below)
-    # builds for it.
+    # builds for it. No cargo-ndk: ndk_build runs cargo with the clang of
+    # $ANDROID_NDK_HOME as the linker.
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: x86_64-linux-android
-
-    - name: Install cargo-ndk
-      run: cargo install cargo-ndk
 
     - name: Enable KVM group perms
       run: |
