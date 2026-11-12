@@ -124,7 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         PathBuf::from("/vendor/etc/selinux/vendor_property_contexts"),
     ];
 
-    // Configure build.prop files
+    // Configure build.prop files. A missing or unreadable file fails
+    // startup; a file writable by group or others is logged at `error`
+    // and not loaded, and the service starts without its properties.
     let build_props = vec![
         PathBuf::from("/system/build.prop"),
         PathBuf::from("/vendor/build.prop"),

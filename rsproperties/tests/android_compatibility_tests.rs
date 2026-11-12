@@ -10,7 +10,9 @@
 
 mod common;
 
-use rsproperties::{self, build_trie, load_properties_from_file, MatchKeyword, PropertyInfoEntry};
+use rsproperties::{
+    self, build_trie, load_properties_from_file, MatchKeyword, PropFileOutcome, PropertyInfoEntry,
+};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -68,7 +70,8 @@ fn test_android_build_prop_parsing() {
         let result = load_properties_from_file(&copy, None, &mut properties);
 
         match result {
-            Ok(_) => {
+            Ok(outcome) => {
+                assert_eq!(outcome, PropFileOutcome::Loaded, "{file}");
                 assert!(
                     !properties.is_empty(),
                     "Should have loaded properties from {file}"

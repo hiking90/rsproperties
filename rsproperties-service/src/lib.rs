@@ -134,6 +134,11 @@ impl ServiceOptions {
 
     /// build.prop files, loaded in order (a later file overrides an
     /// earlier one's key).
+    ///
+    /// A file that cannot be opened or read fails startup. A file whose
+    /// mode has the group- or other-write bit is not loaded, as init's
+    /// `ReadFile` does: the service logs it at `error` and starts without
+    /// that file's properties.
     pub fn build_prop_files<I, P>(mut self, files: I) -> Self
     where
         I: IntoIterator<Item = P>,

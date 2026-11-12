@@ -284,17 +284,21 @@ With the `builder` feature enabled, you can create property databases:
 ```rust
 #[cfg(feature = "builder")]
 use rsproperties::{
-    build_trie, load_properties_from_file, AreaWriterLock, PropertyInfoEntry, SystemProperties,
+    build_trie, load_properties_from_file, AreaWriterLock, PropFileOutcome, PropertyInfoEntry,
+    SystemProperties,
 };
 use std::{collections::HashMap, path::Path};
 
-// Load build.prop-format entries (key=value) into a HashMap.
+// Load build.prop-format entries (key=value) into a HashMap. A file
+// writable by group or others (0664 from a umask 002 checkout) is not
+// read: the call then returns `PropFileOutcome::SkippedWritable { mode }`.
 let mut properties = HashMap::new();
-load_properties_from_file(
+let outcome = load_properties_from_file(
     Path::new("system_build.prop"),
     None,                       // optional name filter (e.g. "ro.*")
     &mut properties,
 )?;
+assert_eq!(outcome, PropFileOutcome::Loaded);
 
 // Serialize a property-info trie from `property_contexts`-style entries.
 let property_infos: Vec<PropertyInfoEntry> = vec![/* parsed entries */];

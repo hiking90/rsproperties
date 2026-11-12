@@ -8,8 +8,8 @@ use rsproperties::wire::{
     PROP_ERROR_SET_FAILED, PROP_SUCCESS,
 };
 use rsproperties::{
-    build_trie, load_properties_from_file, AreaWriterLock, MatchKeyword, PropertyInfoEntry,
-    SystemProperties,
+    build_trie, load_properties_from_file, AreaWriterLock, MatchKeyword, PropFileOutcome,
+    PropertyInfoEntry, SystemProperties,
 };
 
 use crate::persistent_properties::{is_persistent_name, PersistentStore};
@@ -92,7 +92,14 @@ fn init_system_properties_sync(
     // by the keys, not by HashMap's randomised hash seed.
     let mut properties_unordered: HashMap<String, String> = HashMap::new();
     for file in build_prop_files {
-        load_properties_from_file(&file, None, &mut properties_unordered).map_err(io_other)?;
+        match load_properties_from_file(&file, None, &mut properties_unordered).map_err(io_other)? {
+            PropFileOutcome::Loaded => {}
+            // Startup continues, as AOSP init does after `ReadFile`
+            // refuses the file ("Couldn't load property file").
+            PropFileOutcome::SkippedWritable { mode } => log::error!(
+                "build.prop file {file:?} not loaded: mode {mode:o} allows group or other writes"
+            ),
+        }
     }
     let properties: BTreeMap<String, String> = properties_unordered.into_iter().collect();
 
@@ -569,6 +576,29 @@ mod tests {
         assert!(err.to_string().contains("missing_build.prop"), "{err}");
         assert_eq!(std::fs::metadata(&info).unwrap().ino(), before_ino);
         assert_eq!(std::fs::read(&info).unwrap(), before);
+    }
+
+    /// A group-writable build.prop file is not loaded and init goes on
+    /// with the other files, as AOSP init does after `ReadFile` refuses
+    /// one.
+    #[test]
+    fn writable_build_prop_is_skipped_and_init_continues() {
+        let tmp = TempDir::new("rsprops_svc_writable_build_prop");
+        let props = tmp.0.join("props");
+        let inputs = tmp.0.join("inputs");
+        std::fs::create_dir_all(&inputs).unwrap();
+        let write_prop = |name: &str, line: &str, mode: u32| {
+            let path = inputs.join(name);
+            std::fs::write(&path, format!("{line}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        };
+        let writable = write_prop("writable.prop", "ro.from.writable=1", 0o664);
+        let ok = write_prop("ok.prop", "ro.from.ok=1", 0o644);
+
+        let sp = init_locked(vec![], vec![writable, ok], &props).unwrap();
+        assert_eq!(sp.get("ro.from.ok").unwrap(), "1");
+        assert!(sp.get("ro.from.writable").is_err());
     }
 
     /// A writer lock for another directory is refused before anything is

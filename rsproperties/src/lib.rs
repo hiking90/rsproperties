@@ -221,7 +221,10 @@ pub(crate) mod test_support {
         );
 
         let mut properties = HashMap::new();
-        crate::load_properties_from_file(&copy, None, &mut properties).unwrap();
+        assert_eq!(
+            crate::load_properties_from_file(&copy, None, &mut properties).unwrap(),
+            crate::PropFileOutcome::Loaded
+        );
         assert_eq!(properties.get("ro.x").map(String::as_str), Some("1"));
         assert!(
             !properties.contains_key("ro.y"),
@@ -233,7 +236,7 @@ pub(crate) mod test_support {
 // Explicit re-export lists (not globs) so the public API surface is
 // visible here and additions to the modules don't silently become public.
 #[cfg(feature = "builder")]
-pub use build_property_parser::load_properties_from_file;
+pub use build_property_parser::{load_properties_from_file, PropFileOutcome};
 #[cfg(feature = "builder")]
 pub use contexts_serialized::AreaWriterLock;
 #[cfg(feature = "builder")]
@@ -748,14 +751,18 @@ mod tests {
         let mut properties = HashMap::new();
         for name in build_prop_files {
             let file = crate::test_support::copy_android_fixture(name, fixtures.path());
-            load_properties_from_file(&file, None, &mut properties).unwrap();
+            // A group/other-writable prop file (git checkout under umask
+            // 002) is skipped with `Ok(SkippedWritable)`, which would
+            // leave callers looping over nothing.
+            assert_eq!(
+                load_properties_from_file(&file, None, &mut properties).unwrap(),
+                PropFileOutcome::Loaded,
+                "{name}"
+            );
         }
-        // A group/other-writable prop file (git checkout under umask 002)
-        // is skipped with `Ok`, which would leave callers looping over
-        // nothing.
         assert!(
             properties.contains_key("ro.build.version.sdk"),
-            "tests/android/*.prop not loaded (group/other-writable?)"
+            "tests/android/*.prop hold no ro.build.version.sdk"
         );
 
         properties

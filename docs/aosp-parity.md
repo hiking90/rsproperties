@@ -40,6 +40,7 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
 | S5 | service | `ro.property_service.version` 미설정 | (c) | 이 branch에서 수정 |
 | S6 | service | 변경 알림 hook 없음 | (a) | 검토 대상 아님 |
 | S7 | service | properties dir writer lock(`AreaWriterLock`) | (a), 해제 방식은 (b) | lock은 0.6.0부터 있음, 해제 방식은 이 branch에서 수정 |
+| S8 | service, builder | prop 파일을 읽지 못했을 때의 반환값 | open 실패로 시작 실패는 (b) | 시작 실패는 0.6.0부터 있음, skip 반환값은 이 branch에서 추가 |
 
 ## Client
 
@@ -864,6 +865,43 @@ temp 파일에 쓴 뒤 rename으로 교체하므로 `O_EXCL`로는 두 번째 wr
   유지된다. child의 fd 사본은 child가 종료하거나 fd를 닫을 때 없어진다.
 - `LOCK_UN`이 실패하면 `warn!`을 남긴다. 이 경우 lock은 fd 사본이 모두 닫힐 때
   풀린다.
+
+### S8. prop 파일을 읽지 못했을 때의 반환값 — open 실패로 시작 실패는 (b)
+
+**AOSP.** init의 `load_properties_from_file`은 `Result<void>`를 반환한다
+(`property_service.cpp:823-836`). `ReadFile`이 실패하면 원인을 구분하지 않고
+`Error()`를 반환한다. 원인은 파일 없음, 마지막 path component가 symlink인
+경우(`O_NOFOLLOW`), group 또는 other write bit가 있는 경우
+(`util.cpp:179-180`, "Skipping insecure file")다. 호출부는 세 곳에서만 log를
+남긴다: second stage ramdisk prop(`:844`, `WARNING`), recovery의
+`/prop.default`(`:1155`, `ERROR`), `/system/build.prop`(`:1207`, `WARNING`).
+partition별 파일은 반환값을 읽지 않거나, `.ok()`로 legacy 경로를 시도할지만
+정한다(`:1167`, `:1213-1220`). 어느 호출부도 부팅을 중단하지 않는다.
+
+**rsproperties.** `load_properties_from_file`은 두 경우를 다른 값으로
+반환한다.
+
+- open 또는 read 실패는 `Err`다. service는 `build_prop_files`의 파일 하나가
+  `Err`이면 `property_info`를 게시하기 전에 시작을 중단한다
+  (`StartupStage::PropertiesService`). 0.6.0도 같은 동작이다. init과 다른
+  점이며 (b)로 분류한다. init의 경로 목록에는 기기 구성에 따라 없는 partition
+  파일이 들어 있지만, `build_prop_files`는 호출자가 직접 지정한 경로다.
+- group 또는 other write bit가 있는 파일은 읽지 않고
+  `Ok(PropFileOutcome::SkippedWritable { mode })`를 반환한다. 이 branch
+  이전에는 `Ok(())`였고, 읽은 경우와 구분할 수단은 `warn` log뿐이었다.
+  umask 002로 checkout한 저장소의 파일은 mode가 0664여서 이 경우에 해당한다.
+  이 crate의 test는 그래서 `tests/android/*.prop`의 0644 사본을 만들어
+  load한다(`copy_fixture_0644`).
+  service는 이 값을 받으면 `error` log를 남기고 그 파일 없이 시작한다. 계속
+  진행한다는 점은 init과 같다.
+- `import`한 파일의 실패(open 실패, write bit, depth 초과)는 반환값에 반영하지
+  않고 `warn` log만 남긴다. init의 `LoadProperties`도 import 실패를
+  `LOG(WARNING)`으로만 남긴다(`:764-767`).
+
+**포기한 것.** write bit가 있는 파일을 `Err`로 바꾸면 init의 `Result<void>`와
+형태가 같아진다. 그렇게 하지 않은 이유는 service 호출부가 `?`로 전파하므로
+0664 파일 하나 때문에 service가 시작하지 못하게 되기 때문이다. 대신 enum에
+`#[must_use]`를 붙여 반환값을 읽지 않는 호출부가 compile 경고를 받게 했다.
 
 ## 누락으로 보지 않는 것
 

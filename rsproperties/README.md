@@ -451,7 +451,9 @@ clients that want to point at a custom socket directory:
 - `load_properties_from_file(path, filter, &mut HashMap)` —
   parse build.prop entries; like AOSP init it opens each file with
   `O_NOFOLLOW` and skips (with a warning) a file writable by group or
-  others
+  others. Returns `PropFileOutcome`: `Loaded`, or
+  `SkippedWritable { mode }` when `path` itself was skipped (a skipped
+  `import` is only logged)
 - `PropertyInfoEntry::parse_from_file(path, MatchKeyword)` —
   parse a `property_contexts`-format file into
   `(Vec<PropertyInfoEntry>, Vec<Error>)` (the entries that survived
@@ -491,19 +493,22 @@ for handle in handles {
 ```rust
 #[cfg(feature = "builder")]
 use rsproperties::{
-    build_trie, load_properties_from_file, AreaWriterLock, MatchKeyword, PropertyConfig,
-    PropertyInfoEntry, SystemProperties,
+    build_trie, load_properties_from_file, AreaWriterLock, MatchKeyword, PropFileOutcome,
+    PropertyConfig, PropertyInfoEntry, SystemProperties,
 };
 use std::collections::HashMap;
 use std::path::Path;
 
-// Load properties from Android build.prop files
+// Load properties from Android build.prop files. A file writable by group
+// or others (0664 from a umask 002 checkout) is not read: the call then
+// returns `PropFileOutcome::SkippedWritable { mode }`.
 let mut properties = HashMap::new();
-load_properties_from_file(
+let outcome = load_properties_from_file(
     Path::new("system_build.prop"),
     None,
     &mut properties
 )?;
+assert_eq!(outcome, PropFileOutcome::Loaded);
 
 // Take the directory's writer lock first, then publish the context trie as
 // `<dir>/property_info` and create the areas under that lock. Do not write

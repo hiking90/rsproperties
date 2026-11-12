@@ -133,8 +133,8 @@ mod host {
     use std::sync::Once;
 
     use rsproperties::{
-        build_trie, load_properties_from_file, AreaWriterLock, MatchKeyword, PropertyConfig,
-        PropertyInfoEntry, SystemProperties,
+        build_trie, load_properties_from_file, AreaWriterLock, MatchKeyword, PropFileOutcome,
+        PropertyConfig, PropertyInfoEntry, SystemProperties,
     };
 
     pub(super) fn init() {
@@ -237,14 +237,16 @@ mod host {
             "vendor_odm_dlkm_build.prop",
         ] {
             let copy = super::copy_fixture_0644(&android.join(file), copies.path());
-            load_properties_from_file(&copy, None, &mut properties)
+            // The loader skips a group- or world-writable file with
+            // `Ok(SkippedWritable)`; fail here instead of in each value
+            // assertion.
+            let outcome = load_properties_from_file(&copy, None, &mut properties)
                 .unwrap_or_else(|e| panic!("load {file}: {e}"));
+            assert_eq!(outcome, PropFileOutcome::Loaded, "{file}");
         }
-        // The loader skips a group- or world-writable file with only a
-        // warning; fail here instead of in each value assertion.
         assert!(
             properties.contains_key("ro.build.version.sdk"),
-            "tests/android/*.prop were not loaded (group- or world-writable?)"
+            "tests/android/*.prop hold no ro.build.version.sdk"
         );
 
         let lock = AreaWriterLock::acquire(dir).expect("AreaWriterLock::acquire");

@@ -207,6 +207,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `load_properties_from_file(path, filter, properties)` loses its
     `context` argument, which was checked against nothing: on Linux no
     SELinux context is available to compare with.
+  - `load_properties_from_file` returns `Result<PropFileOutcome>` (was
+    `Result<()>`). `PropFileOutcome::SkippedWritable { mode }` reports
+    that the file given to the call was not read because its mode has
+    the group- or other-write bit; `PropFileOutcome::Loaded` reports
+    that it was read. The enum is `#[must_use]`. Before, both cases were
+    `Ok(())` and only a `warn` log line told them apart. An `import`
+    that is skipped does not change the result.
   - `PropertyInfoEntry::parse_from_file(path, MatchKeyword)` takes an
     enum instead of `require_prefix_or_exact: bool`:
     `MatchKeyword::Checked` is `true`, `MatchKeyword::Unchecked` is
@@ -487,8 +494,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ReadFile`: with `O_NOFOLLOW`, so a symlink as the last path component
   fails to open (an error for the root file; an `import` is skipped with
   a warning), and a file writable by group or others is skipped with a
-  warning (for the root file the call returns `Ok(())` with nothing
-  loaded). 0.6.0 followed symlinks and loaded such files.
+  warning (for the root file the call returns
+  `Ok(PropFileOutcome::SkippedWritable { mode })` with nothing loaded).
+  0.6.0 followed symlinks and loaded such files.
 - Android: `set` accepts V2 names and `ro.` values up to 65535 bytes, the limit
   AOSP init enforces (bionic `__system_property_set` sends such `ro.`
   values; init rejects lengths above 0xffff). The client rejected names
@@ -787,7 +795,9 @@ Service (`rsproperties-service`, git dependency only):
     that read `ctl.*` values back from the area must use the handler;
   - `load_properties_from_file` skips a prop file whose mode has the
     group- or other-write bit (with a warning; for the root file the call
-    returns `Ok(())` with nothing loaded), and fails to open a prop file
+    returns `Ok(PropFileOutcome::SkippedWritable { mode })` with nothing
+    loaded; the service logs such a `build_prop_files` entry at `error`
+    and starts without it), and fails to open a prop file
     whose last path component is a symlink (`Error::Context` for the root
     file; such an `import` is skipped). Files created under umask 002
     (`File::create`, `std::fs::write`) are group-writable: create them
@@ -1063,6 +1073,11 @@ Service (`rsproperties-service`, git dependency only):
     and the code.
   - A `builder` caller that matched `Error::PermissionDenied` to detect
     a second set of a `ro.` property matches `Error::ReadOnlyProperty`.
+  - `load_properties_from_file(..)?;` no longer compiles without a
+    warning (`unused_must_use`). Where a file that loads nothing is a
+    failure, match the result and handle
+    `PropFileOutcome::SkippedWritable { mode }`; where it is not,
+    write `let _ = load_properties_from_file(..)?;`.
 - **Changed error values**:
   - `rsproperties_service::run` returns `StartupError` (0.6.0:
     `Box<dyn Error + Send + Sync>` holding a `Failed to start … service:`
