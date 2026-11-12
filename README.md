@@ -15,10 +15,9 @@ The library implements Android's property system semantics, including property c
 
 ## Supported Android Versions
 
-This library supports Android versions from Android 9 (API level 28) to Android 16 (API level 36).
-Android 17 (API level 37) is outside that range: its appcompat-override lookup is implemented from
-the AOSP `android-17.0.0_r1` sources and was compared with `getprop` on an API 37 emulator, but the
-test suite has not been run there.
+This library supports Android versions from Android 9 (API level 28) to Android 17 (API level 37).
+The Android 17 appcompat-override lookup is implemented from the AOSP `android-17.0.0_r1` sources
+and was compared with `getprop` on an API 37 emulator.
 
 ## Features
 

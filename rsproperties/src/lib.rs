@@ -133,6 +133,33 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Removes every `temp_dir()/<prefix><pid>` whose process is gone
+    /// (`kill(pid, 0)` fails with `ESRCH`).
+    ///
+    /// For a dir that a `static` owns until the process exits, where no
+    /// guard can remove it: the next run of the test removes it instead.
+    /// The dir of a live process — another `cargo test` running the same
+    /// test — is kept. A reused pid keeps a dead dir: that leaks one
+    /// directory but never deletes a live one.
+    pub(crate) fn sweep_dead_dirs(prefix: &str) {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let pid = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_prefix(prefix))
+                .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|p| p.parse::<i32>().ok())
+                .and_then(rustix::process::Pid::from_raw);
+            let Some(pid) = pid else { continue };
+            if rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
     /// Copies `tests/android/<name>` into `into` with mode 0644 and returns
     /// the copy's path.
     ///
@@ -677,8 +704,14 @@ mod tests {
     #[cfg(all(feature = "builder", not(target_os = "android")))]
     use std::sync::{Mutex, MutexGuard};
 
+    /// The store of `system_properties_area` is
+    /// `temp_dir()/<this prefix><pid>`. The pid keeps two processes running
+    /// these tests at once (two `cargo test` runs in one checkout, or a
+    /// runner that starts one process per test) off each other's store: a
+    /// path shared between them made the second `AreaWriterLock::acquire`
+    /// fail with `Error::Lock`.
     #[cfg(all(feature = "builder", not(target_os = "android")))]
-    const TEST_PROPERTY_DIR: &str = "__properties__";
+    const TEST_STORE_PREFIX: &str = "rsprops_lib_store_";
 
     #[cfg(any(feature = "builder", target_os = "android"))]
     fn enable_logger() {
@@ -780,13 +813,18 @@ mod tests {
         let mut system_properties_guard = SYSTEM_PROPERTIES.lock().unwrap();
 
         if system_properties_guard.is_none() {
-            *system_properties_guard = Some(build_property_dir(TEST_PROPERTY_DIR));
+            // The `static` above owns the writer until the process exits,
+            // so nothing removes the store in this run; the next run does.
+            crate::test_support::sweep_dead_dirs(TEST_STORE_PREFIX);
+            let dir =
+                std::env::temp_dir().join(format!("{TEST_STORE_PREFIX}{}", std::process::id()));
+            *system_properties_guard = Some(build_property_dir(&dir));
         }
         system_properties_guard
     }
 
     #[cfg(all(feature = "builder", not(target_os = "android")))]
-    fn build_property_dir(dir: &str) -> SystemProperties {
+    fn build_property_dir(dir: &Path) -> SystemProperties {
         // `init` fails if another test in this binary latched a *different*
         // directory first; the `properties_dir()` cleanup below would then
         // delete that directory instead of ours.

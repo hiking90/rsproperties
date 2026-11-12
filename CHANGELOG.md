@@ -31,10 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Appcompat override lookup: on Android API 37+ (and on Linux), a
   read-only instance created while `BIONIC_APPCOMPAT_OVERRIDE` is set
   looks up `ro.appcompat_override.<name>` first in `find` and
-  `read_with`, as bionic does. API 37 is outside the supported range
-  (28–36); this follows the AOSP `android-17.0.0_r1` sources and
-  returned the same values as `getprop` on an API 37 emulator. The test
-  suite has not been run on API 37.
+  `read_with`, as bionic does. This follows the AOSP
+  `android-17.0.0_r1` sources and returned the same values as `getprop`
+  on an API 37 emulator.
+- Android 17 (API level 37) is in the supported range (0.6.0: 28–36).
+  The Android test binaries (18 binaries, 74 tests) pass on an API 37
+  emulator (`android-37.0` google_apis x86_64, `CE2A.260420.019`) as
+  root and as the shell user, and the `android-test.yml` matrix runs
+  API 37 as well. Its system image package is `android-37.0`; there is
+  no `android-37` package.
 - `Error::root_cause()`: the error under every `Error::Context` and
   `Error::Init` layer, so a `match` on it sees `Error::Io`,
   `Error::Lock`, … whether or not the failing path added context.
@@ -682,6 +687,17 @@ Service (`rsproperties-service`, git dependency only):
   writes take `&mut self`), and the 0.6.0 Waits notes say so. The `serial`
   rustdoc no longer calls its clean-serial wait bionic parity: current
   bionic `__system_property_serial` returns the raw serial.
+- The service README states that a release build, and a build with
+  `strict-file-validation`, runs only as uid 0 / gid 0: `run` as another
+  user fails at `StartupStage::PropertiesService` with
+  `Error::FileOwnership`, because `rsproperties` requires root-owned
+  property files there, as bionic does. A debug build skips the check, so
+  the failure first appears in the release build. Nothing changed in the
+  code; 0.6.0 behaves the same.
+- CI runs the tests of both configurations that enforce the ownership
+  check (`--all-features`, and `--features builder --release`) as root,
+  through cargo's target runner (`sudo -E`). Until now they were only
+  compiled.
 
 ### Migration from 0.6.0
 

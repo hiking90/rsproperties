@@ -12,8 +12,9 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
   - libcutils: `system/core/libcutils/properties.cpp`
   - init: `system/core/init/property_service.cpp`
 - 지원 범위: client는 Linux와 Android, `rsproperties-service`는 Linux 전용,
-  Android 지원 API level은 28–36이다(API 37 동작은 AOSP `android-17.0.0_r1`
-  source 기준으로 구현했고 실측하지 않았다). Android에서 service를 쓰는 경로와 macOS는
+  Android 지원 API level은 28–37이다(API 37 동작은 AOSP `android-17.0.0_r1`
+  source 기준으로 구현했고, API 37 emulator에서 override 조회와 test suite를
+  실행했다. C3의 검증 항목 참고). Android에서 service를 쓰는 경로와 macOS는
   비교 대상에서 제외한다.
 - 분류
   - (a) Linux emulation이라서 생기는 차이
@@ -226,8 +227,20 @@ override가 켜진 프로세스에서는 같은 property에 대해 libc
   API 37 emulator(`rsbinder-a17`, android-37.0 google_apis)에서는 수정 후
   binary가 toybox와 같은 값을 읽는다(위 실측). 이 AVD는 `-memory 4096`으로
   띄워야 한다. AVD 설정값인 1536M에서는 guest가 kernel panic으로 재부팅을
-  반복해서 adb가 `offline`과 `device`를 오간다. API 37에서 실행한 것은 이
-  example binary뿐이고, test suite는 실행하지 않았다.
+  반복해서 adb가 `offline`과 `device`를 오간다.
+- API 37 test suite: 같은 image에서 `envsetup.sh`의 `ndk_prepare`,
+  `ndk_build`, `ndk_sync`, `ndk_test`, `ndk_test_shell`을 차례로 실행했다.
+  test binary 18개의 test 74개가 root(`u:r:su:s0`)와 shell user
+  (`u:r:shell:s0`) 실행에서 모두 통과했다. `android-test.yml`의 절차대로 만든
+  AVD(`avdmanager create avd -k "system-images;android-37.0;google_apis;x86_64"`,
+  emulator option `-wipe-data -memory 4096 -partition-size 2048`)에서도 결과가
+  같다. 로컬 조건은 system image revision 6, emulator 36.5.11, NDK r28b이고,
+  workflow는 `sdkmanager`가 받는 최신 revision과 NDK 27.2를 쓴다. GitHub
+  runner에서 API 37 job을 실행한 결과는 확인 필요다(workflow는
+  `workflow_dispatch`로만 시작한다).
+  - `sdkmanager`에는 `android-37` package가 없고 `android-37.0`이 있다.
+    `ro.build.version.sdk`는 37이다. workflow의 matrix는 `api-level: 37`에
+    `platform: android-37.0`을 따로 지정한다.
 
 ### C4. `WaitForProperty` / `WaitForPropertyCreation`
 
@@ -740,8 +753,17 @@ temp 파일에 쓴 뒤 rename으로 교체하므로 `O_EXCL`로는 두 번째 wr
 - per-property SELinux / SO_PEERCRED 인가: (a)이며 `socket_service.rs`
   `SOCKET_FILE_MODE` doc의 Access model 문단에 문서화된 의도적 단순화다.
 - `ContextsSplit` / `ContextsPreSplit` layout: `property_info`가 없는 이전
-  Android용 layout이다. 지원 범위(API 28–36) 밖이다.
+  Android용 layout이다. 지원 범위(API 28–37) 밖이다.
 - deprecated API(`__system_property_find_nth`, `__system_property_read`,
   `__system_property_set_filename`).
 - `__system_properties_zygote_reload` 자체: zygote 전용이다. 그 결과로 생기는
   override 조회는 C3에서 다룬다.
+- property 파일의 root 소유 검사: bionic `prop_area.cpp:117`과 같은 조건
+  (`st_uid != 0 || st_gid != 0`이면 거부)이며 divergence가 아니다. 이 crate는
+  release build이거나 `strict-file-validation` feature가 켜져 있을 때 검사를
+  실행한다(`file_validation.rs`). 그 결과 Linux에서 release build service는
+  uid 0, gid 0으로만 시작한다. 비root로 실행하면 `publish_property_info`가
+  임시 파일을 다시 읽는 단계에서 `Error::FileOwnership`이 되어
+  `StartupStage::PropertiesService`로 실패한다(release build
+  `example_service`를 uid 973으로 실행해 확인). 다른 소유자를 허용하는 설정은
+  두지 않기로 했다. 검사가 실행되는 두 구성의 test는 CI에서 root로 실행한다.

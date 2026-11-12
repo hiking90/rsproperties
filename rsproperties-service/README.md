@@ -300,6 +300,26 @@ socket_dir/
 └── property_service_for_system        # System property socket
 ```
 
+### File ownership: a release build runs as root
+
+`rsproperties` checks the metadata of every property file it maps
+(`property_info` and the area files). A release build (no
+`debug-assertions`), and any build with the `strict-file-validation`
+feature of `rsproperties`, requires the file to be owned by uid 0 and
+gid 0, as bionic does (`prop_area.cpp`).
+
+The service creates these files as its own user and reads
+`property_info` back before it renames it into place. In such a build,
+`run` as any other user fails at `StartupStage::PropertiesService` with
+`Error::FileOwnership` ("File not owned by root: uid=…, gid=…"), and a
+client built the same way refuses the files a non-root service created.
+Run the service as uid 0 with gid 0. No option accepts another owner.
+
+A debug build without `strict-file-validation` skips the ownership
+check and logs one warning ("root-ownership check on property files is
+disabled"), so a non-root service starts there. The check first applies
+in the release build.
+
 ## Security & Hardening
 
 ### Hardening highlights
@@ -427,6 +447,10 @@ cargo run -p rsproperties-service --example example_service -- \
     --socket-dir /tmp/test_sockets
 ```
 
+This is a debug build, which any user can run. With `--release` the
+service has to run as root; see
+[File ownership](#file-ownership-a-release-build-runs-as-root).
+
 ### Testing with netcat
 
 ```bash
@@ -448,6 +472,17 @@ RUST_LOG=debug cargo test -- --nocapture
 # Run a single integration-test binary (file under `tests/`)
 cargo test --test integration_tests
 cargo test --test performance_tests
+```
+
+`cargo test --release` and `cargo test --all-features` enforce the
+root-ownership check (see
+[File ownership](#file-ownership-a-release-build-runs-as-root)), so as a
+non-root user every test that creates property files fails there. Build
+as yourself and start the test binaries as root through cargo's runner,
+as CI does:
+
+```bash
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo test --release
 ```
 
 ## Dependencies

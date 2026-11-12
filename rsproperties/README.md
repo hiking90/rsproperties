@@ -8,10 +8,9 @@ A pure Rust implementation of Android's property system, providing cross-platfor
 
 ## Supported Android Versions
 
-This library supports Android versions from Android 9 (API level 28) to Android 16 (API level 36).
-Android 17 (API level 37) is outside that range: its appcompat-override lookup is implemented from
-the AOSP `android-17.0.0_r1` sources and was compared with `getprop` on an API 37 emulator, but the
-test suite has not been run there.
+This library supports Android versions from Android 9 (API level 28) to Android 17 (API level 37).
+The Android 17 appcompat-override lookup is implemented from the AOSP `android-17.0.0_r1` sources
+and was compared with `getprop` on an API 37 emulator.
 
 ## Features
 
@@ -358,7 +357,7 @@ On Android API 37+, a process started with `BIONIC_APPCOMPAT_OVERRIDE`
 in its environment (zygote sets it) reads `ro.appcompat_override.<name>`
 first, like bionic; see `SystemProperties::read_with`. This follows the
 AOSP `android-17.0.0_r1` sources and returned the same values as
-`getprop` on an API 37 emulator (API 37 is outside the supported range).
+`getprop` on an API 37 emulator.
 On API 35–36 the override is a bind mount over `/dev/__properties__`,
 which a reader created in that process follows without extra code.
 

@@ -8,41 +8,41 @@
 //! `run` calls the process-global `rsproperties::init`, so the second
 //! instance (with its own directories) runs in
 //! a child process: this test binary re-executed with
-//! [`CHILD_ENV`] set, running only this test.
+//! [`CHILD_ENV`] set to the parent's properties dir, running only this test.
 
 mod common;
 
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rsproperties_service::StartupStage;
 
-/// Set in the child process started by the parent half of the test.
+/// Set in the child process started by the parent half of the test, to
+/// the properties dir of the parent's service. The dir's name contains the
+/// parent's pid, so the child cannot derive it.
 const CHILD_ENV: &str = "RSPROPS_SECOND_INSTANCE_CHILD";
 
 const TEST_NAME: &str = "second_instance_leaves_running_service_intact";
 
 #[tokio::test]
 async fn second_instance_leaves_running_service_intact() {
-    if std::env::var_os(CHILD_ENV).is_some() {
-        second_instance().await;
+    if let Some(parent_dir) = std::env::var_os(CHILD_ENV) {
+        second_instance(&PathBuf::from(parent_dir)).await;
         return;
     }
 
     common::init_test().await;
     rsproperties::set("test.second.before", "1").unwrap();
 
-    let dir = Path::new(common::TEST_PROPERTIES_DIR);
+    let dir = common::properties_dir();
     let info = dir.join("property_info");
-    let socket = dir
-        .join("sockets")
-        .join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
+    let socket = common::socket_dir().join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
     let info_before = std::fs::read(&info).unwrap();
     let socket_ino_before = std::fs::symlink_metadata(&socket).unwrap().ino();
 
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", TEST_NAME, "--test-threads=1", "--nocapture"])
-        .env(CHILD_ENV, "1")
+        .env(CHILD_ENV, dir)
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -78,8 +78,9 @@ async fn second_instance_leaves_running_service_intact() {
 
 /// The child half: `run` on the dirs the parent's service owns.
 ///
-/// It must not call `common::init_test()`, which deletes and recreates
-/// `__properties__`. The `Error::Lock` check relies on
+/// It must not call `common::init_test()` or `common::properties_dir()`:
+/// in the child they name a new directory (the child's pid), where a `run`
+/// succeeds. The `Error::Lock` check relies on
 /// `AreaWriterLock::acquire` returning that error unwrapped (not inside
 /// `Error::Context`).
 ///
@@ -91,10 +92,11 @@ async fn second_instance_leaves_running_service_intact() {
 /// stopping the child's socket service then unlinks them). If `run` stops
 /// waiting for the socket service first, this test can stop detecting that
 /// regression.
-async fn second_instance() {
+async fn second_instance(parent_dir: &Path) {
+    // The same layout as `common::socket_dir`.
     let config = rsproperties::PropertyConfig::new()
-        .properties_dir(common::TEST_PROPERTIES_DIR)
-        .socket_dir(Path::new(common::TEST_PROPERTIES_DIR).join("sockets"));
+        .properties_dir(parent_dir)
+        .socket_dir(parent_dir.join("sockets"));
     let err = match rsproperties_service::run(config, rsproperties_service::ServiceOptions::new())
         .await
     {

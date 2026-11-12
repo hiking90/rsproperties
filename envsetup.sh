@@ -176,8 +176,8 @@ function update_cargo_lock() {
 
 # Runs the smoke test and every test binary as root (ndk_prepare ran
 # `adb root`). Returns the run's exit status. No test data is pushed: the
-# tests that read `tests/android` or `__properties__` are builder tests,
-# which the Android build (no `builder` feature) does not include.
+# tests that read `tests/android` or a store built from it are builder
+# tests, which the Android build (no `builder` feature) does not include.
 function ndk_test() {
     ndk_run_tests
 }
