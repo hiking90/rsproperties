@@ -422,7 +422,7 @@ pub fn system_properties() -> Result<&'static system_properties::SystemPropertie
     }
     let dir = properties_dir();
     log::debug!("Initializing global SystemProperties instance from: {dir:?}");
-    match system_properties::SystemProperties::new(dir) {
+    match system_properties::SystemProperties::open(dir) {
         // Only a holder of `SYSTEM_PROPERTIES_INIT` sets the cell, and it
         // was empty above, so `props` is the value stored.
         Ok(props) => Ok(SYSTEM_PROPERTIES.get_or_init(|| props)),

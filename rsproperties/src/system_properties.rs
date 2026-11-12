@@ -229,7 +229,9 @@ pub struct PropertyIndex {
 /// trie and the area files it names, mapped into this process.
 ///
 /// A read-only instance comes from [`crate::system_properties()`] (the
-/// process-wide one). With the `builder` feature, `SystemProperties::new_area`
+/// process-wide one, on the directory [`crate::init`] set) or from
+/// [`SystemProperties::open`] (any directory). With the `builder` feature,
+/// `SystemProperties::new_area`
 /// and `SystemProperties::new_area_locked` create the areas and return the
 /// writer instance.
 pub struct SystemProperties {
@@ -271,9 +273,36 @@ impl SystemProperties {
         }
     }
 
-    // Create a new system properties to read system properties from a file or a directory.
-    pub(crate) fn new(filename: &Path) -> Result<Self> {
-        let mut sp = Self::new_ro(filename, false)?;
+    /// Opens the property store of the properties directory `dir` for
+    /// reading.
+    ///
+    /// The instance is independent of the process-wide one
+    /// ([`crate::system_properties()`]): it neither needs nor changes
+    /// [`crate::init`], so one process can read several directories, or a
+    /// directory other than the one `init` latched. Each call maps the
+    /// files again; keep the instance instead of opening one per read.
+    ///
+    /// Fails when `<dir>/property_info` or `<dir>/properties_serial` cannot
+    /// be opened or is not a valid file of the store. For a directory no
+    /// property service has populated yet, [`Error::root_cause`] is an
+    /// [`Error::Io`] of kind `NotFound`.
+    ///
+    /// Like the process-wide instance, it looks up
+    /// `ro.appcompat_override.<name>` first when `BIONIC_APPCOMPAT_OVERRIDE`
+    /// is set in the environment at the time of the call (on Android: API
+    /// 37 and later).
+    ///
+    /// ```rust,no_run
+    /// use rsproperties::SystemProperties;
+    ///
+    /// # fn main() -> rsproperties::Result<()> {
+    /// let props = SystemProperties::open("/run/my_service/properties")?;
+    /// let mode = props.get("debug.my_service.mode")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
+        let mut sp = Self::new_ro(dir.as_ref(), false)?;
         sp.appcompat_override = std::env::var_os(APPCOMPAT_OVERRIDE_ENV_VAR).is_some()
             && sp.bionic_reads_override_env();
         Ok(sp)
@@ -298,7 +327,7 @@ impl SystemProperties {
         true
     }
 
-    /// [`Self::new`] with the override lookup decided by the caller
+    /// [`Self::open`] with the override lookup decided by the caller
     /// instead of the environment (tests cannot set the variable without
     /// racing the other tests of the process).
     fn new_ro(filename: &Path, appcompat_override: bool) -> Result<Self> {
@@ -1347,7 +1376,7 @@ mod tests {
     #[cfg(target_os = "android")]
     #[test]
     fn test_system_properties() -> Result<()> {
-        let system_properties = SystemProperties::new(Path::new(crate::PROP_DIRNAME))?;
+        let system_properties = SystemProperties::open(Path::new(crate::PROP_DIRNAME))?;
 
         let handle = std::thread::spawn(move || {
             let version1 = system_properties.get(VERSION_PROPERTY).unwrap_or_default();
@@ -1468,7 +1497,7 @@ mod long_flag_tests {
 
         assert_eq!(fx.sp.get("debug.rsp.bit16").unwrap(), "v32767");
         // A read-only instance, as the global reader opens it.
-        let reader = SystemProperties::new(fx.dir()).unwrap();
+        let reader = SystemProperties::open(fx.dir()).unwrap();
         assert_eq!(reader.get("debug.rsp.bit16").unwrap(), "v32767");
     }
 
@@ -1528,7 +1557,7 @@ mod long_flag_tests {
         let long = "x".repeat(200);
         fx.sp.add("ro.rsp.long", &long).unwrap();
         assert_eq!(fx.sp.get("ro.rsp.long").unwrap(), long);
-        let reader = SystemProperties::new(fx.dir()).unwrap();
+        let reader = SystemProperties::open(fx.dir()).unwrap();
         assert_eq!(reader.get("ro.rsp.long").unwrap(), long);
     }
 }
@@ -1553,7 +1582,7 @@ mod wait_tests {
     fn index_wait_compares_before_timeout() {
         let mut fx = Fixture::new("wait_zero");
         fx.sp.add("debug.rsp.zero", "0").unwrap();
-        let reader = SystemProperties::new(fx.dir()).unwrap();
+        let reader = SystemProperties::open(fx.dir()).unwrap();
         let idx = reader.find("debug.rsp.zero").unwrap().unwrap();
         let old = reader.serial(idx).unwrap();
         fx.sp.set("debug.rsp.zero", "1").unwrap();
@@ -1586,7 +1615,7 @@ mod wait_tests {
         let widx = fx.sp.find("debug.rsp.wake").unwrap().unwrap();
         // Another instance, as the global reader is: it maps the file
         // separately and takes none of the writer's locks.
-        let reader = SystemProperties::new(fx.dir()).unwrap();
+        let reader = SystemProperties::open(fx.dir()).unwrap();
         let idx = reader.find("debug.rsp.wake").unwrap().unwrap();
         let guard = reader
             .contexts

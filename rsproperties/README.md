@@ -332,6 +332,10 @@ rsproperties::init(
 
 ### `SystemProperties` (read side)
 
+- `SystemProperties::open(dir)` — a read-only instance on `dir`,
+  independent of `init` and of the global reader: for a second properties
+  directory in one process, or a library that must not set the
+  process-wide one
 - `read_with(name, |&str| -> R)` — zero-alloc callback reader
 - `get(name)` — the value as a `String`; `Err(NotFound)` when missing
 - `find(name)` — `Result<Option<PropertyIndex>>`; `Ok(None)` for a

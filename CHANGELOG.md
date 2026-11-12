@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `wait_for_value(name, expected, timeout)` (libbase
   `WaitForPropertyCreation` / `WaitForProperty`), with
   `Option<Duration>` timeouts.
+- `SystemProperties::open(dir)`: a read-only instance on a directory the
+  caller names. 0.6.0 had no public read-only constructor, so a process
+  could read only the one directory `init` latched, and a library could
+  not read a store without setting that process-wide directory.
 - `parse::parse_bool` and `parse::parse_int`: libbase `ParseBool` /
   `ParseInt` / `ParseUint` rules (`yes`/`on`/`1`, leading whitespace,
   `0x` hex, no trailing characters).
