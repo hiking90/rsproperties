@@ -23,8 +23,10 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::time::{Duration, Instant};
 
-use rsproperties::wire::{PROP_ERROR, PROP_MSG_SETPROP2, PROP_SUCCESS, PROP_VALUE_MAX};
-use rsproperties::{Error, PropertyConfig, PROPERTY_SERVICE_SOCKET_NAME};
+use rsproperties::wire::{
+    PROP_ERROR, PROP_ERROR_INVALID_VALUE, PROP_MSG_SETPROP2, PROP_SUCCESS, PROP_VALUE_MAX,
+};
+use rsproperties::{Error, PropertyConfig, SetRejection, PROPERTY_SERVICE_SOCKET_NAME};
 
 /// What the fake service read from one connection.
 #[derive(Debug)]
@@ -167,15 +169,23 @@ fn test_v2_set_frames() {
         );
     }
 
-    // Phase 2 — a non-success status becomes `ServiceError` with that code.
-    let (frame, result) = set_against(&listener, "edge.rejected", "v", PROP_ERROR);
-    assert_eq!(frame.name, b"edge.rejected");
-    match result {
-        Err(Error::ServiceError { name, code }) => {
-            assert_eq!(name, "edge.rejected");
-            assert_eq!(code, PROP_ERROR);
+    // Phase 2 — a non-success status becomes `SetRejected` with that
+    // code: one with a variant, the 0.6.0 service's -1, and one without.
+    for (status, expected) in [
+        (PROP_ERROR_INVALID_VALUE, SetRejection::InvalidValue),
+        (PROP_ERROR, SetRejection::Unspecified),
+        (0x7abc, SetRejection::Unknown(0x7abc)),
+    ] {
+        let (frame, result) = set_against(&listener, "edge.rejected", "v", status);
+        assert_eq!(frame.name, b"edge.rejected");
+        match result {
+            Err(Error::SetRejected { name, reason }) => {
+                assert_eq!(name, "edge.rejected");
+                assert_eq!(reason, expected);
+                assert_eq!(reason.code(), status);
+            }
+            other => panic!("expected SetRejected, got {other:?}"),
         }
-        other => panic!("expected ServiceError, got {other:?}"),
     }
 
     drop(listener);

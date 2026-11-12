@@ -347,8 +347,9 @@ in the release build.
   reply, so a `set` that returns `TimedOut` while waiting for the reply
   may have been applied (a `TimedOut` while connecting or sending means
   the request was not delivered). Retrying with the same value is
-  harmless except for `ro.*`, where the retry gets `ServiceError` if the
-  first attempt was applied, and `ctl.*`, whose handler runs once per
+  harmless except for `ro.*`, where the retry gets
+  `rsproperties::Error::SetRejected` (`SetRejection::ReadOnlyProperty`)
+  if the first attempt was applied, and `ctl.*`, whose handler runs once per
   request (a handler call outlives the client's `TimedOut`, so a retry
   can run the action twice).
 - **`accept()` back-off**: a 100 ms sleep is inserted after an `accept()`

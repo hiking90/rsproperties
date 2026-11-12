@@ -221,7 +221,9 @@ fn apply_set(system_properties: &mut SystemProperties, name: &str, value: &str) 
         return PROP_ERROR_INVALID_VALUE;
     }
     // `set` encapsulates find → update-or-add, including the `ro.`
-    // rejection (`PermissionDenied`).
+    // rejection (`ReadOnlyProperty`). Every other failure, including
+    // `PermissionDenied` (a file mode or a read-only mapping), is a
+    // storage failure.
     match system_properties.set(name, value) {
         // Mask the value (same policy as `PropertyMessage`'s Debug impl
         // and the socket layer).
@@ -229,7 +231,7 @@ fn apply_set(system_properties: &mut SystemProperties, name: &str, value: &str) 
             log::info!("Set property: {name:?} (<{} bytes>)", value.len());
             PROP_SUCCESS
         }
-        Err(rsproperties::Error::PermissionDenied(_)) => PROP_ERROR_READ_ONLY_PROPERTY,
+        Err(rsproperties::Error::ReadOnlyProperty(_)) => PROP_ERROR_READ_ONLY_PROPERTY,
         Err(e) => {
             log::error!("Failed to set property {name:?}: {e}");
             PROP_ERROR_SET_FAILED

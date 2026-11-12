@@ -82,7 +82,7 @@ mod errors;
 mod from_property;
 pub mod parse;
 pub mod wire;
-pub use errors::{Error, Result};
+pub use errors::{Error, Result, SetRejection};
 pub use from_property::FromProperty;
 
 #[cfg(feature = "builder")]
@@ -597,7 +597,7 @@ where
 ///
 /// If an error occurs, it returns Err.
 /// The V1 protocol has no status reply: a server-side rejection is not
-/// observable and returns `Ok(())`; only V2 reports `Error::ServiceError`.
+/// observable and returns `Ok(())`; only V2 reports `Error::SetRejected`.
 /// V2 names and `ro.` values are limited to 65535 bytes on Android
 /// (`wire::AOSP_MAX_WIRE_STRING_LEN`, AOSP init's limit) and to
 /// [`wire::MAX_WIRE_NAME_LEN`] / [`wire::MAX_WIRE_VALUE_LEN`] elsewhere

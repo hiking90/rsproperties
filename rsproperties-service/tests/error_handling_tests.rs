@@ -532,21 +532,21 @@ async fn test_type_conversion_boundaries() -> anyhow::Result<()> {
 }
 
 /// The service replies with init's codes, which the client reports as
-/// `ServiceError { code }`; `ctl.*` is refused (no control handler in the
+/// `SetRejected { reason }`; `ctl.*` is refused (no control handler in the
 /// test service) and never stored.
 #[tokio::test]
 async fn test_service_rejections_carry_init_codes() -> anyhow::Result<()> {
-    use rsproperties::wire::{PROP_ERROR_HANDLE_CONTROL_MESSAGE, PROP_ERROR_READ_ONLY_PROPERTY};
+    use rsproperties::SetRejection;
     setup_test_env().await;
 
-    let code_of = |result: rsproperties::Result<()>| match result {
-        Err(rsproperties::Error::ServiceError { code, .. }) => Some(code),
+    let reason_of = |result: rsproperties::Result<()>| match result {
+        Err(rsproperties::Error::SetRejected { reason, .. }) => Some(reason),
         _ => None,
     };
 
     assert_eq!(
-        code_of(rsproperties::set("ctl.start", "some_service")),
-        Some(PROP_ERROR_HANDLE_CONTROL_MESSAGE)
+        reason_of(rsproperties::set("ctl.start", "some_service")),
+        Some(SetRejection::ControlMessage)
     );
     assert!(matches!(
         rsproperties::get::<String>("ctl.start"),
@@ -555,8 +555,8 @@ async fn test_service_rejections_carry_init_codes() -> anyhow::Result<()> {
 
     rsproperties::set("ro.test.codes.once", "1")?;
     assert_eq!(
-        code_of(rsproperties::set("ro.test.codes.once", "2")),
-        Some(PROP_ERROR_READ_ONLY_PROPERTY)
+        reason_of(rsproperties::set("ro.test.codes.once", "2")),
+        Some(SetRejection::ReadOnlyProperty)
     );
 
     // Set by the service at startup, like init.

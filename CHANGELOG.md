@@ -230,6 +230,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     default). A `FromStr` type without a `FromProperty` implementation —
     `f32`, `f64`, `i128`, `char`, `IpAddr`, … — no longer compiles with
     these functions; read it with `SystemProperties::read_with`.
+  - `Error::ServiceError { name, code: i32 }` is renamed to
+    `Error::SetRejected { name, reason: SetRejection }`. `SetRejection`
+    is a `#[non_exhaustive]` enum with one variant per
+    `wire::PROP_ERROR_*` code and `Unknown(i32)` for any other;
+    `reason.code()` returns the number. The old name was also the name
+    of `rsproperties_service::ServiceError`, an unrelated type.
+  - `SystemProperties::update` and `set` (`builder`) refuse a `ro.`
+    property that already has a value with
+    `Error::ReadOnlyProperty(name)` (0.6.0: `Error::PermissionDenied`).
+    `PermissionDenied` is left with the two conditions that are not
+    about `ro.`: a file mode this crate refuses, and a write through an
+    instance whose areas are mapped read-only. The service maps only
+    `ReadOnlyProperty` to `PROP_ERROR_READ_ONLY_PROPERTY` (0.6.0: every
+    `PermissionDenied`); its writer reaches neither of the other two
+    conditions today, so no reply changes.
 - **Breaking (service API):** `run` is the only way to start the service,
   and no rsactor or tokio type is left in the public API:
   - `run` returns a `ServiceHandle` (see Added) instead of the tuple
@@ -262,8 +277,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule sends V2; a V1 client gets no result code and its `persist.*`
   sets are not stored (see Added).
 - Service: V2 replies carry init's error codes instead of `PROP_ERROR`
-  (-1), so a client's `Error::ServiceError { code }` names the reason
-  (e.g. `PROP_ERROR_READ_ONLY_PROPERTY` for a second set of a `ro.`
+  (-1), so a client's `Error::SetRejected { reason }` names the reason
+  (e.g. `SetRejection::ReadOnlyProperty` for a second set of a `ro.`
   property). A value that does not match its `property_contexts` type is
   now rejected (`PROP_ERROR_INVALID_VALUE`), and `ctl.*` sets are no
   longer stored.
@@ -353,7 +368,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name verbatim), to the disallowed-key `error` log of
   `load_properties_from_file`, and to the line and tokens that
   `PropertyInfoEntry::parse_from_file` logs and returns for a line it
-  cannot parse, to the `Error::PermissionDenied` that
+  cannot parse, to the `Error::ReadOnlyProperty` that
   `SystemProperties::update` (and `set` on an existing `ro.` name)
   returns and logs, and to the `build_trie` errors and log lines that
   name a property and the invalid-type error of
@@ -1039,6 +1054,15 @@ Service (`rsproperties-service`, git dependency only):
     `ServiceOptions::control_handler`);
   - `PropertyIndex` is 16 bytes (was 8), and only the `SystemProperties`
     instance that returned it accepts it (see Changed error values).
+  - `Error::ServiceError { name, code }` becomes
+    `Error::SetRejected { name, reason }`. A comparison
+    `code == wire::PROP_ERROR_READ_ONLY_PROPERTY` becomes
+    `reason == SetRejection::ReadOnlyProperty` (or
+    `reason.code() == wire::PROP_ERROR_READ_ONLY_PROPERTY`), and
+    `{code:#x}` in a message becomes `{reason}`, which prints the cause
+    and the code.
+  - A `builder` caller that matched `Error::PermissionDenied` to detect
+    a second set of a `ro.` property matches `Error::ReadOnlyProperty`.
 - **Changed error values**:
   - `rsproperties_service::run` returns `StartupError` (0.6.0:
     `Box<dyn Error + Send + Sync>` holding a `Failed to start … service:`
@@ -1069,11 +1093,14 @@ Service (`rsproperties-service`, git dependency only):
     `SystemProperties::get`, `read_with`, `SystemProperties::add` and `set`)
     reads `no context for property "<name>"`, the name `Debug`-escaped
     (0.6.0: `no context for property <name>`). The `FileValidation`
-    message for a name whose context was skipped at init, and the
-    `PermissionDenied` message of `SystemProperties::update` (and `set`)
-    for an existing `ro.` name, quote the name the same way (0.6.0:
-    unquoted). Code that compared or searched these payloads for the raw
-    name must compare with the escaped form or match the variant only.
+    message for a name whose context was skipped at init quotes the name
+    the same way (0.6.0: unquoted). Code that compared or searched these
+    payloads for the raw name must compare with the escaped form or match
+    the variant only.
+  - `SystemProperties::update` (and `set`) for an existing `ro.` name
+    returns `Error::ReadOnlyProperty` with the name as its payload
+    (0.6.0: `Error::PermissionDenied` with a message). Its `Display`
+    quotes the name `Debug`-escaped.
   - The other error payloads that embed a property name, line, token or
     type string print it `Debug`-escaped (`"…"`; 0.6.0: raw or in `'…'`):
     the `InvalidArgument` of `wire::validate_property_name`, which
@@ -1162,9 +1189,10 @@ Service (`rsproperties-service`, git dependency only):
     (0xB) for a second set of an `ro.` property,
     `PROP_ERROR_HANDLE_CONTROL_MESSAGE` (0x20) for a refused `ctl.*`, and
     `PROP_ERROR_SET_FAILED` (0x24) for any other storage failure. The
-    client's `Error::ServiceError { code }` carries these values. Code
-    that matched `code: -1` (or `wire::PROP_ERROR`) must match the
-    `wire::PROP_ERROR_*` constants, or match the variant only.
+    client's `Error::SetRejected { reason }` carries these values as
+    `SetRejection` variants. Code that matched `code: -1` (or
+    `wire::PROP_ERROR`) must match those variants, or match
+    `Error::SetRejected` only.
   - service: a V2 frame that ends inside the name-length field gets the
     4-byte `PROP_ERROR_READ_DATA` (0x8) reply before the connection is
     closed (0.6.0 closed it without a reply). A client that reads the

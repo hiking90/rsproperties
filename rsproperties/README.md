@@ -258,8 +258,9 @@ fn set_app_config() -> Result<()> {
     ] {
         if let Err(e) = rsproperties::set(key, value) {
             match e.root_cause() {
-                // Rejected by the service: `code` is a `wire::PROP_ERROR_*`.
-                Error::ServiceError { code, .. } => eprintln!("{key} rejected: {code:#x}"),
+                // Rejected by the service: `reason` is a `SetRejection`,
+                // e.g. `SetRejection::ReadOnlyProperty`.
+                Error::SetRejected { reason, .. } => eprintln!("{key} rejected: {reason}"),
                 // No service socket, a closed connection, a timeout.
                 Error::Io(io) => eprintln!("{key}: I/O failure: {io}"),
                 _ => eprintln!("{key}: {e}"),
@@ -419,8 +420,13 @@ clients that want to point at a custom socket directory:
 
 - `Error` — non-exhaustive enum (`Io`, `NotFound`, `Utf8`, `Parse`,
   `FileValidation`, `InvalidArgument`, `AlreadyInitialized`,
-  `LimitExceeded`, `ServiceError`, `PermissionDenied`, `FileSize`,
-  `AreaFull`, `FileOwnership`, `Lock`, `Init`, `Context`)
+  `LimitExceeded`, `SetRejected`, `ReadOnlyProperty`, `PermissionDenied`,
+  `FileSize`, `AreaFull`, `FileOwnership`, `Lock`, `Init`, `Context`)
+- `SetRejection` — why the service rejected a set, in
+  `Error::SetRejected { name, reason }`: a non-exhaustive enum with one
+  variant per `wire::PROP_ERROR_*` code (`ReadOnlyProperty`,
+  `InvalidName`, `InvalidValue`, `PermissionDenied`, …) and
+  `Unknown(i32)`; `code()` returns the number
 - `Error::root_cause()` — the error under the `Context` / `Init` layers
 - `Result<T>` = `Result<T, Error>`
 

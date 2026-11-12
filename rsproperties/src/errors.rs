@@ -76,18 +76,39 @@ pub enum Error {
     #[error("Limit exceeded: {0}")]
     LimitExceeded(String),
 
-    /// The property service accepted the connection but rejected the
+    /// The property service accepted the connection but rejected the set
     /// request at the protocol level — the socket itself is healthy, so
-    /// this is deliberately not an [`Error::Io`].
-    #[error("Property service rejected \"{name}\": error code {code:#x}")]
-    ServiceError {
+    /// this is deliberately not an [`Error::Io`]. Returned by
+    /// [`set`](crate::set) over the V2 protocol only; V1 has no reply.
+    #[error("Property service rejected \"{name}\": {reason}")]
+    SetRejected {
         /// The property name of the rejected request.
         name: String,
-        /// The service's reply code: one of `wire::PROP_ERROR_*`.
-        code: i32,
+        /// The service's reply code.
+        reason: SetRejection,
     },
 
-    /// The property service refused the request for this sender.
+    /// A writer was asked to change a `ro.` property that already has a
+    /// value (`SystemProperties::update` / `set`, `builder` feature). The
+    /// payload is the property name; `Display` prints it `Debug`-escaped.
+    ///
+    /// A client never sees this variant: the service answers that set
+    /// with [`SetRejection::ReadOnlyProperty`] inside
+    /// [`Error::SetRejected`].
+    #[error("Read-only property already has a value: {0:?}")]
+    ReadOnlyProperty(String),
+
+    /// Access this crate refuses without asking the OS:
+    ///
+    /// - a file of the property store, or a prop file, is group- or
+    ///   other-writable (`property_info` also when owner-writable, with
+    ///   the `strict-file-validation` feature);
+    /// - a write went to an instance whose areas are mapped read-only,
+    ///   e.g. `set` on a `SystemProperties::open` reader.
+    ///
+    /// An `EACCES` / `EPERM` from a syscall is [`Error::Io`], and a
+    /// service that refuses a set for this sender is
+    /// [`Error::SetRejected`] with [`SetRejection::PermissionDenied`].
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
 
@@ -142,6 +163,119 @@ pub enum Error {
         #[source]
         source: Box<Error>,
     },
+}
+
+/// Why the property service rejected a set request: the reply code of the
+/// V2 protocol (`wire::PROP_ERROR_*`, bionic `sys/system_properties.h`).
+///
+/// `#[non_exhaustive]` because AOSP can add codes. A code this version has
+/// no variant for is [`SetRejection::Unknown`]; a later version may give
+/// that code a variant of its own, so compare [`SetRejection::code`]
+/// instead of matching `Unknown(n)` when one specific number matters.
+///
+/// ```
+/// use rsproperties::{Error, SetRejection};
+///
+/// fn already_set(err: &Error) -> bool {
+///     matches!(
+///         err,
+///         Error::SetRejected { reason: SetRejection::ReadOnlyProperty, .. }
+///     )
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SetRejection {
+    /// The service could not read the command word (`PROP_ERROR_READ_CMD`).
+    ReadCommand,
+    /// The service could not read the name or value, or one of them is
+    /// longer than the service accepts (`PROP_ERROR_READ_DATA`).
+    ReadData,
+    /// The `ro.` property already has a value
+    /// (`PROP_ERROR_READ_ONLY_PROPERTY`).
+    ReadOnlyProperty,
+    /// The name is not a legal property name (`PROP_ERROR_INVALID_NAME`).
+    InvalidName,
+    /// The value is too long, not UTF-8, or does not match the property's
+    /// type in `property_contexts` (`PROP_ERROR_INVALID_VALUE`).
+    InvalidValue,
+    /// The sender may not set this property
+    /// (`PROP_ERROR_PERMISSION_DENIED`).
+    PermissionDenied,
+    /// The service does not know the command word
+    /// (`PROP_ERROR_INVALID_CMD`).
+    InvalidCommand,
+    /// A `ctl.*` control message was refused or failed
+    /// (`PROP_ERROR_HANDLE_CONTROL_MESSAGE`).
+    ControlMessage,
+    /// Storing the property failed, e.g. the property area is full
+    /// (`PROP_ERROR_SET_FAILED`).
+    SetFailed,
+    /// `PROP_ERROR` (-1), which names no cause. AOSP init never sends it;
+    /// the 0.6.0 service of this crate answers every rejected set with it.
+    Unspecified,
+    /// A non-zero code without a variant in this version.
+    Unknown(i32),
+}
+
+impl SetRejection {
+    /// The variant for a non-success reply code.
+    pub(crate) fn from_code(code: i32) -> Self {
+        use crate::wire::*;
+        match code {
+            PROP_ERROR_READ_CMD => Self::ReadCommand,
+            PROP_ERROR_READ_DATA => Self::ReadData,
+            PROP_ERROR_READ_ONLY_PROPERTY => Self::ReadOnlyProperty,
+            PROP_ERROR_INVALID_NAME => Self::InvalidName,
+            PROP_ERROR_INVALID_VALUE => Self::InvalidValue,
+            PROP_ERROR_PERMISSION_DENIED => Self::PermissionDenied,
+            PROP_ERROR_INVALID_CMD => Self::InvalidCommand,
+            PROP_ERROR_HANDLE_CONTROL_MESSAGE => Self::ControlMessage,
+            PROP_ERROR_SET_FAILED => Self::SetFailed,
+            PROP_ERROR => Self::Unspecified,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// The reply code as the service sent it: one of `wire::PROP_ERROR_*`,
+    /// or the payload of [`SetRejection::Unknown`].
+    pub fn code(self) -> i32 {
+        use crate::wire::*;
+        match self {
+            Self::ReadCommand => PROP_ERROR_READ_CMD,
+            Self::ReadData => PROP_ERROR_READ_DATA,
+            Self::ReadOnlyProperty => PROP_ERROR_READ_ONLY_PROPERTY,
+            Self::InvalidName => PROP_ERROR_INVALID_NAME,
+            Self::InvalidValue => PROP_ERROR_INVALID_VALUE,
+            Self::PermissionDenied => PROP_ERROR_PERMISSION_DENIED,
+            Self::InvalidCommand => PROP_ERROR_INVALID_CMD,
+            Self::ControlMessage => PROP_ERROR_HANDLE_CONTROL_MESSAGE,
+            Self::SetFailed => PROP_ERROR_SET_FAILED,
+            Self::Unspecified => PROP_ERROR,
+            Self::Unknown(code) => code,
+        }
+    }
+}
+
+/// The cause in words, then the code as [`SetRejection::code`] returns it
+/// in hex (`Unspecified` prints `0xffffffff`).
+impl std::fmt::Display for SetRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cause = match self {
+            Self::ReadCommand => "the command could not be read",
+            Self::ReadData => "the name or value could not be read",
+            Self::ReadOnlyProperty => "the read-only property already has a value",
+            Self::InvalidName => "invalid property name",
+            Self::InvalidValue => "invalid property value",
+            Self::PermissionDenied => "permission denied",
+            Self::InvalidCommand => "unknown command",
+            Self::ControlMessage => "the control message was refused or failed",
+            Self::SetFailed => "the property could not be stored",
+            Self::Unspecified => "no cause given",
+            Self::Unknown(_) => "unknown error code",
+        };
+        write!(f, "{cause} ({:#x})", self.code())
+    }
 }
 
 impl Error {
@@ -282,6 +416,45 @@ mod tests {
             wrapped.root_cause(),
             Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound
         ));
+    }
+
+    /// Every `wire::PROP_ERROR_*` code has a variant and survives the
+    /// round trip; other codes are kept in `Unknown`.
+    #[test]
+    fn set_rejection_round_trips_wire_codes() {
+        use crate::wire::*;
+        let named = [
+            PROP_ERROR,
+            PROP_ERROR_READ_CMD,
+            PROP_ERROR_READ_DATA,
+            PROP_ERROR_READ_ONLY_PROPERTY,
+            PROP_ERROR_INVALID_NAME,
+            PROP_ERROR_INVALID_VALUE,
+            PROP_ERROR_PERMISSION_DENIED,
+            PROP_ERROR_INVALID_CMD,
+            PROP_ERROR_HANDLE_CONTROL_MESSAGE,
+            PROP_ERROR_SET_FAILED,
+        ];
+        for code in named {
+            let reason = SetRejection::from_code(code);
+            assert!(
+                !matches!(reason, SetRejection::Unknown(_)),
+                "{code:#x} has no variant"
+            );
+            assert_eq!(reason.code(), code);
+        }
+        assert_eq!(SetRejection::from_code(0x28), SetRejection::Unknown(0x28));
+        assert_eq!(SetRejection::Unknown(0x28).code(), 0x28);
+
+        let err = Error::SetRejected {
+            name: "ro.a".into(),
+            reason: SetRejection::ReadOnlyProperty,
+        };
+        assert_eq!(
+            err.to_string(),
+            "Property service rejected \"ro.a\": \
+             the read-only property already has a value (0xb)"
+        );
     }
 
     fn try_open_file() -> Result<()> {

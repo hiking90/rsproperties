@@ -733,8 +733,7 @@ init은 control message를 queue에 넣고 main thread의 `HandleControlMessage`
 **변경 전(main).** service는 실패하면 항상 `PROP_ERROR(-1)`를 보낸다. init은
 `PROP_ERROR_READ_ONLY_PROPERTY`, `INVALID_NAME`, `INVALID_VALUE`,
 `PERMISSION_DENIED`, `SET_FAILED`, `HANDLE_CONTROL_MESSAGE` 등을 구분한다.
-client의 `Error::ServiceError { code }`(`errors.rs:80`)에는 Linux에서 항상
--1만 들어온다.
+client의 `Error::ServiceError { code }`에는 Linux에서 항상 -1만 들어온다.
 
 **변경.** `wire::PROP_ERROR_*`에 bionic의 code 값을 추가하고, 아래 "init과
 다른 점"을 제외하면 init과 같은 조건에서 같은 code를 보낸다.
@@ -754,6 +753,33 @@ V2 field의 NUL·UTF-8 오류는 읽을 때 발견하지만 두 field를 다 읽
 보류한다. 그래서 두 번째 field를 읽지 못하면 `READ_DATA`, 이름과 값이 둘 다
 잘못되면(예: 이름 `.bad`, 값에 NUL) 이름이 먼저 걸려 `INVALID_NAME`이다
 (`property_service.cpp:500-502`). 공개 `PROP_ERROR`(-1) 상수는 그대로 두었다.
+
+client는 응답 code를 `Error::SetRejected { name, reason: SetRejection }`으로
+반환한다(변경 전 이름은 `Error::ServiceError { name, code: i32 }`).
+- bionic `__system_property_set`은 code를 호출자에게 넘기지 않는다. log에
+  `__prop_error_to_string(result)`와 code를 남기고 -1을 반환한다
+  (`system_property_set.cpp:258-327`). libbase `SetProperty`는 `bool`이다. code를
+  호출자에게 넘기는 것은 이 crate가 추가한 동작이다(b).
+- `SetRejection`은 `__prop_error_to_string`이 구분하는 code 9개에 variant를
+  하나씩 둔 `#[non_exhaustive]` enum이다. `PROP_ERROR`(-1)는 `Unspecified`,
+  그 밖의 값은 `Unknown(i32)`이고, `code()`가 원래 숫자를 반환한다. `i32`를
+  그대로 두면 호출자가 `wire::PROP_ERROR_*` 상수와 직접 비교해야 하고,
+  `Debug`·`Display` 출력에 숫자만 나온다. `Unknown(n)`의 `n`이 나중 version에서
+  variant를 얻으면 `Unknown(n)`을 match하던 코드는 그 arm에 도달하지 않는다.
+  그래서 특정 숫자를 비교할 때는 `code()`를 쓰라고 문서에 적었다.
+- 이름을 바꾼 이유는 `rsproperties_service::ServiceError`(service 종료 원인)와
+  이름이 같았기 때문이다. 두 타입은 관계가 없다.
+
+service는 writer의 오류 중 `Error::ReadOnlyProperty`만 `READ_ONLY_PROPERTY`로
+바꾼다. 변경 전에는 `ro.` 거부가 `Error::PermissionDenied`였고, 이 variant는
+파일 mode 거부와 read-only mapping에 대한 쓰기에도 쓰였다. service는 variant
+전체를 `READ_ONLY_PROPERTY`로 바꿨으므로, 뒤의 두 조건이 `set` 중에 발생하면
+client는 `ro.` 거부로 보고받는다. 현재 코드에서 service의 writer는 두 조건에
+도달하지 않는다. writer는 시작할 때 모든 area를 `PropertyAreaMap::new_rw`로
+열고, 파일 mode 검사는 `new_ro`와 `property_info` load에만 있다. 따라서 이
+변경으로 service의 응답이 달라지는 경우는 없고, 변환 대상을 `ro.` 거부로
+한정한 것이다. 두 조건이 `set` 경로에 생기면 응답은 `SET_FAILED`다.
+
 init과 다른 점은 다음과 같다.
 - (c) `sys.powerctl`과 `selinux.restorecon_recursive`의 분기가 없다. init
   `HandlePropertySet`은 `sys.powerctl`=`reboot,userspace`에

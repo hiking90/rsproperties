@@ -885,6 +885,9 @@ impl SystemProperties {
     /// reader and a writer on the same directory are different instances.
     /// An index from another instance fails with `Error::InvalidArgument`
     /// before any area is touched.
+    ///
+    /// A `ro.` property is never updated: `Error::ReadOnlyProperty`, with
+    /// the stored value and serial unchanged.
     #[cfg(feature = "builder")]
     pub fn update(&mut self, index: PropertyIndex, value: &str) -> Result<()> {
         // Another instance's offsets address an unrelated layout.
@@ -920,12 +923,9 @@ impl SystemProperties {
                 })?
                 .to_bytes();
             if name.starts_with(b"ro.") {
-                let error_msg = format!(
-                    "Try to update the read-only property: {:?}",
-                    String::from_utf8_lossy(name)
-                );
-                log::error!("{error_msg}");
-                return Err(Error::PermissionDenied(error_msg));
+                let err = Error::ReadOnlyProperty(String::from_utf8_lossy(name).into_owned());
+                log::error!("{err}");
+                return Err(err);
             }
             // Value-length check — `update` writes the short slot only:
             // only `ro.` entries are long and they were rejected above (and
@@ -1633,20 +1633,44 @@ mod long_flag_tests {
     }
 
     /// The `ro.` refusal of `update` (also reached by `set` on an existing
-    /// `ro.` name) prints the name `Debug`-escaped, so a name carrying a
-    /// newline cannot forge a log line.
+    /// `ro.` name) carries the name as stored and prints it
+    /// `Debug`-escaped, so a name carrying a newline cannot forge a log
+    /// line.
     #[test]
     fn ro_update_refusal_escapes_name() {
         let mut fx = Fixture::new("ro_escape");
         let name = "ro.rsp.x\nFAKE: forged";
         fx.sp.add(name, "1").unwrap();
-        match fx.sp.set(name, "2") {
-            Err(Error::PermissionDenied(msg)) => {
-                assert!(!msg.contains('\n'), "raw newline in {msg:?}");
-                assert!(msg.contains(r#""ro.rsp.x\nFAKE: forged""#), "{msg:?}");
-            }
-            other => panic!("expected PermissionDenied, got {other:?}"),
+        let err = fx.sp.set(name, "2").unwrap_err();
+        match &err {
+            Error::ReadOnlyProperty(refused) => assert_eq!(refused, name),
+            other => panic!("expected ReadOnlyProperty, got {other:?}"),
         }
+        let msg = err.to_string();
+        assert!(!msg.contains('\n'), "raw newline in {msg:?}");
+        assert!(msg.contains(r#""ro.rsp.x\nFAKE: forged""#), "{msg:?}");
+        assert_eq!(fx.sp.get(name).unwrap(), "1");
+    }
+
+    /// A write through a read-only instance is `PermissionDenied`, not
+    /// the `ro.` refusal: the service maps only the latter to
+    /// `PROP_ERROR_READ_ONLY_PROPERTY`.
+    #[test]
+    fn write_through_reader_is_permission_denied() {
+        let mut fx = Fixture::new("reader_write");
+        fx.sp.add("debug.rsp.w", "1").unwrap();
+        let mut reader = SystemProperties::open(fx.dir()).unwrap();
+        for result in [
+            reader.set("debug.rsp.w", "2"),
+            reader.set("debug.rsp.new", "2"),
+        ] {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err.root_cause(), Error::PermissionDenied(_)),
+                "{err:?}"
+            );
+        }
+        assert_eq!(fx.sp.get("debug.rsp.w").unwrap(), "1");
     }
 
     #[test]

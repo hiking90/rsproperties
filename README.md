@@ -351,7 +351,7 @@ fn handle_property_operation() {
         Ok(_) => println!("Property set"),
         Err(e) => match e.root_cause() {
             Error::Io(io) => eprintln!("I/O failure: {io}"),
-            Error::ServiceError { name, code } => eprintln!("{name} rejected: {code:#x}"),
+            Error::SetRejected { name, reason } => eprintln!("{name} rejected: {reason}"),
             _ => eprintln!("other: {e}"),
         },
     }
