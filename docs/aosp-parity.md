@@ -82,8 +82,28 @@ exit 1로 끝난다.
   않고 `Err`를 반환한다. 이 crate는 손상과 부재를 구분한다는 정책을 따른다.
   손상된 context보다 앞서 순회한 context의 index는 이미 callback에 전달된
   상태다.
+- `SystemProperties::list(|name, value| ...)`를 추가한다. libcutils
+  `property_list`(`libcutils/properties.cpp:103-115`)에 대응하며, `foreach`의
+  index마다 값을 읽어 callback에 넘긴다. 열거 대상, 순서, 건너뛰는 area는
+  `foreach`와 같다.
+  - 이름과 값을 호출 1회당 `String` 두 개에 복사하고, node read lock을 놓은
+    뒤에 callback을 호출한다. `property_list`는 `read_callback` 안에서, 즉
+    값을 읽는 도중에 callback을 호출한다. 이 crate에서 그렇게 하면 callback이
+    같은 instance의 read API를 호출할 때 같은 `RwLock`의 read lock을 두 번
+    잡는다. 복사 비용은 property마다 `memcpy` 두 번이고, buffer를 재사용하므로
+    할당은 값 길이가 늘어날 때만 생긴다.
+  - 다른 점(a): UTF-8이 아닌 byte는 U+FFFD로 바꿔 넘긴다
+    (`String::from_utf8_lossy`). `property_list`는 C 문자열을 그대로 넘기지만
+    callback 인자가 `&str`이므로 같은 방식은 쓸 수 없다. `Error::Utf8`로
+    순회를 끝내면 그런 값 하나 때문에 나머지 property를 열거하지 못한다.
+    건너뛰면 호출자가 그 property의 존재를 알 수 없다. 값을 byte 그대로
+    받으려는 호출자를 위한 API는 두지 않았다.
+  - 그 밖의 read 오류는 순회를 끝내고 `Err`로 반환한다(trie 손상과 같은 규칙).
+  - 검증: `client_parity_tests::list_matches_foreach_and_allows_reentry`(Linux,
+    writer와 reader instance 양쪽). UTF-8이 아닌 값을 쓰는 writer가 없어
+    U+FFFD 치환 경로는 test하지 못했다.
 - `getprop` 예제는 인자가 없으면 toybox `getprop`처럼 이름순으로
-  `[name]: [value]`를 출력한다.
+  `[name]: [value]`를 출력한다. 열거는 `list`를 쓴다.
 - 검증: API 36 emulator의 adb shell(SELinux `shell` domain)에서 이 예제의
   출력과 toybox `getprop` 출력이 531줄 모두 일치했다. Linux에서는
   `example_service` + `setprop`으로 넣은 4개 property(`ro.` long value

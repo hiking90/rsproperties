@@ -702,13 +702,19 @@ impl SystemProperties {
     /// stops that area's walk without reporting it); `f` has then already
     /// run for the areas visited before.
     ///
+    /// [`Self::list`] passes the name and value instead of the index.
+    ///
     /// ```rust,no_run
     /// # fn main() -> rsproperties::Result<()> {
+    /// use std::collections::HashMap;
+    ///
+    /// // The serial of every property, to tell later which ones changed.
     /// let props = rsproperties::system_properties()?;
+    /// let mut serials = HashMap::new();
     /// props.foreach(|index| {
-    ///     let _ = props.read_index_with(index, |name, value, _serial| {
-    ///         println!("[{name}]: [{value}]");
-    ///     });
+    ///     if let Ok(serial) = props.serial(index) {
+    ///         serials.insert(index, serial);
+    ///     }
     /// })?;
     /// # Ok(())
     /// # }
@@ -716,6 +722,17 @@ impl SystemProperties {
     pub fn foreach<F>(&self, mut f: F) -> Result<()>
     where
         F: FnMut(PropertyIndex),
+    {
+        self.try_foreach(|index| {
+            f(index);
+            Ok(())
+        })
+    }
+
+    /// [`Self::foreach`] that stops at the first `Err` of `f`.
+    fn try_foreach<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(PropertyIndex) -> Result<()>,
     {
         for context_index in 0..self.contexts.context_count() {
             let Some(offsets) = self.contexts.entry_offsets_at(context_index)? else {
@@ -726,10 +743,52 @@ impl SystemProperties {
                     context_index,
                     property_index,
                     instance: self.instance,
-                });
+                })?;
             }
         }
         Ok(())
+    }
+
+    /// Calls `f` with the name and value of every property this process
+    /// can read — libcutils `property_list`, which is
+    /// `__system_property_foreach` with a `__system_property_read_callback`
+    /// per property. The properties, their order and the skipped areas are
+    /// those of [`Self::foreach`].
+    ///
+    /// Name and value are copied into two buffers this call reuses, and
+    /// `f` runs after the node's read lock is released, so it may call any
+    /// read method of this instance.
+    ///
+    /// Bytes that are not UTF-8 reach `f` as U+FFFD
+    /// (`String::from_utf8_lossy`), so one such value does not end or
+    /// shorten the listing; [`Self::read_index_with`] fails with
+    /// `Error::Utf8` for that property instead. A property that cannot be
+    /// read for another reason ends the walk with that error, as a corrupt
+    /// trie does; `f` has then run for the properties before it.
+    ///
+    /// ```rust,no_run
+    /// # fn main() -> rsproperties::Result<()> {
+    /// let props = rsproperties::system_properties()?;
+    /// props.list(|name, value| println!("[{name}]: [{value}]"))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn list<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&str, &str),
+    {
+        let mut name = String::new();
+        let mut value = String::new();
+        self.try_foreach(|index| {
+            self.read_index_bytes(index, |name_bytes, value_bytes, _serial| {
+                name.clear();
+                name.push_str(&String::from_utf8_lossy(name_bytes));
+                value.clear();
+                value.push_str(&String::from_utf8_lossy(value_bytes));
+            })?;
+            f(&name, &value);
+            Ok(())
+        })
     }
 
     /// The value of `name` — libbase `GetProperty` without its default:
@@ -1806,6 +1865,44 @@ mod client_parity_tests {
             let got: BTreeMap<String, String> =
                 dump(sp).into_iter().map(|(n, (v, _))| (n, v)).collect();
             assert_eq!(got, expected);
+        }
+    }
+
+    /// `list` reports what `foreach` + `read_index_with` report, in the
+    /// same order, and its callback may read through the same instance.
+    #[test]
+    fn list_matches_foreach_and_allows_reentry() {
+        let mut fx = Fixture::new("list");
+        let long = "l".repeat(200);
+        for (name, value) in [
+            ("debug.a", "1"),
+            ("debug.b.c", ""),
+            ("ro.x", "3"),
+            ("ro.long", long.as_str()),
+            ("other.default", "4"),
+        ] {
+            fx.sp.add(name, value).unwrap();
+        }
+        let reader = SystemProperties::open(fx.dir()).unwrap();
+        for sp in [&fx.sp, &reader] {
+            let mut by_index = Vec::new();
+            sp.foreach(|idx| {
+                by_index.push(
+                    sp.read_index_with(idx, |n, v, _| (n.to_owned(), v.to_owned()))
+                        .unwrap(),
+                );
+            })
+            .unwrap();
+            assert_eq!(by_index.len(), 5);
+
+            let mut listed = Vec::new();
+            sp.list(|name, value| {
+                // Same context as the property being listed.
+                assert_eq!(sp.get(name).unwrap(), value);
+                listed.push((name.to_owned(), value.to_owned()));
+            })
+            .unwrap();
+            assert_eq!(listed, by_index);
         }
     }
 

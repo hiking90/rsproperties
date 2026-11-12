@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was denied (`EACCES`/`EPERM`) is not tried again by that instance; a
   missing area file is retried. The `getprop` example lists all
   properties when run without arguments.
+- `SystemProperties::list(|name, value| ...)`: the name and value of every
+  property the process can read (libcutils `property_list`), in `foreach`
+  order. The callback runs with no lock held. Bytes that are not UTF-8
+  are passed as U+FFFD instead of ending the listing. The `getprop`
+  example uses it.
 - `SystemProperties::read_index_with(index, |name, value, serial| ...)`:
   reads by index without a name lookup and passes the serial the value
   was read under (bionic `__system_property_read_callback`).

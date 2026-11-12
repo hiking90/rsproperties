@@ -364,6 +364,9 @@ rsproperties::init(
   (bionic `__system_property_read_callback`)
 - `foreach(|index| ...)` — every readable property's index (bionic
   `__system_property_foreach`); areas the process may not open are skipped
+- `list(|name, value| ...)` — every readable property's name and value
+  (libcutils `property_list`), in `foreach` order; bytes that are not
+  UTF-8 arrive as U+FFFD
 - `serial(index)` / `area_serial()` — a property's serial / the global
   serial that any change advances (bionic `__system_property_area_serial`)
 - `wait(index, old_serial, timeout)` — futex-wait until the serial
