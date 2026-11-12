@@ -5,11 +5,13 @@
 //! reads the same here as through `android::base::GetBoolProperty` /
 //! `GetIntProperty` / `GetUintProperty`.
 //!
-//! [`crate::get`] parses with Rust's `FromStr`, which differs from libbase:
-//! `FromStr` rejects leading whitespace and a `0x` prefix, and `bool`
-//! accepts only `true`/`false`. Use these functions (or
-//! [`crate::get_bool_or`] / [`crate::get_int_or`]) where a value must be
-//! read the way Android's C++ code reads it.
+//! [`crate::get`], [`crate::get_or`] and [`crate::get_or_else`] apply
+//! these parsers to `bool` and the integer types (see
+//! [`crate::FromProperty`]). Call them directly on a value that came from
+//! somewhere else — [`crate::SystemProperties::read_with`], a
+//! [`crate::FromProperty`] implementation of your own — or where Rust's
+//! `FromStr` would differ: `FromStr` rejects leading whitespace and a `0x`
+//! prefix, and `bool` accepts only `true`/`false`.
 //!
 //! libcutils (`property_get_int32` / `property_get_int64`) follows other
 //! rules — octal (`010` is 8) and trailing characters (`12abc` is 12) are

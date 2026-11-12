@@ -69,9 +69,10 @@ println!("SDK Version: {}", sdk_version);
 
 // Get property with type parsing and default fallback
 let sdk_version: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
-// Boolean properties, by libbase's `GetBoolProperty` rules: "1"/"0",
-// "true"/"false", "y"/"n", "yes"/"no", "on"/"off".
-let is_debuggable: bool = rsproperties::get_bool_or("ro.debuggable", false);
+// `bool` and the integers are read by libbase's rules: "1"/"0",
+// "true"/"false", "y"/"n", "yes"/"no", "on"/"off" for a `bool`, and
+// leading whitespace or a `0x` prefix for an integer.
+let is_debuggable: bool = rsproperties::get_or("ro.debuggable", false);
 
 // Get property with error handling
 match rsproperties::get::<String>("ro.build.version.release") {

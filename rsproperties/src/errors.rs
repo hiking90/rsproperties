@@ -38,12 +38,11 @@ pub enum Error {
     Utf8(#[from] std::str::Utf8Error),
 
     /// Text that could not be parsed: malformed property names, bad
-    /// property-info lines, and — via `get<T>` — values whose `FromStr`
-    /// failed. This is the **single** parse-failure variant of the public
-    /// API: `get<T>`'s `T::Err` is only bound by `Display`, so the cause
-    /// is flattened into the message rather than carried as `source()`.
-    /// (A `ParseInt(ParseIntError)` sibling variant used to exist but was
-    /// never constructed — one variant, one contract.)
+    /// property-info lines, and — via `get<T>` — a value that is not a
+    /// `T` (`FromProperty::from_property` returned `None`). This is the
+    /// **single** parse-failure variant of the public API. For `get<T>`
+    /// the message names the property, the value's length and `T`, never
+    /// the value, and there is no `source()`.
     #[error("Parse error: {0}")]
     Parse(String),
 

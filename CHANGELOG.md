@@ -24,10 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `wait_for_value(name, expected, timeout)` (libbase
   `WaitForPropertyCreation` / `WaitForProperty`), with
   `Option<Duration>` timeouts.
-- `parse::parse_bool`, `parse::parse_int` and the global
-  `get_bool_or` / `get_int_or`: libbase `ParseBool` / `ParseInt` /
-  `ParseUint` rules (`yes`/`on`/`1`, leading whitespace, `0x` hex, no
-  trailing characters). `get<T>` keeps Rust's `FromStr`.
+- `parse::parse_bool` and `parse::parse_int`: libbase `ParseBool` /
+  `ParseInt` / `ParseUint` rules (`yes`/`on`/`1`, leading whitespace,
+  `0x` hex, no trailing characters).
+- `FromProperty`, the trait `get` / `get_or` / `get_or_else` convert a
+  value with (see Changed). It is implemented for `String`, `bool`
+  (`parse::parse_bool`) and `i8`–`i64`, `isize`, `u8`–`u64`, `usize`
+  (`parse::parse_int`), and can be implemented for a type of the
+  caller's.
 - Appcompat override lookup: on Android API 37+ (and on Linux), a
   read-only instance created while `BIONIC_APPCOMPAT_OVERRIDE` is set
   looks up `ro.appcompat_override.<name>` first in `find` and
@@ -202,6 +206,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     A reference to a `Display` value is `Display`, so `set(name, &value)`
     and `set(name, "text")` compile unchanged; only a call that names the
     type parameter (`set::<str>(..)`) does not.
+  - `get`, `get_or` and `get_or_else` take `T: FromProperty` (0.6.0:
+    `T: FromStr`). `bool` and the integers are read by libbase's rules,
+    so `get_or("ro.debuggable", false)` is `true` for the value `1`
+    (0.6.0: `bool: FromStr` failed on it and `get_or` returned the
+    default). A `FromStr` type without a `FromProperty` implementation —
+    `f32`, `f64`, `i128`, `char`, `IpAddr`, … — no longer compiles with
+    these functions; read it with `SystemProperties::read_with`.
 - **Breaking (service API):** `run` is the only way to start the service,
   and no rsactor or tokio type is left in the public API:
   - `run` returns a `ServiceHandle` (see Added) instead of the tuple
@@ -349,10 +360,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full property name, like the other in-area miss paths; it carried only the
   last-looked-up segment (`foo` for `ro.foo`).
 - `get::<T>` parse errors no longer include the property value (they
-  give the name and the value length), so logging the error does not
-  log the value. The message still ends with `T::Err`'s `Display`, which
-  for std's parse errors carries no input but for a third-party `T` may
-  echo part of the value.
+  give the name, the value length and the name of `T`), so logging the
+  error does not log the value.
 - The property area header's `bytes_used` is an atomic, as the module's
   shared-mmap protocol requires for fields rewritten after readers
   attach (no layout or API change).
@@ -771,6 +780,15 @@ Service (`rsproperties-service`, git dependency only):
     (0.6.0 failed to open the path and skipped the line);
   - an `import` path ending in a lone `$` loads the path without the `$`
     (AOSP `ExpandProps`; 0.6.0 skipped the import);
+  - `get`, `get_or` and `get_or_else` read more values as a `bool` or an
+    integer: `1`/`y`/`yes`/`on` and `0`/`n`/`no`/`off` as a `bool`, and
+    for integers a value with leading C whitespace (`" 42"`) or a `0x`
+    prefix (`0x10` is 16). In 0.6.0 `get` failed with `Error::Parse` on
+    these and `get_or` returned the default. Every value `FromStr`
+    accepted for these types reads as the same value as before. Code
+    that relied on the default for such a value — `get_or(name, true)`
+    on a property set to `0` returned `true` — now gets the parsed
+    value;
   - a non-`ro.` property whose serial has bit 16 set (init's counter sets
     it during updates 32768–65535 of every 65536) can be read: `get` /
     `read_with` return its value
@@ -906,6 +924,11 @@ Service (`rsproperties-service`, git dependency only):
     service. A `let _ = run(..).await?;` therefore stops it at once;
     bind the handle to a name.
 - **Changed API**:
+  - `get::<f64>(name)` and other reads of a `FromStr` type that is not a
+    `FromProperty` type become
+    `system_properties()?.read_with(name, |v| v.parse::<f64>())?`, which
+    returns the `Result` of the parse. For a type of your own, implement
+    `FromProperty` and keep the `get` / `get_or` call;
   - `rsproperties_service::run` returns `Result<_, StartupError>` (see
     Changed error values);
   - `rsproperties_service::run(config, contexts, props)` becomes
@@ -1045,8 +1068,8 @@ Service (`rsproperties-service`, git dependency only):
     `prefix` (0.6.0: `new`); and the
     per-line `Parse` errors of `PropertyInfoEntry::parse_from_file`
     (missing property or context entry, invalid match operation or type).
-    The `Parse` of `get::<T>` reads `Failed to parse property "<name>"
-    (<N bytes>): …` (0.6.0: `Failed to parse '<value>' for property
+    The `Parse` of `get::<T>` reads `property "<name>" (<N bytes>) is
+    not a <T>` (0.6.0: `Failed to parse '<value>' for property
     '<name>': …`). Match the variant instead of the text.
   - `SystemProperties::new_area`: the `Error::Context` messages for
     creating and sizing an area file or `properties_serial` name the temp

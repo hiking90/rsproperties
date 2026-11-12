@@ -79,9 +79,11 @@ impl PropertyConfig {
 }
 
 mod errors;
+mod from_property;
 pub mod parse;
 pub mod wire;
 pub use errors::{Error, Result};
+pub use from_property::FromProperty;
 
 #[cfg(feature = "builder")]
 mod build_property_parser;
@@ -460,23 +462,27 @@ pub(crate) fn bionic_align(value: usize, alignment: usize) -> usize {
         & !(alignment - 1)
 }
 
-/// Get a property value parsed to specified type
-/// Returns Err if property not found, system error, or parse error occurs
+/// Reads the property `name` as a `T`.
+///
+/// `T` is a [`FromProperty`] type: `String`, `bool`, an integer, or a
+/// type of the caller's. `bool` and the integers follow AOSP libbase
+/// (`"1"` is `true`, `"0x10"` is `16`); the table on [`FromProperty`] has
+/// the rules.
+///
+/// Fails with `Error::NotFound` for a missing property, `Error::Parse`
+/// for a value that is not a `T`, and with the read's own error otherwise
+/// (a non-UTF-8 value is `Error::Utf8`; a store that cannot be opened is
+/// `Error::Init`).
 ///
 /// Note: unlike [`get_or`], an *empty* property value is not special-cased
 /// here — `get::<String>` returns `Ok("")` for a set-but-empty property,
 /// while `get_or` follows the Android convention (empty = unset) and
 /// falls back to the default.
 ///
-/// The `FromStr` parse runs while the property area's internal read lock
-/// is held (see [`SystemProperties::read_with`]): keep it cheap and do not
-/// re-enter this crate's property API from it — every ordinary `FromStr`
-/// (ints, floats, `String`) is fine.
-///
-/// The parse is Rust's `FromStr`, not AOSP libbase's: `" 5"` and `"0x10"`
-/// fail for integers, and `bool` accepts only `true`/`false`. To read a
-/// value the way `android::base::GetBoolProperty` / `GetIntProperty` do,
-/// use [`get_bool_or`] / [`get_int_or`] or the parsers in [`parse`].
+/// The conversion runs while the property area's internal read lock is
+/// held (see [`SystemProperties::read_with`]). This matters only for a
+/// [`FromProperty`] implementation of the caller's: keep it short and do
+/// not call this crate's property API from it.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -486,47 +492,39 @@ pub(crate) fn bionic_align(value: usize, alignment: usize) -> usize {
 /// let version: String = get("ro.build.version.release").unwrap();
 ///
 /// // Boolean properties are written as "0"/"1" (`ro.debuggable`) or
-/// // "true"/"false" (`ro.apex.updatable`); `bool: FromStr` accepts only
-/// // "true"/"false". `get_bool_or` reads both the way Android does:
-/// let is_debuggable = rsproperties::get_bool_or("ro.debuggable", false);
+/// // "true"/"false" (`ro.apex.updatable`); both read as a `bool`.
+/// let is_debuggable: bool = get("ro.debuggable").unwrap();
 ///
 /// // With fallback
 /// let sdk_version: i32 = get("ro.build.version.sdk").unwrap_or(0);
 /// let version: String = get("ro.build.version.release").unwrap_or_default();
 /// ```
-pub fn get<T>(name: &str) -> Result<T>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    // Route through `read_with` so the parse-and-discard path never
-    // allocates a `String` — the value bytes are handed to `FromStr` as
-    // `&str` borrowed from the seqlock buffer (short variant) or the mmap
-    // (long variant).
+pub fn get<T: FromProperty>(name: &str) -> Result<T> {
+    // Route through `read_with` so the convert-and-discard path never
+    // allocates a `String` — the value bytes are handed to
+    // `from_property` as `&str` borrowed from the seqlock buffer (short
+    // variant) or the mmap (long variant).
     system_properties()?.read_with(name, |value| {
         // The raw value is not formatted here (the error's Display reaches
-        // logs), same policy as the set path's error log. `T::Err`'s Display
-        // is included verbatim: std's numeric/bool/addr parse errors do not
-        // echo their input, but a third-party `T` may.
-        value.parse().map_err(|e| {
+        // logs), same policy as the set path's error log.
+        T::from_property(value).ok_or_else(|| {
             Error::Parse(format!(
-                "Failed to parse property {name:?} (<{} bytes>): {e}",
-                value.len()
+                "property {name:?} (<{} bytes>) is not a {}",
+                value.len(),
+                std::any::type_name::<T>()
             ))
         })
     })?
 }
 
-/// Get a property value with default fallback
-/// Never fails - always returns a valid value; falls back on the same
-/// conditions as [`get_or_else`].
+/// Reads the property `name` as a `T`, or returns `default`.
 ///
-/// The default is constructed eagerly; when it is expensive to build
-/// (e.g. an allocated `String`), prefer [`get_or_else`], which only
-/// constructs it on the fallback path.
+/// Never fails: it falls back on the same conditions as [`get_or_else`]
+/// (missing, empty, not a `T`, or a failed read). `T` is a
+/// [`FromProperty`] type, as for [`get`].
 ///
-/// The `FromStr` parse runs under the property area's read lock — see the
-/// caution on [`get`].
+/// The default is constructed eagerly; when it allocates (a `String`),
+/// prefer [`get_or_else`], which constructs it only on the fallback path.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -535,29 +533,25 @@ where
 /// let sdk_version: i32 = get_or("ro.build.version.sdk", 0);
 /// let version: String = get_or("ro.build.version.release", "unknown".to_owned());
 ///
-/// // `bool: FromStr` accepts only "true"/"false"; for "0"/"1" properties
-/// // (`ro.debuggable`) use `get_bool_or`, which reads both like Android.
-/// let is_debuggable = rsproperties::get_bool_or("ro.debuggable", false);
+/// // "1" and "true" are both `true`, as with libbase `GetBoolProperty`.
+/// let is_debuggable = get_or("ro.debuggable", false);
 /// ```
-pub fn get_or<T>(name: &str, default: T) -> T
-where
-    T: std::str::FromStr,
-{
+pub fn get_or<T: FromProperty>(name: &str, default: T) -> T {
     get_or_else(name, move || default)
 }
 
 /// Like [`get_or`], but the default is produced lazily: the closure runs
-/// when the property is missing or empty, when its value fails to parse as
-/// `T`, or when the read fails for any other reason — a non-UTF-8 value
+/// when the property is missing or empty, when its value is not a `T`, or
+/// when the read fails for any other reason — a non-UTF-8 value
 /// (`Error::Utf8`), a corrupt property area, or a failed global
 /// initialization (see [`system_properties()`]; the next call tries
 /// again).
-/// Use [`get`] to tell these cases apart. The found-and-parsed hot path
-/// never pays for constructing the default.
+/// Use [`get`] to tell these cases apart. A property that is found and
+/// converts does not construct the default.
 ///
-/// The `FromStr` parse runs under the property area's read lock — see the
-/// caution on [`get`]. (The `default` closure runs after the lock is
-/// released.)
+/// The conversion runs under the property area's read lock — see the
+/// caution on [`get`]. The `default` closure runs after the lock is
+/// released.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -567,66 +561,24 @@ where
 /// ```
 pub fn get_or_else<T, F>(name: &str, default: F) -> T
 where
-    T: std::str::FromStr,
+    T: FromProperty,
     F: FnOnce() -> T,
 {
     let Ok(props) = system_properties() else {
         return default();
     };
-    // Two-stage closure: the inner `Result<T, ()>` carries the parsed
-    // value back out of `read_with` without ever allocating a `String`.
-    // `Err(())` signals "use the default"; the default itself is produced
-    // at the match below, so the `FnOnce` callback never needs to own it.
+    // `None` from the callback means "use the default". The default is
+    // produced below, after `read_with` released the read lock, so the
+    // callback never owns it.
     match props.read_with(name, |value| {
         if value.is_empty() {
-            return Err(());
+            return None;
         }
-        value.parse::<T>().map_err(|_| ())
+        T::from_property(value)
     }) {
-        Ok(Ok(v)) => v,
+        Ok(Some(v)) => v,
         _ => default(),
     }
-}
-
-/// Reads a boolean property the way AOSP libbase `GetBoolProperty` does:
-/// [`parse::parse_bool`] on the value (`1`/`y`/`yes`/`on`/`true`,
-/// `0`/`n`/`no`/`off`/`false`), and `default` for any other value, an
-/// empty or missing property, or a failed read — the same fallback
-/// conditions as [`get_or_else`].
-///
-/// ```rust,no_run
-/// let debuggable = rsproperties::get_bool_or("ro.debuggable", false);
-/// ```
-pub fn get_bool_or(name: &str, default: bool) -> bool {
-    let Ok(props) = system_properties() else {
-        return default;
-    };
-    props
-        .read_with(name, parse::parse_bool)
-        .ok()
-        .flatten()
-        .unwrap_or(default)
-}
-
-/// Reads an integer property the way AOSP libbase `GetIntProperty`
-/// (signed `T`) / `GetUintProperty` (unsigned `T`) do without range
-/// arguments: [`parse::parse_int`] on the value (leading whitespace
-/// skipped, `0x` for hexadecimal, no trailing characters), and `default`
-/// for a value that does not parse or is outside `T`, an empty or missing
-/// property, or a failed read.
-///
-/// ```rust,no_run
-/// let sdk: i32 = rsproperties::get_int_or("ro.build.version.sdk", 0);
-/// ```
-pub fn get_int_or<T: parse::Integer>(name: &str, default: T) -> T {
-    let Ok(props) = system_properties() else {
-        return default;
-    };
-    props
-        .read_with(name, parse::parse_int::<T>)
-        .ok()
-        .flatten()
-        .unwrap_or(default)
 }
 
 /// Set a value of the property with any Display type.

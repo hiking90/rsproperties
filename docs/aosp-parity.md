@@ -309,11 +309,22 @@ override가 켜진 프로세스에서는 같은 property에 대해 libc
   `parse_int::<T>(&str) -> Option<T>`를 추가한다. 둘 다 libbase 규칙을 따른다.
   `T`는 sealed trait `parse::Integer`로 제한하며, libbase가 instantiate하는
   `i8..i64`, `u8..u64`에 `isize`, `usize`를 더한다.
-- 전역 함수 `get_bool_or(name, default)`와 `get_int_or::<T>(name, default)`를
-  추가한다. `GetBoolProperty`, 범위 인자를 생략한 `GetIntProperty` /
+- 전역 함수 `get`, `get_or`, `get_or_else`의 bound를 `FromStr`에서 trait
+  `FromProperty`로 바꾼다. `bool`은 `parse_bool`, 정수는 `parse_int`,
+  `String`은 값 그대로 읽는다. `get_or(name, false)`가 `GetBoolProperty`에,
+  `get_or(name, 0)`이 범위 인자를 생략한 `GetIntProperty` /
   `GetUintProperty`에 대응한다.
-- 기존 `get::<T>`의 `FromStr` 동작은 바꾸지 않는다. 바꾸면 이미 배포된
-  호출자의 결과가 달라진다.
+- 처음에는 `get::<T>`의 `FromStr` 동작을 유지하고 `get_bool_or` /
+  `get_int_or`를 따로 두었다. 이 구성에서는 `get_or("ro.debuggable", false)`가
+  compile되고 값 `1`에 대해 default를 반환하므로, 함수 이름을 잘못 고른
+  호출부를 compiler도 test도 찾지 못한다. 그래서 타입 하나에 규칙 하나만
+  남기고 두 함수를 제거했다(둘 다 0.6.0에 없던 함수다).
+- 0.6.0 호출자의 결과가 달라지는 입력은 `FromStr`이 거부하던 값뿐이다.
+  `FromStr`이 받는 입력을 `FromProperty`가 같은 값으로 읽는지는
+  `from_property.rs`의 `accepts_what_from_str_accepted` test가 확인한다.
+- `f32`/`f64`는 `FromProperty`를 구현하지 않는다. libbase에 float getter가
+  없어 따를 규칙이 없다. `SystemProperties::read_with`에 `str::parse`를 넘겨
+  읽는다.
 - libcutils 규칙(8진수, 뒤에 남은 문자 허용)은 따르지 않는다. libbase가 더
   나중에 나온 API이고, libcutils 소스도 8진수 허용을 결함으로 적는다.
 

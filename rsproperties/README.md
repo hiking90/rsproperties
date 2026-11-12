@@ -47,9 +47,10 @@ println!("SDK Version: {}", sdk_version);
 
 // Get property with type parsing and default fallback
 let sdk_version: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
-// Boolean properties, by libbase's `GetBoolProperty` rules: "1"/"0",
-// "true"/"false", "y"/"n", "yes"/"no", "on"/"off".
-let is_debuggable: bool = rsproperties::get_bool_or("ro.debuggable", false);
+// `bool` and the integers are read by libbase's rules: "1"/"0",
+// "true"/"false", "y"/"n", "yes"/"no", "on"/"off" for a `bool`, and
+// leading whitespace or a `0x` prefix for an integer.
+let is_debuggable: bool = rsproperties::get_or("ro.debuggable", false);
 
 // Get property with error handling
 match rsproperties::get::<String>("ro.build.version.release") {
@@ -307,12 +308,16 @@ rsproperties::init(
 
 ### Property Operations
 
-- `get<T>(name)` — parse-typed read; `Err` on missing / parse failure
-- `get_or<T>(name, default)` — infallible read with fallback
-- `get_bool_or(name, default)` / `get_int_or::<T>(name, default)` — read
-  with AOSP libbase's `GetBoolProperty` / `GetIntProperty` rules
+- `get<T>(name)` — typed read; `Err` on missing / a value that is not a `T`
+- `get_or<T>(name, default)` / `get_or_else<T>(name, || default)` —
+  infallible read with fallback (missing, empty, not a `T`, failed read)
+- `FromProperty` — the trait behind `T`. `String` is the value unchanged;
+  `bool` and `i8`–`i64`, `isize`, `u8`–`u64`, `usize` follow AOSP
+  libbase's `GetBoolProperty` / `GetIntProperty` rules
   (`parse::parse_bool` / `parse::parse_int`: `yes`/`on`/`1`…, leading
-  whitespace, `0x` hex); `get<T>` uses Rust's `FromStr` instead
+  whitespace, `0x` hex). Implement it for a type of your own; read a
+  float or another `FromStr` type with
+  `system_properties()?.read_with(name, |v| v.parse::<f64>())`
 - `set(name, value)` — `value: impl Display` (`set("a.b", 42)`,
   `set("a.b", "text")`, `set("a.b", &owned)`); the formatted value is
   sent to the property service over the socket; V2 names and `ro.` values may be up to 65535

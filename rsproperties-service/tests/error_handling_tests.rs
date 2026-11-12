@@ -100,10 +100,10 @@ async fn test_floating_point_special_values() -> anyhow::Result<()> {
         let prop_name = format!("test.float_special.{name}");
         rsproperties::set(&prop_name, special_value)?;
 
-        let result: Result<f64, _> = rsproperties::get(&prop_name);
+        let result: anyhow::Result<f64> = common::read_parsed(&prop_name);
 
-        // The service stores the value unchanged, `get` does not trim it,
-        // and `f64::from_str` accepts "inf", "-inf" and "NaN".
+        // The service stores the value unchanged, `read_with` hands it over
+        // untrimmed, and `f64::from_str` accepts "inf", "-inf" and "NaN".
         match *name {
             "infinity" => {
                 let val: f64 = result?;
@@ -155,8 +155,9 @@ async fn test_string_parsing_edge_cases() -> anyhow::Result<()> {
 
         // Try parsing as integer
         let int_result: Result<i32, _> = rsproperties::get(&prop_name);
-        // The property was just set, so `get` finds it; a `FromStr`
-        // failure is reported as `Error::Parse`, never as another variant.
+        // The property was just set, so `get` finds it; a value that is
+        // not an `i32` is reported as `Error::Parse`, never as another
+        // variant.
         let is_error = matches!(int_result, Err(rsproperties::Error::Parse(_)));
         assert!(
             is_error || int_result.is_ok(),
@@ -414,7 +415,7 @@ async fn test_memory_usage_patterns() -> anyhow::Result<()> {
 
         // Overwrite with different types
         rsproperties::set(&prop_name, i as f64 * 1.5)?;
-        let _as_float: f64 = rsproperties::get(&prop_name)?;
+        let _as_float: f64 = common::read_parsed(&prop_name)?;
 
         rsproperties::set(&prop_name, format!("string_{i}"))?;
         let _as_string: String = rsproperties::get(&prop_name)?;
