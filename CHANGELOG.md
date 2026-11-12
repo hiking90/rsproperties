@@ -149,11 +149,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instances are never equal. An index can be a `HashMap` key, for example
   to keep the serial last seen per property.
 - `PropertyConfig` implements `PartialEq` and `Eq`.
+- `PropertyConfig::get_properties_dir()` and
+  `PropertyConfig::get_socket_dir()` return the directory the value
+  holds as `Option<&Path>` (`None` when its setter was not called). The
+  `get_` prefix follows `std::process::Command::get_current_dir`: the
+  bare names are the setters. They read the config value only; the
+  directory in effect is still `rsproperties::properties_dir()` /
+  `socket_dir()`.
 - `MatchKeyword` (`builder` feature): `Checked` / `Unchecked`, the second
   argument of `PropertyInfoEntry::parse_from_file` (see Changed).
 - `PropertyInfoEntry::exact(name, context, type_str)` and
   `PropertyInfoEntry::prefix(name, context, type_str)` (`builder`
-  feature), which replace `PropertyInfoEntry::new` (see Changed).
+  feature), which replace `PropertyInfoEntry::new` (see Changed). `name`
+  and `context` are `impl Into<String>`, so string literals are passed
+  as they are.
+- `PropertyInfoEntry` implements `PartialEq` and `Eq` (`builder`
+  feature): name, context, stored type and match operation are compared,
+  so an entry built with a constructor can be compared with a parsed one.
 
 ### Changed
 
@@ -224,7 +236,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `PropertyInfoEntry::new(name, context, type_str, exact_match)` is
     replaced by `PropertyInfoEntry::exact(name, context, type_str)` and
     `PropertyInfoEntry::prefix(name, context, type_str)`. The
-    `exact_match()` accessor is unchanged.
+    `exact_match()` accessor is unchanged. `name` and `context` are
+    `impl Into<String>` (0.6.0 `new`: `String`).
   - `set(name, value)` takes `value: impl Display` (0.6.0:
     `value: &T` with `T: Display + ?Sized`), so `set("a.b", 42)` compiles.
     A reference to a `Display` value is `Display`, so `set(name, &value)`
@@ -1053,7 +1066,10 @@ Service (`rsproperties-service`, git dependency only):
   - `PropertyInfoEntry::new(name, context, type_str, true)` becomes
     `PropertyInfoEntry::exact(name, context, type_str)`, and `false`
     becomes `PropertyInfoEntry::prefix(name, context, type_str)`. For a
-    `bool` known only at run time, branch on it;
+    `bool` known only at run time, branch on it. A `String`,
+    `.to_string()` or `String::from(..)` argument compiles unchanged; an
+    argument written `"ro.a".into()` no longer infers its type (E0283):
+    drop the `.into()`;
   - `set(name, &value)` keeps compiling. Where the borrowed value is a
     `Copy` value or a temporary (`set(name, &42)`,
     `set(name, &n.to_string())`), clippy's

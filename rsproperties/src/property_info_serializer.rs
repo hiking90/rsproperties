@@ -32,7 +32,10 @@ pub enum MatchKeyword {
 /// SELinux context it maps to, its value type, and whether the name is an
 /// exact match or a prefix. [`build_trie`] turns a list of entries into
 /// the `property_info` file's content.
-#[derive(Debug, Clone)]
+///
+/// Two entries are equal when all four are equal; the type is compared in
+/// its stored form, so `"enum  a b"` and `"enum a b"` give equal entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropertyInfoEntry {
     name: String,
     context: String,
@@ -45,23 +48,42 @@ impl PropertyInfoEntry {
     /// match operation of a `property_contexts` line (the file-based path
     /// is [`Self::parse_from_file`]).
     ///
-    /// `type_str` is the space-separated type (`"string"`, `"enum a b"`,
-    /// or `""` for none). It is borrowed: only its whitespace-normalized
-    /// copy is stored.
+    /// `name` and `context` are stored as given, so a `String` is moved in
+    /// and a `&str` is copied. `type_str` is the space-separated type
+    /// (`"string"`, `"enum a b"`, or `""` for none). It is borrowed: only
+    /// its whitespace-normalized copy is stored.
+    ///
+    /// ```
+    /// use rsproperties::PropertyInfoEntry;
+    ///
+    /// # fn main() -> rsproperties::Result<()> {
+    /// let entry = PropertyInfoEntry::exact("ro.build.host", "u:object_r:build_prop:s0", "string")?;
+    /// assert!(entry.exact_match());
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
     /// [`Error::InvalidArgument`] for a `type_str` the parser would
     /// reject.
-    pub fn exact(name: String, context: String, type_str: &str) -> Result<Self> {
-        Self::with_match(name, context, type_str, true)
+    pub fn exact(
+        name: impl Into<String>,
+        context: impl Into<String>,
+        type_str: &str,
+    ) -> Result<Self> {
+        Self::with_match(name.into(), context.into(), type_str, true)
     }
 
     /// An entry that matches every property whose name starts with `name`
     /// — the `prefix` match operation. Arguments and errors as for
     /// [`Self::exact`].
-    pub fn prefix(name: String, context: String, type_str: &str) -> Result<Self> {
-        Self::with_match(name, context, type_str, false)
+    pub fn prefix(
+        name: impl Into<String>,
+        context: impl Into<String>,
+        type_str: &str,
+    ) -> Result<Self> {
+        Self::with_match(name.into(), context.into(), type_str, false)
     }
 
     fn with_match(
@@ -376,8 +398,7 @@ mod tests {
     #[test]
     fn build_trie_error_escapes_the_name() {
         let entry =
-            PropertyInfoEntry::prefix("a..b\u{1b}[31m".into(), "u:object_r:x:s0".into(), "string")
-                .unwrap();
+            PropertyInfoEntry::prefix("a..b\u{1b}[31m", "u:object_r:x:s0", "string").unwrap();
         let msg = build_trie(&[entry], "u:object_r:default_prop:s0", "string")
             .unwrap_err()
             .to_string();
@@ -453,22 +474,44 @@ mod tests {
     #[test]
     fn constructors_validate_type_and_set_match() {
         let ctx = || String::from("u:object_r:build_prop:s0");
-        let exact = PropertyInfoEntry::exact("ro.a".into(), ctx(), "string").unwrap();
+        let exact = PropertyInfoEntry::exact("ro.a", ctx(), "string").unwrap();
         assert!(exact.exact_match());
-        let prefix = PropertyInfoEntry::prefix("ro.a".into(), ctx(), "").unwrap();
+        let prefix = PropertyInfoEntry::prefix("ro.a", ctx(), "").unwrap();
         assert!(!prefix.exact_match());
         assert_eq!(prefix.type_str(), "");
         // Whitespace-only normalizes to the same empty type as "" and must
         // behave identically.
-        let blank = PropertyInfoEntry::prefix("ro.a".into(), ctx(), "   ").unwrap();
+        let blank = PropertyInfoEntry::prefix("ro.a", ctx(), "   ").unwrap();
         assert_eq!(blank.type_str(), "");
-        let spaced = PropertyInfoEntry::exact("ro.a".into(), ctx(), " enum  a   b ").unwrap();
+        let spaced = PropertyInfoEntry::exact("ro.a", ctx(), " enum  a   b ").unwrap();
         assert_eq!(spaced.type_str(), "enum a b");
         for bad in [
-            PropertyInfoEntry::exact("ro.a".into(), ctx(), "not_a_type"),
-            PropertyInfoEntry::prefix("ro.a".into(), ctx(), "not_a_type"),
+            PropertyInfoEntry::exact("ro.a", ctx(), "not_a_type"),
+            PropertyInfoEntry::prefix("ro.a", ctx(), "not_a_type"),
         ] {
             assert!(matches!(bad, Err(Error::InvalidArgument(_))), "{bad:?}");
+        }
+    }
+
+    /// A constructed entry equals the one parsed from the same line, and
+    /// the match operation, the context and the type each break equality.
+    #[test]
+    fn entries_compare_by_all_four_fields() {
+        let ctx = "u:object_r:build_prop:s0";
+        let parsed =
+            PropertyInfoEntry::parse_from_line(&format!("ro.a {ctx} exact enum  a b"), true)
+                .unwrap();
+        // `&str` and `String` arguments, and an un-normalized type.
+        let built = PropertyInfoEntry::exact("ro.a", String::from(ctx), "enum a   b").unwrap();
+        assert_eq!(parsed, built);
+
+        for other in [
+            PropertyInfoEntry::prefix("ro.a", ctx, "enum a b").unwrap(),
+            PropertyInfoEntry::exact("ro.b", ctx, "enum a b").unwrap(),
+            PropertyInfoEntry::exact("ro.a", "u:object_r:other:s0", "enum a b").unwrap(),
+            PropertyInfoEntry::exact("ro.a", ctx, "string").unwrap(),
+        ] {
+            assert_ne!(built, other);
         }
     }
 

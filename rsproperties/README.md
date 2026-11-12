@@ -317,6 +317,9 @@ rsproperties::init(
 
 - `PropertyConfig::new().properties_dir(dir).socket_dir(dir)` — the
   directories to set; either may be left out
+- `PropertyConfig::get_properties_dir()` / `get_socket_dir()` — the
+  directory a config value holds (`Option<&Path>`), without touching the
+  process-wide setting
 - `init(config)` — set them once per process; `Ok` again for the same
   paths, `Err(AlreadyInitialized)` for a different one
 - `properties_dir()` — currently-configured properties directory
@@ -463,7 +466,8 @@ clients that want to point at a custom socket directory:
   `MatchKeyword::Unchecked` takes such a line as a prefix match
 - `PropertyInfoEntry::exact(name, context, type_str)` /
   `PropertyInfoEntry::prefix(name, context, type_str)` — build an entry
-  without a file
+  without a file; `name` and `context` take a `&str` or a `String`.
+  Entries compare with `==`
 - `build_trie(entries, default_context, default_type)` — serialize a
   property-info trie
 

@@ -76,6 +76,32 @@ impl PropertyConfig {
         self.socket_dir = Some(dir.into());
         self
     }
+
+    /// The properties directory this value holds, `None` when
+    /// [`Self::properties_dir`] was not called. It reads this value only:
+    /// the directory in effect is the free function [`properties_dir`],
+    /// which latches the default when nothing was set.
+    ///
+    /// Named like [`std::process::Command::get_current_dir`]: the bare
+    /// name is the setter.
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// let config = rsproperties::PropertyConfig::new().properties_dir("/custom/properties");
+    /// assert_eq!(config.get_properties_dir(), Some(Path::new("/custom/properties")));
+    /// assert_eq!(config.get_socket_dir(), None);
+    /// ```
+    pub fn get_properties_dir(&self) -> Option<&Path> {
+        self.properties_dir.as_deref()
+    }
+
+    /// The socket directory this value holds, `None` when
+    /// [`Self::socket_dir`] was not called. See
+    /// [`Self::get_properties_dir`].
+    pub fn get_socket_dir(&self) -> Option<&Path> {
+        self.socket_dir.as_deref()
+    }
 }
 
 mod errors;
