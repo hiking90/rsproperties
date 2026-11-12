@@ -20,7 +20,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use rsproperties::{build_trie, PropertyInfoEntry, SystemProperties};
+use rsproperties::{build_trie, MatchKeyword, PropertyInfoEntry, SystemProperties};
 
 fn build_property_info(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
@@ -36,7 +36,8 @@ fn build_property_info(dir: &Path) {
     writeln!(f, "bench. u:object_r:bench_prop:s0 prefix string").unwrap();
     drop(f);
 
-    let (entries, errors) = PropertyInfoEntry::parse_from_file(&contexts_path, false).unwrap();
+    let (entries, errors) =
+        PropertyInfoEntry::parse_from_file(&contexts_path, MatchKeyword::Unchecked).unwrap();
     assert!(errors.is_empty(), "parse errors: {errors:?}");
 
     let data = build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap();

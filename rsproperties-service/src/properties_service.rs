@@ -8,64 +8,32 @@ use rsproperties::wire::{
     PROP_ERROR_SET_FAILED, PROP_SUCCESS,
 };
 use rsproperties::{
-    build_trie, load_properties_from_file, AreaWriterLock, PropertyInfoEntry, SystemProperties,
+    build_trie, load_properties_from_file, AreaWriterLock, MatchKeyword, PropertyInfoEntry,
+    SystemProperties,
 };
 
 use crate::persistent_properties::{is_persistent_name, PersistentStore};
 use crate::property_type::check_type;
+use crate::SetProtocol;
 
-pub struct PropertiesServiceArgs {
-    property_contexts_files: Vec<PathBuf>,
-    build_prop_files: Vec<PathBuf>,
-    writer_lock: Option<AreaWriterLock>,
-    persistent_properties_file: Option<PathBuf>,
-}
-
-impl PropertiesServiceArgs {
-    /// Public constructor: the type is exposed through `Actor::Args`, so
-    /// downstream users spawning the actor directly (instead of via
-    /// `run`) need a way to build it.
-    ///
-    /// Without [`writer_lock`](Self::writer_lock), the actor's
-    /// `on_start` reads the `property_contexts` and build.prop files and
-    /// then takes the writer lock of `rsproperties::properties_dir()`
-    /// itself, before it writes `property_info` or any area file. A
-    /// [`SocketService`] spawned
-    /// next to it must not start before that lock is held: spawned earlier,
-    /// a second instance renames its sockets over a running instance's
-    /// sockets before its properties service fails on the lock. Take the
-    /// lock first ([`AreaWriterLock::acquire`]) and pass it here, as
-    /// `rsproperties_service::run` does.
-    ///
-    /// [`SocketService`]: crate::socket_service::SocketService
-    pub fn new(property_contexts_files: Vec<PathBuf>, build_prop_files: Vec<PathBuf>) -> Self {
-        Self {
-            property_contexts_files,
-            build_prop_files,
-            writer_lock: None,
-            persistent_properties_file: None,
-        }
-    }
-
-    /// Stores `persist.*` / `next_boot.*` properties in `path`; see
-    /// [`crate::ServiceOptions::persistent_properties_file`].
-    pub fn persistent_properties_file(mut self, path: impl Into<PathBuf>) -> Self {
-        self.persistent_properties_file = Some(path.into());
-        self
-    }
-
-    /// Hands the actor a writer lock the caller already holds. The lock
-    /// must be for `rsproperties::properties_dir()` (compared as paths with
-    /// [`Path::eq`]); otherwise `on_start` fails with
+/// What [`spawn`] starts the properties service with.
+pub(crate) struct PropertiesServiceArgs {
+    pub(crate) property_contexts_files: Vec<PathBuf>,
+    pub(crate) build_prop_files: Vec<PathBuf>,
+    /// The writer lock of `rsproperties::properties_dir()`, taken by `run`
+    /// before either actor is spawned: the socket service must not bind
+    /// while another instance holds the lock, or it renames its sockets
+    /// over that instance's sockets. A lock for another directory
+    /// (compared as paths with [`Path::eq`]) makes `on_start` fail with
     /// `std::io::ErrorKind::InvalidInput` before it writes anything. The
     /// service keeps the lock until it is dropped.
-    pub fn writer_lock(mut self, lock: AreaWriterLock) -> Self {
-        self.writer_lock = Some(lock);
-        self
-    }
+    pub(crate) writer_lock: AreaWriterLock,
+    /// Stores `persist.*` / `next_boot.*` properties in this file; see
+    /// [`crate::ServiceOptions::persistent_properties_file`].
+    pub(crate) persistent_properties_file: Option<PathBuf>,
 }
 
-pub struct PropertiesService {
+pub(crate) struct PropertiesService {
     system_properties: SystemProperties,
     persistent: Option<PersistentStore>,
 }
@@ -81,15 +49,13 @@ where
 }
 
 /// Synchronous initialisation: parses property_contexts files, builds the
-/// trie, loads build.prop files, takes the writer lock (unless `lock` is
-/// given), publishes the trie as `property_info`, and applies the build.prop
-/// entries to freshly created areas.
+/// trie, loads build.prop files, publishes the trie as `property_info`
+/// under `lock`, and applies the build.prop entries to freshly created
+/// areas.
 ///
 /// Every input file is read before `property_info` or any area file in
-/// `dir` is written, and the writer lock is held before `property_info` is
-/// replaced: a failed input
-/// file or a second instance (which fails on the lock) leaves the running
-/// instance's `property_info` untouched.
+/// `dir` is written, so a failed input file leaves the previous
+/// `property_info` untouched. `lock` must be the writer lock of `dir`.
 ///
 /// Kept synchronous on purpose — every step is blocking I/O against the
 /// filesystem and we don't want to scatter `spawn_blocking` calls through
@@ -105,12 +71,12 @@ fn init_system_properties_sync(
     property_contexts_files: Vec<PathBuf>,
     build_prop_files: Vec<PathBuf>,
     dir: &Path,
-    lock: Option<AreaWriterLock>,
+    lock: AreaWriterLock,
 ) -> std::io::Result<SystemProperties> {
     let mut property_infos = Vec::new();
     for file in property_contexts_files {
         let (mut property_info, errors) =
-            PropertyInfoEntry::parse_from_file(&file, false).map_err(io_other)?;
+            PropertyInfoEntry::parse_from_file(&file, MatchKeyword::Unchecked).map_err(io_other)?;
         if !errors.is_empty() {
             log::error!("{errors:?}");
         }
@@ -126,28 +92,21 @@ fn init_system_properties_sync(
     // by the keys, not by HashMap's randomised hash seed.
     let mut properties_unordered: HashMap<String, String> = HashMap::new();
     for file in build_prop_files {
-        load_properties_from_file(&file, None, "u:r:init:s0", &mut properties_unordered)
-            .map_err(io_other)?;
+        load_properties_from_file(&file, None, &mut properties_unordered).map_err(io_other)?;
     }
     let properties: BTreeMap<String, String> = properties_unordered.into_iter().collect();
 
-    // First write to `dir` (unless the caller already took the lock, which
-    // created `.writer_lock`): everything above only read files. The lock
-    // comes before `publish_property_info`, so a losing second instance
-    // fails here without replacing the running instance's `property_info`.
-    let lock = match lock {
-        Some(lock) if lock.dir() == dir => lock,
-        Some(lock) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "writer lock is for {:?}, properties dir is {dir:?}",
-                    lock.dir()
-                ),
-            ))
-        }
-        None => AreaWriterLock::acquire(dir).map_err(io_other)?,
-    };
+    // First write to `dir` since the lock was taken (which created
+    // `.writer_lock`): everything above only read files.
+    if lock.dir() != dir {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "writer lock is for {:?}, properties dir is {dir:?}",
+                lock.dir()
+            ),
+        ));
+    }
     lock.publish_property_info(&data).map_err(io_other)?;
     let mut system_properties = SystemProperties::new_area_locked(lock).map_err(io_other)?;
     // `new_area_locked` starts from a freshly-created, empty area and the
@@ -359,26 +318,41 @@ impl rsactor::Message<crate::PropertyMessage> for PropertiesService {
         _actor_ref: &ActorRef<Self>,
     ) -> Self::Reply {
         log::debug!("Handling property message: {message:?}");
-        self.client_set(&message.name, message.value).await
+        self.client_set(&message.name, message.value, message.protocol)
+            .await
     }
 }
 
 impl PropertiesService {
-    /// One set from a client: [`apply_set`], then the persistent file.
-    async fn client_set(&mut self, name: &str, value: String) -> i32 {
+    /// One set from a client: [`apply_set`], then, for a V2 set, the
+    /// persistent file.
+    async fn client_set(&mut self, name: &str, value: String, protocol: SetProtocol) -> i32 {
         let code = apply_set(&mut self.system_properties, name, &value);
         if code != PROP_SUCCESS || !is_persistent_name(name.as_bytes()) {
             return code;
         }
-        // init `PropertySet`: a client set of a `persist.` / `next_boot.`
-        // name is written to the file before the reply. init writes only
-        // V2 sets (`socket &&`); V1 sets come here too and are written as
-        // well (docs/aosp-parity.md S1). The write runs on
-        // the blocking pool; awaiting it keeps this actor's sets, and so
-        // the file writes, in order.
         let Some(store) = self.persistent.as_mut() else {
             return code;
         };
+        // init `PropertySet` writes the file only when the set came with a
+        // socket to answer on (`socket && persistent_properties_loaded &&
+        // need_persist`), and the V1 command calls it without one
+        // (`HandlePropertySetNoSocket`). The store's records are left as
+        // they are too: init's next write starts from the file, which does
+        // not hold this value (docs/aosp-parity.md S1).
+        if protocol == SetProtocol::V1 {
+            log::warn!(
+                "{name:?} was set with the V1 command (PROP_MSG_SETPROP): the value is in the \
+                 property area only and is not written to {:?}, as in init; it is lost when the \
+                 service restarts. Set it with PROP_MSG_SETPROP2 to store it",
+                store.path()
+            );
+            return code;
+        }
+        // A V2 set of a `persist.` / `next_boot.` name is written to the
+        // file before the reply. The write runs on the blocking pool;
+        // awaiting it keeps this actor's sets, and so the file writes, in
+        // order.
         if store.reload_pending() {
             let path = store.shared_path();
             match tokio::task::spawn_blocking(move || {
@@ -420,14 +394,14 @@ impl PropertiesService {
     }
 }
 
-/// Spawns the properties service actor with `args`. See
-/// [`PropertiesServiceArgs::new`] for when the writer lock is taken.
-pub fn spawn(args: PropertiesServiceArgs) -> crate::ServiceContext<PropertiesService> {
-    let (actor_ref, join_handle) = rsactor::spawn(args);
-    crate::ServiceContext {
-        actor_ref,
-        join_handle,
-    }
+/// Spawns the properties service actor with `args`.
+pub(crate) fn spawn(
+    args: PropertiesServiceArgs,
+) -> (
+    ActorRef<PropertiesService>,
+    tokio::task::JoinHandle<rsactor::ActorResult<PropertiesService>>,
+) {
+    rsactor::spawn(args)
 }
 
 #[cfg(test)]
@@ -457,6 +431,17 @@ mod tests {
         }
     }
 
+    /// [`init_system_properties_sync`] with the writer lock of `dir`, taken
+    /// first as `run` does.
+    fn init_locked(
+        property_contexts_files: Vec<PathBuf>,
+        build_prop_files: Vec<PathBuf>,
+        dir: &Path,
+    ) -> std::io::Result<SystemProperties> {
+        let lock = AreaWriterLock::acquire(dir).map_err(io_other)?;
+        init_system_properties_sync(property_contexts_files, build_prop_files, dir, lock)
+    }
+
     /// A reader that already holds the previous `property_info` must keep
     /// seeing its bytes: the new trie is published on a new inode.
     #[test]
@@ -472,7 +457,7 @@ mod tests {
         let mut old_reader = std::fs::File::open(&info_path).unwrap();
         let old_ino = old_reader.metadata().unwrap().ino();
 
-        drop(init_system_properties_sync(vec![], vec![], &tmp.0, None).unwrap());
+        drop(init_locked(vec![], vec![], &tmp.0).unwrap());
 
         let new_meta = std::fs::metadata(&info_path).unwrap();
         assert_ne!(new_meta.ino(), old_ino);
@@ -492,7 +477,7 @@ mod tests {
         std::fs::write(&info_path, b"stale").unwrap();
         std::fs::set_permissions(&info_path, std::fs::Permissions::from_mode(0o664)).unwrap();
 
-        drop(init_system_properties_sync(vec![], vec![], &tmp.0, None).unwrap());
+        drop(init_locked(vec![], vec![], &tmp.0).unwrap());
 
         let mode = std::fs::metadata(&info_path).unwrap().mode() & 0o777;
         assert_eq!(mode, PROPERTY_INFO_MODE);
@@ -505,7 +490,7 @@ mod tests {
         let stale = tmp.0.join(".property_info.tmp-4294967295");
         std::fs::write(&stale, b"half-written trie").unwrap();
 
-        drop(init_system_properties_sync(vec![], vec![], &tmp.0, None).unwrap());
+        drop(init_locked(vec![], vec![], &tmp.0).unwrap());
 
         assert!(!stale.exists());
     }
@@ -525,7 +510,7 @@ mod tests {
         // group-writable prop file is skipped like AOSP init does.
         std::fs::set_permissions(&build_prop, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        let props = init_system_properties_sync(vec![], vec![build_prop], &tmp.0, None).unwrap();
+        let props = init_locked(vec![], vec![build_prop], &tmp.0).unwrap();
         assert_eq!(props.get("ro.ok").unwrap(), "1");
         assert!(props.get("persist.vendor.too_long").is_err());
     }
@@ -540,40 +525,28 @@ mod tests {
         path
     }
 
-    /// Whether `e` wraps `rsproperties::Error::Lock`.
-    fn is_lock_error(e: &std::io::Error) -> bool {
-        matches!(
-            e.get_ref()
-                .and_then(|inner| inner.downcast_ref::<rsproperties::Error>()),
-            Some(rsproperties::Error::Lock(_))
-        )
-    }
-
-    /// A second init on a properties dir whose writer lock is held fails
-    /// on the lock before it replaces the running instance's
-    /// `property_info`.
+    /// The service holds the writer lock it was given for as long as its
+    /// `SystemProperties` lives, so a second instance's `acquire` (the
+    /// first step of `run`) fails until then.
     #[test]
-    fn second_init_fails_before_replacing_property_info() {
+    fn writer_lock_is_held_while_properties_live() {
         let tmp = TempDir::new("rsprops_svc_second_init");
         let props = tmp.0.join("props");
-        let info = props.join("property_info");
-        let contexts_a = contexts_file(&tmp, "a", "debug.a.", "u:object_r:debug_a_prop:s0");
-        let contexts_b = contexts_file(&tmp, "b", "debug.b.", "u:object_r:debug_b_prop:s0");
+        let contexts = contexts_file(&tmp, "a", "debug.a.", "u:object_r:debug_a_prop:s0");
 
-        let first = init_system_properties_sync(vec![contexts_a], vec![], &props, None).unwrap();
-        let before = std::fs::read(&info).unwrap();
-
-        let err = init_system_properties_sync(vec![contexts_b], vec![], &props, None)
-            .err()
-            .expect("the writer lock is held by `first`");
-        assert!(is_lock_error(&err), "expected Error::Lock, got: {err}");
-        assert_eq!(
-            std::fs::read(&info).unwrap(),
-            before,
-            "the losing instance replaced property_info"
-        );
-        assert!(!props.join("u:object_r:debug_b_prop:s0").exists());
+        let first = init_locked(vec![contexts], vec![], &props).unwrap();
+        assert!(matches!(
+            AreaWriterLock::acquire(&props),
+            Err(rsproperties::Error::Lock(_))
+        ));
         drop(first);
+        // At once, with no retry: other tests of this binary start child
+        // processes, and a child between its clone and its `exec` holds a
+        // copy of the lock's descriptor. `AreaWriterLock`'s `Drop` unlocks
+        // instead of relying on the last close.
+        if let Err(e) = AreaWriterLock::acquire(&props) {
+            panic!("the lock must be released with the properties: {e}");
+        }
     }
 
     /// A build.prop file that cannot be read fails init before
@@ -583,15 +556,14 @@ mod tests {
         let tmp = TempDir::new("rsprops_svc_bad_build_prop");
         let props = tmp.0.join("props");
         let info = props.join("property_info");
-        drop(init_system_properties_sync(vec![], vec![], &props, None).unwrap());
+        drop(init_locked(vec![], vec![], &props).unwrap());
         let before = std::fs::read(&info).unwrap();
         let before_ino = std::fs::metadata(&info).unwrap().ino();
 
         let contexts = contexts_file(&tmp, "c", "debug.c.", "u:object_r:debug_c_prop:s0");
         let missing = tmp.0.join("inputs").join("missing_build.prop");
-        let err = init_system_properties_sync(vec![contexts], vec![missing], &props, None)
-            .err()
-            .expect("a missing build.prop must fail init");
+        let err = init_locked(vec![contexts], vec![missing], &props)
+            .expect_err("a missing build.prop must fail init");
         assert!(err.to_string().contains("missing_build.prop"), "{err}");
         assert_eq!(std::fs::metadata(&info).unwrap().ino(), before_ino);
         assert_eq!(std::fs::read(&info).unwrap(), before);
@@ -607,9 +579,8 @@ mod tests {
         std::fs::create_dir_all(&props).unwrap();
         let lock = AreaWriterLock::acquire(&other).unwrap();
 
-        let err = init_system_properties_sync(vec![], vec![], &props, Some(lock))
-            .err()
-            .expect("a lock for another dir must be refused");
+        let err = init_system_properties_sync(vec![], vec![], &props, lock)
+            .expect_err("a lock for another dir must be refused");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
         assert!(!props.join("property_info").exists());
         assert!(!other.join("property_info").exists());
@@ -639,7 +610,7 @@ mod tests {
              ro. u:object_r:ro_prop:s0 prefix string\n",
         )
         .unwrap();
-        init_system_properties_sync(vec![contexts], vec![], &tmp.0.join("props"), None).unwrap()
+        init_locked(vec![contexts], vec![], &tmp.0.join("props")).unwrap()
     }
 
     /// init's codes, in init's order of checks.
@@ -753,8 +724,15 @@ mod tests {
         assert!(startup_at(&mut sp, Some(&path)).is_err());
     }
 
-    /// A successful client set of a `persist.` / `next_boot.` name rewrites
-    /// the file; a rejected set or another name does not.
+    impl PropertiesService {
+        /// A set that arrived as `PROP_MSG_SETPROP2`.
+        async fn set_v2(&mut self, name: &str, value: &str) -> i32 {
+            self.client_set(name, value.into(), SetProtocol::V2).await
+        }
+    }
+
+    /// A successful V2 client set of a `persist.` / `next_boot.` name
+    /// rewrites the file; a rejected set or another name does not.
     #[tokio::test]
     async fn client_set_writes_persistent_file() {
         use crate::persistent_properties::decode;
@@ -769,25 +747,16 @@ mod tests {
         let on_disk = || decode(&std::fs::read(&path).unwrap_or_default()).unwrap();
         let rec = |n: &str, v: &str| (n.as_bytes().to_vec(), v.as_bytes().to_vec());
 
-        assert_eq!(
-            service.client_set("persist.x", "1".into()).await,
-            PROP_SUCCESS
-        );
+        assert_eq!(service.set_v2("persist.x", "1").await, PROP_SUCCESS);
         assert_eq!(on_disk(), vec![rec("persist.x", "1")]);
+        assert_eq!(service.set_v2("debug.y", "1").await, PROP_SUCCESS);
         assert_eq!(
-            service.client_set("debug.y", "1".into()).await,
-            PROP_SUCCESS
-        );
-        assert_eq!(
-            service.client_set("persist.int", "bad".into()).await,
+            service.set_v2("persist.int", "bad").await,
             PROP_ERROR_INVALID_VALUE
         );
+        assert_eq!(service.set_v2("persist.x", "2").await, PROP_SUCCESS);
         assert_eq!(
-            service.client_set("persist.x", "2".into()).await,
-            PROP_SUCCESS
-        );
-        assert_eq!(
-            service.client_set("next_boot.persist.z", "9".into()).await,
+            service.set_v2("next_boot.persist.z", "9").await,
             PROP_SUCCESS
         );
         assert_eq!(
@@ -806,6 +775,72 @@ mod tests {
             on_disk(),
             vec![rec("persist.x", "2"), rec("persist.z", "9")]
         );
+    }
+
+    /// init `PropertySet` writes the file for a V2 set only (`socket &&`):
+    /// a V1 set of a `persist.` / `next_boot.` name changes the area and
+    /// neither the file nor the records a later V2 write starts from.
+    #[tokio::test]
+    async fn v1_set_is_not_written_to_persistent_file() {
+        use crate::persistent_properties::decode;
+        let tmp = TempDir::new("rsprops_svc_client_persist_v1");
+        let mut sp = typed_properties(&tmp);
+        let path = tmp.0.join("persistent_properties");
+        let persistent = startup_at(&mut sp, Some(&path)).unwrap();
+        let mut service = PropertiesService {
+            system_properties: sp,
+            persistent,
+        };
+        let on_disk = || decode(&std::fs::read(&path).unwrap_or_default()).unwrap();
+        let rec = |n: &str, v: &str| (n.as_bytes().to_vec(), v.as_bytes().to_vec());
+
+        assert_eq!(service.set_v2("persist.x", "1").await, PROP_SUCCESS);
+        for (name, value) in [
+            ("persist.x", "2"),
+            ("persist.v1only", "a"),
+            ("next_boot.persist.s", "5"),
+        ] {
+            assert_eq!(
+                service
+                    .client_set(name, value.into(), SetProtocol::V1)
+                    .await,
+                PROP_SUCCESS,
+                "{name}"
+            );
+            assert_eq!(service.system_properties.get(name).unwrap(), value);
+        }
+        assert_eq!(on_disk(), vec![rec("persist.x", "1")]);
+        // A type mismatch is rejected for V1 as for V2.
+        assert_eq!(
+            service
+                .client_set("persist.int", "bad".into(), SetProtocol::V1)
+                .await,
+            PROP_ERROR_INVALID_VALUE
+        );
+
+        // A V2 write of another name does not carry the V1 values along.
+        assert_eq!(service.set_v2("persist.y", "1").await, PROP_SUCCESS);
+        assert_eq!(
+            on_disk(),
+            vec![rec("persist.x", "1"), rec("persist.y", "1")]
+        );
+        // A V2 set of the value the area already has (from V1) is written:
+        // the file's record, not the area, decides whether it changed.
+        assert_eq!(service.set_v2("persist.x", "2").await, PROP_SUCCESS);
+        assert_eq!(
+            on_disk(),
+            vec![rec("persist.x", "2"), rec("persist.y", "1")]
+        );
+
+        // The V1-only values are gone after a restart.
+        drop(service);
+        let tmp2 = TempDir::new("rsprops_svc_client_persist_v1_restart");
+        let mut sp = typed_properties(&tmp2);
+        startup_at(&mut sp, Some(&path)).unwrap();
+        assert_eq!(sp.get("persist.x").unwrap(), "2");
+        assert!(sp.find("persist.v1only").unwrap().is_none());
+        assert!(sp.find("persist.s").unwrap().is_none());
+        assert!(sp.find("next_boot.persist.s").unwrap().is_none());
     }
 
     /// After `load` hit a transient read error, the first persistent set
@@ -830,14 +865,8 @@ mod tests {
             persistent: Some(store),
         };
 
-        assert_eq!(
-            service.client_set("persist.b", "new".into()).await,
-            PROP_SUCCESS
-        );
-        assert_eq!(
-            service.client_set("persist.c", "3".into()).await,
-            PROP_SUCCESS
-        );
+        assert_eq!(service.set_v2("persist.b", "new").await, PROP_SUCCESS);
+        assert_eq!(service.set_v2("persist.c", "3").await, PROP_SUCCESS);
         assert_eq!(
             decode(&std::fs::read(&path).unwrap()).unwrap(),
             vec![

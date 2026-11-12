@@ -24,7 +24,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use rsproperties::{
-    build_trie, AreaWriterLock, PropertyConfig, PropertyInfoEntry, SystemProperties,
+    build_trie, AreaWriterLock, MatchKeyword, PropertyConfig, PropertyInfoEntry, SystemProperties,
 };
 
 fn build_property_info(dir: &Path) {
@@ -36,7 +36,8 @@ fn build_property_info(dir: &Path) {
         .write_all(b"test. u:object_r:test_prop:s0 prefix string\n")
         .unwrap();
 
-    let (entries, errors) = PropertyInfoEntry::parse_from_file(&contexts_path, false).unwrap();
+    let (entries, errors) =
+        PropertyInfoEntry::parse_from_file(&contexts_path, MatchKeyword::Unchecked).unwrap();
     assert!(errors.is_empty(), "parse errors: {errors:?}");
 
     let data = build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap();
@@ -57,7 +58,7 @@ fn test_wait_wake_across_instances() {
     writer.add("test.wait.prop", "0").unwrap();
 
     rsproperties::init(PropertyConfig::new().properties_dir(dir.path())).expect("init");
-    let reader = rsproperties::system_properties();
+    let reader = rsproperties::system_properties().expect("global reader");
     let idx = reader
         .find("test.wait.prop")
         .unwrap()
@@ -69,11 +70,9 @@ fn test_wait_wake_across_instances() {
     // passes without the per-property futex wake. The wake itself is
     // checked by `system_properties::wait_tests::update_wakes_property_futex`,
     // which waits without slicing.
-    let old = reader.serial(&idx).expect("initial serial");
-    let waiter = std::thread::spawn(move || {
-        let reader = rsproperties::system_properties();
-        reader.wait(Some(&idx), Some(old), Some(Duration::from_secs(10)))
-    });
+    let old = reader.serial(idx).expect("initial serial");
+    let waiter =
+        std::thread::spawn(move || reader.wait(Some(idx), old, Some(Duration::from_secs(10))));
     std::thread::sleep(Duration::from_millis(300));
     writer.set("test.wait.prop", "1").unwrap();
     let woken = waiter.join().expect("waiter thread panicked");
@@ -86,9 +85,9 @@ fn test_wait_wake_across_instances() {
     // Phase 2 — timeout: with no writer activity the wait must expire close
     // to the requested bound (deadline math, clamped final slice), not hang
     // and not return early.
-    let old = reader.serial(&idx).unwrap();
+    let old = reader.serial(idx).unwrap();
     let start = Instant::now();
-    let res = reader.wait(Some(&idx), Some(old), Some(Duration::from_millis(300)));
+    let res = reader.wait(Some(idx), old, Some(Duration::from_millis(300)));
     let elapsed = start.elapsed();
     assert!(
         matches!(res, Ok(None)),
@@ -106,10 +105,10 @@ fn test_wait_wake_across_instances() {
     // Phase 3 — lost-wakeup contract: if the property already changed since
     // `old_serial`, wait must return immediately with the new serial
     // instead of parking until the *next* change.
-    let old = reader.serial(&idx).unwrap();
+    let old = reader.serial(idx).unwrap();
     writer.set("test.wait.prop", "2").unwrap();
     let start = Instant::now();
-    let res = reader.wait(Some(&idx), Some(old), Some(Duration::from_secs(10)));
+    let res = reader.wait(Some(idx), old, Some(Duration::from_secs(10)));
     let elapsed = start.elapsed();
     let new_serial = res
         .unwrap()
@@ -122,11 +121,9 @@ fn test_wait_wake_across_instances() {
 
     // Phase 4 — global serial: a wait with an explicit old_serial from the
     // global serial area, woken by any update.
-    let old_global = reader.context_serial();
-    let waiter = std::thread::spawn(move || {
-        let reader = rsproperties::system_properties();
-        reader.wait(None, Some(old_global), Some(Duration::from_secs(10)))
-    });
+    let old_global = reader.area_serial();
+    let waiter =
+        std::thread::spawn(move || reader.wait(None, old_global, Some(Duration::from_secs(10))));
     std::thread::sleep(Duration::from_millis(200));
     writer.set("test.wait.prop", "3").unwrap();
     let woken = waiter.join().expect("global waiter panicked");
@@ -138,22 +135,22 @@ fn test_wait_wake_across_instances() {
     // Phase 5 — a zero timeout still compares `old_serial` first. bionic
     // gets the same answer from the kernel: FUTEX_WAIT returns EAGAIN for a
     // changed word with a zero timeout, and bionic reloads the serial.
-    let old = reader.serial(&idx).unwrap();
+    let old = reader.serial(idx).unwrap();
     writer.set("test.wait.prop", "4").unwrap();
-    let got = reader.wait(Some(&idx), Some(old), Some(Duration::ZERO));
+    let got = reader.wait(Some(idx), old, Some(Duration::ZERO));
     assert!(
         matches!(got, Ok(Some(s)) if s != old),
         "already-changed serial must be reported, got {got:?}"
     );
     // An unchanged serial with a zero timeout returns `Ok(None)` without
     // waiting.
-    let cur = reader.serial(&idx).unwrap();
-    let got = reader.wait(Some(&idx), Some(cur), Some(Duration::ZERO));
+    let cur = reader.serial(idx).unwrap();
+    let got = reader.wait(Some(idx), cur, Some(Duration::ZERO));
     assert!(matches!(got, Ok(None)), "{got:?}");
     // Regression only (passes before the fix): the global-serial path
     // compared before the futex already, and gives the same answer.
-    let g = reader.context_serial();
+    let g = reader.area_serial();
     writer.set("test.wait.prop", "5").unwrap();
-    let got = reader.wait(None, Some(g), Some(Duration::ZERO));
+    let got = reader.wait(None, g, Some(Duration::ZERO));
     assert!(matches!(got, Ok(Some(_))), "{got:?}");
 }

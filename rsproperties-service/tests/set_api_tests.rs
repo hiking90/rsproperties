@@ -95,56 +95,56 @@ async fn test_set_display_integers() -> anyhow::Result<()> {
     // Test i8
     let prop_name = "test.set.i8";
     let test_value = i8::MAX;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test i16
     let prop_name = "test.set.i16";
     let test_value = i16::MAX;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test i32
     let prop_name = "test.set.i32";
     let test_value = i32::MAX;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test i64
     let prop_name = "test.set.i64";
     let test_value = i64::MAX;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test u8
     let prop_name = "test.set.u8";
     let test_value = u8::MAX;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test u16
     let prop_name = "test.set.u16";
     let test_value = u16::MAX;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test u32
     let prop_name = "test.set.u32";
     let test_value = u32::MAX;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test u64 (using a smaller value to avoid potential issues)
     let prop_name = "test.set.u64";
     let test_value = u64::MAX / 2;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
@@ -158,42 +158,42 @@ async fn test_set_display_negative_integers() -> anyhow::Result<()> {
     // Test i8 min
     let prop_name = "test.set.neg_i8";
     let test_value = i8::MIN;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test i16 min
     let prop_name = "test.set.neg_i16";
     let test_value = i16::MIN;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test i32 min
     let prop_name = "test.set.neg_i32";
     let test_value = i32::MIN;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test i64 min
     let prop_name = "test.set.neg_i64";
     let test_value = i64::MIN;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test zero
     let prop_name = "test.set.neg_zero";
     let test_value = 0i32;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test small negative
     let prop_name = "test.set.neg_small";
     let test_value = -42i32;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
@@ -207,42 +207,42 @@ async fn test_set_display_floats() -> anyhow::Result<()> {
     // Test f32
     let prop_name = "test.set.f32";
     let test_value = 3.14159f32;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test f64
     let prop_name = "test.set.f64";
     let test_value = 2.718281828459045f64;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test f32 zero
     let prop_name = "test.set.f32_zero";
     let test_value = 0.0f32;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test f64 negative
     let prop_name = "test.set.f64_negative";
     let test_value = -123.456f64;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test f32 small
     let prop_name = "test.set.f32_small";
     let test_value = f32::EPSILON;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
     // Test f64 large (use smaller value to avoid length limits)
     let prop_name = "test.set.f64_large";
     let test_value = 1e10f64; // Smaller than 1e100 to fit in 92 chars
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, test_value.to_string());
 
@@ -330,7 +330,7 @@ async fn test_set_overwrite_existing() -> anyhow::Result<()> {
 
     // Overwrite with different type
     let new_value = 12345i32;
-    rsproperties::set(prop_name, &new_value)?;
+    rsproperties::set(prop_name, new_value)?;
     let retrieved_value: String = rsproperties::get(prop_name)?;
     assert_eq!(retrieved_value, new_value.to_string());
 
@@ -408,7 +408,7 @@ async fn test_set_and_get_integration() -> anyhow::Result<()> {
     let original_value = 98765i32;
 
     // Set using Display trait
-    rsproperties::set(prop_name, &original_value)?;
+    rsproperties::set(prop_name, original_value)?;
 
     // Get as string
     let string_value: String = rsproperties::get(prop_name)?;
@@ -528,7 +528,7 @@ async fn test_set_consistency_between_set_and_set() -> anyhow::Result<()> {
 
     // Set using set with String
     let prop_name2 = "test.consistency.set";
-    rsproperties::set(prop_name2, &test_value.to_string())?;
+    rsproperties::set(prop_name2, test_value.to_string())?;
 
     // Both should produce the same result
     let value1: String = rsproperties::get(prop_name1)?;

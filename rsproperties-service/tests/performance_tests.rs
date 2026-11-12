@@ -130,7 +130,7 @@ async fn test_large_property_values() -> Result<()> {
     setup_perf_test_env().await;
 
     // Test with various sizes approaching PROP_VALUE_MAX
-    let sizes = vec![10, 50, 80, rsproperties::PROP_VALUE_MAX - 5];
+    let sizes = vec![10, 50, 80, rsproperties::wire::PROP_VALUE_MAX - 5];
 
     // Warm-up: the first set() pays one-time costs (socket connect, the
     // service's lazy property-area open) that would otherwise show up in

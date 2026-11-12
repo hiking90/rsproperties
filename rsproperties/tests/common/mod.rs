@@ -133,8 +133,8 @@ mod host {
     use std::sync::Once;
 
     use rsproperties::{
-        build_trie, load_properties_from_file, AreaWriterLock, PropertyConfig, PropertyInfoEntry,
-        SystemProperties,
+        build_trie, load_properties_from_file, AreaWriterLock, MatchKeyword, PropertyConfig,
+        PropertyInfoEntry, SystemProperties,
     };
 
     pub(super) fn init() {
@@ -150,7 +150,7 @@ mod host {
                     .socket_dir(dir.join("sockets")),
             )
             .expect("init_test: init");
-            rsproperties::try_system_properties().expect("init_test: the store must load");
+            rsproperties::system_properties().expect("init_test: the store must load");
         });
     }
 
@@ -211,7 +211,7 @@ mod host {
             "vendor_property_contexts",
         ] {
             let (mut parsed, errors) =
-                PropertyInfoEntry::parse_from_file(&android.join(file), false)
+                PropertyInfoEntry::parse_from_file(&android.join(file), MatchKeyword::Unchecked)
                     .unwrap_or_else(|e| panic!("parse {file}: {e}"));
             assert!(errors.is_empty(), "{file}: {errors:?}");
             entries.append(&mut parsed);
@@ -237,7 +237,7 @@ mod host {
             "vendor_odm_dlkm_build.prop",
         ] {
             let copy = super::copy_fixture_0644(&android.join(file), copies.path());
-            load_properties_from_file(&copy, None, "u:r:init:s0", &mut properties)
+            load_properties_from_file(&copy, None, &mut properties)
                 .unwrap_or_else(|e| panic!("load {file}: {e}"));
         }
         // The loader skips a group- or world-writable file with only a

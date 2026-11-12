@@ -39,8 +39,9 @@
 //!   lifetime, so two services given the same file do not overwrite each
 //!   other's records. Dropping the store unlocks it with `LOCK_UN`, so a
 //!   child process that has not yet `exec`ed and still holds a copy of
-//!   the fd does not keep the file locked. init has no lock; it is the
-//!   only writer on a device.
+//!   the fd does not keep the file locked. A store dropped in a `fork`
+//!   child does not unlock: the lock stays with the process that loaded
+//!   it. init has no lock; it is the only writer on a device.
 //! - Duplicate names are merged at load, keeping the last value (the one
 //!   loading leaves in the property area). init's file never has
 //!   duplicates; one from another source would otherwise bring an old
@@ -92,7 +93,9 @@ pub(crate) struct PersistentStore {
     /// [`finish_reload`](Self::finish_reload).
     reload_pending: bool,
     /// `<path>.lock`, `flock`ed exclusively; unlocked in `Drop`.
-    _lock: File,
+    lock: File,
+    /// Process that called `load`. `Drop` unlocks only there.
+    owner_pid: u32,
 }
 
 impl PersistentStore {
@@ -169,7 +172,8 @@ impl PersistentStore {
             unpersisted: Vec::new(),
             unsynced: false,
             reload_pending,
-            _lock: lock,
+            lock,
+            owner_pid: std::process::id(),
         };
         // Both steps run; `|` does not short-circuit.
         if store.merge_duplicates() | store.apply_staged() {
@@ -400,8 +404,19 @@ impl Drop for PersistentStore {
     /// when no other fd refers to the open file description, and a child
     /// this process is spawning has a copy of every fd until its `exec`
     /// closes the `O_CLOEXEC` ones; `LOCK_UN` releases it regardless.
+    ///
+    /// Not in a `fork` child (pid differs from the loading process), as in
+    /// `rsproperties::AreaWriterLock`: `LOCK_UN` there would unlock the
+    /// file while the parent still writes to it.
     fn drop(&mut self) {
-        let _ = rustix::fs::flock(&self._lock, rustix::fs::FlockOperation::Unlock);
+        if std::process::id() != self.owner_pid {
+            return;
+        }
+        if let Err(e) = rustix::fs::flock(&self.lock, rustix::fs::FlockOperation::Unlock) {
+            // The close that follows still releases it, once every copy of
+            // the fd is closed.
+            warn!("Failed to unlock the lock file of {:?}: {e}", self.path);
+        }
     }
 }
 
@@ -868,12 +883,32 @@ mod tests {
         let path = tmp.0.join("persistent_properties");
         let store = PersistentStore::load(&path).unwrap();
         // Same open file description, as in a child's fd table.
-        let copy = store._lock.try_clone().unwrap();
+        let copy = store.lock.try_clone().unwrap();
         drop(store);
         let reloaded = PersistentStore::load(&path);
         drop(copy);
         if let Err(err) = reloaded {
             panic!("load after drop failed: {err}");
+        }
+    }
+
+    /// A store dropped in a `fork` child leaves the lock with the parent,
+    /// whose descriptor shares the open file description.
+    #[test]
+    fn drop_in_another_process_does_not_unlock() {
+        let tmp = TempDir::new("rsprops_persist_lock_fork");
+        let path = tmp.0.join("persistent_properties");
+        let mut store = PersistentStore::load(&path).unwrap();
+        // The parent's descriptor, still open after the child's drop.
+        let parent = store.lock.try_clone().unwrap();
+        // What the child sees: `load` ran under another pid.
+        store.owner_pid = store.owner_pid.wrapping_add(1);
+        drop(store);
+        let while_parent_holds = PersistentStore::load(&path);
+        drop(parent);
+        match while_parent_holds {
+            Err(err) => assert_eq!(err.kind(), ErrorKind::WouldBlock, "{err}"),
+            Ok(_) => panic!("the child's drop must not unlock"),
         }
     }
 

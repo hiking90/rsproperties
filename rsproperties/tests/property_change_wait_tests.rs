@@ -12,9 +12,7 @@
 //!
 //! Names are under `debug.`: the shell SELinux domain may set `debug.*`
 //! but not `test.*`, so the tests also pass after `adb unroot`. The pid
-//! suffix keeps concurrent runs apart. `wait(None, None, None)` (bionic's
-//! `__system_property_wait_any`) is not tested: without an `old_serial`,
-//! no test of it can be free of the lost-wakeup race.
+//! suffix keeps concurrent runs apart.
 
 #![cfg(target_os = "android")]
 
@@ -53,17 +51,17 @@ fn test_wait_for_property_change() {
         let barrier = Arc::clone(&barrier);
         let prop_name = test_prop.clone();
         thread::spawn(move || {
-            let system_properties = rsproperties::system_properties();
+            let system_properties = rsproperties::system_properties().expect("global reader");
             let index = system_properties
                 .find(&prop_name)
                 .expect("find")
                 .expect("property exists after set");
-            let old_serial = system_properties.serial(&index).expect("serial");
+            let old_serial = system_properties.serial(index).expect("serial");
 
             barrier.wait();
 
             system_properties
-                .wait(Some(&index), Some(old_serial), Some(WAIT_TIMEOUT))
+                .wait(Some(index), old_serial, Some(WAIT_TIMEOUT))
                 .expect("wait failed")
                 .expect("wait timed out: the change was not observed");
             rsproperties::get::<String>(&prop_name).expect("get after wait")
@@ -89,12 +87,12 @@ fn test_wait_for_any_property_change() {
     let waiter = {
         let barrier = Arc::clone(&barrier);
         thread::spawn(move || {
-            let system_properties = rsproperties::system_properties();
-            let old_serial = system_properties.context_serial();
+            let system_properties = rsproperties::system_properties().expect("global reader");
+            let old_serial = system_properties.area_serial();
 
             barrier.wait();
 
-            system_properties.wait(None, Some(old_serial), Some(WAIT_TIMEOUT))
+            system_properties.wait(None, old_serial, Some(WAIT_TIMEOUT))
         })
     };
 

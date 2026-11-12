@@ -20,8 +20,17 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        api-level: [28, 30, 34, 36]
+        api-level: [28, 30, 34, 36, 37]
+        include:
+          # sdkmanager has no `android-37` package: the API 37 images are
+          # `android-37.0` (and `37.1`, `37.2`, which ship only 16 KB page
+          # size images). `api-level` stays the integer that
+          # `ro.build.version.sdk` reports.
+          - api-level: 37
+            platform: android-37.0
       fail-fast: false
+    env:
+      SYSTEM_IMAGE: system-images;${{ matrix.platform || format('android-{0}', matrix.api-level) }};google_apis;x86_64
 
     steps:
     - name: Checkout code
@@ -32,8 +41,8 @@ jobs:
 
     - name: Install system images and emulator
       run: |
-        echo "Installing system images for API level ${{ matrix.api-level }}..."
-        yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "system-images;android-${{ matrix.api-level }};google_apis;x86_64"
+        echo "Installing $SYSTEM_IMAGE for API level ${{ matrix.api-level }}..."
+        yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "$SYSTEM_IMAGE"
         echo "Installing emulator..."
         yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "emulator"
         echo "Installing platform-tools..."
@@ -102,11 +111,11 @@ jobs:
         echo "Checking installed packages..."
         $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --list_installed
         echo "Checking available system images..."
-        $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --list | grep "system-images;android-${{ matrix.api-level }}" | head -5
+        $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --list | grep -F "${SYSTEM_IMAGE%;google_apis;x86_64};" | head -5
         echo "Creating AVD with basic configuration..."
-        echo "no" | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager create avd --force -n test-api${{ matrix.api-level }} -k "system-images;android-${{ matrix.api-level }};google_apis;x86_64" --abi google_apis/x86_64 --path $HOME/.android/avd/test-api${{ matrix.api-level }}.avd || {
+        echo "no" | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager create avd --force -n test-api${{ matrix.api-level }} -k "$SYSTEM_IMAGE" --abi google_apis/x86_64 --path $HOME/.android/avd/test-api${{ matrix.api-level }}.avd || {
           echo "First attempt failed, trying alternative method..."
-          echo "no" | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager create avd --force -n test-api${{ matrix.api-level }} -k "system-images;android-${{ matrix.api-level }};google_apis;x86_64"
+          echo "no" | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager create avd --force -n test-api${{ matrix.api-level }} -k "$SYSTEM_IMAGE"
         }
         echo "Checking AVD creation result..."
         $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager list avd
@@ -123,6 +132,8 @@ jobs:
         $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager list avd
         if [ -f "$HOME/.android/avd/test-api${{ matrix.api-level }}.avd/config.ini" ]; then
           echo "AVD config found, starting emulator..."
+          # `-memory 4096`: avdmanager writes `hw.ramSize=96M`, and the
+          # API 37 guest reboots in a loop (kernel panic, oom) with 1536M.
           nohup $ANDROID_SDK_ROOT/emulator/emulator -avd test-api${{ matrix.api-level }} -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot -wipe-data -memory 4096 -partition-size 2048 > emulator.log 2>&1 &
           echo "Emulator started in background"
           sleep 10

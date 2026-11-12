@@ -10,6 +10,28 @@ use crate::errors::*;
 use crate::trie_builder::*;
 use crate::trie_serializer::*;
 
+/// Whether [`PropertyInfoEntry::parse_from_file`] checks the match
+/// operation of a `property_contexts` line — its third token, `prefix` or
+/// `exact`. AOSP's `ParsePropertyInfoFile` takes this as
+/// `bool require_prefix_or_exact`.
+///
+/// In both modes a line without a third token (the two-token
+/// `<property> <context>` form of older files) is a prefix match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchKeyword {
+    /// A line whose third token is neither `prefix` nor `exact` is
+    /// rejected (`require_prefix_or_exact = true`; AOSP init passes this
+    /// for a vendor image of API level 30 or later).
+    Checked,
+    /// A third token other than `exact` makes the line a prefix match,
+    /// whatever the token is (`require_prefix_or_exact = false`).
+    Unchecked,
+}
+
+/// One `property_contexts` line: a property name (or name prefix), the
+/// SELinux context it maps to, its value type, and whether the name is an
+/// exact match or a prefix. [`build_trie`] turns a list of entries into
+/// the `property_info` file's content.
 #[derive(Debug, Clone)]
 pub struct PropertyInfoEntry {
     name: String,
@@ -19,15 +41,35 @@ pub struct PropertyInfoEntry {
 }
 
 impl PropertyInfoEntry {
-    /// Constructs an entry programmatically (the file-based path is
-    /// [`Self::parse_from_file`]). Validates `type_str` with the same rule
-    /// as the parser; AOSP's `PropertyInfoEntry` likewise exposes a public
-    /// constructor.
+    /// An entry that matches the property named `name` only — the `exact`
+    /// match operation of a `property_contexts` line (the file-based path
+    /// is [`Self::parse_from_file`]).
     ///
-    /// `type_str` is borrowed: only its whitespace-normalized copy is
-    /// stored, so taking ownership would force callers to allocate a
-    /// `String` that is immediately discarded.
-    pub fn new(name: String, context: String, type_str: &str, exact_match: bool) -> Result<Self> {
+    /// `type_str` is the space-separated type (`"string"`, `"enum a b"`,
+    /// or `""` for none). It is borrowed: only its whitespace-normalized
+    /// copy is stored.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] for a `type_str` the parser would
+    /// reject.
+    pub fn exact(name: String, context: String, type_str: &str) -> Result<Self> {
+        Self::with_match(name, context, type_str, true)
+    }
+
+    /// An entry that matches every property whose name starts with `name`
+    /// — the `prefix` match operation. Arguments and errors as for
+    /// [`Self::exact`].
+    pub fn prefix(name: String, context: String, type_str: &str) -> Result<Self> {
+        Self::with_match(name, context, type_str, false)
+    }
+
+    fn with_match(
+        name: String,
+        context: String,
+        type_str: &str,
+        exact_match: bool,
+    ) -> Result<Self> {
         // Store the whitespace-normalized form (`join(" ")`), matching
         // `parse_from_line` — otherwise the same logical type could
         // serialize as different bytes depending on which constructor
@@ -93,7 +135,8 @@ impl PropertyInfoEntry {
     // The line should be in the format:
     // <property> <context> <match operation> <type> [<type> ...]
     // where <match operation> is either "prefix" or "exact".
-    // If require_prefix_or_exact is true, the match operation must be specified.
+    // If require_prefix_or_exact is true, a match operation that is present
+    // must be one of the two; a line without one is a prefix match.
     // Example:
     //     ro.build.host u:object_r:build_prop:s0 exact string
     fn parse_from_line(line: &str, require_prefix_or_exact: bool) -> Result<PropertyInfoEntry> {
@@ -116,20 +159,22 @@ impl PropertyInfoEntry {
 
         if match_operation == Some("exact") {
             exact_match = true;
-        } else if require_prefix_or_exact && match_operation != Some("prefix") {
-            // AOSP parity (`ParsePropertyInfoLine`): with
-            // `require_prefix_or_exact`, anything but 'prefix'/'exact' is
-            // an error — including a *missing* operation (AOSP's tokenizer
-            // yields "" there, and `"" != "prefix"`). Legacy two-token
-            // `<property> <context>` lines are only legal when the flag is
-            // false, where they default to prefix match.
+        } else if let Some(op) = match_operation.filter(|&op| op != "prefix") {
+            // AOSP `ParsePropertyInfoLine` rejects on
+            // `match_operation != "prefix" && match_operation != "" &&
+            // require_prefix_or_exact`: a *missing* operation (its
+            // tokenizer yields "" there) is legal with the flag too —
+            // "older files will not contain them" — and the two-token
+            // `<property> <context>` line is a prefix match. Only a token
+            // that is present and neither 'prefix' nor 'exact' is an error.
             // No log here: the only caller (`parse_from_file`) already
             // warns with line context — logging both duplicated every
             // parse failure.
-            return Err(Error::Parse(format!(
-                "Match operation {:?} is not valid. Must be 'prefix' or 'exact'",
-                match_operation.unwrap_or("")
-            )));
+            if require_prefix_or_exact {
+                return Err(Error::Parse(format!(
+                    "Match operation {op:?} is not valid. Must be 'prefix' or 'exact'"
+                )));
+            }
         }
 
         if !type_strings.is_empty() && !Self::is_type_valid(&type_strings) {
@@ -149,10 +194,30 @@ impl PropertyInfoEntry {
         Ok(entry)
     }
 
+    /// Parses a `property_contexts` file. Each line is
+    /// `<property> <context> [<prefix|exact> [<type> ...]]`, for example
+    /// `ro.build.host u:object_r:build_prop:s0 exact string`; empty lines
+    /// and lines starting with `#` are skipped.
+    ///
+    /// A line without a third token is a prefix match. With
+    /// [`MatchKeyword::Checked`], a third token that is neither `prefix`
+    /// nor `exact` is an error (AOSP `ParsePropertyInfoLine` with
+    /// `require_prefix_or_exact`); with [`MatchKeyword::Unchecked`], such
+    /// a line is a prefix match too.
+    ///
+    /// Returns the parsed entries and one [`Error::Parse`] per rejected
+    /// line (naming the line number and the file): a bad line does not
+    /// stop the parse, so check the second vector when every line must be
+    /// valid.
+    ///
+    /// # Errors
+    ///
+    /// Only when the file cannot be opened or read.
     pub fn parse_from_file(
         filename: &Path,
-        require_prefix_or_exact: bool,
+        match_keyword: MatchKeyword,
     ) -> Result<(Vec<PropertyInfoEntry>, Vec<Error>)> {
+        let require_prefix_or_exact = match_keyword == MatchKeyword::Checked;
         info!(
             "Parsing property info file: {filename:?} (require_prefix_or_exact={require_prefix_or_exact})"
         );
@@ -243,6 +308,23 @@ impl PropertyInfoEntry {
     }
 }
 
+/// Serializes `property_info` entries into the content of a
+/// `property_info` file, in the format bionic maps
+/// (`property_info_parser`). `default_context` and `default_type` apply to
+/// a name that no entry matches.
+///
+/// Write the result with `AreaWriterLock::publish_property_info`, which
+/// replaces the file by rename; a file rewritten in place can fault a
+/// reader that has it mapped.
+///
+/// # Errors
+///
+/// - [`Error::InvalidArgument`] when `default_context` or `default_type`
+///   contains a NUL byte.
+/// - [`Error::Parse`] for an entry whose name has an empty segment
+///   (`a..b`) or too many segments.
+/// - [`Error::FileValidation`] for two entries with the same name and
+///   match kind, and when the trie cannot be serialized.
 pub fn build_trie(
     property_info: &[PropertyInfoEntry],
     default_context: &str,
@@ -289,16 +371,13 @@ mod tests {
     use super::*;
 
     /// Names reach `build_trie` from `property_contexts` lines and from
-    /// `PropertyInfoEntry::new`; its errors print them `Debug`-escaped.
+    /// `PropertyInfoEntry::exact`/`prefix`; its errors print them
+    /// `Debug`-escaped.
     #[test]
     fn build_trie_error_escapes_the_name() {
-        let entry = PropertyInfoEntry::new(
-            "a..b\u{1b}[31m".into(),
-            "u:object_r:x:s0".into(),
-            "string",
-            false,
-        )
-        .unwrap();
+        let entry =
+            PropertyInfoEntry::prefix("a..b\u{1b}[31m".into(), "u:object_r:x:s0".into(), "string")
+                .unwrap();
         let msg = build_trie(&[entry], "u:object_r:default_prop:s0", "string")
             .unwrap_err()
             .to_string();
@@ -337,17 +416,28 @@ mod tests {
         assert!(!entry.exact_match);
 
         // AOSP parity: with require_prefix_or_exact, a MISSING operation
-        // is an error just like a present-but-invalid one; the legacy
-        // two-token form is only accepted when the flag is false (above).
-        assert!(
+        // is still a prefix match (`match_operation != ""` in
+        // `ParsePropertyInfoLine`); only a present-but-invalid one is an
+        // error.
+        let entry =
             PropertyInfoEntry::parse_from_line("ro.build.host u:object_r:build_prop:s0", true)
-                .is_err()
-        );
+                .unwrap();
+        assert_eq!(entry.type_str, "");
+        assert!(!entry.exact_match);
         assert!(PropertyInfoEntry::parse_from_line(
             "ro.build.host u:object_r:build_prop:s0 bogus string",
             true
         )
         .is_err());
+        // Without the flag the invalid token is taken as a prefix match
+        // and the rest as the type.
+        let entry = PropertyInfoEntry::parse_from_line(
+            "ro.build.host u:object_r:build_prop:s0 bogus string",
+            false,
+        )
+        .unwrap();
+        assert_eq!(entry.type_str, "string");
+        assert!(!entry.exact_match);
 
         let entry = PropertyInfoEntry::parse_from_line(
             "ro.build.host u:object_r:build_prop:s0 exact enum string int",
@@ -361,36 +451,183 @@ mod tests {
     }
 
     #[test]
-    fn test_new_validates_type() {
-        assert!(PropertyInfoEntry::new(
-            "ro.a".into(),
-            "u:object_r:build_prop:s0".into(),
-            "string",
-            true
-        )
-        .is_ok());
-        assert!(PropertyInfoEntry::new(
-            "ro.a".into(),
-            "u:object_r:build_prop:s0".into(),
-            "",
-            false
-        )
-        .is_ok());
+    fn constructors_validate_type_and_set_match() {
+        let ctx = || String::from("u:object_r:build_prop:s0");
+        let exact = PropertyInfoEntry::exact("ro.a".into(), ctx(), "string").unwrap();
+        assert!(exact.exact_match());
+        let prefix = PropertyInfoEntry::prefix("ro.a".into(), ctx(), "").unwrap();
+        assert!(!prefix.exact_match());
+        assert_eq!(prefix.type_str(), "");
         // Whitespace-only normalizes to the same empty type as "" and must
         // behave identically.
-        assert!(PropertyInfoEntry::new(
-            "ro.a".into(),
-            "u:object_r:build_prop:s0".into(),
-            "   ",
-            false
+        let blank = PropertyInfoEntry::prefix("ro.a".into(), ctx(), "   ").unwrap();
+        assert_eq!(blank.type_str(), "");
+        let spaced = PropertyInfoEntry::exact("ro.a".into(), ctx(), " enum  a   b ").unwrap();
+        assert_eq!(spaced.type_str(), "enum a b");
+        for bad in [
+            PropertyInfoEntry::exact("ro.a".into(), ctx(), "not_a_type"),
+            PropertyInfoEntry::prefix("ro.a".into(), ctx(), "not_a_type"),
+        ] {
+            assert!(matches!(bad, Err(Error::InvalidArgument(_))), "{bad:?}");
+        }
+    }
+
+    /// `MatchKeyword` selects what `parse_from_file` does with a third
+    /// token that is neither `prefix` nor `exact`; a two-token line is a
+    /// prefix match in both modes.
+    #[test]
+    fn parse_from_file_match_keyword() {
+        let path = std::env::temp_dir().join(format!(
+            "rsprops_match_keyword_{}_property_contexts",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "ro.a u:object_r:a:s0 exact string\n\
+             ro.b. u:object_r:b:s0\n\
+             ro.c. u:object_r:c:s0 bogus string\n",
         )
-        .is_ok());
-        assert!(PropertyInfoEntry::new(
-            "ro.a".into(),
-            "u:object_r:build_prop:s0".into(),
-            "not_a_type",
-            true
+        .unwrap();
+        let unchecked = PropertyInfoEntry::parse_from_file(&path, MatchKeyword::Unchecked);
+        let checked = PropertyInfoEntry::parse_from_file(&path, MatchKeyword::Checked);
+        std::fs::remove_file(&path).unwrap();
+
+        let (entries, errors) = unchecked.unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(entries.len(), 3);
+        assert!(entries[0].exact_match());
+        assert_eq!(entries[1].name(), "ro.b.");
+        assert!(!entries[1].exact_match());
+        assert_eq!(entries[2].name(), "ro.c.");
+        assert!(!entries[2].exact_match());
+        assert_eq!(entries[2].type_str(), "string");
+
+        let (entries, errors) = checked.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name(), "ro.a");
+        assert_eq!(entries[1].name(), "ro.b.");
+        assert!(!entries[1].exact_match());
+        assert_eq!(errors.len(), 1);
+        let msg = errors[0].to_string();
+        assert!(msg.contains("line 3"), "{msg}");
+    }
+
+    /// Every third-token class against both modes, as AOSP
+    /// `ParsePropertyInfoLine` decides it:
+    ///
+    /// ```text
+    /// if (match_operation == "exact") exact_match = true;
+    /// else if (match_operation != "prefix" && match_operation != "" &&
+    ///          require_prefix_or_exact) -> error
+    /// ```
+    ///
+    /// then the type check on the tokens after the third one. `Ok` holds
+    /// `(exact_match, type_str)`.
+    #[test]
+    fn match_operation_table_follows_aosp() {
+        type Expected = std::result::Result<(bool, &'static str), ()>;
+        // (rest of the line after `<property> <context>`, unchecked, checked)
+        let table: &[(&str, Expected, Expected)] = &[
+            // No third token: a prefix match in both modes.
+            ("", Ok((false, "")), Ok((false, ""))),
+            (" \t ", Ok((false, "")), Ok((false, ""))),
+            (" prefix", Ok((false, "")), Ok((false, ""))),
+            (
+                " prefix string",
+                Ok((false, "string")),
+                Ok((false, "string")),
+            ),
+            (" exact", Ok((true, "")), Ok((true, ""))),
+            (" exact string", Ok((true, "string")), Ok((true, "string"))),
+            (
+                " exact  enum  a b",
+                Ok((true, "enum a b")),
+                Ok((true, "enum a b")),
+            ),
+            // Any other third token: a prefix match unchecked, an error
+            // checked. The comparison is byte-exact, so `Exact` is one.
+            (" bogus", Ok((false, "")), Err(())),
+            (" bogus string", Ok((false, "string")), Err(())),
+            (" Exact string", Ok((false, "string")), Err(())),
+            // A type where the match operation belongs is the match
+            // operation, not the type.
+            (" string", Ok((false, "")), Err(())),
+            // The type check does not depend on the mode.
+            (" prefix not_a_type", Err(()), Err(())),
+            (" exact enum", Err(()), Err(())),
+        ];
+        for (rest, unchecked, checked) in table {
+            let line = format!("ro.x u:object_r:x_prop:s0{rest}");
+            for (require_prefix_or_exact, want) in [(false, unchecked), (true, checked)] {
+                let got = PropertyInfoEntry::parse_from_line(&line, require_prefix_or_exact);
+                let got_summary = got
+                    .as_ref()
+                    .map(|e| (e.exact_match, e.type_str.as_str()))
+                    .map_err(|_| ());
+                assert_eq!(
+                    &got_summary, want,
+                    "line {line:?}, require_prefix_or_exact = {require_prefix_or_exact}: {got:?}"
+                );
+                if let Ok(entry) = got {
+                    assert_eq!(entry.name, "ro.x");
+                    assert_eq!(entry.context, "u:object_r:x_prop:s0");
+                }
+            }
+        }
+    }
+
+    /// A two-token line read with `MatchKeyword::Checked` reaches the
+    /// serialized trie as a prefix entry: names under it resolve to its
+    /// context, and it does not match as an exact entry would.
+    #[test]
+    fn checked_two_token_line_resolves_as_prefix() {
+        use crate::property_info_parser::PropertyInfoArea;
+        use zerocopy::IntoBytes;
+
+        const DEFAULT: &str = "u:object_r:default_prop:s0";
+        const TWO: &str = "u:object_r:two_prop:s0";
+        const TYPED: &str = "u:object_r:typed_prop:s0";
+        const EXACT: &str = "u:object_r:exact_prop:s0";
+
+        let path = std::env::temp_dir().join(format!(
+            "rsprops_two_token_trie_{}_property_contexts",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                "ro.two. {TWO}\n\
+                 ro.two.typed. {TYPED} prefix int\n\
+                 ro.exact.name {EXACT} exact string\n"
+            ),
         )
-        .is_err());
+        .unwrap();
+        let parsed = PropertyInfoEntry::parse_from_file(&path, MatchKeyword::Checked);
+        std::fs::remove_file(&path).unwrap();
+        let (entries, errors) = parsed.unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(entries.len(), 3);
+
+        let bytes = build_trie(&entries, DEFAULT, "string").unwrap();
+        // The area reads `u32`s in place; a `Vec<u8>` is not aligned for it.
+        let mut words = vec![0u32; bytes.len().div_ceil(4)];
+        words.as_mut_bytes()[..bytes.len()].copy_from_slice(&bytes);
+        let area = PropertyInfoArea::new(&words.as_bytes()[..bytes.len()]);
+        let context_of = |name: &str| {
+            let (index, _) = area.get_property_info_indexes(name);
+            let offset = area.context_offset(index as usize).unwrap();
+            area.cstr(offset).unwrap().to_str().unwrap()
+        };
+
+        assert_eq!(context_of("ro.two.a"), TWO);
+        assert_eq!(context_of("ro.two.a.b"), TWO);
+        // The longer prefix wins under it.
+        assert_eq!(context_of("ro.two.typed.a"), TYPED);
+        // `ro.two.` is a prefix with its dot: `ro.two` is outside it.
+        assert_eq!(context_of("ro.two"), DEFAULT);
+        // The exact entry matches its own name only.
+        assert_eq!(context_of("ro.exact.name"), EXACT);
+        assert_eq!(context_of("ro.exact.name.a"), DEFAULT);
+        assert_eq!(context_of("ro.other"), DEFAULT);
     }
 }

@@ -26,6 +26,12 @@ builder = []
 # writes it with mode 0444).
 strict-file-validation = []
 
+# docs.rs documents the `builder` API too, and `--cfg docsrs` turns on
+# `doc_cfg` in lib.rs, which labels each item with the feature it needs.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 rustix.workspace = true
 log.workspace = true

@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rsproperties::{
-    build_trie, AreaWriterLock, Error, PropertyConfig, PropertyIndex, PropertyInfoEntry,
-    SystemProperties,
+    build_trie, AreaWriterLock, Error, MatchKeyword, PropertyConfig, PropertyIndex,
+    PropertyInfoEntry, SystemProperties,
 };
 
 struct Dir(PathBuf);
@@ -41,7 +41,8 @@ fn writer(dir: &Path) -> SystemProperties {
     std::fs::create_dir_all(dir).unwrap();
     let contexts = dir.join("property_contexts");
     std::fs::write(&contexts, "test. u:object_r:test_prop:s0 prefix string\n").unwrap();
-    let (entries, errors) = PropertyInfoEntry::parse_from_file(&contexts, false).unwrap();
+    let (entries, errors) =
+        PropertyInfoEntry::parse_from_file(&contexts, MatchKeyword::Unchecked).unwrap();
     assert!(errors.is_empty(), "{errors:?}");
     let trie = build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap();
 
@@ -56,14 +57,10 @@ fn writer(dir: &Path) -> SystemProperties {
 /// `InvalidArgument`. `wait` gets an `old_serial` that differs from the
 /// current one, so a missing instance check would return `Ok(Some)` at
 /// once instead.
-fn assert_serial_and_wait_reject(props: &SystemProperties, foreign: &PropertyIndex) {
+fn assert_serial_and_wait_reject(props: &SystemProperties, foreign: PropertyIndex) {
     let err = props.serial(foreign).unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
-    let got = props.wait(
-        Some(foreign),
-        Some(u32::MAX),
-        Some(Duration::from_millis(1)),
-    );
+    let got = props.wait(Some(foreign), u32::MAX, Some(Duration::from_millis(1)));
     assert!(matches!(got, Err(Error::InvalidArgument(_))), "{got:?}");
 }
 
@@ -75,16 +72,16 @@ fn foreign_index_from_other_directory_is_rejected() {
     let mut b = writer(&dir_b.0);
 
     let index_a = a.find("test.x").unwrap().expect("test.x in a");
-    let err = b.update(&index_a, "2").unwrap_err();
+    let err = b.update(index_a, "2").unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
     assert_eq!(b.get("test.x").unwrap(), "1");
-    assert_serial_and_wait_reject(&b, &index_a);
+    assert_serial_and_wait_reject(&b, index_a);
 
     // The instance that returned the index still accepts it.
     let index_b = b.find("test.x").unwrap().unwrap();
-    b.update(&index_b, "3").unwrap();
+    b.update(index_b, "3").unwrap();
     assert_eq!(b.get("test.x").unwrap(), "3");
-    assert!(b.serial(&index_b).is_ok());
+    assert!(b.serial(index_b).is_ok());
 }
 
 #[test]
@@ -95,10 +92,58 @@ fn index_from_before_writer_restart_is_rejected() {
     drop(old);
 
     let mut new = writer(&dir.0);
-    let err = new.update(&old_index, "2").unwrap_err();
+    let err = new.update(old_index, "2").unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
     assert_eq!(new.get("test.x").unwrap(), "1");
-    assert_serial_and_wait_reject(&new, &old_index);
+    assert_serial_and_wait_reject(&new, old_index);
+}
+
+/// Equality follows the entry and the instance: `find` twice and `find`
+/// against `foreach` agree, an update or a later add does not change an
+/// entry's index, and the same entry seen through another instance is a
+/// different index.
+#[test]
+fn index_equality_follows_entry_and_instance() {
+    use std::collections::{HashMap, HashSet};
+
+    let dir = Dir::new("eq");
+    let mut w = writer(&dir.0);
+    w.add("test.y", "2").unwrap();
+
+    let x = w.find("test.x").unwrap().unwrap();
+    let y = w.find("test.y").unwrap().unwrap();
+    assert_eq!(x, w.find("test.x").unwrap().unwrap());
+    assert_ne!(x, y);
+
+    let mut seen = HashSet::new();
+    w.foreach(|index| {
+        assert!(seen.insert(index), "foreach gave {index:?} twice");
+    })
+    .unwrap();
+    assert_eq!(seen, HashSet::from([x, y]));
+
+    // An entry keeps its index across a value update and a later add.
+    w.update(x, "10").unwrap();
+    w.add("test.z", "3").unwrap();
+    assert_eq!(x, w.find("test.x").unwrap().unwrap());
+    assert_eq!(y, w.find("test.y").unwrap().unwrap());
+
+    // The use the `Hash` impl is for: the serial last seen per property.
+    let mut serials: HashMap<PropertyIndex, u32> = HashMap::new();
+    serials.insert(x, w.serial(x).unwrap());
+    serials.insert(y, w.serial(y).unwrap());
+    w.update(y, "20").unwrap();
+    let again = w.find("test.y").unwrap().unwrap();
+    assert_ne!(serials[&again], w.serial(again).unwrap());
+    assert_eq!(serials[&x], w.serial(x).unwrap());
+
+    // Another instance with the same layout (see `writer`): the offsets of
+    // its `test.x` are the same numbers, and the index is still unequal.
+    let other_dir = Dir::new("eq_other");
+    let other = writer(&other_dir.0);
+    let other_x = other.find("test.x").unwrap().unwrap();
+    assert_ne!(x, other_x);
+    assert!(!seen.contains(&other_x));
 }
 
 /// The only test in this binary that initializes the global reader.
@@ -107,15 +152,15 @@ fn global_reader_index_is_rejected_by_writer() {
     let dir = Dir::new("global");
     let mut w = writer(&dir.0);
     rsproperties::init(PropertyConfig::new().properties_dir(&dir.0)).unwrap();
-    let reader = rsproperties::system_properties();
+    let reader = rsproperties::system_properties().unwrap();
 
     let reader_index = reader.find("test.x").unwrap().unwrap();
-    let err = w.update(&reader_index, "2").unwrap_err();
+    let err = w.update(reader_index, "2").unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
     assert_eq!(reader.get("test.x").unwrap(), "1");
-    assert_serial_and_wait_reject(&w, &reader_index);
+    assert_serial_and_wait_reject(&w, reader_index);
 
     // And the other way round.
     let writer_index = w.find("test.x").unwrap().unwrap();
-    assert_serial_and_wait_reject(reader, &writer_index);
+    assert_serial_and_wait_reject(reader, writer_index);
 }

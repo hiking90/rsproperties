@@ -10,7 +10,7 @@
 
 mod common;
 
-use rsproperties::{self, build_trie, load_properties_from_file, PropertyInfoEntry};
+use rsproperties::{self, build_trie, load_properties_from_file, MatchKeyword, PropertyInfoEntry};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -25,8 +25,9 @@ fn test_android_property_contexts_parsing() {
     ];
 
     for file in context_files {
-        let (property_infos, errors) = PropertyInfoEntry::parse_from_file(Path::new(file), false)
-            .unwrap_or_else(|_| panic!("Failed to parse {file}"));
+        let (property_infos, errors) =
+            PropertyInfoEntry::parse_from_file(Path::new(file), MatchKeyword::Unchecked)
+                .unwrap_or_else(|_| panic!("Failed to parse {file}"));
 
         assert!(
             !property_infos.is_empty(),
@@ -64,7 +65,7 @@ fn test_android_build_prop_parsing() {
     for file in build_files {
         let copy = common::copy_fixture_0644(Path::new(file), copies.path());
         let mut properties = HashMap::new();
-        let result = load_properties_from_file(&copy, None, "u:r:init:s0", &mut properties);
+        let result = load_properties_from_file(&copy, None, &mut properties);
 
         match result {
             Ok(_) => {
@@ -93,7 +94,7 @@ fn test_property_trie_building() {
     // Parse property contexts to get property info entries
     let (property_infos, _) = PropertyInfoEntry::parse_from_file(
         Path::new("tests/android/plat_property_contexts"),
-        false,
+        MatchKeyword::Unchecked,
     )
     .expect("Failed to parse property contexts");
 

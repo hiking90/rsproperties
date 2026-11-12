@@ -195,7 +195,7 @@ mod error_handling_tests {
 
         let prop_name = "test.max.value";
         // Create a value close to PROP_VALUE_MAX
-        let long_value = "x".repeat(rsproperties::PROP_VALUE_MAX - 10);
+        let long_value = "x".repeat(rsproperties::wire::PROP_VALUE_MAX - 10);
 
         rsproperties::set(prop_name, &long_value).expect("a value within limits is accepted");
         let read: String = rsproperties::get(prop_name).expect("get after set");
@@ -208,7 +208,7 @@ mod error_handling_tests {
 
         let prop_name = "test.exceeding.max";
         // Create a value that exceeds PROP_VALUE_MAX
-        let too_long_value = "x".repeat(rsproperties::PROP_VALUE_MAX + 10);
+        let too_long_value = "x".repeat(rsproperties::wire::PROP_VALUE_MAX + 10);
 
         // A non-`ro.` value is never truncated: the client rejects it
         // before connecting (`wire::validate_value_len`).

@@ -14,7 +14,7 @@ use common::init_test;
 fn test_library_constants() {
     // Test that library constants are properly exposed and have correct values
     assert_eq!(
-        rsproperties::PROP_VALUE_MAX,
+        rsproperties::wire::PROP_VALUE_MAX,
         92,
         "PROP_VALUE_MAX should be 92 bytes"
     );
@@ -25,7 +25,7 @@ fn test_library_constants() {
     );
 
     println!("✓ Library constants are correct");
-    println!("  PROP_VALUE_MAX = {}", rsproperties::PROP_VALUE_MAX);
+    println!("  PROP_VALUE_MAX = {}", rsproperties::wire::PROP_VALUE_MAX);
     println!("  PROP_DIRNAME = {}", rsproperties::PROP_DIRNAME);
 }
 
@@ -109,7 +109,10 @@ fn test_empty_segment_names_are_not_found() {
         );
     }
     assert!(
-        matches!(rsproperties::system_properties().find("a."), Ok(None)),
+        matches!(
+            rsproperties::system_properties().unwrap().find("a."),
+            Ok(None)
+        ),
         "find(\"a.\") must be Ok(None)"
     );
 }
@@ -125,7 +128,7 @@ mod write_tests {
         init_test();
 
         // Non-`ro.` values must be shorter than PROP_VALUE_MAX.
-        let long_value = "x".repeat(rsproperties::PROP_VALUE_MAX + 10);
+        let long_value = "x".repeat(rsproperties::wire::PROP_VALUE_MAX + 10);
         let result = rsproperties::set("test.long.value", &long_value);
         assert!(
             matches!(result, Err(Error::InvalidArgument(_))),
@@ -239,7 +242,7 @@ fn test_api_completeness() {
     let _: std::path::PathBuf = rsproperties::properties_dir().to_path_buf();
 
     // Constants
-    let _: usize = rsproperties::PROP_VALUE_MAX;
+    let _: usize = rsproperties::wire::PROP_VALUE_MAX;
     let _: &str = rsproperties::PROP_DIRNAME;
 
     println!("✓ All expected API functions are accessible");

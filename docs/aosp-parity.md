@@ -12,8 +12,9 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
   - libcutils: `system/core/libcutils/properties.cpp`
   - init: `system/core/init/property_service.cpp`
 - 지원 범위: client는 Linux와 Android, `rsproperties-service`는 Linux 전용,
-  Android 지원 API level은 28–36이다(API 37 동작은 AOSP `android-17.0.0_r1`
-  source 기준으로 구현했고 실측하지 않았다). Android에서 service를 쓰는 경로와 macOS는
+  Android 지원 API level은 28–37이다(API 37 동작은 AOSP `android-17.0.0_r1`
+  source 기준으로 구현했고, API 37 emulator에서 override 조회와 test suite를
+  실행했다. C3의 검증 항목 참고). Android에서 service를 쓰는 경로와 macOS는
   비교 대상에서 제외한다.
 - 분류
   - (a) Linux emulation이라서 생기는 차이
@@ -37,6 +38,7 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
 | S4 | service | 실패 응답 코드가 항상 `PROP_ERROR` | (c) | 이 branch에서 수정 |
 | S5 | service | `ro.property_service.version` 미설정 | (c) | 이 branch에서 수정 |
 | S6 | service | 변경 알림 hook 없음 | (a) | 검토 대상 아님 |
+| S7 | service | properties dir writer lock(`AreaWriterLock`) | (a), 해제 방식은 (b) | lock은 0.6.0부터 있음, 해제 방식은 이 branch에서 수정 |
 
 ## Client
 
@@ -101,7 +103,7 @@ backup slot에서 읽은 이전 값이다). libbase `WaitForProperty`와 `Cached
 lookup을 다시 한다. callback은 value만 받는다. `PropertyIndex`로 값을 읽는
 경로가 없고, value와 serial을 같은 seqlock 구간에서 얻을 수도 없다.
 
-**변경.** `SystemProperties::read_index_with(&PropertyIndex, |name, value, serial| ...)`를
+**변경.** `SystemProperties::read_index_with(PropertyIndex, |name, value, serial| ...)`를
 추가한다.
 - long 여부는 entry 자신의 이름으로 판정한다. bionic `ReadCallback`이
   `pi->name`으로 판정하는 것과 같다. 기존 `read_with`는 lookup에 쓴 이름으로
@@ -114,29 +116,86 @@ lookup을 다시 한다. callback은 value만 받는다. `PropertyIndex`로 값�
 
 ### C3. appcompat override 조회 (API 35+)
 
-**AOSP.** `SystemProperties::Init`은 `BIONIC_APPCOMPAT_OVERRIDE` 환경변수가
-있으면(값은 보지 않는다) `use_appcompat_override_`를 켠다
-(`system_properties.cpp:80-82`). 이 flag가 켜진 프로세스에서 `Find(name)`은
-`ro.appcompat_override.<name>`을 먼저 찾는다. 그 이름의 area가 없거나 entry가
-없으면 원래 이름을 찾는다(`:168-197`). override entry는 일반 context area에
-있다. 쓰기 경로인 `AreaInit`은 이 flag를 켜지 않는다. 환경변수는 zygote가
-`__system_properties_zygote_reload()`(`EnableOverrides`, `:145-152`)를
-호출할 때 `putenv`로 설정하고, 자식 프로세스가 그대로 물려받는다. zygote가
-어떤 app process에서 이 함수를 호출하는지는 frameworks/base가 checkout에
-없어서 확인 필요다.
+**AOSP (API 37, `android-17.0.0_r1`).** `SystemProperties::Init`은
+`BIONIC_APPCOMPAT_OVERRIDE` 환경변수가 있으면(값은 보지 않는다)
+`use_appcompat_override_`를 켠다(`system_properties.cpp:80-82`). 이 flag가
+켜진 프로세스에서 `Find(name)`은 `ro.appcompat_override.<name>`을 먼저 찾는다.
+그 이름의 area가 없거나 entry가 없으면 원래 이름을 찾는다(`:168-197`).
+override entry는 일반 context area에 있다. 쓰기 경로인 `AreaInit`은 이 flag를
+켜지 않는다. 환경변수는 zygote가 `__system_properties_zygote_reload()`
+(`EnableOverrides`, `:145-152`)를 호출할 때 `putenv`로 설정하고, 자식
+프로세스가 그대로 물려받는다.
 
-**version별 차이.** 환경변수 경로는 bionic `3bcd5082d`(2026-03-05, "Update
-appcompat override for getprop checks")에서 추가되었다. android-1x tag 중에서는
-`android-17.0.0_r1`만 이 commit을 포함한다. 이 commit 이전(API 35–36)의
-`EnableOverrides`는 in-memory flag만 켠다. 그래서 zygote가 fork한 프로세스만
-flag를 물려받고, exec한 프로세스나 별도 reader는 flag가 켜졌는지 알 수
-없다. API 36 emulator(`BE2A.250530.026.D1`)에서 다음을 실측했다.
-- libc.so에 `ro.appcompat_override.` 문자열은 있고 `BIONIC_APPCOMPAT_OVERRIDE`
-  문자열은 없다.
-- root로 `debug.rsp.ac=orig`, `ro.appcompat_override.debug.rsp.ac=ovr`를
-  설정하고 `BIONIC_APPCOMPAT_OVERRIDE=1 getprop debug.rsp.ac`를 실행하면
-  toybox(bionic)는 `orig`를 출력한다.
-- Android 16 QPR(API 36) branch에 이 commit이 backport되었는지는 확인 필요다.
+**AOSP (API 35–36, `android-15.0.0_r1` ~ `android-16.0.0_r4`).** `Find`에
+prefix 조회가 없고(`android-16.0.0_r4` `system_properties.cpp:162-174`),
+환경변수도 읽지 않는다. override는 별도 directory와 bind mount로 적용한다.
+- init은 `/dev/__properties__/appcompat_override` directory를 만든다
+  (`property_service.cpp:1296-1302`, `WRITE_APPCOMPAT_OVERRIDE_SYSTEM_PROPERTIES`
+  build 조건).
+- writer의 `AreaInit`은 이 directory가 있으면 두 번째 `ContextsSerialized`로
+  연다(`:123-135`). `Add`는 모든 property를 이 directory의 area에도 같은
+  이름으로 쓴다. `ro.appcompat_override.<name>`은 prefix를 뗀 `<name>`으로
+  쓰고, `<name>`이 이미 있으면 그 entry의 value만 덮어쓴다(`:383-409`). 이때
+  entry의 serial(value 길이 포함)은 바꾸지 않는다.
+- zygote는 대상 app process의 mount namespace에서 이 directory를
+  `/dev/__properties__` 위에 bind mount한 뒤
+  `__system_properties_zygote_reload()`를 호출한다(frameworks/base
+  `android-16.0.0_r1` `com_android_internal_os_Zygote.cpp:1820-1834`). 이
+  version의 함수는 `Reload(false)`로 context를 다시 연다
+  (`system_property_api.cpp:134-137`).
+
+**mechanism이 바뀐 commit.** bionic `d355473e2`(2026-01-29, "Fix appcompat
+override mechanism in system_properties")가 `Find`의 prefix 조회와
+`EnableOverrides`를 추가했고, `3bcd5082d`(2026-03-05, "Update appcompat
+override for getprop checks")가 환경변수를 추가했다. 두 commit을 포함하는
+android-1x tag는 `android-17.0.0_r1`뿐이다. android-16 tag는 r1~r4가 전부이고,
+`android-16.0.0_r4`와 branch `android16-qpr2-release`, `android16-release`,
+`android16-security-release`의 `system_properties.cpp`에는
+`BIONIC_APPCOMPAT_OVERRIDE`가 없다. `android-17.0.0_r1`의 zygote는 bind
+mount를 하지 않고 reload 함수만 호출한다(`:1842-1847`). init과 writer는
+17에서도 `appcompat_override` directory를 만들고 쓴다
+(`property_service.cpp:1328-1334`, `system_properties.cpp:128-139`).
+
+**zygote의 호출 조건.** `SpecializeCommon`은 `mount_sysprop_overrides`가 true일
+때만 위 함수를 호출한다(16 `:1964-1967`, 17 `:1978-1981`). 이 값은
+`ProcessList.java`가 정한다. DeviceConfig `app_compat` namespace의
+`appcompat_sysprop_override_pkgs` 목록에 process의 package가 있으면 true다
+(16 `:2519-2529`). 17은 여기에 userdebug/eng build 조건을 더한다
+(`:2603-2614`).
+
+**실측.**
+- API 36 emulator(`BE2A.250530.026.D1`):
+  - libc.so에 `ro.appcompat_override.` 문자열은 있고
+    `BIONIC_APPCOMPAT_OVERRIDE` 문자열은 없다.
+  - root로 `debug.rsp.ac=orig`, `ro.appcompat_override.debug.rsp.ac=ovr`를
+    설정하고 `BIONIC_APPCOMPAT_OVERRIDE=1 getprop debug.rsp.ac`를 실행하면
+    toybox(bionic)는 `orig`를 출력한다.
+  - `/dev/__properties__/appcompat_override`가 있고 파일은 355개다
+    (`/dev/__properties__`는 이 directory를 포함해 356개).
+  - 새 mount namespace에서 이 directory를 `/dev/__properties__` 위에 bind
+    mount하면 toybox와 이 crate의 `getprop` example이 모두 override 값을
+    읽는다(`debug.rsp.ac` → `ovr`, 원래 값보다 긴 `ro.*` override와 짧은
+    `ro.*` override 포함). `ro.appcompat_override.debug.rsp.ac`라는 이름은 이
+    namespace에서 둘 다 찾지 못한다.
+  - mutable property의 override가 원래 값보다 길면 결과가 다르다.
+    `debug.rsp.grow=ab`, override `abcdefgh`에서 toybox는 `abc`, 이 crate는
+    `abcdefgh`를 출력한다. bionic `ReadMutablePropertyValue`는 serial의 길이로
+    `len + 1` byte만 복사하는데(`:184-198`), 위 `Add`가 serial을 바꾸지 않아서
+    길이가 원래 값 기준이다. 복사한 buffer에는 NUL이 없으므로 bionic 출력은
+    정해진 값이 아니다. 이 crate는 NUL까지 읽는다. `ro.*`는 bionic
+    `ReadCallback`도 NUL까지 읽으므로 차이가 없다.
+  - zygote 경로는 이 image에서 동작을 확인하지 못했다.
+    `device_config put app_compat appcompat_sysprop_override_pkgs
+    com.android.settings` 뒤에 Settings를 시작하면 fork된 process가
+    SIGSEGV(fault addr 0x60)로 종료한다(test property 없이 재부팅한 뒤에도
+    같다). 목록에 없을 때는 정상 시작하고 그 process의 mountinfo에 bind
+    mount가 없다. crash 원인은 확인 필요다.
+- API 37 emulator(`CE2A.260420.019`, userdebug, `ro.build.version.sdk=37`):
+  - libc.so에 `BIONIC_APPCOMPAT_OVERRIDE` 문자열이 있다.
+  - 같은 두 property를 설정하면 toybox와 이 crate 모두 환경변수가 없을 때
+    `orig`, 있을 때(빈 값 포함) `ovr`를 출력한다. override entry가 없는
+    이름(`ro.build.version.release`)은 둘 다 원래 값을 출력한다.
+  - `/dev/__properties__/appcompat_override`가 있다(파일 384개).
 
 **rsproperties.** bionic의 override 조회 분기에 해당하는 코드가 없다.
 override가 켜진 프로세스에서는 같은 property에 대해 libc
@@ -148,9 +207,13 @@ override가 켜진 프로세스에서는 같은 property에 대해 libc
 - Android에서는 `ro.build.version.sdk`가 37 이상일 때만 환경변수를 따른다.
   API 35–36에서 환경변수를 따르면, 같은 프로세스의 libc가 읽지 않는 override
   값을 이 crate만 읽게 된다(위 실측).
-- 한계: API 35–36에서 zygote가 fork한 app process(JNI library로 이 crate를
-  쓰는 경우)는 libc가 override를 읽지만, 이 crate는 그 사실을 관찰할 방법이
-  없어서 원래 이름을 읽는다.
+- API 35–36의 bind mount 방식에는 별도 코드가 필요 없다. 이 crate도
+  `/dev/__properties__` 경로를 열므로, bind mount된 namespace에서 만든
+  reader는 libc와 같은 파일을 읽는다(위 실측). 조건은 reader를 bind mount
+  뒤에 만드는 것이다. bind mount 전에 mmap한 area는 이전 파일을 계속
+  가리키고, 이 crate에는 bionic `Reload`에 해당하는 API가 없다. zygote가
+  specialize하기 전에 이 crate의 reader를 만드는 구성(zygote preload)은
+  지원 대상으로 보지 않는다.
 - override 조회는 어떤 오류든 원래 이름 조회로 넘어간다. bionic도 area를
   열 수 없거나(`pa == nullptr`) entry가 없으면 넘어간다. 오류를 그대로
   반환하면 override context를 열 권한이 없는 프로세스에서 모든 읽기가
@@ -161,9 +224,23 @@ override가 켜진 프로세스에서는 같은 property에 대해 libc
   Linux에서는 사용자가 직접 설정하지 않는 한 이 변수가 없다.
 - 검증: API 36 emulator에서 수정 전 binary는 환경변수가 있으면 `ovr`를
   읽어 toybox(`orig`)와 달랐다. 이 결과에 따라 API 37 조건을 추가했다.
-  API 37 emulator(`rsbinder-a17`, android-37.0 google_apis)는 adb가
-  `offline`에서 벗어나지 못해 실측하지 못했다. API 37에서 bionic이
-  환경변수를 따르는지, `ro.build.version.sdk`가 37인지는 확인 필요다.
+  API 37 emulator(`rsbinder-a17`, android-37.0 google_apis)에서는 수정 후
+  binary가 toybox와 같은 값을 읽는다(위 실측). 이 AVD는 `-memory 4096`으로
+  띄워야 한다. AVD 설정값인 1536M에서는 guest가 kernel panic으로 재부팅을
+  반복해서 adb가 `offline`과 `device`를 오간다.
+- API 37 test suite: 같은 image에서 `envsetup.sh`의 `ndk_prepare`,
+  `ndk_build`, `ndk_sync`, `ndk_test`, `ndk_test_shell`을 차례로 실행했다.
+  test binary 18개의 test 74개가 root(`u:r:su:s0`)와 shell user
+  (`u:r:shell:s0`) 실행에서 모두 통과했다. `android-test.yml`의 절차대로 만든
+  AVD(`avdmanager create avd -k "system-images;android-37.0;google_apis;x86_64"`,
+  emulator option `-wipe-data -memory 4096 -partition-size 2048`)에서도 결과가
+  같다. 로컬 조건은 system image revision 6, emulator 36.5.11, NDK r28b이고,
+  workflow는 `sdkmanager`가 받는 최신 revision과 NDK 27.2를 쓴다. GitHub
+  runner에서 API 37 job을 실행한 결과는 확인 필요다(workflow는
+  `workflow_dispatch`로만 시작한다).
+  - `sdkmanager`에는 `android-37` package가 없고 `android-37.0`이 있다.
+    `ro.build.version.sdk`는 37이다. workflow의 matrix는 `api-level: 37`에
+    `platform: android-37.0`을 따로 지정한다.
 
 ### C4. `WaitForProperty` / `WaitForPropertyCreation`
 
@@ -188,9 +265,17 @@ override가 켜진 프로세스에서는 같은 property에 대해 libc
   lookup 실패를 `Err`로 반환하고, timeout만 `Ok(None)` / `Ok(false)`로
   반환한다(b). `wait`도 같은 형태로 바꾼다. timeout은 `Option<Duration>`이고
   결과는 `Result<Option<u32>>`다. bionic `__system_property_wait`의 `bool`도
-  실패를 timeout과 구분하지 않는다. bionic이 deprecated로 둔
-  `__system_property_wait_any`(`system_properties.h:124`)에 대응하던
-  `wait_any`는 삭제하고, `wait(None, None, None)`으로 대신한다.
+  실패를 timeout과 구분하지 않는다.
+- `wait`의 `old_serial`은 bionic `__system_property_wait`와 같이 필수
+  인자(`u32`)다. 0.6.0은 `Option<u32>`였고 `None`이면 `wait` 안에서 현재
+  serial을 읽었으므로, 호출 전에 일어난 변경은 반환하지 않았다. bionic에는
+  이 형태가 없다.
+- bionic이 deprecated로 둔 `__system_property_wait_any(old_serial)`
+  (`system_properties.h:125`)은 `Wait(nullptr, old_serial, &new_serial,
+  nullptr)`다. 대응하던 `wait_any()`는 삭제했고, `wait(None, old_serial,
+  None)`이 같은 호출이다. 이때 `old_serial`은 `area_serial()`
+  (`__system_property_area_serial`, `system_properties.h:150`)에서 얻는다.
+  0.6.0의 `wait_any()`는 인자가 없어 bionic 함수와 signature가 달랐다.
 - 값 비교는 byte 단위로 한다. 값이 UTF-8이 아니면 `expected`와 같지 않은
   것으로 보고 계속 기다린다.
 
@@ -236,7 +321,8 @@ override가 켜진 프로세스에서는 같은 property에 대해 libc
 시도한다. read 경로는 다시 시도하지 않는다. Android에서는 libc가 process
 시작 시 `Init`을 호출하고, 그 시점에 property area가 이미 있다.
 
-**rsproperties.** global reader(`try_system_properties`)는 첫 시도의 결과를
+**rsproperties.** global reader(0.6.0의 `try_system_properties`, 현재
+`system_properties`)는 첫 시도의 결과를
 `OnceLock<Result<..>>`에 저장했다. 실패도 저장되므로, service보다 먼저
 시작한 client는 첫 read가 실패하면 process가 끝날 때까지 모든 read가
 실패했다. 원인은 `OnceLock::get_or_try_init`(Rust issue 109737)이 unstable이라
@@ -325,19 +411,81 @@ init과 다른 점은 다음과 같다.
   내용 전체를 파일에 쓴다. 쓸 때마다 파일을 다시 읽지 않는다.
   - init이 다시 읽는 이유는 소스 주석에 적힌 대로 PID 1의 상주 메모리를
     줄이기 위해서다("we rather not keep any data in memory"). 다시 읽기는
-    동기화 수단이 아니다. init에서 이 파일 쓰기는 두 socket thread에서 lock
-    없이 실행될 수 있다. `StartPropertyService`는 `property_service_for_system`과
-    `property_service` socket마다 `StartThread`로 thread를 하나씩 띄우고
-    (`property_service.cpp:1534-1564`), 두 thread 모두 `handle_property_set_fd`
-    → `PropertySet`을 실행한다. `ro.property_service.async_persist_writes`가
-    false(기본값, `:1566-1571`)이면 `PersistWriteThread`가 없으므로 각 thread가
-    `WritePersistentProperty`를 직접 호출하고(`:422`), 이 호출 경로에는 mutex가
-    없다. 이 값이 true이면 `PersistWriteThread` 하나가 queue의 쓰기를 순서대로
-    실행한다(`:1501-1520`). `PropertySet`의 `sys.powerctl` 주석은 두 번째
-    thread로 오는 이름이 `sys.powerctl`뿐이라는 관례를 전제하고, bionic
-    `__system_property_set`도 `sys.powerctl`만 `property_service_for_system`으로
-    보낸다. 그 밖의 client가 이 socket으로 `persist.*`를 보내 두 쓰기가 실제로
-    겹치는 경우가 있는지는 확인 필요다.
+    동기화 수단이 아니다. `persistent_properties.cpp`에는 mutex가 없다. init에서
+    이 파일 쓰기가 thread 하나에서만 실행되는 것은 init의 검사가 아니라 client가
+    고르는 socket에 따른 결과다.
+    - thread 구성. `StartPropertyService`는 `property_service_for_system`(0660,
+      root:system)과 `property_service`(0666) socket마다 `StartThread`로 thread를
+      하나씩 띄우고(`property_service.cpp:1534-1564`), 두 thread 모두
+      `handle_property_set_fd` → `PropertySet`을 실행한다. init은 socket에 따라
+      이름을 제한하지 않는다. `ro.property_service.async_persist_writes`가
+      false(기본값, `:1566-1571`)이면 `PersistWriteThread`가 없으므로 각 thread가
+      `WritePersistentProperty`를 직접 호출한다(`:422`). 이 값이 true이면
+      `PersistWriteThread` 하나가 queue의 쓰기를 순서대로 실행한다
+      (`:1501-1520`).
+    - bionic을 거치는 client만 있으면 두 쓰기는 겹치지 않는다. bionic
+      `__system_property_set`은 이름이 `sys.powerctl`이고 socket에 쓰기 권한이
+      있을 때만 `property_service_for_system`으로 보낸다
+      (`system_property_set.cpp:64-73`). `PropertySet`은 이름이 `sys.powerctl`이면
+      area 변경과 파일 쓰기를 모두 건너뛴다(`:378-430`). 두 번째 socket을 추가한
+      commit `689adfad3`(2023-07-18)의 message가 이 제한을 적고 있다: "since
+      writes to properties are not thread-safe, limit use of this second socket
+      to just sys.powerctl messages". 이름 제한 없이 socket을 추가한 `90879edee`는
+      race condition을 이유로 `be392fc69`에서 revert되었다. API 36 emulator
+      image(`sdk_phone64_x86_64`)에서 이 socket 이름을 포함한 파일은 bionic
+      `libc.so`, `init`, 정적 link된 `snapuserd`, `plat_file_contexts`뿐이다.
+    - 겹치는 조건 1: root 또는 system group process가 bionic을 거치지 않고
+      `property_service_for_system`에 V2 `persist.*` set을 보내는 경우. SELinux
+      label은 두 socket이 같으므로(`property_socket`,
+      `private/file_contexts:182`) 접근을 가르는 것은 DAC뿐이다. API 36
+      emulator에서 root shell로 실측했다. `persist.rsprop.a`를
+      `property_service`로, `persist.rsprop.b`를 `property_service_for_system`으로
+      동시에 set하는 round를 300회 실행하면, 응답이 `PROP_SUCCESS`이고 area 값도
+      바뀌었는데 파일에 record가 없는 set이 53건(재실행 63건) 나온다. init
+      log에는 같은 수의 "Unable to rename persistent property file: No such file
+      or directory"가 남는다. 두 thread가 같은 `.tmp` 경로에 쓰고(`:171`), 읽는
+      쪽은 `.tmp`가 있으면 `unlink`하기 때문이다(`:127-134`). 두 set을 모두
+      `property_service`로 보낸 대조 실행 300회에서는 빠진 record가 없다.
+      이런 client가 실제로 있는지는 GitHub code search
+      (`property_service_for_system`, 상위 100건)로 확인했다. 이 socket에
+      쓰는 code는 bionic과 그 fork(`topjohnwu/system_properties`, 같은
+      `sys.powerctl` 전용 routing)뿐이고, 나머지는 init·sepolicy 사본과 server
+      재구현이다. 공개 source와 emulator image 범위에서는 이런 client가 없다.
+      비공개 vendor binary는 조사 범위 밖이다. 있더라도 이 service의 동작은
+      달라지지 않는다.
+    - 겹치는 조건 2: `load_persist_props`가 두 번 실행되는 경우.
+      `do_load_persist_props`에는 횟수 guard가 없다(`builtins.cpp:1072-1077`).
+      `kLoadPersistentProperties`는 `property_service_for_system` thread가
+      처리하고(`:1562`의 `listen_init`, `:1447`), `LoadPersistentProperties`는
+      파일을 읽을 때 `.tmp`를 `unlink`하며 staged record가 있으면 파일을 다시
+      쓴다(`persistent_properties.cpp:315`). 첫 load 동안에는
+      `persistent_properties_loaded`가 false라서 다른 thread의 set이 파일을 쓰지
+      않는다. AOSP `rootdir/init.rc`와 API 36·37 emulator image의 rc 파일에서
+      이 command를 호출하는 곳은 `init.rc` 한 곳이다. GitHub code search
+      (`load_persist_props`, `.rc`, 상위 100건)에서 두 번째 호출이 있는 rc는
+      세 부류다. Android 13 이하 `init.rc` 사본의 FDE용
+      `on property:vold.decrypt=trigger_load_persist_props`(그 version의
+      `do_load_persist_props`에는 횟수 guard가 있었다), recovery 전용
+      `init.rc`(TWRP 계열), 비공식 Magisk rc 사본의 `on post-fs-data`다.
+      Magisk 공식 tag(v20.4, v21.4, v23.0, v25.2, v26.4, v27.0)와 default
+      branch의 `magiskrc.inc`에는 이 호출이 없다.
+      Android 14 이후 tree에서 두 번째 호출을 추가한 rc는 찾지 못했다.
+      공개 source와 emulator image 범위에서는 두 번째 호출이 없다. 비공개
+      vendor tree는 조사 범위 밖이다. 있더라도 이 service의 동작은 달라지지
+      않는다.
+    - 조건 2의 첫 load 구간에서는 파일 쓰기와 별개로 area 변경이 겹칠 수
+      있다. `property_service_for_system` thread가 load한 record를
+      `InitPropertySet`으로 적용하는 동안(`:1447-1463`) `property_service`
+      thread는 client set을 처리하고, `PropertySet`의 area 변경 구간에는
+      lock이 없다. bionic `SystemProperties::Add`와 `prop_area::allocate_obj`는
+      writer가 하나라는 전제로 작성되어 있다(`system_properties.cpp:434`의
+      주석 "There is only a single mutator", `prop_area.cpp:152-157`의
+      `bytes_used_`는 atomic이 아니다). `689adfad3` 이전에는 thread 하나가
+      init socket과 client socket을 모두 처리했다. source로만 확인했고
+      실측하지 않았다. 이 service는 startup record를 `on_start`에서 적용한
+      뒤에 mailbox의 set을 처리하므로 이 구간이 없다.
+    - 이 service에서는 두 socket의 set이 모두 `PropertiesService` actor 하나를
+      거치므로(아래 "쓰기 순서") 위 두 조건이 생기지 않는다.
   - 메모리 방식에서는 쓰기가 실패한 변경이 메모리에 남아 다음 쓰기에 함께
     기록된다. init 방식은 다음 쓰기 때 파일을 다시 읽으므로, 실패한 변경이
     파일에서 빠진다.
@@ -351,7 +499,11 @@ init과 다른 점은 다음과 같다.
   `<file>.lock`(0600, `O_NOFOLLOW`)에 `flock(LOCK_EX|LOCK_NB)`을 잡고 store가
   살아 있는 동안 유지한다. store를 drop할 때 `flock(LOCK_UN)`으로 푼다. fd를
   닫는 것만으로는 같은 process가 만드는 중인 child가 `exec` 전까지 가진 fd
-  사본 때문에 lock이 남을 수 있다. 두 번째 instance는 시작에 실패한다
+  사본 때문에 lock이 남을 수 있다. `fork`한 child에서 store가 drop되면
+  (`load`를 호출한 pid와 현재 pid가 다르면) `LOCK_UN`을 호출하지 않는다. child의
+  fd는 parent의 fd와 같은 open file description을 가리키므로, child가 `LOCK_UN`을
+  호출하면 parent가 쓰는 중인 파일의 lock이 풀린다. S7의 `AreaWriterLock`과 같은
+  규칙이다. 두 번째 instance는 시작에 실패한다
   (`ErrorKind::WouldBlock`). init에는 lock이 없다. device에서는 init이 유일한
   writer이기 때문이다.
 - (b) load할 때 같은 이름의 record를 첫 위치로 합치고 마지막 값을 남긴다.
@@ -379,11 +531,32 @@ init과 다른 점은 다음과 같다.
   area에 남는 값은 init과 같다. 이런 record를 area에도 적용하지 않는 방법도 있으나,
   그러면 첫 재시작 후 area 결과가 init과 달라진다.
 - 손상된 파일은 owner 결정에 따라 init처럼 삭제한다.
-- V1(`PROP_MSG_SETPROP`) set도 파일에 기록한다. init의 기록 조건은
+- V1(`PROP_MSG_SETPROP`) set은 init과 같이 area에만 반영하고 파일에는 기록하지
+  않는다. init의 기록 조건은
   `socket && persistent_properties_loaded && need_persist`(`:417`)이고, V1은
-  `HandlePropertySetNoSocket`(socket 없음)을 거치므로 기록되지 않는다. 이
-  service에서는 V1과 V2가 같은 `client_set`을 거친다.
-- `run`이 반환되기 전에 도착한 `persist.*` set은 load한 값을 덮어쓰고 파일에도
+  `HandlePropertySetNoSocket`(socket 없음)을 거치므로 기록되지 않는다. API 36
+  emulator에서 V1 frame으로 `persist.*`를 set하면 area 값은 바뀌고 파일에는
+  record가 생기지 않는다. 이 service에서는 socket service가 frame의 command를
+  `SetProtocol`로 넘기고, `client_set`은 `SetProtocol::V1`이면 `apply_set` 뒤에
+  바로 반환한다. `PersistentStore`의 record도 고치지 않는다. init의 다음 쓰기는
+  파일을 다시 읽은 내용에서 시작하므로 V1 값이 들어가지 않는데, 메모리 방식에서
+  같은 결과를 내려면 record에 V1 값이 없어야 한다. V1로 set한 값을 그 뒤에 V2로
+  다시 set하면 파일에 기록된다. `update`가 area가 아니라 record의 값과 비교해서
+  변경 여부를 정하기 때문이다(init도 이 경우 파일에 쓴다).
+  - init의 조건에 `socket &&`가 들어간 것은 `0af9ab330`(2022-10-07, "init:
+    Allow persistent properties to be written asynchronously")부터다. V1
+    호출부는 그 전에도 socket 없이 호출했으므로, 그 이전 init은 V1
+    `persist.*`도 파일에 기록했다. commit message에는 V1에 대한 언급이 없다.
+    이 service는 현재 init의 동작을 따른다.
+- (b) V1 요청을 받을 때마다 `warn` level로 log를 남긴다. init은 수락한 V1 set을
+  log에 남기지 않는다. socket service가 요청마다 이름, value 길이, peer pid를
+  기록한다. persistent properties file이 설정된 상태에서 `persist.`/`next_boot.`
+  이름이 V1로 set되면, properties service가 그 값이 area에만 있고 파일에
+  기록되지 않았다는 log를 파일 경로와 함께 한 번 더 남긴다. 이 service가
+  `ro.property_service.version=2`를 set하므로(S5) bionic 규칙을 따르는 client는
+  V1을 보내지 않는다. V1을 보내는 client는 응답을 받지 않으므로, set이
+  거부되었는지와 값이 파일에 기록되지 않았는지를 알 방법이 service의 log뿐이다.
+- `run`이 반환되기 전에 도착한 V2 `persist.*` set은 load한 값을 덮어쓰고 파일에도
   기록된다. mailbox에서 기다린 set은 `on_start`가 persistent record까지 적용한
   뒤(`apply_startup_properties`) 처리되기 때문이다. init은 load 전의 set을
   파일에 쓰지 않는다(`persistent_properties_loaded`, `property_service.cpp:414-417`).
@@ -543,13 +716,54 @@ init은 property가 바뀌면 `PropertyChanged`로 `on property:` trigger를
 init.rc trigger는 emulation 범위 밖이다. 따라서 parity 결함이 아니라 기능
 확장 후보로 분류한다.
 
+### S7. properties dir writer lock — (a), 해제 방식은 (b)
+
+**AOSP.** writer는 init 하나다. init은 `/dev/__properties__`를 만들고
+`property_info`를 쓴 뒤 `__system_property_area_init`을 호출한다
+(`property_service.cpp:1410-1412`). bionic은 area 파일을
+`O_CREAT | O_EXCL`로 연다(`prop_area.cpp:60`). `/dev`는 부팅마다 새로 만드는
+tmpfs이므로 이전 실행의 파일이 남지 않고, 같은 directory에서 area를 두 번
+만들면 `EEXIST`로 실패한다. lock 파일은 없다.
+
+**rsproperties.** Linux에서는 properties dir이 실행 사이에 남고, 같은
+directory를 인자로 받은 process가 둘 이상일 수 있다. writer는 area 파일을
+temp 파일에 쓴 뒤 rename으로 교체하므로 `O_EXCL`로는 두 번째 writer를
+거부할 수 없다. 그래서 `<dir>/.writer_lock`에 `flock(LOCK_EX|LOCK_NB)`을
+잡는다(`AreaWriterLock::acquire`). `property_info` 게시
+(`publish_property_info`)와 area 생성(`new_area_locked`)은 이 lock을 쥔 채로
+실행한다. 두 번째 writer는 `property_info`와 area 파일을 바꾸기 전에
+`Error::Lock`으로 실패한다. 여기까지가 (a)다.
+
+**해제 방식 — (b).**
+- lock을 쥔 값(`AreaWriterLock` 또는 그것을 넘겨받은 `SystemProperties`)이
+  drop될 때 `flock(LOCK_UN)`을 호출한다. 0.6.0은 fd를 닫기만 했다. `flock`은
+  같은 open file description을 가리키는 fd가 모두 닫혀야 풀리는데,
+  `std::process::Command`가 만든 child는 `exec` 전까지 fd 사본을 가진다.
+  그래서 drop 직후의 `acquire`가 실패할 수 있었다. thread 4개가 `/bin/true`를
+  반복 실행하는 동안 drop 후 `acquire`를 20000회 반복하면, 수정 전에는
+  1696회와 1649회 실패했고 수정 후에는 실패하지 않았다.
+- `acquire`를 호출한 pid와 drop 시점의 pid가 다르면 `LOCK_UN`을 호출하지
+  않는다. `fork`만 하고 `exec`하지 않은 child가 값을 drop해도 parent의 lock은
+  유지된다. child의 fd 사본은 child가 종료하거나 fd를 닫을 때 없어진다.
+- `LOCK_UN`이 실패하면 `warn!`을 남긴다. 이 경우 lock은 fd 사본이 모두 닫힐 때
+  풀린다.
+
 ## 누락으로 보지 않는 것
 
 - per-property SELinux / SO_PEERCRED 인가: (a)이며 `socket_service.rs`
   `SOCKET_FILE_MODE` doc의 Access model 문단에 문서화된 의도적 단순화다.
 - `ContextsSplit` / `ContextsPreSplit` layout: `property_info`가 없는 이전
-  Android용 layout이다. 지원 범위(API 28–36) 밖이다.
+  Android용 layout이다. 지원 범위(API 28–37) 밖이다.
 - deprecated API(`__system_property_find_nth`, `__system_property_read`,
   `__system_property_set_filename`).
 - `__system_properties_zygote_reload` 자체: zygote 전용이다. 그 결과로 생기는
   override 조회는 C3에서 다룬다.
+- property 파일의 root 소유 검사: bionic `prop_area.cpp:117`과 같은 조건
+  (`st_uid != 0 || st_gid != 0`이면 거부)이며 divergence가 아니다. 이 crate는
+  release build이거나 `strict-file-validation` feature가 켜져 있을 때 검사를
+  실행한다(`file_validation.rs`). 그 결과 Linux에서 release build service는
+  uid 0, gid 0으로만 시작한다. 비root로 실행하면 `publish_property_info`가
+  임시 파일을 다시 읽는 단계에서 `Error::FileOwnership`이 되어
+  `StartupStage::PropertiesService`로 실패한다(release build
+  `example_service`를 uid 973으로 실행해 확인). 다른 소유자를 허용하는 설정은
+  두지 않기로 했다. 검사가 실행되는 두 구성의 test는 CI에서 root로 실행한다.

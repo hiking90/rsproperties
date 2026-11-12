@@ -95,26 +95,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(path) = args.persistent_properties_file {
         options = options.persistent_properties_file(path);
     }
-    let (socket_service, properties_service) = rsproperties_service::run(config, options).await?;
+    let mut service = rsproperties_service::run(config, options).await?;
 
     println!("✅ Services started successfully!");
     println!("🔄 Services are running. Press Ctrl+C to stop.");
 
-    // Handle graceful shutdown
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             println!("\n🛑 Shutdown signal received...");
         }
-        result1 = socket_service.join_handle => {
-            if let Err(e) = result1 {
-                eprintln!("❌ Socket service error: {e}");
-            }
-        }
-        result2 = properties_service.join_handle => {
-            if let Err(e) = result2 {
-                eprintln!("❌ Properties service error: {e}");
-            }
-        }
+        // The service ended by itself; `shutdown` below returns why.
+        _ = service.join() => {}
+    }
+
+    // Unlinks the sockets and releases the writer lock before returning.
+    if let Err(e) = service.shutdown().await {
+        eprintln!("❌ {e}");
     }
 
     println!("👋 Services stopped.");

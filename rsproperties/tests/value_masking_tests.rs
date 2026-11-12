@@ -19,7 +19,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 
-use rsproperties::{build_trie, AreaWriterLock, PropertyInfoEntry, SystemProperties};
+use rsproperties::{build_trie, AreaWriterLock, MatchKeyword, PropertyInfoEntry, SystemProperties};
 
 struct CaptureLogger {
     lines: Mutex<Vec<String>>,
@@ -53,7 +53,8 @@ fn build_property_info(dir: &Path) {
         .write_all(b"test. u:object_r:test_prop:s0 prefix string\n")
         .unwrap();
 
-    let (entries, errors) = PropertyInfoEntry::parse_from_file(&contexts_path, false).unwrap();
+    let (entries, errors) =
+        PropertyInfoEntry::parse_from_file(&contexts_path, MatchKeyword::Unchecked).unwrap();
     assert!(errors.is_empty(), "parse errors: {errors:?}");
 
     let data = build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap();
@@ -147,6 +148,14 @@ fn add_does_not_log_value() {
         let mut props = SystemProperties::new_area(dir.path()).expect("new_area");
         props.add("test.token", SECRET).unwrap();
         assert_eq!(props.get("test.token").unwrap(), SECRET);
+
+        // `Debug` prints neither the name nor the value.
+        let shown = format!("{props:?}");
+        assert!(shown.starts_with("SystemProperties {"), "{shown}");
+        assert!(
+            !shown.contains(SECRET) && !shown.contains("test.token"),
+            "{shown}"
+        );
     }
 
     // Copied out: asserting under the guard would poison the lock on

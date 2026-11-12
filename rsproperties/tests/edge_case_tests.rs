@@ -8,7 +8,7 @@
 
 #[cfg(any(feature = "builder", target_os = "android"))]
 use rsproperties::Error;
-use rsproperties::{self, PROP_DIRNAME, PROP_VALUE_MAX};
+use rsproperties::{self, wire::PROP_VALUE_MAX, PROP_DIRNAME};
 
 mod common;
 #[cfg(any(feature = "builder", target_os = "android"))]
@@ -168,7 +168,7 @@ fn test_maximum_length_values() {
     setup_edge_test_env();
 
     for length in [PROP_VALUE_MAX, PROP_VALUE_MAX + 10] {
-        let result = rsproperties::set("edge.oversized", &"x".repeat(length));
+        let result = rsproperties::set("edge.oversized", "x".repeat(length));
         assert!(
             matches!(result, Err(Error::InvalidArgument(_))),
             "{length} byte value: {result:?}"

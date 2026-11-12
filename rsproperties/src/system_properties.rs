@@ -30,13 +30,17 @@ const APPCOMPAT_PREFIX: &str = "ro.appcompat_override.";
 const APPCOMPAT_OVERRIDE_ENV_VAR: &str = "BIONIC_APPCOMPAT_OVERRIDE";
 
 /// First API level whose bionic reads [`APPCOMPAT_OVERRIDE_ENV_VAR`]
-/// (bionic 3bcd5082d, first in android-17.0.0_r1). API 35–36 bionic has
-/// the override lookup but enables it only in memory: zygote's call sets a
-/// flag that forked children inherit, and nothing a separate reader can
-/// observe. There, honoring the variable would make this crate read
-/// overrides that libc in the same process does not (measured on an API
-/// 36 emulator: `BIONIC_APPCOMPAT_OVERRIDE=1 getprop` returns the plain
-/// value).
+/// (bionic 3bcd5082d, first in android-17.0.0_r1). API 35–36 bionic
+/// neither reads the variable nor looks up the prefixed name: the writer
+/// mirrors every property into `/dev/__properties__/appcompat_override`,
+/// with the overrides stored under their plain names, and zygote bind
+/// mounts that directory over `/dev/__properties__` in the app's mount
+/// namespace. A reader created there opens the mirrored files, so this
+/// crate needs no code for it. Honoring the variable on those levels
+/// would make this crate read overrides that libc in the same process
+/// does not (measured on an API 36 emulator:
+/// `BIONIC_APPCOMPAT_OVERRIDE=1 getprop` returns the plain value; on an
+/// API 37 emulator it returns the override).
 #[cfg(target_os = "android")]
 const FIRST_SDK_WITH_OVERRIDE_ENV: u32 = 37;
 
@@ -164,7 +168,7 @@ fn futex_wait(
                 Err(Errno::TIMEDOUT) => return Ok(None),
                 Err(e) => {
                     log::error!("Failed to wait for property change: {e}");
-                    return Err(e.into());
+                    return Err(e.into_error());
                 }
             }
         }
@@ -192,15 +196,26 @@ fn no_futex() -> Error {
 /// Locked once per instance creation.
 static NEXT_INSTANCE: std::sync::Mutex<u64> = std::sync::Mutex::new(1);
 
-/// Handle to one property, returned by [`SystemProperties::find`].
+/// Handle to one property, returned by [`SystemProperties::find`] and
+/// [`SystemProperties::foreach`]. `Copy`: the methods that use one take it
+/// by value.
 ///
-/// An index is valid only on the instance whose `find` returned it — the
-/// global reader and a writer on the same directory are different
-/// instances, and so are two instances created one after the other on the
-/// same directory. [`SystemProperties::update`], [`SystemProperties::serial`]
-/// and [`SystemProperties::wait`] reject an index from another instance.
+/// An index is valid only on the instance that returned it — the global
+/// reader and a writer on the same directory are different instances, and
+/// so are two instances created one after the other on the same directory.
+/// [`SystemProperties::read_index_with`], [`SystemProperties::serial`],
+/// [`SystemProperties::wait`] and (`builder` feature)
+/// `SystemProperties::update` reject an index from another instance.
+///
+/// Two indexes are equal when the same instance returned them for the same
+/// entry, as two `const prop_info*` are in bionic: `find` on one name
+/// twice, or `find` and `foreach`, give equal indexes, and an entry keeps
+/// its index for the life of the instance (entries are never moved or
+/// removed). Indexes from different instances are never equal. So an
+/// index can be a `HashMap` key, for example to cache the serial last seen
+/// per property.
 // To avoid lifetime issues, the property index is used to access the property value.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PropertyIndex {
     pub(crate) context_index: u32,
     /// Entry offset from `find` on context `context_index`'s area
@@ -210,8 +225,13 @@ pub struct PropertyIndex {
     pub(crate) instance: u64,
 }
 
-/// System properties
-/// It can't be created directly. Use `system_properties()` or `system_properties_area()` instead.
+/// The property store of one properties directory: the `property_info`
+/// trie and the area files it names, mapped into this process.
+///
+/// A read-only instance comes from [`crate::system_properties()`] (the
+/// process-wide one). With the `builder` feature, `SystemProperties::new_area`
+/// and `SystemProperties::new_area_locked` create the areas and return the
+/// writer instance.
 pub struct SystemProperties {
     contexts: ContextsSerialized,
     /// Unique per instance; recorded in every `PropertyIndex` it returns.
@@ -222,6 +242,17 @@ pub struct SystemProperties {
     /// `Init`; writer instances look up names as given, like bionic's
     /// `AreaInit`.
     appcompat_override: bool,
+}
+
+/// Prints the instance id and the lookup mode only: no property name or
+/// value, and no mapped memory.
+impl std::fmt::Debug for SystemProperties {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SystemProperties")
+            .field("instance", &self.instance)
+            .field("appcompat_override", &self.appcompat_override)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SystemProperties {
@@ -329,7 +360,7 @@ impl SystemProperties {
     /// `Error::InvalidArgument` (logged) unless `index` was returned by this
     /// instance's `find` or `foreach`. Every method taking an index calls
     /// it before any lock or mmap access (property_area.rs \[SM5\]).
-    fn check_index(&self, index: &PropertyIndex) -> Result<()> {
+    fn check_index(&self, index: PropertyIndex) -> Result<()> {
         if index.instance == self.instance {
             return Ok(());
         }
@@ -360,7 +391,7 @@ impl SystemProperties {
     where
         F: FnOnce(&str) -> R,
     {
-        // `Error::Utf8`, not `Encoding(String)`: keep every UTF-8 decode
+        // `Error::Utf8`, not a message string: keep every UTF-8 decode
         // failure on the same source-preserving variant.
         self.read_entry(pa, pi_offset, name, |bytes, _| {
             std::str::from_utf8(bytes).map(f)
@@ -589,7 +620,7 @@ impl SystemProperties {
     /// instance, and with `Error::Utf8` for a non-UTF-8 name or value. `f`
     /// runs under the context node's read lock, with the cautions of
     /// [`Self::read_with`].
-    pub fn read_index_with<R, F>(&self, index: &PropertyIndex, f: F) -> Result<R>
+    pub fn read_index_with<R, F>(&self, index: PropertyIndex, f: F) -> Result<R>
     where
         F: FnOnce(&str, &str, u32) -> R,
     {
@@ -602,7 +633,7 @@ impl SystemProperties {
     }
 
     /// [`Self::read_index_with`] on raw bytes: entry name, value, serial.
-    fn read_index_bytes<R, F>(&self, index: &PropertyIndex, f: F) -> Result<R>
+    fn read_index_bytes<R, F>(&self, index: PropertyIndex, f: F) -> Result<R>
     where
         F: FnOnce(&[u8], &[u8], u32) -> R,
     {
@@ -643,9 +674,9 @@ impl SystemProperties {
     ///
     /// ```rust,no_run
     /// # fn main() -> rsproperties::Result<()> {
-    /// let props = rsproperties::try_system_properties()?;
+    /// let props = rsproperties::system_properties()?;
     /// props.foreach(|index| {
-    ///     let _ = props.read_index_with(&index, |name, value, _serial| {
+    ///     let _ = props.read_index_with(index, |name, value, _serial| {
     ///         println!("[{name}]: [{value}]");
     ///     });
     /// })?;
@@ -753,7 +784,7 @@ impl SystemProperties {
         // already logs with full context — a second line per failure only
         // duplicated the noise.
         match self.find(name)? {
-            Some(prop_ref) => self.update(&prop_ref, value),
+            Some(prop_ref) => self.update(prop_ref, value),
             None => self.add(name, value),
         }
     }
@@ -766,7 +797,7 @@ impl SystemProperties {
     /// An index from another instance fails with `Error::InvalidArgument`
     /// before any area is touched.
     #[cfg(feature = "builder")]
-    pub fn update(&mut self, index: &PropertyIndex, value: &str) -> Result<()> {
+    pub fn update(&mut self, index: PropertyIndex, value: &str) -> Result<()> {
         // Another instance's offsets address an unrelated layout.
         self.check_index(index)?;
         let mut res = match self.contexts.prop_area_mut_with_index(index.context_index) {
@@ -932,7 +963,16 @@ impl SystemProperties {
         Ok(())
     }
 
-    pub fn context_serial(&self) -> u32 {
+    /// Reads the global serial (bionic `__system_property_area_serial`):
+    /// one counter per properties directory, kept in the `properties_serial`
+    /// area, that every property add and update increments. A plain atomic
+    /// load; no lock is taken.
+    ///
+    /// Pass it as `old_serial` to [`Self::wait`] with `index == None` to
+    /// wait for the next change to any property. Sample it *before* the
+    /// lookup whose result decides whether to wait, so a change between the
+    /// lookup and the wait is not missed.
+    pub fn area_serial(&self) -> u32 {
         let serial_pa = self.contexts.serial_prop_area();
         load_acquire(serial_pa.serial())
     }
@@ -961,7 +1001,7 @@ impl SystemProperties {
     /// the global reader and a writer on the same directory are different
     /// instances. An index from another instance fails with
     /// `Error::InvalidArgument`.
-    pub fn serial(&self, idx: &PropertyIndex) -> Result<u32> {
+    pub fn serial(&self, idx: PropertyIndex) -> Result<u32> {
         self.check_index(idx)?;
         #[cfg(any(target_os = "android", target_os = "linux"))]
         {
@@ -1023,17 +1063,37 @@ impl SystemProperties {
     /// change and `Ok(None)` when `timeout` expires first; `None` waits
     /// forever (also for a timeout too large to represent). A lookup or
     /// futex failure is `Err`, unlike bionic, whose `bool` reports it as a
-    /// timeout. `wait(None, None, None)` is bionic's deprecated
-    /// `__system_property_wait_any`.
+    /// timeout. `wait(None, old_serial, None)` is bionic's deprecated
+    /// `__system_property_wait_any(old_serial)`.
     ///
-    /// `old_serial` should be the serial observed when the caller last read
-    /// the value (via [`Self::serial`] / [`Self::context_serial`]). Passing
-    /// `Some` closes the lost-wakeup window between reading a value and
-    /// entering the wait: if the property already changed since
-    /// `old_serial`, this returns immediately with the new serial — the
-    /// same contract as bionic `__system_property_wait(pi, old_serial, …)`.
-    /// With `None`, the current serial is sampled at entry, so a change
-    /// that lands before this call is only observed at the *next* change.
+    /// `old_serial` is the serial observed when the caller last read the
+    /// value: from [`Self::serial`] or [`Self::read_index_with`] for an
+    /// index, from [`Self::area_serial`] for the global serial. If the
+    /// serial already differs from `old_serial`, this returns immediately
+    /// with the current one, so a change between the read and the wait is
+    /// not missed — the contract of bionic
+    /// `__system_property_wait(pi, old_serial, …)`, where the argument is
+    /// required as well. `0` reports the current serial at once unless it
+    /// is `0` itself (bionic: "If you don't know the current serial, use
+    /// 0").
+    ///
+    /// ```rust,no_run
+    /// # fn main() -> rsproperties::Result<()> {
+    /// let props = rsproperties::system_properties()?;
+    /// if let Some(index) = props.find("sys.boot_completed")? {
+    ///     loop {
+    ///         // Value and serial from one read; wait from that serial.
+    ///         let (booted, serial) =
+    ///             props.read_index_with(index, |_, value, serial| (value == "1", serial))?;
+    ///         if booted {
+    ///             break;
+    ///         }
+    ///         props.wait(Some(index), serial, None)?;
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// With an index, the returned serial can have the dirty bit (bit 0)
     /// set: a writer on another instance stores the dirty serial, writes
@@ -1083,8 +1143,8 @@ impl SystemProperties {
     /// sliced.
     pub fn wait(
         &self,
-        index: Option<&PropertyIndex>,
-        old_serial: Option<u32>,
+        index: Option<PropertyIndex>,
+        old_serial: u32,
         timeout: Option<Duration>,
     ) -> Result<Option<u32>> {
         self.wait_until(index, old_serial, &Deadline::after(timeout))
@@ -1094,8 +1154,8 @@ impl SystemProperties {
     /// / `wait_for_value` can bound a whole loop of waits with one.
     fn wait_until(
         &self,
-        index: Option<&PropertyIndex>,
-        old_serial: Option<u32>,
+        index: Option<PropertyIndex>,
+        old_serial: u32,
         deadline: &Deadline,
     ) -> Result<Option<u32>> {
         // No index → wait on the global serial (lock-free, no slicing).
@@ -1106,12 +1166,10 @@ impl SystemProperties {
             // but on macOS (no futex — `futex_wait` fails immediately)
             // it is the only thing keeping the `old_serial` contract.
             let current = load_acquire(serial_pa);
-            let old = match old_serial {
-                Some(old) if old != current => return Ok(Some(current)),
-                Some(old) => old,
-                None => current,
-            };
-            return futex_wait(serial_pa, old, deadline.remaining().as_ref());
+            if current != old_serial {
+                return Ok(Some(current));
+            }
+            return futex_wait(serial_pa, old_serial, deadline.remaining().as_ref());
         };
         // Covers both platform branches below.
         self.check_index(idx)?;
@@ -1124,7 +1182,6 @@ impl SystemProperties {
             /// cause.
             const LOCK_SLICE: Duration = Duration::from_millis(100);
 
-            let mut old = old_serial;
             let mut first = true;
             loop {
                 // The slice is computed BEFORE the lock is (re-)taken. The
@@ -1148,12 +1205,11 @@ impl SystemProperties {
                 // (Re-)acquire the node lock for this slice only.
                 let guard = self.contexts.prop_area_with_index(idx.context_index)?;
                 let pi = guard.property_area().property_info(idx.property_index)?;
-                let old_val = *old.get_or_insert_with(|| load_acquire(&pi.serial));
                 // The serial may have changed while the lock was released
                 // between slices — the futex wake fired with no waiter, so
                 // this re-check is what closes that window.
                 let current = load_acquire(&pi.serial);
-                if current != old_val {
+                if current != old_serial {
                     return Ok(Some(current));
                 }
                 // Expired timeout: the comparison above was the only one.
@@ -1161,7 +1217,7 @@ impl SystemProperties {
                     return Ok(None);
                 };
                 let slice = Deadline::after(Some(slice));
-                if let Some(s) = futex_wait(&pi.serial, old_val, slice.remaining().as_ref())? {
+                if let Some(s) = futex_wait(&pi.serial, old_serial, slice.remaining().as_ref())? {
                     return Ok(Some(s));
                 }
                 // Slice expired: fall through, dropping `guard` at the end of
@@ -1175,7 +1231,7 @@ impl SystemProperties {
             // a serial that already moved past `old_serial` returns
             // immediately instead of being misreported as a failure.
             let current = self.serial(idx)?;
-            if old_serial.is_some_and(|old| old != current) {
+            if current != old_serial {
                 return Ok(Some(current));
             }
             let _ = deadline;
@@ -1212,12 +1268,12 @@ impl SystemProperties {
             // Sampled BEFORE `find`: an add that lands between the lookup
             // and the wait has already moved the global serial, so the
             // wait returns at once instead of missing it.
-            let serial = self.context_serial();
+            let serial = self.area_serial();
             if let Some(index) = self.find(name)? {
                 return Ok(Some(index));
             }
             let changed = self
-                .wait_until(None, Some(serial), deadline)
+                .wait_until(None, serial, deadline)
                 .with_context_location(|| format!("waiting for property {name:?}"))?;
             if changed.is_none() {
                 return Ok(None);
@@ -1241,7 +1297,7 @@ impl SystemProperties {
     /// # fn main() -> rsproperties::Result<()> {
     /// use std::time::Duration;
     ///
-    /// let props = rsproperties::try_system_properties()?;
+    /// let props = rsproperties::system_properties()?;
     /// if props.wait_for_value("sys.boot_completed", "1", Some(Duration::from_secs(30)))? {
     ///     println!("booted");
     /// }
@@ -1259,14 +1315,14 @@ impl SystemProperties {
             return Ok(false);
         };
         loop {
-            let (matches, serial) = self.read_index_bytes(&index, |_, value, serial| {
+            let (matches, serial) = self.read_index_bytes(index, |_, value, serial| {
                 (value == expected.as_bytes(), serial)
             })?;
             if matches {
                 return Ok(true);
             }
             let changed = self
-                .wait_until(Some(&index), Some(serial), &deadline)
+                .wait_until(Some(index), serial, &deadline)
                 .with_context_location(|| format!("waiting for property {name:?}"))?;
             if changed.is_none() {
                 return Ok(false);
@@ -1313,7 +1369,7 @@ mod tests {
 mod test_fixture {
     use super::*;
     use crate::property_info::LONG_FLAG;
-    use crate::{build_trie, AreaWriterLock, PropertyInfoEntry};
+    use crate::{build_trie, AreaWriterLock, MatchKeyword, PropertyInfoEntry};
     use std::path::PathBuf;
 
     /// Removes the dir on drop. Made before anything is created in it, so
@@ -1349,7 +1405,8 @@ mod test_fixture {
                  ro. u:object_r:ro_prop:s0 prefix string\n",
             )
             .unwrap();
-            let (entries, errors) = PropertyInfoEntry::parse_from_file(&contexts, false).unwrap();
+            let (entries, errors) =
+                PropertyInfoEntry::parse_from_file(&contexts, MatchKeyword::Unchecked).unwrap();
             assert!(errors.is_empty(), "{errors:?}");
             let trie = build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap();
             let lock = AreaWriterLock::acquire(dir).unwrap();
@@ -1378,7 +1435,7 @@ mod test_fixture {
             idx
         }
 
-        pub(super) fn serial_word(&self, idx: &PropertyIndex) -> u32 {
+        pub(super) fn serial_word(&self, idx: PropertyIndex) -> u32 {
             let guard = self
                 .sp
                 .contexts
@@ -1421,10 +1478,10 @@ mod long_flag_tests {
         fx.sp.add("debug.rsp.bit16", "v32767").unwrap();
         let idx = fx.set_bit16("debug.rsp.bit16");
 
-        fx.sp.update(&idx, "v32768").unwrap();
+        fx.sp.update(idx, "v32768").unwrap();
         assert_eq!(fx.sp.get("debug.rsp.bit16").unwrap(), "v32768");
         assert_eq!(
-            fx.serial_word(&idx) & LONG_FLAG,
+            fx.serial_word(idx) & LONG_FLAG,
             0,
             "this crate's counter keeps bit 16 clear"
         );
@@ -1438,12 +1495,12 @@ mod long_flag_tests {
         let mut fx = Fixture::new("carry");
         fx.sp.add("debug.rsp.carry", "a").unwrap();
         let idx = fx.sp.find("debug.rsp.carry").unwrap().unwrap();
-        let start = fx.serial_word(&idx);
+        let start = fx.serial_word(idx);
         for i in 0..32768u32 {
             let v = if i % 2 == 0 { "b" } else { "a" };
-            fx.sp.update(&idx, v).unwrap();
+            fx.sp.update(idx, v).unwrap();
         }
-        let end = fx.serial_word(&idx);
+        let end = fx.serial_word(idx);
         assert_ne!(end, start, "serial repeated after 32768 updates");
         assert_eq!(end & LONG_FLAG, 0);
     }
@@ -1498,21 +1555,19 @@ mod wait_tests {
         fx.sp.add("debug.rsp.zero", "0").unwrap();
         let reader = SystemProperties::new(fx.dir()).unwrap();
         let idx = reader.find("debug.rsp.zero").unwrap().unwrap();
-        let old = reader.serial(&idx).unwrap();
+        let old = reader.serial(idx).unwrap();
         fx.sp.set("debug.rsp.zero", "1").unwrap();
 
-        let got = reader
-            .wait(Some(&idx), Some(old), Some(Duration::ZERO))
-            .unwrap();
+        let got = reader.wait(Some(idx), old, Some(Duration::ZERO)).unwrap();
         assert!(got.is_some_and(|s| s != old), "{got:?}");
-        let cur = reader.serial(&idx).unwrap();
-        let unchanged = reader.wait(Some(&idx), Some(cur), Some(Duration::ZERO));
+        let cur = reader.serial(idx).unwrap();
+        let unchanged = reader.wait(Some(idx), cur, Some(Duration::ZERO));
         assert!(matches!(unchanged, Ok(None)), "{unchanged:?}");
         // Regression only (passes before the fix): the global path gives
         // the same answer for the same inputs.
-        let global = reader.context_serial();
+        let global = reader.area_serial();
         fx.sp.set("debug.rsp.zero", "2").unwrap();
-        let got = reader.wait(None, Some(global), Some(Duration::ZERO));
+        let got = reader.wait(None, global, Some(Duration::ZERO));
         assert!(matches!(got, Ok(Some(_))), "{got:?}");
     }
 
@@ -1549,7 +1604,7 @@ mod wait_tests {
                 let waiter =
                     s.spawn(|| futex::wait(&pi.serial, futex::Flags::empty(), old, Some(&timeout)));
                 std::thread::sleep(Duration::from_millis(100 << trial));
-                fx.sp.update(&widx, &format!("v{trial}")).expect("update");
+                fx.sp.update(widx, &format!("v{trial}")).expect("update");
                 waiter.join().expect("waiter thread")
             });
             match outcome {
@@ -1586,7 +1641,7 @@ mod wait_tests {
         .expect("created before the timeout");
         assert_eq!(
             reader
-                .read_index_with(&found, |name, value, _| (name.to_owned(), value.to_owned()))
+                .read_index_with(found, |name, value, _| (name.to_owned(), value.to_owned()))
                 .unwrap(),
             ("debug.rsp.later".to_owned(), "x".to_owned())
         );
@@ -1645,9 +1700,9 @@ mod client_parity_tests {
         let mut all = BTreeMap::new();
         sp.foreach(|idx| {
             let (name, value, serial) = sp
-                .read_index_with(&idx, |n, v, s| (n.to_owned(), v.to_owned(), s))
+                .read_index_with(idx, |n, v, s| (n.to_owned(), v.to_owned(), s))
                 .unwrap();
-            assert_eq!(sp.serial(&idx).unwrap(), serial, "{name}");
+            assert_eq!(sp.serial(idx).unwrap(), serial, "{name}");
             assert!(
                 all.insert(name, (value, serial)).is_none(),
                 "reported twice"
@@ -1698,7 +1753,7 @@ mod client_parity_tests {
         let mut names = Vec::new();
         fx.sp
             .foreach(|idx| {
-                names.push(fx.sp.read_index_with(&idx, |n, _, _| n.to_owned()).unwrap());
+                names.push(fx.sp.read_index_with(idx, |n, _, _| n.to_owned()).unwrap());
             })
             .unwrap();
         assert_eq!(
@@ -1714,7 +1769,7 @@ mod client_parity_tests {
         let reader = SystemProperties::new_ro(fx.dir(), false).unwrap();
         let writer_idx = fx.sp.find("debug.rsp.f").unwrap().unwrap();
         assert!(matches!(
-            reader.read_index_with(&writer_idx, |_, _, _| ()),
+            reader.read_index_with(writer_idx, |_, _, _| ()),
             Err(Error::InvalidArgument(_))
         ));
     }
@@ -1750,7 +1805,7 @@ mod client_parity_tests {
 
         let idx = on.find("debug.ac").unwrap().unwrap();
         assert_eq!(
-            on.read_index_with(&idx, |n, v, _| (n.to_owned(), v.to_owned()))
+            on.read_index_with(idx, |n, v, _| (n.to_owned(), v.to_owned()))
                 .unwrap(),
             (
                 "ro.appcompat_override.debug.ac".to_owned(),
@@ -1774,7 +1829,7 @@ mod client_parity_tests {
     fn foreach_names(sp: &SystemProperties) -> Vec<String> {
         let mut names = Vec::new();
         sp.foreach(|idx| {
-            names.push(sp.read_index_with(&idx, |n, _, _| n.to_owned()).unwrap());
+            names.push(sp.read_index_with(idx, |n, _, _| n.to_owned()).unwrap());
         })
         .unwrap();
         names

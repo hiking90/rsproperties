@@ -9,6 +9,11 @@
 //! device. It is not usable on Android, where init owns the property service; the
 //! crate compiles only for `target_os = "linux"` (on other targets the first error
 //! names the reason).
+//!
+//! [`run`] starts the service and returns a [`ServiceHandle`]; see there
+//! for how the service is stopped.
+
+#![warn(missing_docs)]
 
 #[cfg(not(target_os = "linux"))]
 compile_error!(
@@ -23,13 +28,15 @@ use std::sync::Arc;
 use rsactor::{Actor, ActorRef, ActorResult};
 
 mod persistent_properties;
-pub mod properties_service;
+mod properties_service;
 mod property_type;
-pub mod socket_service;
+mod socket_service;
 
-// The actors and their arguments are reached through their modules only
-// (`properties_service::PropertiesService`, `socket_service::SocketService`,
-// ...): one path per item. These imports are for this file.
+// The two actors are private: their messages are crate-private, so code
+// outside this crate could spawn them but not wait for readiness or send
+// a set, and spawning the socket service without the writer lock lets a
+// second instance replace a running instance's sockets. [`run`] is the
+// only way to start them, and [`ServiceHandle`] the only way to stop them.
 use properties_service::{PropertiesService, PropertiesServiceArgs};
 use socket_service::{SocketService, SocketServiceArgs};
 
@@ -159,6 +166,10 @@ impl ServiceOptions {
     ///   A failed write is logged and the set still succeeds, as in init;
     ///   the change stays in memory and goes into the next write. Do not
     ///   edit the file while the service runs: the next write replaces it.
+    /// - Only a V2 (`PROP_MSG_SETPROP2`) set is stored, as in init. A V1
+    ///   (`PROP_MSG_SETPROP`) set of such a name changes the property
+    ///   area and neither the in-memory records nor the file, so the
+    ///   value is gone after a restart; the service logs a warning.
     /// - A file that does not parse is deleted at startup, as init does.
     ///   A group- or world-writable file is not loaded, as init's
     ///   `ReadFile` does; it is not deleted, but the next persistent set
@@ -198,10 +209,22 @@ impl ServiceOptions {
 
 pub(crate) struct ReadyMessage;
 
+/// The frame a client set arrived in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SetProtocol {
+    /// `PROP_MSG_SETPROP`: the client gets no result code, and a
+    /// `persist.` / `next_boot.` name is set in the property area only
+    /// (init writes the persistent file for V2 sets alone).
+    V1,
+    /// `PROP_MSG_SETPROP2`.
+    V2,
+}
+
 #[derive(Clone)]
 pub(crate) struct PropertyMessage {
     pub name: String,
     pub value: String,
+    pub protocol: SetProtocol,
 }
 
 // Mask `value` in `Debug` output so log-level captures don't spill
@@ -214,13 +237,212 @@ impl std::fmt::Debug for PropertyMessage {
         f.debug_struct("PropertyMessage")
             .field("name", &self.name)
             .field("value", &format_args!("<{} bytes>", self.value.len()))
+            .field("protocol", &self.protocol)
             .finish()
     }
 }
 
-pub struct ServiceContext<T: Actor> {
-    pub actor_ref: ActorRef<T>,
-    pub join_handle: tokio::task::JoinHandle<ActorResult<T>>,
+/// One of the service's two actors: its reference, and its task until the
+/// task's result has been read.
+struct ActorSlot<T: Actor> {
+    /// The part's name in [`ServiceError`]'s `Display`.
+    name: &'static str,
+    actor_ref: ActorRef<T>,
+    /// `None` once the task has ended; `failure` then holds what it ended
+    /// with.
+    join_handle: Option<tokio::task::JoinHandle<ActorResult<T>>>,
+    failure: Option<ServiceError>,
+}
+
+impl<T: Actor> ActorSlot<T>
+where
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
+    fn new(
+        name: &'static str,
+        actor_ref: ActorRef<T>,
+        join_handle: tokio::task::JoinHandle<ActorResult<T>>,
+    ) -> Self {
+        Self {
+            name,
+            actor_ref,
+            join_handle: Some(join_handle),
+            failure: None,
+        }
+    }
+
+    /// Waits for the actor's task to end and records its failure, if any.
+    /// Returns at once when that has already happened.
+    ///
+    /// Cancel-safe: the only await is on the join handle, and the slot is
+    /// changed after it, without another await in between.
+    async fn wait(&mut self) {
+        let Some(join_handle) = self.join_handle.as_mut() else {
+            return;
+        };
+        let result = join_handle.await;
+        self.join_handle = None;
+        let cause: Option<Arc<dyn std::error::Error + Send + Sync + 'static>> = match result {
+            Ok(result) => result.into_error().map(|e| Arc::new(e) as _),
+            Err(join) => Some(Arc::new(join)),
+        };
+        self.failure = cause.map(|source| ServiceError {
+            part: self.name,
+            source,
+        });
+    }
+}
+
+/// The running service, returned by [`run`].
+///
+/// The service runs on the tokio runtime that called [`run`] until one of:
+///
+/// - [`shutdown`](Self::shutdown) stops it and waits until it has ended;
+/// - one of its two parts (the socket service, the properties service)
+///   ends by itself, which [`join`](Self::join) reports;
+/// - the handle is dropped. This also stops the service, but nothing
+///   waits for it: the socket files are unlinked and the properties dir's
+///   writer lock is released later, by tasks on the runtime. Call
+///   [`shutdown`](Self::shutdown) when the next step depends on them
+///   being released (starting the service again on the same directories,
+///   for example).
+///
+/// ```no_run
+/// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// use rsproperties_service::ServiceOptions;
+///
+/// let config = rsproperties::PropertyConfig::new()
+///     .properties_dir("/run/props")
+///     .socket_dir("/run/props/sockets");
+/// let mut service = rsproperties_service::run(config, ServiceOptions::new()).await?;
+///
+/// tokio::select! {
+///     _ = tokio::signal::ctrl_c() => {}
+///     // The service ended by itself; `shutdown` below returns the same
+///     // result.
+///     _ = service.join() => {}
+/// }
+/// service.shutdown().await?;
+/// # Ok(())
+/// # }
+/// ```
+#[must_use = "dropping the handle stops the service"]
+pub struct ServiceHandle {
+    socket: ActorSlot<SocketService>,
+    properties: ActorSlot<PropertiesService>,
+}
+
+impl ServiceHandle {
+    /// Waits until the service has ended.
+    ///
+    /// Returns when one of the two parts has ended by itself — after the
+    /// other one has been stopped and has ended too, so the socket files
+    /// are unlinked and the writer lock is released by then. Nothing ends
+    /// a part in normal operation; this returns only after a failure, or
+    /// never.
+    ///
+    /// Cancel-safe, so it can be an arm of `tokio::select!`: a cancelled
+    /// call loses nothing, and the next call (or
+    /// [`shutdown`](Self::shutdown)) continues from where it stopped. Once
+    /// the service has ended, every call returns the same result at once.
+    ///
+    /// # Errors
+    ///
+    /// The failure the service ended with; see [`ServiceError`].
+    pub async fn join(&mut self) -> Result<(), ServiceError> {
+        // A slot whose task was already joined returns at once, so this
+        // also covers a call made after the service has ended.
+        tokio::select! {
+            () = self.socket.wait() => {}
+            () = self.properties.wait() => {}
+        }
+        self.stop_and_wait().await
+    }
+
+    /// Stops the service and waits until it has ended: the socket service
+    /// first (both socket files are unlinked), then the properties service
+    /// (the writer lock and the persistent properties file's lock are
+    /// released). Sets already queued for the properties service are
+    /// applied before it ends; a connection whose request had not been
+    /// queued by then gets an error reply or is closed.
+    ///
+    /// The property area files and `property_info` stay in the properties
+    /// dir, so readers that mapped them keep working; they see no further
+    /// changes.
+    ///
+    /// # Errors
+    ///
+    /// The failure the service ended with, if it had already failed; see
+    /// [`ServiceError`]. Stopping a healthy service returns `Ok(())`.
+    pub async fn shutdown(mut self) -> Result<(), ServiceError> {
+        self.stop_and_wait().await
+    }
+
+    /// Stops both actors and waits for both tasks. The socket service is
+    /// stopped and joined first, so no client request is read after the
+    /// properties service got its stop.
+    ///
+    /// Cancel-safe: `ActorRef::stop` only enqueues a signal and can be
+    /// repeated, also for an actor that has ended, and
+    /// [`ActorSlot::wait`] is cancel-safe.
+    async fn stop_and_wait(&mut self) -> Result<(), ServiceError> {
+        self.socket.actor_ref.stop().await;
+        self.socket.wait().await;
+        self.properties.actor_ref.stop().await;
+        self.properties.wait().await;
+        // Both set: the socket service's failure is the one reported, as
+        // in `run`.
+        match self
+            .socket
+            .failure
+            .as_ref()
+            .or(self.properties.failure.as_ref())
+        {
+            Some(failure) => Err(failure.clone()),
+            None => Ok(()),
+        }
+    }
+}
+
+impl std::fmt::Debug for ServiceHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceHandle")
+            .field("socket_service_alive", &self.socket.actor_ref.is_alive())
+            .field(
+                "properties_service_alive",
+                &self.properties.actor_ref.is_alive(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Error returned by [`ServiceHandle::join`] and
+/// [`ServiceHandle::shutdown`]: one of the service's two parts ended with a
+/// failure after [`run`] had returned.
+///
+/// Neither part returns an error once it has started, so in this version
+/// the cause ([`source`](std::error::Error::source)) is a panic in that
+/// part's task. `Display` prints `<part> failed: <cause>`, where `<part>`
+/// is `socket service` or `properties service`.
+///
+/// `Clone`, because [`ServiceHandle::join`] returns the same failure on
+/// every call.
+#[derive(Debug, Clone)]
+pub struct ServiceError {
+    part: &'static str,
+    source: Arc<dyn std::error::Error + Send + Sync + 'static>,
+}
+
+impl std::fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} failed: {}", self.part, self.source)
+    }
+}
+
+impl std::error::Error for ServiceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
 }
 
 /// The startup step of [`run`] that failed.
@@ -311,7 +533,13 @@ impl std::error::Error for StartupError {
     }
 }
 
-/// Runs the property socket service with the given configuration.
+/// Starts the property service with the given configuration and returns
+/// once it is ready for clients.
+///
+/// The service keeps running on the calling tokio runtime after `run`
+/// returns. The returned [`ServiceHandle`] stops it
+/// ([`ServiceHandle::shutdown`]) and reports a failure after startup
+/// ([`ServiceHandle::join`]); dropping the handle stops the service too.
 ///
 /// # Startup order
 ///
@@ -364,13 +592,52 @@ impl std::error::Error for StartupError {
 /// that opens the store fixes that process's reader for the process
 /// lifetime; a `get` that finds no `property_info` or `properties_serial`
 /// fails, and the next one tries again (see
-/// `rsproperties::try_system_properties`).
+/// `rsproperties::system_properties`).
 ///
 /// # Requirements
 /// The parent of the properties dir must exist: only the properties dir's
 /// last component is created (mode 0711 minus the umask's bits). A missing
 /// socket dir is created with any missing parent (mode 0755 minus the
-/// umask's bits); see [`SocketService`].
+/// umask's bits); see "Socket files" below.
+///
+/// # Socket files
+///
+/// Socket files are created as `socket(SOCK_CLOEXEC|SOCK_NONBLOCK)`,
+/// `fchmod(fd, 0660)`, `bind` at `<socket_dir>/.<name>.tmp-<pid>`. The
+/// kernel creates the file with the socket's mode minus the umask, so from
+/// the moment the path exists its mode is a subset of 0660. If the umask
+/// removed any of those bits (e.g. group write under umask 022), the mode
+/// is raised to exactly 0660 through an
+/// `O_PATH|O_NOFOLLOW` descriptor opened relative to the socket dir
+/// (`chmod("/proc/thread-self/fd/N")`, or `/proc/self/fd/N` on kernels
+/// before 3.17; both need `/proc`) after `fstat`
+/// confirms a socket owned by the service's euid. Only then does the
+/// socket `listen`; before that a `connect` fails with `ECONNREFUSED`.
+/// Both temp sockets are renamed onto their final names only after both
+/// are listening, and a failed start unlinks what it created, final names
+/// included. Both final names are unlinked when the service ends (see
+/// [`ServiceHandle`]).
+///
+/// The socket dir is opened once at startup; every unlink, rename and
+/// chmod is made relative to that descriptor or to a descriptor whose
+/// inode was checked with `fstat`, so the service changes no existing
+/// inode outside that directory. It changes only entries named
+/// `property_service`, `property_service_for_system`, or
+/// `.<either name>.tmp-<pid>` there (the startup sweep removes only
+/// sockets with those prefixes), and never follows a symlink at those
+/// names. `bind` itself takes a path: if the socket dir's path is swapped
+/// after startup opened it, the temp socket is created at the new
+/// location, startup fails, and that socket is left there.
+///
+/// Out of scope: any uid other than the service's euid and root that can
+/// write to the socket dir or any of its ancestors can replace the sockets
+/// with its own and so impersonate the service; nothing in the service can
+/// prevent that. Keep the socket dir and its ancestors writable only by
+/// the service's user and root. A world-writable socket dir without the
+/// sticky bit is reported with a warning at startup; this is not an access
+/// check. A default ACL on the socket dir gives its named users and groups
+/// access beyond the 0660 mode bits; the service does not inspect or
+/// remove ACLs.
 ///
 /// # Failure semantics
 /// `rsproperties::init` commits process-global, first-write-wins state. If
@@ -393,13 +660,7 @@ impl std::error::Error for StartupError {
 pub async fn run(
     config: rsproperties::PropertyConfig,
     options: ServiceOptions,
-) -> Result<
-    (
-        ServiceContext<SocketService>,
-        ServiceContext<PropertiesService>,
-    ),
-    StartupError,
-> {
+) -> Result<ServiceHandle, StartupError> {
     // `init` fails when a global directory already holds a *different*
     // path (earlier service instance, a property read that latched the
     // default first): starting anyway would bind the service to the
@@ -425,63 +686,57 @@ pub async fn run(
         persistent_properties_file,
         control_handler,
     } = options;
-    let mut properties_args =
-        PropertiesServiceArgs::new(property_contexts_files, build_prop_files).writer_lock(lock);
-    if let Some(path) = persistent_properties_file {
-        properties_args = properties_args.persistent_properties_file(path);
-    }
-    let properties_service = properties_service::spawn(properties_args);
-
-    // Initialize the socket service
-    let mut socket_args = SocketServiceArgs::new(
-        rsproperties::socket_dir(),
-        properties_service.actor_ref.clone(),
-    );
-    socket_args.control_handler = control_handler;
-    let socket_service = socket_service::spawn(socket_args);
+    let (properties_ref, properties_join) = properties_service::spawn(PropertiesServiceArgs {
+        property_contexts_files,
+        build_prop_files,
+        writer_lock: lock,
+        persistent_properties_file,
+    });
+    let (socket_ref, socket_join) = socket_service::spawn(SocketServiceArgs {
+        socket_dir: rsproperties::socket_dir().to_path_buf(),
+        properties_service: properties_ref.clone(),
+        control_handler,
+    });
 
     // Sequential readiness checks: the socket service is checked first, so
     // when both fail the socket failure is the one reported. Either failure
     // branch waits for both actors to end, so a socket failure is reported
     // only after the properties service's `on_start` has returned.
     // On failure, stop both actors explicitly instead of leaving them to
-    // the implicit drop of the returned contexts — the caller never sees
-    // the contexts on the error path.
+    // the implicit drop of their references.
     //
     // A failed `ask` only carries rsactor's mailbox error; the `on_start`
     // error that actually stopped the actor is delivered solely through its
     // join handle (rsactor's own log line for it goes to `tracing`, which
     // is not bridged to `log` here). Await the handle to return that cause.
-    if let Err(e) = socket_service.actor_ref.ask(ReadyMessage).await {
-        let _ = socket_service.actor_ref.stop().await;
-        let _ = properties_service.actor_ref.stop().await;
-        let err = startup_error(StartupStage::SocketService, e, socket_service.join_handle).await;
+    if let Err(e) = socket_ref.ask(ReadyMessage).await {
+        socket_ref.stop().await;
+        properties_ref.stop().await;
+        let err = startup_error(StartupStage::SocketService, e, socket_join).await;
         // `stop` only enqueues the signal; the properties service sees it
         // after its `on_start` (input files, `property_info`, areas) ends.
         // Wait for that, so nothing writes the properties dir after `run`
         // returned.
-        let _ = properties_service.join_handle.await;
+        let _ = properties_join.await;
         return Err(err);
     }
-    if let Err(e) = properties_service.actor_ref.ask(ReadyMessage).await {
-        let _ = socket_service.actor_ref.stop().await;
-        let _ = properties_service.actor_ref.stop().await;
-        let err = startup_error(
-            StartupStage::PropertiesService,
-            e,
-            properties_service.join_handle,
-        )
-        .await;
+    if let Err(e) = properties_ref.ask(ReadyMessage).await {
+        socket_ref.stop().await;
+        properties_ref.stop().await;
+        let err = startup_error(StartupStage::PropertiesService, e, properties_join).await;
         // The socket service passed `on_start` and is listening on both
         // final names; it handles the stop on its next loop iteration, and
         // dropping its join result drops the actor, which unlinks both
         // names. Wait for that, so a retry on the same socket dir does not
         // race this instance's unlink.
-        let _ = socket_service.join_handle.await;
+        let _ = socket_join.await;
         return Err(err);
     }
 
-    Ok((socket_service, properties_service))
+    Ok(ServiceHandle {
+        socket: ActorSlot::new("socket service", socket_ref, socket_join),
+        properties: ActorSlot::new("properties service", properties_ref, properties_join),
+    })
 }
 
 /// Builds the [`StartupError`] for a failed actor: the cause is the
@@ -527,6 +782,7 @@ mod tests {
         let msg = PropertyMessage {
             name: "test.key".to_string(),
             value: "test.value".to_string(),
+            protocol: SetProtocol::V2,
         };
         let debug = format!("{msg:?}");
         assert!(!debug.contains("test.value"), "value leaked: {debug}");
@@ -631,13 +887,7 @@ mod tests {
         }
     }
 
-    type RunResult = Result<
-        (
-            ServiceContext<SocketService>,
-            ServiceContext<PropertiesService>,
-        ),
-        StartupError,
-    >;
+    type RunResult = Result<ServiceHandle, StartupError>;
 
     /// A `run` whose properties service is blocked before it creates the
     /// areas, plus a client connection that already sent a SETPROP2
@@ -785,8 +1035,8 @@ mod tests {
             release_fifo(&early.fifo).await;
             assert_eq!(read_reply(&mut early.stream).await, Some(PROP_SUCCESS));
 
-            let (socket_service, properties_service) = match early.run.await.unwrap() {
-                Ok(services) => services,
+            let service = match early.run.await.unwrap() {
+                Ok(service) => service,
                 Err(e) => panic!("run failed: {e}"),
             };
             assert_eq!(
@@ -794,8 +1044,7 @@ mod tests {
                 "1",
                 "the early set must be applied to the areas"
             );
-            let _ = socket_service.actor_ref.stop().await;
-            let _ = properties_service.actor_ref.stop().await;
+            service.shutdown().await.unwrap();
             drop(early.dir);
         });
     }
@@ -929,5 +1178,227 @@ mod tests {
             );
             assert!(!dir.0.join("properties_serial").exists());
         });
+    }
+
+    /// A `persist.*` set sent as a V1 frame reaches the property area and
+    /// not the persistent properties file; the same set as a V2 frame
+    /// reaches both (init: `HandlePropertySetNoSocket` for
+    /// `PROP_MSG_SETPROP`).
+    #[test]
+    fn v1_persistent_set_is_applied_and_not_stored() {
+        use rsproperties::wire::{PROP_MSG_SETPROP, PROP_NAME_MAX, PROP_VALUE_MAX};
+
+        const TEST: &str = "tests::v1_persistent_set_is_applied_and_not_stored";
+        if !is_child(TEST) {
+            run_in_child(TEST);
+            return;
+        }
+        block_on_child(async {
+            let dir = TempDir(socket_test_dir(
+                "rsprops_svc_persist_v1",
+                socket_suffix_len("sockets"),
+            ));
+            let _ = std::fs::remove_dir_all(&dir.0);
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let socket_dir = dir.0.join("sockets");
+            let file = dir.0.join("persistent_properties");
+            let config = rsproperties::PropertyConfig::new()
+                .properties_dir(dir.0.join("props"))
+                .socket_dir(socket_dir.clone());
+            let service = run(
+                config,
+                ServiceOptions::new().persistent_properties_file(file.clone()),
+            )
+            .await
+            .unwrap();
+            let socket = socket_dir.join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
+
+            let mut v1 = PROP_MSG_SETPROP.to_ne_bytes().to_vec();
+            for (field, len) in [("persist.v1.name", PROP_NAME_MAX), ("a", PROP_VALUE_MAX)] {
+                let mut buf = vec![0u8; len];
+                buf[..field.len()].copy_from_slice(field.as_bytes());
+                v1.extend_from_slice(&buf);
+            }
+            let mut stream = UnixStream::connect(&socket).await.unwrap();
+            stream.write_all(&v1).await.unwrap();
+            // V1 has no reply: the service closes the connection once the
+            // set has been handled.
+            assert_eq!(read_reply(&mut stream).await, None);
+
+            let (name, value) = ("persist.v2.name", "b");
+            let mut v2 = PROP_MSG_SETPROP2.to_ne_bytes().to_vec();
+            v2.extend_from_slice(&(name.len() as u32).to_ne_bytes());
+            v2.extend_from_slice(name.as_bytes());
+            v2.extend_from_slice(&(value.len() as u32).to_ne_bytes());
+            v2.extend_from_slice(value.as_bytes());
+            let mut stream = UnixStream::connect(&socket).await.unwrap();
+            stream.write_all(&v2).await.unwrap();
+            assert_eq!(read_reply(&mut stream).await, Some(PROP_SUCCESS));
+
+            assert_eq!(rsproperties::get::<String>("persist.v1.name").unwrap(), "a");
+            assert_eq!(rsproperties::get::<String>("persist.v2.name").unwrap(), "b");
+            assert_eq!(
+                crate::persistent_properties::decode(&std::fs::read(&file).unwrap()).unwrap(),
+                vec![(b"persist.v2.name".to_vec(), b"b".to_vec())],
+                "only the V2 set may be in the file"
+            );
+            service.shutdown().await.unwrap();
+        });
+    }
+
+    /// Whether both final socket names exist in `socket_dir`.
+    fn sockets_exist(socket_dir: &Path) -> bool {
+        [
+            rsproperties::PROPERTY_SERVICE_SOCKET_NAME,
+            rsproperties::PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME,
+        ]
+        .iter()
+        .all(|name| socket_dir.join(name).exists())
+    }
+
+    /// Whether neither final socket name exists in `socket_dir` and the
+    /// writer lock of `properties_dir` can be taken (it is released again).
+    fn service_is_gone(properties_dir: &Path, socket_dir: &Path) -> bool {
+        let unlinked = [
+            rsproperties::PROPERTY_SERVICE_SOCKET_NAME,
+            rsproperties::PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME,
+        ]
+        .iter()
+        .all(|name| !socket_dir.join(name).exists());
+        unlinked && rsproperties::AreaWriterLock::acquire(properties_dir).is_ok()
+    }
+
+    /// The three ways a running service ends, each followed by a new `run`
+    /// on the same directories:
+    /// - `shutdown` returns after the sockets are unlinked and the writer
+    ///   lock is released;
+    /// - `join` returns once one actor has ended, after stopping the other
+    ///   one, and returns the same result when called again;
+    /// - dropping the handle stops both actors without waiting.
+    #[test]
+    fn service_handle_shutdown_join_and_drop() {
+        const TEST: &str = "tests::service_handle_shutdown_join_and_drop";
+        if !is_child(TEST) {
+            run_in_child(TEST);
+            return;
+        }
+        block_on_child(async {
+            let dir = TempDir(socket_test_dir(
+                "rsprops_svc_handle",
+                socket_suffix_len("sockets"),
+            ));
+            let _ = std::fs::remove_dir_all(&dir.0);
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let socket_dir = dir.0.join("sockets");
+            let start = || {
+                run(
+                    rsproperties::PropertyConfig::new()
+                        .properties_dir(dir.0.clone())
+                        .socket_dir(socket_dir.clone()),
+                    ServiceOptions::new(),
+                )
+            };
+
+            // shutdown
+            let service = start().await.expect("first run");
+            assert!(sockets_exist(&socket_dir));
+            assert!(
+                rsproperties::AreaWriterLock::acquire(&dir.0).is_err(),
+                "the running service holds the writer lock"
+            );
+            let shown = format!("{service:?}");
+            assert!(shown.contains("socket_service_alive: true"), "{shown}");
+            service
+                .shutdown()
+                .await
+                .expect("shutdown of a healthy service");
+            assert!(
+                service_is_gone(&dir.0, &socket_dir),
+                "shutdown must return after the sockets are unlinked and the lock is released"
+            );
+
+            // join: nothing has ended, so it must not return.
+            let mut service = start().await.expect("run after shutdown");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), service.join())
+                    .await
+                    .is_err(),
+                "join must wait while both actors run"
+            );
+            assert!(sockets_exist(&socket_dir), "a cancelled join stops nothing");
+            // One actor ends by itself; join stops the other one.
+            service.properties.actor_ref.stop().await;
+            tokio::time::timeout(Duration::from_secs(10), service.join())
+                .await
+                .expect("join must return once the properties service has ended")
+                .expect("a stopped actor is not a failure");
+            assert!(
+                service_is_gone(&dir.0, &socket_dir),
+                "join must return after both actors have ended"
+            );
+            tokio::time::timeout(Duration::from_secs(1), service.join())
+                .await
+                .expect("join after the end returns at once")
+                .unwrap();
+            service.shutdown().await.unwrap();
+
+            // drop
+            let service = start().await.expect("run after join");
+            assert!(sockets_exist(&socket_dir));
+            drop(service);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !service_is_gone(&dir.0, &socket_dir) {
+                assert!(
+                    Instant::now() < deadline,
+                    "dropping the handle must stop the service"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+    }
+
+    /// Fails in `on_start`: with an error for `false`, with a panic for
+    /// `true`.
+    struct FailingActor;
+
+    impl Actor for FailingActor {
+        type Args = bool;
+        type Error = std::io::Error;
+        type IdleEvent = ();
+
+        async fn on_start(
+            panic: Self::Args,
+            _actor_ref: &ActorRef<Self>,
+        ) -> std::result::Result<Self, Self::Error> {
+            if panic {
+                panic!("on_start panicked");
+            }
+            Err(std::io::Error::other("on_start failed"))
+        }
+    }
+
+    /// What `join` / `shutdown` report: the actor's own error, or the
+    /// task's `JoinError` after a panic, under the part's name.
+    #[tokio::test]
+    async fn actor_slot_records_error_and_panic() {
+        let (actor_ref, join_handle) = rsactor::spawn::<FailingActor>(false);
+        let mut slot = ActorSlot::new("test part", actor_ref, join_handle);
+        slot.wait().await;
+        // A second call finds the task joined and keeps the failure.
+        slot.wait().await;
+        let failure = slot.failure.clone().expect("the on_start error");
+        assert_eq!(failure.to_string(), "test part failed: on_start failed");
+        let source = std::error::Error::source(&failure).unwrap();
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
+
+        let (actor_ref, join_handle) = rsactor::spawn::<FailingActor>(true);
+        let mut slot = ActorSlot::new("test part", actor_ref, join_handle);
+        slot.wait().await;
+        let failure = slot.failure.clone().expect("the panic");
+        let source = std::error::Error::source(&failure).unwrap();
+        let join_error = source
+            .downcast_ref::<tokio::task::JoinError>()
+            .expect("a panic is reported as the task's JoinError");
+        assert!(join_error.is_panic());
     }
 }

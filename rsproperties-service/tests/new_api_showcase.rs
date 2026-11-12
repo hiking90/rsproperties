@@ -33,16 +33,16 @@ async fn test_new_api_showcase() -> anyhow::Result<()> {
     rsproperties::set("app.config.name", "MyApplication")?;
 
     // Set numeric properties using set() with different types
-    rsproperties::set("app.config.version_code", &123i32)?;
-    rsproperties::set("app.config.version_minor", &4u8)?;
-    rsproperties::set("app.config.memory_limit", &512.5f64)?;
-    rsproperties::set("app.config.debug_enabled", &true)?;
+    rsproperties::set("app.config.version_code", 123i32)?;
+    rsproperties::set("app.config.version_minor", 4u8)?;
+    rsproperties::set("app.config.memory_limit", 512.5f64)?;
+    rsproperties::set("app.config.debug_enabled", true)?;
 
     // Set using string literals (also uses set())
     rsproperties::set("app.config.api_timeout", "30000")?;
 
     // Set a floating point value
-    rsproperties::set("app.config.ratio", &2.5f64)?;
+    rsproperties::set("app.config.ratio", 2.5f64)?;
 
     // =================================
     // Part 2: Getting and Parsing Properties
@@ -185,12 +185,12 @@ async fn test_type_conversion_showcase() -> anyhow::Result<()> {
     assert_eq!(as_string, "42");
 
     // Set floating point and parse back
-    rsproperties::set("config.pi", &std::f64::consts::PI)?;
+    rsproperties::set("config.pi", std::f64::consts::PI)?;
     let pi_back: f64 = rsproperties::get("config.pi")?;
     assert!((pi_back - std::f64::consts::PI).abs() < 1e-10);
 
     // Set boolean values
-    rsproperties::set("config.feature_flag", &true)?;
+    rsproperties::set("config.feature_flag", true)?;
     let flag_value: String = rsproperties::get("config.feature_flag")?;
     assert_eq!(flag_value, "true");
 
@@ -250,9 +250,9 @@ async fn test_safe_programming_patterns() -> anyhow::Result<()> {
 
     // Set configuration properties
     rsproperties::set("app.name", "TestApp")?;
-    rsproperties::set("app.version", &100u32)?;
-    rsproperties::set("app.debug", &false)?;
-    rsproperties::set("app.timeout", &30000u64)?;
+    rsproperties::set("app.version", 100u32)?;
+    rsproperties::set("app.debug", false)?;
+    rsproperties::set("app.timeout", 30000u64)?;
 
     // Load configuration safely
     let config = AppConfig {
@@ -286,17 +286,17 @@ async fn test_performance_and_concurrency() -> anyhow::Result<()> {
                 // Set different types concurrently
                 match i % 3 {
                     0 => {
-                        rsproperties::set(&prop_name, &(i * 100))?;
+                        rsproperties::set(&prop_name, i * 100)?;
                         let value: i32 = rsproperties::get(&prop_name)?;
                         assert_eq!(value, i * 100);
                     }
                     1 => {
-                        rsproperties::set(&prop_name, &(i as f64 * 1.5))?;
+                        rsproperties::set(&prop_name, i as f64 * 1.5)?;
                         let value: f64 = rsproperties::get(&prop_name)?;
                         assert!((value - (i as f64 * 1.5)).abs() < f64::EPSILON);
                     }
                     2 => {
-                        rsproperties::set(&prop_name, &format!("string_{i}"))?;
+                        rsproperties::set(&prop_name, format!("string_{i}"))?;
                         let value: String = rsproperties::get(&prop_name)?;
                         assert_eq!(value, format!("string_{i}"));
                     }
@@ -330,7 +330,7 @@ async fn test_performance_and_concurrency() -> anyhow::Result<()> {
         let prop_name = format!("perf.measurement.{i}");
 
         // Combined set/get/parse operation
-        rsproperties::set(&prop_name, &i)?;
+        rsproperties::set(&prop_name, i)?;
         let _retrieved: String = rsproperties::get(&prop_name)?;
         let _parsed: i32 = rsproperties::get(&prop_name)?;
     }
@@ -353,9 +353,9 @@ async fn test_complete_feature_summary() -> anyhow::Result<()> {
     // Feature 1: Enhanced Property Setting
     println!("📝 Feature 1: Enhanced Property Setting");
     rsproperties::set("demo.string_prop", "Hello World")?;
-    rsproperties::set("demo.int_prop", &42i32)?;
-    rsproperties::set("demo.float_prop", &2.5f64)?;
-    rsproperties::set("demo.bool_prop", &true)?;
+    rsproperties::set("demo.int_prop", 42i32)?;
+    rsproperties::set("demo.float_prop", 2.5f64)?;
+    rsproperties::set("demo.bool_prop", true)?;
     println!("   ✅ Properties set using set() and set() functions");
 
     // Feature 2: Type-Safe Property Parsing

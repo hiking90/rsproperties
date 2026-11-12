@@ -47,19 +47,33 @@ jobs:
     - name: Build
       run: cargo build --verbose --all-features
 
-    # `--features builder`, not `--all-features`: the strict-file-validation
-    # feature enforces the root-ownership check on property files even in
-    # debug builds, so test fixtures created by the non-root CI user would
-    # be rejected. The Build/clippy/docs jobs still compile with
-    # --all-features, so the strict feature keeps compile coverage.
+    # `--features builder`, not `--all-features`: a debug build without
+    # strict-file-validation is the only configuration that skips the
+    # root-ownership check on property files, so it is the only one whose
+    # tests pass as the non-root CI user. The two steps after this one run
+    # the configurations that enforce the check.
     - name: Run tests
       run: cargo test --verbose --features builder
 
-    # Note: Release mode tests are skipped in CI because they enforce
-    # strict file ownership validation (root ownership) which fails
-    # in GitHub Actions environment. This is intentional security behavior.
-    # - name: Run tests (release mode)
-    #   run: cargo test --verbose --features builder --release
+    # A release build, and any build with strict-file-validation, refuses a
+    # property file not owned by uid 0 / gid 0 (as bionic does), which
+    # includes every file a non-root test creates. cargo still builds as
+    # the CI user; the runner starts each test binary with `sudo -E` (`-E`
+    # keeps the environment cargo sets for a test).
+    #
+    # These steps leave root-owned test directories (`rsprops_*_<pid>`) in
+    # the temp dir. A later test run as the CI user cannot remove them, and
+    # fails if one of its processes gets a pid one of them is named after,
+    # so keep every test step that runs as the CI user above these two.
+    - name: Run tests as root (strict-file-validation)
+      env:
+        CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
+      run: cargo test --verbose --all-features
+
+    - name: Run tests as root (release)
+      env:
+        CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
+      run: cargo test --verbose --features builder --release
 
     # Build only: getprop needs a property area to read, and running it
     # without arguments exits 1.
@@ -188,7 +202,7 @@ jobs:
     - name: Lib unit tests on MSRV
       run: |
         cargo test --locked --lib -p rsproperties --features builder
-        cargo test --locked --lib -p rsproperties-service --features builder
+        cargo test --locked --lib -p rsproperties-service
 
   security:
     name: Security audit
@@ -329,3 +343,11 @@ jobs:
       env:
         RUSTDOCFLAGS: -D warnings
       run: cargo doc --all-features --no-deps --document-private-items
+
+    # Without the `builder` feature its items do not exist, so an intra-doc
+    # link to one from an always-present item resolves only above. This is
+    # the build a crates.io user with default features gets.
+    - name: Check documentation (default features, public items)
+      env:
+        RUSTDOCFLAGS: -D warnings
+      run: cargo doc -p rsproperties --no-deps

@@ -30,6 +30,10 @@
 // inheriting the function's effect. Enabling this lint as a warning today
 // keeps the codebase ready and surfaces regressions in PRs.
 #![warn(unsafe_op_in_unsafe_fn)]
+#![warn(missing_docs)]
+// docs.rs builds with `--cfg docsrs` (see `[package.metadata.docs.rs]`):
+// items behind a `cfg` are then labelled with the feature they need.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::{
     path::{Path, PathBuf},
@@ -47,7 +51,7 @@ use std::{
 ///
 /// Paths are not checked here: a missing directory is reported at its
 /// first use (first property read, first `set`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PropertyConfig {
     properties_dir: Option<PathBuf>,
     socket_dir: Option<PathBuf>,
@@ -74,7 +78,7 @@ impl PropertyConfig {
     }
 }
 
-pub mod errors;
+mod errors;
 pub mod parse;
 pub mod wire;
 pub use errors::{Error, Result};
@@ -126,6 +130,33 @@ pub(crate) mod test_support {
     impl Drop for FixtureDir {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    /// Removes every `temp_dir()/<prefix><pid>` whose process is gone
+    /// (`kill(pid, 0)` fails with `ESRCH`).
+    ///
+    /// For a dir that a `static` owns until the process exits, where no
+    /// guard can remove it: the next run of the test removes it instead.
+    /// The dir of a live process — another `cargo test` running the same
+    /// test — is kept. A reused pid keeps a dead dir: that leaks one
+    /// directory but never deletes a live one.
+    pub(crate) fn sweep_dead_dirs(prefix: &str) {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let pid = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_prefix(prefix))
+                .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|p| p.parse::<i32>().ok())
+                .and_then(rustix::process::Pid::from_raw);
+            let Some(pid) = pid else { continue };
+            if rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
         }
     }
 
@@ -187,7 +218,7 @@ pub(crate) mod test_support {
         );
 
         let mut properties = HashMap::new();
-        crate::load_properties_from_file(&copy, None, "u:r:init:s0", &mut properties).unwrap();
+        crate::load_properties_from_file(&copy, None, &mut properties).unwrap();
         assert_eq!(properties.get("ro.x").map(String::as_str), Some("1"));
         assert!(
             !properties.contains_key("ro.y"),
@@ -203,7 +234,7 @@ pub use build_property_parser::load_properties_from_file;
 #[cfg(feature = "builder")]
 pub use contexts_serialized::AreaWriterLock;
 #[cfg(feature = "builder")]
-pub use property_info_serializer::{build_trie, PropertyInfoEntry};
+pub use property_info_serializer::{build_trie, MatchKeyword, PropertyInfoEntry};
 pub use system_properties::{PropertyIndex, SystemProperties};
 pub use system_property_set::socket_dir;
 
@@ -211,10 +242,9 @@ pub use system_property_set::{
     PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME, PROPERTY_SERVICE_SOCKET_NAME,
 };
 
-// Re-export (not a second definition): `wire::PROP_VALUE_MAX` is the single
-// source of truth — an independent constant here could drift and desync the
-// seqlock read buffer size from the area's reserved slot size.
-pub use wire::PROP_VALUE_MAX;
+/// The default properties directory, used unless [`init`] names another
+/// one (see [`properties_dir`]). On Android this is where init creates the
+/// property areas.
 pub const PROP_DIRNAME: &str = "/dev/__properties__";
 
 // System properties directory.
@@ -362,10 +392,13 @@ pub(crate) fn system_properties_if_initialized(
     SYSTEM_PROPERTIES.get()
 }
 
-/// Get the system properties, returning an error if initialization fails.
+/// The process-wide reader of the properties directory, created on the
+/// first call.
 ///
-/// This is the panic-free variant; [`init`] should be called first when
-/// the properties directory is not the default. The first successful
+/// Call [`init`] first when the properties directory is not the default:
+/// the first call here latches the directory (`/dev/__properties__` unless
+/// `init` set one), and a later `init` naming a different one fails with
+/// `AlreadyInitialized`. The first successful
 /// creation is kept for the process lifetime. A failure is not kept: each
 /// call opens the store again until one succeeds, so a store that appears
 /// after this process started (this crate's service started later) is
@@ -373,7 +406,7 @@ pub(crate) fn system_properties_if_initialized(
 /// (one `open` of `property_info`, or more when it exists but the areas do
 /// not yet); the properties directory itself stays the one latched by the
 /// first call. The failure is `Error::Init`, with the cause as `source()`.
-pub fn try_system_properties() -> Result<&'static system_properties::SystemProperties> {
+pub fn system_properties() -> Result<&'static system_properties::SystemProperties> {
     if let Some(props) = SYSTEM_PROPERTIES.get() {
         return Ok(props);
     }
@@ -402,25 +435,6 @@ pub fn try_system_properties() -> Result<&'static system_properties::SystemPrope
             }
             Err(Error::Init(Box::new(e)))
         }
-    }
-}
-
-/// Get the system properties.
-///
-/// Calling this without a prior `init()` does **not** panic by itself: the
-/// default directory (`/dev/__properties__`) is latched on first use, and
-/// a later `init()` naming a different properties directory then fails
-/// with `AlreadyInitialized`. The panic happens only when the store in the
-/// properties directory (configured or default) cannot be opened; a later
-/// call tries again (see [`try_system_properties`]).
-///
-/// Prefer [`try_system_properties`] in code that must not panic.
-pub fn system_properties() -> &'static system_properties::SystemProperties {
-    match try_system_properties() {
-        // `Error::Init`'s Display already starts with "SystemProperties
-        // initialization failed" — no extra prefix here.
-        Ok(props) => props,
-        Err(e) => panic!("{e}"),
     }
 }
 
@@ -489,7 +503,7 @@ where
     // allocates a `String` — the value bytes are handed to `FromStr` as
     // `&str` borrowed from the seqlock buffer (short variant) or the mmap
     // (long variant).
-    try_system_properties()?.read_with(name, |value| {
+    system_properties()?.read_with(name, |value| {
         // The raw value is not formatted here (the error's Display reaches
         // logs), same policy as the set path's error log. `T::Err`'s Display
         // is included verbatim: std's numeric/bool/addr parse errors do not
@@ -536,7 +550,7 @@ where
 /// when the property is missing or empty, when its value fails to parse as
 /// `T`, or when the read fails for any other reason — a non-UTF-8 value
 /// (`Error::Utf8`), a corrupt property area, or a failed global
-/// initialization (see [`try_system_properties`]; the next call tries
+/// initialization (see [`system_properties()`]; the next call tries
 /// again).
 /// Use [`get`] to tell these cases apart. The found-and-parsed hot path
 /// never pays for constructing the default.
@@ -556,7 +570,7 @@ where
     T: std::str::FromStr,
     F: FnOnce() -> T,
 {
-    let Ok(props) = try_system_properties() else {
+    let Ok(props) = system_properties() else {
         return default();
     };
     // Two-stage closure: the inner `Result<T, ()>` carries the parsed
@@ -584,7 +598,7 @@ where
 /// let debuggable = rsproperties::get_bool_or("ro.debuggable", false);
 /// ```
 pub fn get_bool_or(name: &str, default: bool) -> bool {
-    let Ok(props) = try_system_properties() else {
+    let Ok(props) = system_properties() else {
         return default;
     };
     props
@@ -605,7 +619,7 @@ pub fn get_bool_or(name: &str, default: bool) -> bool {
 /// let sdk: i32 = rsproperties::get_int_or("ro.build.version.sdk", 0);
 /// ```
 pub fn get_int_or<T: parse::Integer>(name: &str, default: T) -> T {
-    let Ok(props) = try_system_properties() else {
+    let Ok(props) = system_properties() else {
         return default;
     };
     props
@@ -649,10 +663,15 @@ pub fn get_int_or<T: parse::Integer>(name: &str, default: T) -> T {
 /// use rsproperties::set;
 ///
 /// // Setting various types (all converted to strings)
-/// set("test.int.property", &42).unwrap();           // Stored as "42"
-/// set("test.bool.property", &true).unwrap();        // Stored as "true"
-/// set("test.float.property", &3.14).unwrap();       // Stored as "3.14"
-/// set("test.string.property", &"hello").unwrap();   // Stored as "hello"
+/// set("test.int.property", 42).unwrap();           // Stored as "42"
+/// set("test.bool.property", true).unwrap();        // Stored as "true"
+/// set("test.float.property", 3.14).unwrap();       // Stored as "3.14"
+/// set("test.string.property", "hello").unwrap();   // Stored as "hello"
+///
+/// // A reference to a `Display` value is itself `Display`, so a borrowed
+/// // value needs no copy.
+/// let owned = String::from("world");
+/// set("test.borrowed.property", &owned).unwrap();
 ///
 /// // For well-known system properties, prefer string literals so the
 /// // stored form matches what other Android components expect ("1", not
@@ -665,7 +684,7 @@ pub fn get_int_or<T: parse::Integer>(name: &str, default: T) -> T {
 /// - Android system properties typically use "0"/"1" for boolean values, not "true"/"false"
 /// - Numeric properties may have specific formatting requirements
 /// - Always test compatibility when setting properties that will be read by other applications
-pub fn set<T: std::fmt::Display + ?Sized>(name: &str, value: &T) -> Result<()> {
+pub fn set(name: &str, value: impl std::fmt::Display) -> Result<()> {
     system_property_set::set(name, &value.to_string())
 }
 
@@ -685,8 +704,14 @@ mod tests {
     #[cfg(all(feature = "builder", not(target_os = "android")))]
     use std::sync::{Mutex, MutexGuard};
 
+    /// The store of `system_properties_area` is
+    /// `temp_dir()/<this prefix><pid>`. The pid keeps two processes running
+    /// these tests at once (two `cargo test` runs in one checkout, or a
+    /// runner that starts one process per test) off each other's store: a
+    /// path shared between them made the second `AreaWriterLock::acquire`
+    /// fail with `Error::Lock`.
     #[cfg(all(feature = "builder", not(target_os = "android")))]
-    const TEST_PROPERTY_DIR: &str = "__properties__";
+    const TEST_STORE_PREFIX: &str = "rsprops_lib_store_";
 
     #[cfg(any(feature = "builder", target_os = "android"))]
     fn enable_logger() {
@@ -769,7 +794,7 @@ mod tests {
         let mut properties = HashMap::new();
         for name in build_prop_files {
             let file = crate::test_support::copy_android_fixture(name, fixtures.path());
-            load_properties_from_file(&file, None, "u:r:init:s0", &mut properties).unwrap();
+            load_properties_from_file(&file, None, &mut properties).unwrap();
         }
         // A group/other-writable prop file (git checkout under umask 002)
         // is skipped with `Ok`, which would leave callers looping over
@@ -788,13 +813,18 @@ mod tests {
         let mut system_properties_guard = SYSTEM_PROPERTIES.lock().unwrap();
 
         if system_properties_guard.is_none() {
-            *system_properties_guard = Some(build_property_dir(TEST_PROPERTY_DIR));
+            // The `static` above owns the writer until the process exits,
+            // so nothing removes the store in this run; the next run does.
+            crate::test_support::sweep_dead_dirs(TEST_STORE_PREFIX);
+            let dir =
+                std::env::temp_dir().join(format!("{TEST_STORE_PREFIX}{}", std::process::id()));
+            *system_properties_guard = Some(build_property_dir(&dir));
         }
         system_properties_guard
     }
 
     #[cfg(all(feature = "builder", not(target_os = "android")))]
-    fn build_property_dir(dir: &str) -> SystemProperties {
+    fn build_property_dir(dir: &Path) -> SystemProperties {
         // `init` fails if another test in this binary latched a *different*
         // directory first; the `properties_dir()` cleanup below would then
         // delete that directory instead of ours.
@@ -810,7 +840,8 @@ mod tests {
         let mut property_infos = Vec::new();
         for file in property_contexts_files {
             let (mut property_info, errors) =
-                PropertyInfoEntry::parse_from_file(Path::new(file), false).unwrap();
+                PropertyInfoEntry::parse_from_file(Path::new(file), MatchKeyword::Unchecked)
+                    .unwrap();
             if !errors.is_empty() {
                 log::error!("{errors:?}");
             }
@@ -842,7 +873,7 @@ mod tests {
         for (key, value) in properties.iter() {
             match system_properties.find(key.as_str()).unwrap() {
                 Some(prop_ref) => {
-                    system_properties.update(&prop_ref, value.as_str()).unwrap();
+                    system_properties.update(prop_ref, value.as_str()).unwrap();
                 }
                 None => {
                     system_properties.add(key.as_str(), value.as_str()).unwrap();
@@ -860,7 +891,7 @@ mod tests {
 
         let _guard = system_properties_area();
 
-        let system_properties = system_properties();
+        let system_properties = system_properties().unwrap();
 
         let properties = load_properties("rsprops_lib_expect");
 
@@ -887,38 +918,32 @@ mod tests {
         // waiter enters futex_wait before or after the change lands. The
         // old sleep-based sync hung forever (not failed) when the waiter
         // lost the race.
+        let reader = system_properties().unwrap();
         let wait_any_from = |old: u32| {
             std::thread::spawn(move || {
-                let system_properties = system_properties();
-                let changed = system_properties.wait(None, Some(old), None).unwrap();
+                let changed = reader.wait(None, old, None).unwrap();
                 assert!(changed.is_some(), "no timeout was given");
             })
         };
 
-        let old = system_properties().context_serial();
+        let old = reader.area_serial();
         let handle = wait_any_from(old);
 
         system_properties_area.add(test_prop, "true").unwrap();
         handle.join().unwrap();
 
-        let index = system_properties()
-            .find(test_prop)
-            .unwrap()
-            .expect("just added");
-        let old_prop_serial = system_properties().serial(&index).expect("index valid");
+        let index = reader.find(test_prop).unwrap().expect("just added");
+        let old_prop_serial = reader.serial(index).expect("index valid");
         let handle = std::thread::spawn(move || {
-            let system_properties = system_properties();
-            let changed = system_properties
-                .wait(Some(&index), Some(old_prop_serial), None)
-                .unwrap();
+            let changed = reader.wait(Some(index), old_prop_serial, None).unwrap();
             assert!(changed.is_some(), "no timeout was given");
         });
 
-        let handle_any = wait_any_from(system_properties().context_serial());
+        let handle_any = wait_any_from(reader.area_serial());
 
         let index = system_properties_area.find(test_prop).unwrap();
         system_properties_area
-            .update(&index.unwrap(), "false")
+            .update(index.unwrap(), "false")
             .unwrap();
 
         handle.join().unwrap();

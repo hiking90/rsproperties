@@ -24,7 +24,7 @@ async fn test_get_parsed_with_default_integers() -> anyhow::Result<()> {
     // Test with existing integer property
     let prop_name = "test.parsed.int";
     let test_value = 42;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
 
     let parsed_value: i32 = rsproperties::get_or(prop_name, 0);
     assert_eq!(parsed_value, test_value);
@@ -116,7 +116,7 @@ async fn test_get_parsed_with_default_floats() -> anyhow::Result<()> {
 
     let prop_name = "test.parsed.float";
     let test_value = std::f64::consts::PI;
-    rsproperties::set(prop_name, &test_value)?;
+    rsproperties::set(prop_name, test_value)?;
 
     let parsed_f32: f32 = rsproperties::get_or(prop_name, 0.0f32);
     assert!((parsed_f32 - test_value as f32).abs() < f32::EPSILON);
@@ -134,7 +134,7 @@ async fn test_get_parsed_success() -> anyhow::Result<()> {
     // Test successful parsing of various types
     let prop_name_int = "test.get_parsed.int";
     let test_int = 12345;
-    rsproperties::set(prop_name_int, &test_int)?;
+    rsproperties::set(prop_name_int, test_int)?;
 
     let result: i32 = rsproperties::get(prop_name_int)?;
     assert_eq!(result, test_int);
@@ -210,13 +210,13 @@ async fn test_get_parsed_complex_types() -> anyhow::Result<()> {
 
     // Test u64
     let large_value = u64::MAX / 2;
-    rsproperties::set(prop_name, &large_value)?;
+    rsproperties::set(prop_name, large_value)?;
     let parsed_u64: u64 = rsproperties::get(prop_name)?;
     assert_eq!(parsed_u64, large_value);
 
     // Test i64 negative
     let negative_value = -12345678901234i64;
-    rsproperties::set(prop_name, &negative_value)?;
+    rsproperties::set(prop_name, negative_value)?;
     let parsed_i64: i64 = rsproperties::get(prop_name)?;
     assert_eq!(parsed_i64, negative_value);
 

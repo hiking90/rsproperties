@@ -19,16 +19,74 @@ use tokio_stream::StreamExt;
 
 use rsactor::{Actor, ActorRef, ActorWeak};
 
-use rsproperties::errors::*;
 use rsproperties::wire::{
     validate_property_name, MAX_WIRE_NAME_LEN, MAX_WIRE_VALUE_LEN,
     PROP_ERROR_HANDLE_CONTROL_MESSAGE, PROP_ERROR_INVALID_CMD, PROP_ERROR_INVALID_NAME,
     PROP_ERROR_INVALID_VALUE, PROP_ERROR_READ_CMD, PROP_ERROR_READ_DATA, PROP_ERROR_SET_FAILED,
     PROP_MSG_SETPROP, PROP_MSG_SETPROP2, PROP_NAME_MAX, PROP_SUCCESS, PROP_VALUE_MAX,
 };
-use rsproperties::{PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME, PROPERTY_SERVICE_SOCKET_NAME};
+use rsproperties::{
+    Error, Result, PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME, PROPERTY_SERVICE_SOCKET_NAME,
+};
 
 use crate::properties_service::PropertiesService;
+use crate::SetProtocol;
+
+/// The error types [`ContextWithLocation`] wraps: `rustix`'s `Errno`, a
+/// `std::io::Error` (both become `Error::Io`) or an `Error`.
+trait IntoError {
+    fn into_error(self) -> Error;
+}
+
+impl IntoError for Error {
+    fn into_error(self) -> Error {
+        self
+    }
+}
+
+impl IntoError for std::io::Error {
+    fn into_error(self) -> Error {
+        Error::Io(self)
+    }
+}
+
+impl IntoError for Errno {
+    fn into_error(self) -> Error {
+        Error::Io(self.into())
+    }
+}
+
+/// Wraps the error of a `Result` in `Error::Context`, with the caller's
+/// source location.
+trait ContextWithLocation<T> {
+    #[track_caller]
+    fn context_with_location(self, msg: &str) -> Result<T>;
+
+    /// Like [`Self::context_with_location`], with the message built only on
+    /// the error path.
+    #[track_caller]
+    fn with_context_location(self, f: impl FnOnce() -> String) -> Result<T>;
+}
+
+impl<T, E> ContextWithLocation<T> for std::result::Result<T, E>
+where
+    E: IntoError,
+{
+    #[track_caller]
+    fn context_with_location(self, msg: &str) -> Result<T> {
+        self.with_context_location(|| msg.to_owned())
+    }
+
+    #[track_caller]
+    fn with_context_location(self, f: impl FnOnce() -> String) -> Result<T> {
+        let location = std::panic::Location::caller();
+        self.map_err(|e| Error::Context {
+            msg: f(),
+            location,
+            source: Box::new(e.into_error()),
+        })
+    }
+}
 
 /// Upper bound on simultaneously *serviced* client connections. Each
 /// handler task holds one permit for the duration of the exchange.
@@ -406,115 +464,40 @@ fn bind_service_sockets_at(dir: &Path, dirfd: OwnedFd) -> Result<BoundSockets> {
 }
 
 /// What [`spawn`] serves: the socket dir and the properties service the
-/// sets are forwarded to. Built with [`SocketServiceArgs::new`], so a
-/// field added later does not break callers.
-pub struct SocketServiceArgs {
+/// sets are forwarded to.
+pub(crate) struct SocketServiceArgs {
     pub(crate) socket_dir: PathBuf,
     pub(crate) properties_service: ActorRef<PropertiesService>,
     /// Handles `ctl.*` sets; `None` refuses them.
     pub(crate) control_handler: Option<crate::ControlHandler>,
 }
 
-impl SocketServiceArgs {
-    /// Serves the sockets in `socket_dir` and forwards sets to
-    /// `properties_service`. `ctl.*` sets are refused until
-    /// [`control_handler`](Self::control_handler) is given.
-    pub fn new(
-        socket_dir: impl Into<PathBuf>,
-        properties_service: ActorRef<PropertiesService>,
-    ) -> Self {
-        Self {
-            socket_dir: socket_dir.into(),
-            properties_service,
-            control_handler: None,
-        }
-    }
-
-    /// Handles `ctl.*` sets; see
-    /// [`crate::ServiceOptions::control_handler`] for how it is called.
-    pub fn control_handler<F>(mut self, handler: F) -> Self
-    where
-        F: Fn(&crate::ControlMessage) -> bool + Send + Sync + 'static,
-    {
-        self.control_handler = Some(Arc::new(handler));
-        self
-    }
-}
-
 /// Spawns the socket service actor with `args`.
 ///
 /// Spawn this only while the properties dir's writer lock
-/// (`rsproperties::AreaWriterLock`) is held — `rsproperties_service::run`
-/// takes it before spawning either actor. Spawned without it, a second
-/// instance can replace and then unlink the running instance's sockets.
-/// The socket files and the socket dir contract are described on
-/// [`SocketService`].
-///
-/// # Returns
-/// A reference to the spawned actor that can be used to interact with the socket service.
-/// The actor can be stopped by calling `actor_ref.stop()` when the service is no longer needed.
-///
-pub fn spawn(args: SocketServiceArgs) -> crate::ServiceContext<SocketService> {
+/// (`rsproperties::AreaWriterLock`) is held — `crate::run` takes it before
+/// spawning either actor. Spawned without it, a second instance can
+/// replace and then unlink the running instance's sockets.
+pub(crate) fn spawn(
+    args: SocketServiceArgs,
+) -> (
+    ActorRef<SocketService>,
+    tokio::task::JoinHandle<rsactor::ActorResult<SocketService>>,
+) {
     // `with_idle()` is required: rsactor's idle-event channel is opt-in, and
     // this actor drives its accept loop through `subscribe_idle` / `on_idle`.
     // Without it `subscribe_idle` would return `IdleChannelNotEnabled` and the
     // listeners would never be polled.
-    let (actor_ref, join_handle) =
-        rsactor::spawn_with_options(args, rsactor::SpawnOptions::new().with_idle());
-    crate::ServiceContext {
-        actor_ref,
-        join_handle,
-    }
+    rsactor::spawn_with_options(args, rsactor::SpawnOptions::new().with_idle())
 }
 
-/// Tokio-based property socket service.
-///
-/// Spawn this only while the properties dir's writer lock
-/// (`rsproperties::AreaWriterLock`) is held — `rsproperties_service::run`
-/// takes it before spawning either actor. Spawned without it, a second
-/// instance can replace and then unlink the running instance's sockets.
-///
-/// # Socket files
-///
-/// A missing socket dir, and any missing parent directory, is created
-/// with mode 0755 minus the umask's bits.
-///
-/// Socket files are created as `socket(SOCK_CLOEXEC|SOCK_NONBLOCK)`,
-/// `fchmod(fd, 0660)`, `bind` at `<socket_dir>/.<name>.tmp-<pid>`. The
-/// kernel creates the file with the socket's mode minus the umask, so from
-/// the moment the path exists its mode is a subset of 0660. If the umask
-/// removed any of those bits (e.g. group write under umask 022), the mode
-/// is raised to exactly 0660 through an
-/// `O_PATH|O_NOFOLLOW` descriptor opened relative to the socket dir
-/// (`chmod("/proc/thread-self/fd/N")`, or `/proc/self/fd/N` on kernels
-/// before 3.17; both need `/proc`) after `fstat`
-/// confirms a socket owned by the service's euid. Only then does the
-/// socket `listen`; before that a `connect` fails with `ECONNREFUSED`.
-/// Both temp sockets are renamed onto their final names only after both
-/// are listening, and a failed start unlinks what it created, final names
-/// included. Dropping the service unlinks both final names.
-///
-/// The socket dir is opened once at startup; every unlink, rename and
-/// chmod is made relative to that descriptor or to a descriptor whose
-/// inode was checked with `fstat`, so the service changes no existing
-/// inode outside that directory. It changes only entries named
-/// `property_service`, `property_service_for_system`, or
-/// `.<either name>.tmp-<pid>` there (the startup sweep removes only
-/// sockets with those prefixes), and never follows a symlink at those
-/// names. `bind` itself takes a path: if the socket dir's path is swapped
-/// after startup opened it, the temp socket is created at the new
-/// location, startup fails, and that socket is left there.
-///
-/// Out of scope: any uid other than the service's euid and root that can
-/// write to the socket dir or any of its ancestors can replace the sockets
-/// with its own and so impersonate the service; nothing in the service can
-/// prevent that. Keep the socket dir and its ancestors writable only by
-/// the service's user and root. A world-writable socket dir without the
-/// sticky bit is reported with a warning at startup; this is not an access
-/// check. A default ACL on the socket dir gives its named users and groups
-/// access beyond the 0660 mode bits; the service does not inspect or
-/// remove ACLs. One service instance per socket dir.
-pub struct SocketService {
+/// The actor that binds `property_service` and
+/// `property_service_for_system` in the socket dir, reads the requests and
+/// forwards the sets to the properties service. How the socket files are
+/// created and what the socket dir must look like is documented on
+/// [`crate::run`] ("Socket files"). Dropping the actor unlinks both final
+/// names.
+pub(crate) struct SocketService {
     properties_service: ActorRef<PropertiesService>,
     /// Limits concurrently in-flight client tasks.
     connection_sem: Arc<Semaphore>,
@@ -528,7 +511,7 @@ pub struct SocketService {
 
 impl Actor for SocketService {
     type Args = SocketServiceArgs;
-    type Error = rsproperties::errors::Error;
+    type Error = Error;
     /// Each idle event is one accepted connection (or an `accept()` error)
     /// tagged with the listener it came from, so logging can name the source.
     /// The accept loop is modelled as `Stream`s of connections subscribed
@@ -800,9 +783,12 @@ impl SocketService {
     /// never stored (init: `HandlePropertySet` sends it to
     /// `SendControlMessage`); any other name goes to the properties
     /// service, whose reply is the code ([`crate::PropertiesService`]).
+    /// `protocol` is the command the set arrived in; the properties
+    /// service stores a persistent name for V2 only.
     async fn dispatch<A>(
         name: String,
         value: String,
+        protocol: SetProtocol,
         pid: Option<i32>,
         service: ActorRef<A>,
         control: Option<ControlCalls>,
@@ -813,7 +799,12 @@ impl SocketService {
         if name.starts_with("ctl.") {
             return Self::handle_control(name, value, pid, control).await;
         }
-        match service.ask(crate::PropertyMessage { name, value }).await {
+        let message = crate::PropertyMessage {
+            name,
+            value,
+            protocol,
+        };
+        match service.ask(message).await {
             Ok(code) => code,
             Err(e) => {
                 error!("Failed to send property message through channel: {e}");
@@ -885,6 +876,14 @@ impl SocketService {
     /// connection is the implicit ack — so failures are logged and the
     /// connection is closed without a response. Validation still happens in
     /// `PropertiesService::handle`, identical to the V2 path.
+    ///
+    /// Every V1 request is logged at `warn!`: init sets
+    /// `ro.property_service.version` to 2 and so does this service, so a
+    /// client that follows bionic's rule sends V2. A V1 frame comes from a
+    /// client that does not read that property, and such a client cannot
+    /// learn that its set was rejected, nor that a `persist.` /
+    /// `next_boot.` value was not stored ([`SetProtocol::V1`]). init does
+    /// not log an accepted V1 set.
     async fn handle_setprop_v1<A>(
         stream: &mut UnixStream,
         service: ActorRef<A>,
@@ -909,10 +908,16 @@ impl SocketService {
 
         let name = Self::string_from_fixed(&name_buf)?;
         let value = Self::string_from_fixed(&value_buf)?;
-        info!("Forwarding V1 property: {name:?} ({} bytes)", value.len());
+        let peer = pid.map_or_else(|| "an unknown pid".to_owned(), |pid| format!("pid {pid}"));
+        warn!(
+            "V1 set request (PROP_MSG_SETPROP) for {name:?} ({} bytes) from {peer}: this legacy \
+             command gives the client no result code, and a persist. / next_boot. value set \
+             with it is not stored. The client should send PROP_MSG_SETPROP2",
+            value.len()
+        );
 
-        // The property name was already logged by the `info!` above.
-        let code = Self::dispatch(name, value, pid, service, control).await;
+        // The property name was already logged by the `warn!` above.
+        let code = Self::dispatch(name, value, SetProtocol::V1, pid, service, control).await;
         if code != PROP_SUCCESS {
             warn!("V1 property was rejected: error code {code:#x}");
         }
@@ -934,8 +939,7 @@ impl SocketService {
         // property *value* — and would leak them into any `{e:?}` log,
         // against this file's don't-log-values policy. `Utf8Error` keeps
         // the position diagnostics and the source chain without the bytes.
-        String::from_utf8(buf[..end].to_vec())
-            .map_err(|e| rsproperties::errors::Error::Utf8(e.utf8_error()))
+        String::from_utf8(buf[..end].to_vec()).map_err(|e| Error::Utf8(e.utf8_error()))
     }
 
     /// Handles SETPROP2 command
@@ -971,7 +975,7 @@ impl SocketService {
         if name_len as usize > MAX_WIRE_NAME_LEN {
             error!("Name length too large: {name_len} (max {MAX_WIRE_NAME_LEN})");
             let _ = Self::send_response(stream, PROP_ERROR_READ_DATA).await;
-            return Err(rsproperties::errors::Error::FileValidation(format!(
+            return Err(Error::FileValidation(format!(
                 "Name length too large: {name_len}"
             )));
         }
@@ -1003,7 +1007,7 @@ impl SocketService {
             error!("Value length too large: {value_len} (max {MAX_WIRE_VALUE_LEN})");
             // Best-effort — see the name-length branch above.
             let _ = Self::send_response(stream, PROP_ERROR_READ_DATA).await;
-            return Err(rsproperties::errors::Error::FileValidation(format!(
+            return Err(Error::FileValidation(format!(
                 "Value length too large: {value_len}"
             )));
         }
@@ -1048,7 +1052,7 @@ impl SocketService {
         // result of sending the reply. A client that gave up waiting
         // (`TimedOut`) may therefore find its set applied; checking the
         // peer here would narrow that window, not close it.
-        let code = Self::dispatch(name, value, pid, service, control).await;
+        let code = Self::dispatch(name, value, SetProtocol::V2, pid, service, control).await;
         if code != PROP_SUCCESS {
             warn!("Property set was rejected: error code {code:#x}");
         }
@@ -1081,14 +1085,14 @@ impl SocketService {
         // downstream validators, which never see the NUL. AOSP init
         // likewise rejects such names (IsLegalPropertyName).
         if buf.contains(&0) {
-            return Err(rsproperties::errors::Error::Encoding(
+            return Err(Error::InvalidArgument(
                 "wire string contains an interior NUL byte".into(),
             ));
         }
 
         // See `string_from_fixed`: drop the failed bytes (possibly a
         // sensitive value), keep the positional diagnostics + source chain.
-        String::from_utf8(buf).map_err(|e| rsproperties::errors::Error::Utf8(e.utf8_error()))
+        String::from_utf8(buf).map_err(|e| Error::Utf8(e.utf8_error()))
     }
 
     /// Sends a status reply with `send(MSG_NOSIGNAL)`, so a peer that

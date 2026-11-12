@@ -17,7 +17,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use rsproperties::{build_trie, AreaWriterLock, PropertyInfoEntry, SystemProperties};
+use rsproperties::{build_trie, AreaWriterLock, MatchKeyword, PropertyInfoEntry, SystemProperties};
 
 fn build_property_info(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
@@ -28,7 +28,8 @@ fn build_property_info(dir: &Path) {
         .write_all(b"test. u:object_r:test_prop:s0 prefix string\n")
         .unwrap();
 
-    let (entries, errors) = PropertyInfoEntry::parse_from_file(&contexts_path, false).unwrap();
+    let (entries, errors) =
+        PropertyInfoEntry::parse_from_file(&contexts_path, MatchKeyword::Unchecked).unwrap();
     assert!(errors.is_empty(), "parse errors: {errors:?}");
 
     let data = build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap();
@@ -81,11 +82,10 @@ fn test_interior_nul_rejected_and_area_stays_healthy() {
 fn test_build_trie_rejects_nul_in_context_and_type() {
     // `build_trie` writes contexts/types into the serialized C-string
     // pool; a NUL would desync the on-disk format for every consumer.
-    let entries = vec![PropertyInfoEntry::new(
+    let entries = vec![PropertyInfoEntry::prefix(
         "test.prop".to_string(),
         "u:object_r:bad\0ctx:s0".to_string(),
         "string",
-        false,
     )
     .unwrap()];
     // `InvalidArgument` (the gate), not the serializer's `FileValidation`
@@ -97,11 +97,10 @@ fn test_build_trie_rejects_nul_in_context_and_type() {
 
     // The defaults bypass `add_to_trie` and are interned directly, so they
     // have their own gate at `build_trie`'s entry.
-    let entries = vec![PropertyInfoEntry::new(
+    let entries = vec![PropertyInfoEntry::prefix(
         "test.prop".to_string(),
         "u:object_r:ok:s0".to_string(),
         "string",
-        false,
     )
     .unwrap()];
     assert!(matches!(

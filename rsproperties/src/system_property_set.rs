@@ -17,7 +17,11 @@ use zerocopy_derive::*;
 use crate::errors::*;
 
 const DEFAULT_SOCKET_DIR: &str = "/dev/socket";
+/// File name, inside [`socket_dir`], of the socket `set` connects to.
 pub const PROPERTY_SERVICE_SOCKET_NAME: &str = "property_service";
+/// File name, inside [`socket_dir`], of the socket `set` tries first for
+/// `sys.powerctl` (as bionic does); every other name goes to
+/// [`PROPERTY_SERVICE_SOCKET_NAME`].
 pub const PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME: &str = "property_service_for_system";
 
 use crate::wire::{
@@ -51,13 +55,17 @@ pub(crate) fn socket_dir_if_set() -> Option<&'static Path> {
     SOCKET_DIR.get().map(PathBuf::as_path)
 }
 
-/// Get the current socket directory.
-/// Returns the configured socket directory, environment variable, or default.
+/// The directory that holds the property service sockets.
 ///
-/// Priority order:
-/// 1. Directory set via `set_socket_dir()`
-/// 2. `PROPERTY_SERVICE_SOCKET_DIR` environment variable
-/// 3. Default directory: `/dev/socket`
+/// The first of:
+/// 1. the directory given to [`crate::init`] with
+///    [`crate::PropertyConfig::socket_dir`];
+/// 2. the `PROPERTY_SERVICE_SOCKET_DIR` environment variable;
+/// 3. `/dev/socket`.
+///
+/// The first call fixes the result for the process lifetime: an
+/// [`crate::init`] with a different socket dir after it fails with
+/// `Error::AlreadyInitialized`.
 pub fn socket_dir() -> &'static Path {
     // Lock-free once initialized; the first call takes `GLOBAL_DIRS_LOCK` so
     // the env/default latch cannot slip between `init`'s pre-check and
