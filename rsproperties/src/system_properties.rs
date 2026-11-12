@@ -17,6 +17,7 @@ use crate::contexts_serialized::ContextsSerialized;
 // through `load_acquire` (`Relaxed` load + `fence(Acquire)`),
 // property_area.rs [R-RO].
 use crate::property_area::{load_acquire, EntryOffset};
+use crate::property_watcher::PropertyWatcher;
 
 pub(crate) use crate::wire::PROP_VALUE_MAX;
 pub(crate) const PROP_TREE_FILE: &str = "/dev/__properties__/property_info";
@@ -64,10 +65,10 @@ fn with_override_name<R>(name: &str, f: impl FnOnce(&str) -> R) -> R {
 
 /// Absolute end of a caller-supplied `Option<Duration>` timeout. `None`
 /// waits forever — also for a timeout too large for `Instant`.
-struct Deadline(Option<Instant>);
+pub(crate) struct Deadline(Option<Instant>);
 
 impl Deadline {
-    fn after(timeout: Option<Duration>) -> Self {
+    pub(crate) fn after(timeout: Option<Duration>) -> Self {
         Self(timeout.and_then(|t| Instant::now().checked_add(t)))
     }
 
@@ -1079,11 +1080,16 @@ impl SystemProperties {
             }
         }
         #[cfg(target_os = "macos")]
-        {
-            let guard = self.contexts.prop_area_with_index(idx.context_index)?;
-            let pi = guard.property_area().property_info(idx.property_index)?;
-            Ok(load_acquire(&pi.serial))
-        }
+        self.serial_word(idx)
+    }
+
+    /// The serial word of `idx` as stored: dirty bit included, no wait —
+    /// what bionic `__system_property_serial` returns.
+    pub(crate) fn serial_word(&self, idx: PropertyIndex) -> Result<u32> {
+        self.check_index(idx)?;
+        let guard = self.contexts.prop_area_with_index(idx.context_index)?;
+        let pi = guard.property_area().property_info(idx.property_index)?;
+        Ok(load_acquire(&pi.serial))
     }
 
     /// Waits until the property at `index` (or, with `index == None`, the
@@ -1181,7 +1187,7 @@ impl SystemProperties {
 
     /// [`Self::wait`] against an absolute deadline, so `wait_for_creation`
     /// / `wait_for_value` can bound a whole loop of waits with one.
-    fn wait_until(
+    pub(crate) fn wait_until(
         &self,
         index: Option<PropertyIndex>,
         old_serial: u32,
@@ -1288,7 +1294,7 @@ impl SystemProperties {
         self.wait_for_creation_until(name, &Deadline::after(timeout))
     }
 
-    fn wait_for_creation_until(
+    pub(crate) fn wait_for_creation_until(
         &self,
         name: &str,
         deadline: &Deadline,
@@ -1358,6 +1364,27 @@ impl SystemProperties {
             }
         }
     }
+
+    /// A [`PropertyWatcher`] for `name`: the value re-read only when it
+    /// has changed, and a wait for the next change — libbase
+    /// `CachedProperty`. `name` does not have to exist yet, and nothing is
+    /// read until the watcher's first call.
+    ///
+    /// ```rust,no_run
+    /// # fn main() -> rsproperties::Result<()> {
+    /// let props = rsproperties::system_properties()?;
+    /// let mut level = props.watch("debug.my_service.log_level");
+    /// loop {
+    ///     // `None` until the property is created.
+    ///     println!("log level: {:?}", level.value()?);
+    ///     // No timeout: returns when the property is created or updated.
+    ///     level.wait_for_change(None)?;
+    /// }
+    /// # }
+    /// ```
+    pub fn watch(&self, name: &str) -> PropertyWatcher<'_> {
+        PropertyWatcher::new(self, name)
+    }
 }
 
 #[cfg(test)]
@@ -1395,7 +1422,7 @@ mod tests {
 /// A builder writer over a fresh properties dir with `debug.` and `ro.`
 /// contexts.
 #[cfg(all(test, feature = "builder", not(target_os = "android")))]
-mod test_fixture {
+pub(crate) mod test_fixture {
     use super::*;
     use crate::property_info::LONG_FLAG;
     use crate::{build_trie, AreaWriterLock, MatchKeyword, PropertyInfoEntry};
@@ -1411,8 +1438,8 @@ mod test_fixture {
         }
     }
 
-    pub(super) struct Fixture {
-        pub(super) sp: SystemProperties,
+    pub(crate) struct Fixture {
+        pub(crate) sp: SystemProperties,
         // Declared after `sp`, so it is dropped after the writer.
         dir: TempDir,
     }
@@ -1420,7 +1447,7 @@ mod test_fixture {
     impl Fixture {
         /// `tag` must differ between the tests of this binary: they run in
         /// parallel in one process and share the pid in the dir name.
-        pub(super) fn new(tag: &str) -> Self {
+        pub(crate) fn new(tag: &str) -> Self {
             let guard = TempDir(
                 std::env::temp_dir().join(format!("rsprops_sp_{tag}_{}", std::process::id())),
             );
@@ -1444,12 +1471,24 @@ mod test_fixture {
             Self { sp, dir: guard }
         }
 
-        pub(super) fn dir(&self) -> &Path {
+        pub(crate) fn dir(&self) -> &Path {
             &self.dir.0
         }
 
         /// What init's counter does on the 32768th update.
-        pub(super) fn set_bit16(&self, name: &str) -> PropertyIndex {
+        pub(crate) fn set_bit16(&self, name: &str) -> PropertyIndex {
+            self.set_serial_bits(name, LONG_FLAG)
+        }
+
+        /// The first store of an update: the dirty serial, with the value
+        /// and the backup slot left as they are. A reader then takes the
+        /// value from the backup slot, which holds the value before the
+        /// last completed update.
+        pub(crate) fn set_dirty(&self, name: &str) -> PropertyIndex {
+            self.set_serial_bits(name, 1)
+        }
+
+        fn set_serial_bits(&self, name: &str, bits: u32) -> PropertyIndex {
             let idx = self.sp.find(name).unwrap().expect("property exists");
             let guard = self
                 .sp
@@ -1460,11 +1499,11 @@ mod test_fixture {
                 .property_area()
                 .property_info(idx.property_index)
                 .unwrap();
-            pi.serial.fetch_or(LONG_FLAG, Ordering::SeqCst);
+            pi.serial.fetch_or(bits, Ordering::SeqCst);
             idx
         }
 
-        pub(super) fn serial_word(&self, idx: PropertyIndex) -> u32 {
+        pub(crate) fn serial_word(&self, idx: PropertyIndex) -> u32 {
             let guard = self
                 .sp
                 .contexts

@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caller names. 0.6.0 had no public read-only constructor, so a process
   could read only the one directory `init` latched, and a library could
   not read a store without setting that process-wide directory.
+- `SystemProperties::watch(name)` and `PropertyWatcher` (libbase
+  `CachedProperty`): `value()` returns the current value, reading the
+  store again only when the property's serial has moved, and
+  `wait_for_change(timeout)` blocks until the property is created or
+  updated. Following one property took `find`, `read_index_with` and
+  `wait` in a loop that carried the index and the serial, and a `wait`
+  from a serial with the dirty bit set reported one update twice. The
+  watcher reports an update once and does not queue changes.
 - `parse::parse_bool` and `parse::parse_int`: libbase `ParseBool` /
   `ParseInt` / `ParseUint` rules (`yes`/`on`/`1`, leading whitespace,
   `0x` hex, no trailing characters).

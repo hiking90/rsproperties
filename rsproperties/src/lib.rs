@@ -95,6 +95,7 @@ mod property_info;
 mod property_info_parser;
 #[cfg(feature = "builder")]
 mod property_info_serializer;
+mod property_watcher;
 mod system_properties;
 mod system_property_set;
 #[cfg(feature = "builder")]
@@ -237,6 +238,7 @@ pub use build_property_parser::load_properties_from_file;
 pub use contexts_serialized::AreaWriterLock;
 #[cfg(feature = "builder")]
 pub use property_info_serializer::{build_trie, MatchKeyword, PropertyInfoEntry};
+pub use property_watcher::PropertyWatcher;
 pub use system_properties::{PropertyIndex, SystemProperties};
 pub use system_property_set::socket_dir;
 

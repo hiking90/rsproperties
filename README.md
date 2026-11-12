@@ -117,53 +117,70 @@ picked up by the next call.
 
 ### Property Monitoring and Waiting
 
-```rust
-use rsproperties;
+Wait once for a value (libbase `WaitForProperty`):
 
-let system_properties = rsproperties::system_properties()?;
+```rust,no_run
+use std::time::Duration;
 
-// Wait for any property change (no timeout: `Ok(Some(serial))` or `Err`).
-// `old_serial` is the serial the caller last saw: a change made between
-// `area_serial()` and `wait` returns at once instead of being missed.
-std::thread::spawn(move || {
-    let old_serial = system_properties.area_serial();
-    if let Ok(Some(new_serial)) = system_properties.wait(None, old_serial, None) {
-        println!("Properties changed, new serial: {}", new_serial);
+fn main() -> rsproperties::Result<()> {
+    let props = rsproperties::system_properties()?;
+    // Returns when the property exists and equals "1"; `false` is a timeout.
+    if !props.wait_for_value("sys.boot_completed", "1", Some(Duration::from_secs(30)))? {
+        eprintln!("not booted after 30 s");
     }
-});
+    Ok(())
+}
+```
 
-// Wait for a specific property change, at most 30 s
-std::thread::spawn(move || {
-    if let Ok(Some(prop_index)) = system_properties.find("sys.boot_completed") {
-        println!("Waiting for boot completion...");
-        let Ok(old_serial) = system_properties.serial(prop_index) else {
-            return;
-        };
-        let timeout = Some(std::time::Duration::from_secs(30));
-        if let Ok(Some(_)) = system_properties.wait(Some(prop_index), old_serial, timeout) {
-            println!("System boot completed!");
-        }
-    }
-});
+Follow one property through every change with a `PropertyWatcher`
+(libbase `CachedProperty`). It keeps the property's index, the serial of
+the value it last read and that value, so the loop has no index or serial
+to carry:
 
-// Or wait for a value directly (libbase `WaitForProperty`)
-let booted = system_properties
-    .wait_for_value("sys.boot_completed", "1", Some(std::time::Duration::from_secs(30)));
-
-// Monitor multiple properties
-let monitored_props = vec![
-    "sys.boot_completed",
-    "dev.bootcomplete",
-    "service.bootanim.exit"
-];
-
-for prop_name in monitored_props {
-    match system_properties.get(prop_name) {
-        Ok(value) => println!("{}: {}", prop_name, value),
-        Err(_) => println!("{}: <not set>", prop_name),
+```rust,no_run
+fn main() -> rsproperties::Result<()> {
+    let props = rsproperties::system_properties()?;
+    let mut level = props.watch("debug.my_service.log_level");
+    loop {
+        // `None` until the property is created. The store is read again
+        // only after a change.
+        println!("log level: {:?}", level.value()?);
+        // Blocks until the property is created or updated. A change made
+        // since the `value()` above returns at once, so none is missed.
+        level.wait_for_change(None)?;
     }
 }
 ```
+
+One update is reported as one change, also when it stores the value the
+property already had; updates that land between two calls are reported as
+one change with the latest value.
+
+Wait for a change to any property on the global serial:
+
+```rust,no_run
+use std::time::Duration;
+
+fn main() -> rsproperties::Result<()> {
+    let props = rsproperties::system_properties()?;
+    // `old_serial` is the serial the caller last saw: a change made
+    // between `area_serial()` and `wait` returns at once.
+    let mut serial = props.area_serial();
+    loop {
+        match props.wait(None, serial, Some(Duration::from_secs(60)))? {
+            Some(new_serial) => {
+                println!("a property changed, serial {new_serial}");
+                serial = new_serial;
+            }
+            None => println!("no change for 60 s"),
+        }
+    }
+}
+```
+
+The watcher is built on `find`, `read_index_with` and
+`wait(Some(index), old_serial, timeout)`; they stay public for a caller
+that keeps its own index and serial.
 
 ### Custom Configuration
 

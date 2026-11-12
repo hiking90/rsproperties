@@ -109,3 +109,59 @@ fn test_wait_for_any_property_change() {
         changed_value
     );
 }
+
+/// `PropertyWatcher` against init: the creation and one update each end
+/// one `wait_for_change`, with the value init stored, and the update is
+/// not reported a second time.
+#[test]
+fn test_watcher_follows_creation_and_update() {
+    setup_android_test();
+
+    // `debug.*` properties outlive the process, so the pid alone could
+    // name a property an earlier run created.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .subsec_nanos();
+    let test_prop = format!("debug.rsproperties.watch.{}.{nanos}", std::process::id());
+
+    let barrier = Arc::new(Barrier::new(2));
+    let waiter = {
+        let barrier = Arc::clone(&barrier);
+        let prop_name = test_prop.clone();
+        thread::spawn(move || {
+            let props = rsproperties::system_properties().expect("global reader");
+            let mut watcher = props.watch(&prop_name);
+            assert_eq!(watcher.value().expect("value before creation"), None);
+
+            barrier.wait();
+            let created = watcher
+                .wait_for_change(Some(WAIT_TIMEOUT))
+                .expect("creation wait failed");
+            assert!(created, "creation wait timed out");
+            let first = watcher.value().expect("value").map(str::to_owned);
+
+            barrier.wait();
+            let updated = watcher
+                .wait_for_change(Some(WAIT_TIMEOUT))
+                .expect("update wait failed");
+            assert!(updated, "update wait timed out");
+            let second = watcher.value().expect("value").map(str::to_owned);
+
+            let again = watcher
+                .wait_for_change(Some(Duration::ZERO))
+                .expect("poll failed");
+            (first, second, again)
+        })
+    };
+
+    barrier.wait();
+    rsproperties::set(&test_prop, "created").expect("create property");
+    barrier.wait();
+    rsproperties::set(&test_prop, "updated").expect("update property");
+
+    let (first, second, again) = waiter.join().expect("waiter thread panicked");
+    assert_eq!(first.as_deref(), Some("created"));
+    assert_eq!(second.as_deref(), Some("updated"));
+    assert!(!again, "one update was reported twice");
+}

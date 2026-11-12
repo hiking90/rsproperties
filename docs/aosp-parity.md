@@ -32,6 +32,7 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
 | C4 | client | `WaitForProperty` / `WaitForPropertyCreation` | (d) | 이 branch에서 추가 |
 | C5 | client | `GetBoolProperty` / `GetIntProperty` 파싱 규칙 | (d), (c) | 이 branch에서 추가 |
 | C6 | client | global reader 초기화 실패를 process 수명 동안 유지 | (c), 재시도 방식은 (a) | 이 branch에서 수정 |
+| C7 | client | 한 property의 값 cache와 변경 대기(`CachedProperty`) | (d) | 이 branch에서 추가 |
 | S1 | service | `persist.*` / `next_boot.*` 영속화 | (d) | 이 branch에서 추가 |
 | S2 | service | property type 검사(`CheckType`) | (c) | 이 branch에서 수정 |
 | S3 | service | `ctl.*`를 일반 property로 저장 | (c) | 이 branch에서 수정 |
@@ -358,6 +359,61 @@ version을 env var나 기본값으로만 골랐다.
 - `init`도 이미 설정된 것과 같은 경로를 다시 받으면 성공한다. bionic `Init`이
   재호출을 성공으로 처리하는 것과 같다. 다른 경로는 `AlreadyInitialized`다.
   bionic은 경로를 바꿀 수 없으므로 이 경우에 대응하는 동작이 없다.
+
+### C7. `CachedProperty` — (d)
+
+**AOSP** (`libbase/properties.cpp:294-370`). `CachedProperty`는 `prop_info*`,
+마지막으로 읽은 property serial, 값 buffer(`PROP_VALUE_MAX`)를 보관한다.
+- `Get(bool* changed)`: `prop_info*`가 없으면, global serial이 지난 조회 때와
+  다를 때만 `__system_property_find`를 다시 호출한다. `prop_info*`가 있으면,
+  `__system_property_serial`이 보관한 serial과 다를 때만 `read_callback`으로
+  값과 serial을 다시 읽는다.
+- `WaitForChange(timeout)`: `prop_info*`가 없으면 `WaitForPropertyCreation`으로
+  생성을 기다린다. 있으면 보관한 serial을 넘겨 `__system_property_wait`를
+  호출한다. 그 뒤 `Get`을 호출해 값을 반환한다. timeout이면 `nullptr`를
+  반환한다.
+
+**rsproperties.** 대응하는 타입이 없다. property 하나의 변경을 계속 읽으려면
+호출자가 `find`, `read_index_with`, `wait`를 loop로 묶고 index와 serial을 직접
+보관해야 한다. README의 예제는 이 조합을 잘못 썼다. `find`가 `None`을
+반환하면 기다리지 않고 끝났고, 변경 1회를 값 확인 없이 "boot completed"로
+출력했다.
+
+**변경.** `SystemProperties::watch(name) -> PropertyWatcher<'_>`를 추가한다.
+`value()`가 `Get`에, `wait_for_change(timeout)`이 `WaitForChange`에 대응한다.
+- `value()`의 반환 타입은 `Result<Option<&str>>`이고, property가 없으면
+  `Ok(None)`이다(b). libbase `Get`은 property가 없을 때 빈 문자열을 반환하므로
+  호출자가 빈 값과 부재를 구분하지 못한다.
+- `wait_for_change`의 반환 타입은 `Result<bool>`이다. timeout은 `Ok(false)`,
+  lookup 실패와 futex 실패는 `Err`다(b, C4와 같은 규칙).
+- update 1회를 변경 1회로 보고한다(b). writer는 dirty serial, 값, clean serial
+  순서로 store하고 futex wake는 clean store 뒤에 한다. `__system_property_wait`는
+  dirty 구간에 진입하면 dirty serial을 반환한다. libbase는 이때 `Get`을 호출해
+  backup slot의 이전 값과 dirty serial을 보관하므로, 다음 `WaitForChange`가 같은
+  update의 clean store에서 한 번 더 반환한다. watcher는 dirty bit를 지운 serial을
+  보관한다. `wait`가 반환한 뒤 읽은 serial에서 dirty bit를 지운 값이 보관한
+  serial과 같으면 그 dirty serial부터 다시 기다린다.
+- 같은 값을 다시 쓴 update도 변경으로 보고한다(libbase와 같다). serial은
+  update마다 증가하고, area에는 이전 값이 남지 않으므로 비교할 대상이 없다.
+- 변경을 queue에 쌓지 않는다(libbase와 같다). 두 호출 사이에 일어난 update
+  여러 번은 변경 1회이고, 값은 마지막 값이다.
+- 값 buffer는 watcher마다 `String` 하나다. libbase는 `ro.` 값을 복사하지 않고
+  mapping 안의 pointer를 반환한다. 이 crate의 read는 node read lock을 잡은
+  동안에만 유효한 `&str`을 넘기므로 `ro.` 값도 복사한다. `ro.` property는
+  serial이 바뀌지 않으므로 복사는 한 번이다.
+- UTF-8이 아닌 값은 `Error::Utf8`이다. 이때 watcher는 serial을 기록하지
+  않는다. 그래서 property가 다시 바뀔 때까지 `value()`는 호출마다 같은 오류를
+  반환하고, `wait_for_change`는 기다리지 않고 같은 오류를 반환한다. 오류를
+  한 번만 보고하려면 watcher가 오류 상태를 따로 보관해야 하는데, 그 경로를
+  재현할 test 수단(UTF-8이 아닌 값을 쓰는 writer)이 없어 넣지 않았다.
+- free 함수 `rsproperties::watch`는 두지 않는다. `system_properties()?.watch(name)`이
+  같은 호출이고, global reader를 열지 못한 오류(`Error::Init`)가 `watch`가 아닌
+  `system_properties()`에서 반환된다.
+- 검증: `property_watcher.rs`의 unit test(Linux, `builder` feature). dirty store는
+  writer mapping의 serial word에 bit 0을 직접 세워 재현한다.
+  `tests/property_change_wait_tests.rs`의
+  `test_watcher_follows_creation_and_update`는 Android에서 init을 상대로 생성
+  1회와 update 1회를 확인한다.
 
 ## Service (Linux)
 
