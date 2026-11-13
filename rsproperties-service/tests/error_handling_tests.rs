@@ -9,7 +9,6 @@
 //! - Robustness and reliability
 //! - API contract validation
 
-#[path = "common.rs"]
 mod common;
 use common::init_test;
 
@@ -147,6 +146,7 @@ async fn test_string_parsing_edge_cases() -> anyhow::Result<()> {
         ("decimal_no_digits", ".123"),
         ("trailing_garbage", "42abc"),
         ("embedded_space", "4 2"),
+        ("very_long_number", "123456789012345678901234567890"),
     ];
 
     for (name, test_value) in edge_cases.iter() {
@@ -183,20 +183,18 @@ async fn test_string_parsing_edge_cases() -> anyhow::Result<()> {
                 assert!(is_error, "Should fail to parse '{test_value}' as integer");
             }
             &"very_long_number" => {
-                // This might succeed or fail depending on the number size
-                // We just ensure it doesn't panic
+                // 30 digits do not fit an `i32` (nor an `i64`).
+                assert!(is_error, "Should fail to parse '{test_value}' as integer");
             }
-            _ => {
-                // For other cases, we just ensure no panic occurs
-            }
+            _ => unreachable!("no expectation for case {name}"),
         }
 
-        // get_parsed_with_default should always succeed
+        // get_or should always succeed
         let with_default: i32 = rsproperties::get_or(&prop_name, 999);
         if is_error {
             assert_eq!(
                 with_default, 999,
-                "get_parsed_with_default should return default for invalid input: '{test_value}'"
+                "get_or should return default for invalid input: '{test_value}'"
             );
         }
     }
@@ -213,10 +211,13 @@ async fn test_property_name_edge_cases() -> anyhow::Result<()> {
     // connecting: ASCII alphanumerics and `_ . - @ :` only, no leading,
     // trailing or consecutive `.`.
     //
-    // The 500-byte name assumes the V2 protocol: this binary never sets
-    // `PROPERTY_SERVICE_VERSION` and its store has no
-    // `ro.property_service.version`, so the client uses V2. V1 would reject
-    // names of PROP_NAME_MAX (32) bytes or more with `InvalidArgument`.
+    // The 500-byte name assumes the V2 protocol. The service sets
+    // `ro.property_service.version` to 2 at startup, and the client takes
+    // the version from that property once this process has created its
+    // reader, which the read in `common::init_test` did. Without that read
+    // the client would use `PROPERTY_SERVICE_VERSION` (V2 when unset) for a
+    // `set` that no read preceded. The client's V1 path rejects names of
+    // PROP_NAME_MAX (32) bytes or more with `InvalidArgument`.
     let name_cases = [
         ("very_long_name", "a".repeat(500), true),
         ("unicode_name", "测试.property.名称".to_string(), false),
@@ -303,9 +304,18 @@ async fn test_concurrent_error_scenarios() -> anyhow::Result<()> {
 
     let num_tasks = 10;
 
+    // `get` and `set` block, so each task gets a thread of the blocking
+    // pool (tasks spawned on this current-thread runtime would run one
+    // after another). The barrier holds every thread until all have
+    // started.
+    let start = std::sync::Arc::new(std::sync::Barrier::new(num_tasks));
+
     let handles: Vec<_> = (0..num_tasks)
         .map(|task_id| {
-            tokio::spawn(async move {
+            let start = start.clone();
+            tokio::task::spawn_blocking(move || {
+                start.wait();
+
                 // Each task tries various error scenarios
                 let base_name = format!("test.concurrent_errors.task_{task_id}");
 
@@ -326,7 +336,7 @@ async fn test_concurrent_error_scenarios() -> anyhow::Result<()> {
                     "{result:?}"
                 );
 
-                // But get_parsed_with_default should work
+                // But get_or should work
                 let with_default: i32 = rsproperties::get_or(&invalid_prop, 42);
                 assert_eq!(with_default, 42);
 
@@ -348,7 +358,7 @@ async fn test_api_contract_validation() -> anyhow::Result<()> {
 
     // Test that API contracts are maintained
 
-    // Contract 1: get_parsed_with_default never fails
+    // Contract 1: get_or never fails
     let test_cases = [
         ("non.existent.property", 42),
         ("test.contract.invalid", 999),
@@ -361,7 +371,7 @@ async fn test_api_contract_validation() -> anyhow::Result<()> {
         let result: i32 = rsproperties::get_or(prop_name, *default_value);
         assert_eq!(
             result, *default_value,
-            "get_parsed_with_default should always return default for invalid cases"
+            "get_or should always return default for invalid cases"
         );
     }
 
@@ -410,18 +420,23 @@ async fn test_memory_usage_patterns() -> anyhow::Result<()> {
 
         // Create and destroy many property values
         rsproperties::set(&prop_name, i)?;
-        let _retrieved: String = rsproperties::get(&prop_name)?;
-        let _parsed: i32 = rsproperties::get(&prop_name)?;
+        let retrieved: String = rsproperties::get(&prop_name)?;
+        assert_eq!(retrieved, i.to_string());
+        let parsed: i32 = rsproperties::get(&prop_name)?;
+        assert_eq!(parsed, i);
 
         // Overwrite with different types
         rsproperties::set(&prop_name, i as f64 * 1.5)?;
-        let _as_float: f64 = common::read_parsed(&prop_name)?;
+        let as_float: f64 = common::read_parsed(&prop_name)?;
+        assert_eq!(as_float, i as f64 * 1.5);
 
         rsproperties::set(&prop_name, format!("string_{i}"))?;
-        let _as_string: String = rsproperties::get(&prop_name)?;
+        let as_string: String = rsproperties::get(&prop_name)?;
+        assert_eq!(as_string, format!("string_{i}"));
     }
 
-    // If we get here without crashing, memory management is working
+    // Every read returned the value of the latest `set`. Memory use is not
+    // measured.
     Ok(())
 }
 
@@ -440,10 +455,8 @@ async fn test_error_message_quality() -> anyhow::Result<()> {
     let error_msg = result.unwrap_err().to_string();
     // Error should mention the property name
     assert!(
-        error_msg.contains("non.existent.test.property")
-            || error_msg.to_lowercase().contains("not found")
-            || error_msg.to_lowercase().contains("notfound"),
-        "Error message should be informative: '{error_msg}'"
+        error_msg.contains("non.existent.test.property"),
+        "NotFound message should name the property: '{error_msg}'"
     );
 
     // Test 2: Parse error
@@ -454,12 +467,23 @@ async fn test_error_message_quality() -> anyhow::Result<()> {
         "{result:?}"
     );
     let error_msg = result.unwrap_err().to_string();
-    // Error should mention parsing failure and the value
+    // The message names the property, the value's length and the type,
+    // never the value.
     assert!(
-        error_msg.to_lowercase().contains("parse")
-            || error_msg.to_lowercase().contains("invalid")
-            || error_msg.contains("invalid_for_integer"),
-        "Parse error message should be informative: '{error_msg}'"
+        error_msg.contains("\"test.error_msg.parse\""),
+        "Parse message should name the property: '{error_msg}'"
+    );
+    assert!(
+        error_msg.contains("<19 bytes>"),
+        "Parse message should give the value's length: '{error_msg}'"
+    );
+    assert!(
+        error_msg.contains("i32"),
+        "Parse message should name the type: '{error_msg}'"
+    );
+    assert!(
+        !error_msg.contains("invalid_for_integer"),
+        "Parse message must not contain the value: '{error_msg}'"
     );
 
     Ok(())
@@ -516,7 +540,7 @@ async fn test_type_conversion_boundaries() -> anyhow::Result<()> {
             );
         }
 
-        // Verify get_parsed_with_default behavior
+        // Verify get_or behavior
         let default_signed: i32 = rsproperties::get_or(&prop_name, -999);
         let default_unsigned: u32 = rsproperties::get_or(&prop_name, 999);
 

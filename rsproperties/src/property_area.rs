@@ -81,7 +81,8 @@
 //!   `PropertyIndex` — and can copy it but not make one. The type does not record which area an
 //!   offset belongs to: a `PropertyIndex` pairs it with its
 //!   `context_index` and is accepted only by the instance whose `find` or
-//!   `foreach` made it (`owns_index`). Bounds and alignment are checked at every
+//!   `foreach` made it (`SystemProperties::check_index`). Bounds and
+//!   alignment are checked at every
 //!   access. An offset from any other source would be a bug in this file,
 //!   not the \[SM5\] residual; \[SM5\] covers only a file whose link words
 //!   or long offsets are corrupt.
@@ -1664,7 +1665,7 @@ impl MemoryMap {
         let ptr_addr = (self.data as usize).wrapping_add(offset);
         if ptr_addr % align != 0 {
             return Err(Error::FileValidation(format!(
-                "Misaligned object at offset {offset}: required align={align}, addr={ptr_addr:#x}"
+                "Misaligned object at offset {offset}: required align={align}"
             )));
         }
         Ok(())

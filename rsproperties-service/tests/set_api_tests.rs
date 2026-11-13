@@ -9,7 +9,6 @@
 //! - Error handling and edge cases
 #![allow(clippy::approx_constant)]
 
-#[path = "common.rs"]
 mod common;
 use common::init_test;
 
@@ -429,10 +428,17 @@ async fn test_set_and_get_integration() -> anyhow::Result<()> {
 async fn test_set_concurrent_properties() -> anyhow::Result<()> {
     setup_test_env().await;
 
-    // Test setting properties concurrently (basic test)
+    // Test setting properties concurrently (basic test). `set` and `get`
+    // block, so each task gets a thread of the blocking pool (tasks
+    // spawned on this current-thread runtime would run one after another).
+    // The barrier holds every thread until all have started.
+    let start = std::sync::Arc::new(std::sync::Barrier::new(10));
     let handles: Vec<_> = (0..10)
         .map(|i| {
-            tokio::spawn(async move {
+            let start = start.clone();
+            tokio::task::spawn_blocking(move || {
+                start.wait();
+
                 let prop_name = format!("test.concurrent.prop_{i}");
                 let prop_value = format!("value_{i}");
 
@@ -494,10 +500,13 @@ async fn test_set_error_handling() {
     let very_long_name = "a".repeat(1000);
     let very_long_value = "b".repeat(10000);
 
-    // Assumes the V2 protocol: this binary never sets
-    // `PROPERTY_SERVICE_VERSION` and its store has no
-    // `ro.property_service.version`, so the client uses V2. V1 would reject
-    // names of PROP_NAME_MAX (32) bytes or more with `InvalidArgument`.
+    // Assumes the V2 protocol. The service sets
+    // `ro.property_service.version` to 2 at startup, and the client takes
+    // the version from that property once this process has created its
+    // reader, which the read in `common::init_test` did. Without that read
+    // the client would use `PROPERTY_SERVICE_VERSION` (V2 when unset) for a
+    // `set` that no read preceded. The client's V1 path rejects names of
+    // PROP_NAME_MAX (32) bytes or more with `InvalidArgument`.
     rsproperties::set(&very_long_name, "test").unwrap_or_else(|e| {
         panic!(
             "V2 has no name-length rule beyond MAX_WIRE_NAME_LEN (1024), so a \

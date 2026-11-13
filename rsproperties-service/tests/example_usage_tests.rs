@@ -8,7 +8,6 @@
 
 use rsproperties::{self, Result};
 
-#[path = "common.rs"]
 mod common;
 use common::init_test;
 
@@ -18,7 +17,7 @@ async fn example_basic_usage() -> Result<()> {
     // Initialize the library with a test directory
     init_test().await;
 
-    // Reading a property that doesn't exist - use get_with_default
+    // Reading a property that doesn't exist - use get_or
     let sdk_version = rsproperties::get_or("ro.build.version.sdk", "unknown".to_string());
     println!("SDK Version: {sdk_version}");
     assert_eq!(sdk_version, "unknown"); // Should return default since property doesn't exist
@@ -144,6 +143,9 @@ async fn example_android_property_patterns() {
     for (prop, description) in android_properties {
         let value = rsproperties::get_or(prop, "not_set".to_string());
         println!("{description}: {prop} = {value}");
+        // No test of this binary sets these names and the service does not
+        // create them at startup, so the default is returned.
+        assert_eq!(value, "not_set", "{prop}");
 
         // Demonstrate type conversion for numeric properties
         if prop.contains("sdk") || prop.contains("port") {
@@ -239,6 +241,9 @@ async fn example_property_monitoring() {
     for prop in &monitored_properties {
         let current_value = rsproperties::get_or(prop, "unknown".to_string());
         println!("Currently monitoring {prop}: {current_value}");
+        // No test of this binary sets these names, so the default is
+        // returned.
+        assert_eq!(current_value, "unknown", "{prop}");
     }
 
     // In a real application, you might:

@@ -5,13 +5,12 @@
 //!
 //! These tests verify the complete integration between:
 //! - set() function with type conversion
-//! - get_parsed() and get_parsed_with_default() functions
+//! - get() and get_or() functions
 //! - Type safety and conversion accuracy
 //! - Error handling and edge cases
 //! - Performance and consistency
 #![allow(clippy::approx_constant)]
 
-#[path = "common.rs"]
 mod common;
 use common::init_test;
 
@@ -103,6 +102,7 @@ async fn test_string_consistency() -> anyhow::Result<()> {
         "simple_string",
         "string with spaces",
         "unicode_测试_🚀",
+        // The service stores an empty value; `get` reads it back as "".
         "",
         "123456",
         "true",
@@ -113,11 +113,6 @@ async fn test_string_consistency() -> anyhow::Result<()> {
 
     for (i, test_string) in test_strings.iter().enumerate() {
         let prop_name = format!("test.string_consistency.set_{i}");
-
-        // Skip empty strings as they may not be supported by the underlying property system
-        if test_string.is_empty() {
-            continue;
-        }
 
         // Set using set function (which handles Display types including &str)
         rsproperties::set(&prop_name, test_string)?;
@@ -299,10 +294,7 @@ async fn test_numeric_edge_cases() -> anyhow::Result<()> {
 
         // Also test with get_or
         let with_default: i64 = rsproperties::get_or(&prop_name, 42);
-        assert_eq!(
-            with_default, *expected,
-            "get_parsed_with_default failed for {name}"
-        );
+        assert_eq!(with_default, *expected, "get_or failed for {name}");
     }
 
     Ok(())
@@ -367,12 +359,9 @@ async fn test_boolean_string_variations() -> anyhow::Result<()> {
             "Invalid bool case should fail for {name} ({string_value}): {result:?}"
         );
 
-        // But get_parsed_with_default should return the default
+        // But get_or should return the default
         let with_default: bool = rsproperties::get_or(&prop_name, true);
-        assert!(
-            with_default,
-            "get_parsed_with_default should return default for {name}"
-        );
+        assert!(with_default, "get_or should return default for {name}");
     }
 
     Ok(())
@@ -448,10 +437,7 @@ async fn test_android_property_patterns() -> anyhow::Result<()> {
 
         // Get with default (safe app usage)
         let with_default: i32 = rsproperties::get_or(prop_name, -1);
-        assert_eq!(
-            with_default, *expected_int,
-            "get_parsed_with_default failed for {prop_name}"
-        );
+        assert_eq!(with_default, *expected_int, "get_or failed for {prop_name}");
 
         // Verify string representation is preserved
         let as_string: String = rsproperties::get(prop_name)?;

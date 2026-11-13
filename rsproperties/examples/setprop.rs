@@ -15,8 +15,12 @@
 //!   setprop persist.sys.usb.config adb         # Set USB configuration
 //!   setprop --socket-dir ./socket debug.prop value  # Use custom socket directory
 //!
-//! Exit code 0 is the success signal, like AOSP setprop (which prints
-//! nothing on success). Errors go to stderr with exit code 1.
+//! Exit code 0 is the success signal, like AOSP setprop (toolbox), which
+//! prints nothing on success. Errors go to stderr with exit code 1 (2
+//! for a command-line usage error, which clap reports).
+//! Stdout stays empty on success. A name starting with `ro.` gets a
+//! warning on stderr before the set, whether or not the set succeeds;
+//! AOSP setprop prints no such warning.
 
 use clap::Parser;
 use rsproperties::PropertyConfig;
@@ -67,7 +71,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Validate property name and value
+    // Validate property name
     if let Err(msg) = validate_property(&args.property_name) {
         // `let _ =` on every output write: a closed stderr must not turn
         // into a panic (exit code 101) that hides the real exit code.
@@ -75,7 +79,13 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Set the property. Nothing is printed on success.
+    // Set the property. On success this example writes nothing more
+    // itself: stdout stays empty, and the only line it wrote to stderr is
+    // the `ro.` warning from `validate_property`. Log lines of the library
+    // also go to stderr (env_logger, default filter `info`). Two examples:
+    // `init` logs each directory given with `--properties-dir` /
+    // `--socket-dir` at `info`, and `set` logs a `PROPERTY_SERVICE_VERSION`
+    // that is not a number at `warn`.
     if let Err(e) = rsproperties::set(&args.property_name, &args.property_value) {
         let _ = writeln!(
             std::io::stderr(),

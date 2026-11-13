@@ -49,7 +49,7 @@ fn test_get_with_default_basic() {
     let result = rsproperties::get_or("test.nonexistent.basic", "default_value".to_string());
     assert_eq!(result, "default_value");
 
-    println!("✓ Basic get_with_default test passed");
+    println!("✓ Basic get_or test passed");
 }
 
 #[cfg(any(feature = "builder", target_os = "android"))]
@@ -57,7 +57,7 @@ fn test_get_with_default_basic() {
 fn test_get_with_default_edge_cases() {
     init_properties();
 
-    // Test edge cases for get_with_default
+    // Test edge cases for get_or
     let test_cases = [
         ("test.empty.default", "", "empty default value"),
         ("test.spaces", "value with spaces", "default with spaces"),
@@ -76,7 +76,7 @@ fn test_get_with_default_edge_cases() {
     }
 
     println!(
-        "✓ get_with_default edge cases passed ({} test cases)",
+        "✓ get_or edge cases passed ({} test cases)",
         test_cases.len()
     );
 }
@@ -104,6 +104,21 @@ fn test_get_nonexistent_returns_error() {
     println!("✓ get nonexistent properties test passed");
 }
 
+/// The directory `init_properties` leaves configured: on a host this
+/// binary's store, `temp_dir()/rsprops_it_production_tests_<pid>`
+/// (`tests/common/mod.rs`); on Android the default directory.
+#[cfg(any(feature = "builder", target_os = "android"))]
+fn expected_properties_dir() -> std::path::PathBuf {
+    if cfg!(target_os = "android") {
+        PROP_DIRNAME.into()
+    } else {
+        std::env::temp_dir().join(format!(
+            "rsprops_it_production_tests_{}",
+            std::process::id()
+        ))
+    }
+}
+
 #[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_dirname_function() {
@@ -112,8 +127,12 @@ fn test_dirname_function() {
     let dirname = rsproperties::properties_dir();
     let dirname_str = dirname.to_string_lossy();
 
-    // Verify dirname returns a valid path
-    assert!(!dirname_str.is_empty(), "dirname should not be empty");
+    // Verify dirname returns the directory `init_properties` configured
+    assert_eq!(
+        dirname,
+        expected_properties_dir(),
+        "dirname should be the configured properties directory"
+    );
 
     println!("✓ dirname function test passed");
     println!("  dirname = '{dirname_str}'");
@@ -123,20 +142,51 @@ fn test_dirname_function() {
 #[test]
 fn test_value_length_limits() {
     // Test property value length limits
-    let max_value = "x".repeat(PROP_VALUE_MAX);
-    assert_eq!(max_value.len(), PROP_VALUE_MAX);
+    let max_value = "x".repeat(PROP_VALUE_MAX - 1);
+    assert_eq!(max_value.len(), PROP_VALUE_MAX - 1);
 
-    let too_long_value = "x".repeat(PROP_VALUE_MAX + 1);
-    assert_eq!(too_long_value.len(), PROP_VALUE_MAX + 1);
+    let too_long_value = "x".repeat(PROP_VALUE_MAX);
+    assert_eq!(too_long_value.len(), PROP_VALUE_MAX);
 
     init_properties();
 
-    // Test with get_or (should work with any length default)
-    let result1 = rsproperties::get_or("test.max.length", max_value.clone());
-    assert_eq!(result1, max_value);
+    // A non-`ro.` value of PROP_VALUE_MAX bytes is rejected before `set`
+    // connects. On a host, a `set` that went on to the socket would
+    // return `Error::Io` instead (see below).
+    let result = rsproperties::set("test.too.long", &too_long_value);
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{PROP_VALUE_MAX} byte value: {result:?}"
+    );
 
-    let result2 = rsproperties::get_or("test.too.long", too_long_value.clone());
-    assert_eq!(result2, too_long_value);
+    // A value of PROP_VALUE_MAX - 1 bytes passes the length check and `set`
+    // goes on to the property service socket.
+    let result = rsproperties::set("test.max.length", &max_value);
+
+    // Host: no property service runs on this binary's store (its socket
+    // dir is never created), so the request fails at the socket. The
+    // rsproperties-service tests check the stored value against a service.
+    #[cfg(not(target_os = "android"))]
+    assert!(
+        matches!(result, Err(Error::Io(_))),
+        "{} byte value: {result:?}",
+        PROP_VALUE_MAX - 1
+    );
+
+    // Android: init answers. It stores the value, or refuses the name for
+    // the caller's SELinux domain.
+    #[cfg(target_os = "android")]
+    match result {
+        Ok(()) => assert_eq!(
+            rsproperties::get::<String>("test.max.length").unwrap(),
+            max_value
+        ),
+        Err(e) => assert!(
+            matches!(e, Error::SetRejected { .. }),
+            "{} byte value: {e:?}",
+            PROP_VALUE_MAX - 1
+        ),
+    }
 
     println!("✓ Value length limits test passed");
 }
@@ -154,6 +204,7 @@ fn test_thread_safety_basic() {
     let expected: Arc<String> = Arc::new(
         rsproperties::get("ro.build.version.sdk").expect("ro.build.version.sdk is stored"),
     );
+    let expected_dir: Arc<std::path::PathBuf> = Arc::new(expected_properties_dir());
     let counter = Arc::new(AtomicUsize::new(0));
     let mut handles = vec![];
 
@@ -161,6 +212,7 @@ fn test_thread_safety_basic() {
     for _ in 0..5 {
         let counter_clone = Arc::clone(&counter);
         let expected = Arc::clone(&expected);
+        let expected_dir = Arc::clone(&expected_dir);
 
         let handle = thread::spawn(move || {
             // Each thread performs property operations
@@ -178,7 +230,8 @@ fn test_thread_safety_basic() {
                 counter_clone.fetch_add(1, Ordering::SeqCst);
 
                 // Test dirname
-                let _dirname = rsproperties::properties_dir();
+                let dirname = rsproperties::properties_dir();
+                assert_eq!(dirname, *expected_dir);
                 counter_clone.fetch_add(1, Ordering::SeqCst);
             }
         });
@@ -191,6 +244,8 @@ fn test_thread_safety_basic() {
         handle.join().expect("Thread should complete");
     }
 
+    // Each increment follows a checked result, so the count is the number
+    // of verified operations.
     let final_count = counter.load(Ordering::SeqCst);
     assert_eq!(final_count, 5 * 10 * 3, "All operations should complete");
 
@@ -284,7 +339,7 @@ fn test_comprehensive_integration() {
 
     // 2. Test dirname
     let dirname = rsproperties::properties_dir();
-    assert!(!dirname.to_string_lossy().is_empty());
+    assert_eq!(dirname, expected_properties_dir());
 
     // 3. Test get_or for multiple properties
     let props = ["int.test.1", "int.test.2", "int.test.3"];

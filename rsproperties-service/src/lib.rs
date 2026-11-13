@@ -4,11 +4,19 @@
 //! Linux emulation of the Android system property service.
 //!
 //! Serves the `property_service` / `property_service_for_system` socket protocol
-//! (SETPROP2 and legacy SETPROP) and maintains the property area files on a Linux
+//! (`PROP_MSG_SETPROP2`) and maintains the property area files on a Linux
 //! host, so `rsproperties` clients can `set`, `get` and `wait` without an Android
 //! device. It is not usable on Android, where init owns the property service; the
 //! crate compiles only for `target_os = "linux"` (on other targets the first error
 //! names the reason).
+//!
+//! The V1 command (`PROP_MSG_SETPROP`), which init still handles, is not
+//! supported: such a request sets nothing and gets
+//! `PROP_ERROR_INVALID_CMD`. A V1 client does not read that reply and
+//! reports success, so clients must send `PROP_MSG_SETPROP2`. The service
+//! sets `ro.property_service.version` to `2`, which is what bionic and
+//! `rsproperties` clients read to choose the command, and [`run`] fails
+//! when a build.prop file sets that property to a value that selects V1.
 //!
 //! [`run`] starts the service and returns a [`ServiceHandle`]; see there
 //! for how the service is stopped.
@@ -50,7 +58,7 @@ struct WorkspaceReadmeDoctests;
 // second instance replace a running instance's sockets. [`run`] is the
 // only way to start them, and [`ServiceHandle`] the only way to stop them.
 use properties_service::{PropertiesService, PropertiesServiceArgs};
-use socket_service::{SocketService, SocketServiceArgs};
+use socket_service::{ControlCalls, ControlCallsDrain, SocketService, SocketServiceArgs};
 
 /// A `ctl.*` set, which AOSP init handles as a control message instead of
 /// storing it: `ctl.<action>` = `<target>`, e.g. `ctl.start` =
@@ -183,10 +191,6 @@ impl ServiceOptions {
     ///   A failed write is logged and the set still succeeds, as in init;
     ///   the change stays in memory and goes into the next write. Do not
     ///   edit the file while the service runs: the next write replaces it.
-    /// - Only a V2 (`PROP_MSG_SETPROP2`) set is stored, as in init. A V1
-    ///   (`PROP_MSG_SETPROP`) set of such a name changes the property
-    ///   area and neither the in-memory records nor the file, so the
-    ///   value is gone after a restart; the service logs a warning.
     /// - A file that does not parse is deleted at startup, as init does.
     ///   A group- or world-writable file is not loaded, as init's
     ///   `ReadFile` does; it is not deleted, but the next persistent set
@@ -215,6 +219,30 @@ impl ServiceOptions {
     /// until it returns, and a request that finds all 16 slots taken gets
     /// `PROP_ERROR_HANDLE_CONTROL_MESSAGE` without the handler being called
     /// and without using a blocking thread.
+    ///
+    /// [`ServiceHandle::shutdown`] and [`ServiceHandle::join`] return only
+    /// after every call has returned, and so does a [`run`] that fails to
+    /// start, for the calls made while it was starting. A call that never
+    /// returns keeps them pending, and a handler must not wait for any of
+    /// the three to return.
+    ///
+    /// `handler` and what it captured can be dropped later than that. The
+    /// task of each accepted connection holds a clone until the task ends,
+    /// which two 10 s timeouts bound from the time the connection was
+    /// accepted (the wait for a connection slot, then the exchange with
+    /// the client), and the blocking thread of a call drops its clone just
+    /// after the call has been counted as returned. Code that waits for a
+    /// captured value to be dropped (for example a channel sender, or the
+    /// last clone of an `Arc`) must allow for that delay after `shutdown`
+    /// or `join` has returned.
+    ///
+    /// The timeouts run inside the connection's task, so the bound holds
+    /// only while the runtime keeps polling that task. On a current-thread
+    /// runtime whose thread is blocked, or has left `block_on`, the task
+    /// keeps its clone until the runtime polls it again or is dropped;
+    /// dropping the runtime drops the task. Code that waits for a captured
+    /// value to be dropped must therefore not block that thread while it
+    /// waits.
     pub fn control_handler<F>(mut self, handler: F) -> Self
     where
         F: Fn(&ControlMessage) -> bool + Send + Sync + 'static,
@@ -226,22 +254,11 @@ impl ServiceOptions {
 
 pub(crate) struct ReadyMessage;
 
-/// The frame a client set arrived in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SetProtocol {
-    /// `PROP_MSG_SETPROP`: the client gets no result code, and a
-    /// `persist.` / `next_boot.` name is set in the property area only
-    /// (init writes the persistent file for V2 sets alone).
-    V1,
-    /// `PROP_MSG_SETPROP2`.
-    V2,
-}
-
+/// One set that arrived as `PROP_MSG_SETPROP2`.
 #[derive(Clone)]
 pub(crate) struct PropertyMessage {
     pub name: String,
     pub value: String,
-    pub protocol: SetProtocol,
 }
 
 // Mask `value` in `Debug` output so log-level captures don't spill
@@ -254,7 +271,6 @@ impl std::fmt::Debug for PropertyMessage {
         f.debug_struct("PropertyMessage")
             .field("name", &self.name)
             .field("value", &format_args!("<{} bytes>", self.value.len()))
-            .field("protocol", &self.protocol)
             .finish()
     }
 }
@@ -319,10 +335,14 @@ where
 ///   ends by itself, which [`join`](Self::join) reports;
 /// - the handle is dropped. This also stops the service, but nothing
 ///   waits for it: the socket files are unlinked and the properties dir's
-///   writer lock is released later, by tasks on the runtime. Call
-///   [`shutdown`](Self::shutdown) when the next step depends on them
-///   being released (starting the service again on the same directories,
-///   for example).
+///   writer lock is released later, by tasks on the runtime. Control
+///   handler calls are not waited for either: a `ctl.*` request is
+///   refused once the socket service has ended, which is after the drop
+///   returned, and a call whose request was read before that runs to
+///   completion. Call [`shutdown`](Self::shutdown) when the next step
+///   depends on the files and locks being released (starting the service
+///   again on the same directories, for example) or on no handler call
+///   running.
 ///
 /// ```no_run
 /// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -347,16 +367,19 @@ where
 pub struct ServiceHandle {
     socket: ActorSlot<SocketService>,
     properties: ActorSlot<PropertiesService>,
+    /// `None` without a control handler.
+    control_calls: Option<ControlCallsDrain>,
 }
 
 impl ServiceHandle {
     /// Waits until the service has ended.
     ///
     /// Returns when one of the two parts has ended by itself — after the
-    /// other one has been stopped and has ended too, so the socket files
-    /// are unlinked and the writer lock is released by then. Nothing ends
-    /// a part in normal operation; this returns only after a failure, or
-    /// never.
+    /// other one has been stopped and has ended too, and after the control
+    /// handler calls have returned (as for [`shutdown`](Self::shutdown)),
+    /// so the socket files are unlinked, the writer lock is released and
+    /// no handler call is running by then. Nothing ends a part in normal
+    /// operation; this returns only after a failure, or never.
     ///
     /// Cancel-safe, so it can be an arm of `tokio::select!`: a cancelled
     /// call loses nothing, and the next call (or
@@ -381,7 +404,23 @@ impl ServiceHandle {
     /// (the writer lock and the persistent properties file's lock are
     /// released). Sets already queued for the properties service are
     /// applied before it ends; a connection whose request had not been
-    /// queued by then gets an error reply or is closed.
+    /// queued by then gets an error reply or is closed. A `ctl.*` request
+    /// read after the socket service has ended is refused with
+    /// `PROP_ERROR_HANDLE_CONTROL_MESSAGE`.
+    ///
+    /// Last, this waits for the control handler calls whose requests were
+    /// read before the socket service ended: those that are running and
+    /// those still queued for a blocking thread. When it returns, no
+    /// handler call is running and none begins afterwards. There is no
+    /// timeout, so a call that does not return keeps this pending (init
+    /// runs its control functions on its main thread and does not time
+    /// them out either). Dropping the returned future before it completes
+    /// is dropping the handle at that point: a part that has not ended is
+    /// stopped without being waited for, and handler calls that have not
+    /// returned keep running. During the last wait both parts have ended,
+    /// so the socket files are unlinked and the locks are released. The
+    /// handler value itself can be dropped after this returns; see
+    /// [`ServiceOptions::control_handler`].
     ///
     /// The property area files and `property_info` stay in the properties
     /// dir, so readers that mapped them keep working; they see no further
@@ -396,17 +435,31 @@ impl ServiceHandle {
     }
 
     /// Stops both actors and waits for both tasks. The socket service is
-    /// stopped and joined first, so no client request is read after the
-    /// properties service got its stop.
+    /// stopped and joined first, so no connection is accepted after the
+    /// properties service got its stop. The connection tasks are detached
+    /// and are not waited for: one that reads its request later has it
+    /// refused — by the properties service's closed mailbox, or, for
+    /// `ctl.*`, by the control-call semaphore that the socket service
+    /// closes when it is dropped (joining its task drops it). The
+    /// client then gets an error reply.
+    ///
+    /// The control handler calls that got a permit before the semaphore
+    /// was closed are waited for last ([`ControlCallsDrain::wait`]): the
+    /// refusal is in effect before that wait starts, and the wait comes
+    /// after both tasks so that a call that does not return leaves the
+    /// socket files unlinked and the locks released.
     ///
     /// Cancel-safe: `ActorRef::stop` only enqueues a signal and can be
     /// repeated, also for an actor that has ended, and
-    /// [`ActorSlot::wait`] is cancel-safe.
+    /// [`ActorSlot::wait`] and [`ControlCallsDrain::wait`] are cancel-safe.
     async fn stop_and_wait(&mut self) -> Result<(), ServiceError> {
         self.socket.actor_ref.stop().await;
         self.socket.wait().await;
         self.properties.actor_ref.stop().await;
         self.properties.wait().await;
+        if let Some(control_calls) = &self.control_calls {
+            control_calls.wait().await;
+        }
         // Both set: the socket service's failure is the one reported, as
         // in `run`.
         match self
@@ -667,13 +720,33 @@ impl std::error::Error for StartupError {
 /// `tokio::spawn`ed and the error converted into `anyhow::Error` or
 /// `Box<dyn Error + Send + Sync>`.
 ///
+/// The socket service accepts requests while the properties service is
+/// still starting, so a [control handler](ServiceOptions::control_handler)
+/// can be called before `run` returns. A failed `run` returns its error
+/// after those calls have returned, as [`ServiceHandle::shutdown`] does,
+/// and without a timeout.
+///
 /// # Properties set at startup
 ///
 /// After the build.prop entries, as AOSP init does: `ro.property_service.version`
-/// = `2` (unless a build.prop file already set it), then the records of
+/// = `2` (unless a build.prop file already set it; `run` fails, before it
+/// writes to the properties dir, when that value is not a number of 2 or
+/// more, because clients would then send the V1 command, which the
+/// service refuses), then the records of
 /// [`ServiceOptions::persistent_properties_file`] (each checked like a
 /// client set), then `ro.persistent_properties.ready` = `true` — also
 /// without a persistent properties file, since init always sets it.
+///
+/// A staged `next_boot.<name>` record leaves the persistent properties
+/// file when the file is loaded: the load rewrites the file without it,
+/// before the property areas are created and before any record is set
+/// (init writes the file first too). A `<name>` that starts with
+/// `persist.` or `next_boot.` is written back under that name, so a later
+/// start still finds it. Any other `<name>` is not written back, and its
+/// value exists only as the set made later in the same startup. That
+/// value is lost when `run` fails after the rewrite, at whatever step
+/// (for example a `property_contexts` or build.prop file that cannot be
+/// read), or when the set is rejected by the checks of a client set.
 pub async fn run(
     config: rsproperties::PropertyConfig,
     options: ServiceOptions,
@@ -709,10 +782,12 @@ pub async fn run(
         writer_lock: lock,
         persistent_properties_file,
     });
+    let control = control_handler.map(ControlCalls::new);
+    let control_calls = control.as_ref().map(ControlCalls::drain);
     let (socket_ref, socket_join) = socket_service::spawn(SocketServiceArgs {
         socket_dir: rsproperties::socket_dir().to_path_buf(),
         properties_service: properties_ref.clone(),
-        control_handler,
+        control,
     });
 
     // Sequential readiness checks: the socket service is checked first, so
@@ -735,6 +810,7 @@ pub async fn run(
         // Wait for that, so nothing writes the properties dir after `run`
         // returned.
         let _ = properties_join.await;
+        wait_for_control_calls(control_calls.as_ref()).await;
         return Err(err);
     }
     if let Err(e) = properties_ref.ask(ReadyMessage).await {
@@ -747,13 +823,26 @@ pub async fn run(
         // names. Wait for that, so a retry on the same socket dir does not
         // race this instance's unlink.
         let _ = socket_join.await;
+        wait_for_control_calls(control_calls.as_ref()).await;
         return Err(err);
     }
 
     Ok(ServiceHandle {
         socket: ActorSlot::new("socket service", socket_ref, socket_join),
         properties: ActorSlot::new("properties service", properties_ref, properties_join),
+        control_calls,
     })
+}
+
+/// The last step of a failed [`run`]: the socket service may have been
+/// listening before the failure, so a `ctl.*` request may have reached
+/// the control handler. Called after the socket service's task was joined
+/// (see [`ControlCallsDrain::wait`]), so no handler call is running or
+/// begins once `run` has returned its error.
+async fn wait_for_control_calls(control_calls: Option<&ControlCallsDrain>) {
+    if let Some(control_calls) = control_calls {
+        control_calls.wait().await;
+    }
 }
 
 /// Builds the [`StartupError`] for a failed actor: the cause is the
@@ -787,7 +876,7 @@ mod tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    use rsproperties::wire::{PROP_MSG_SETPROP2, PROP_SUCCESS};
+    use rsproperties::wire::{PROP_ERROR_HANDLE_CONTROL_MESSAGE, PROP_MSG_SETPROP2, PROP_SUCCESS};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 
@@ -799,7 +888,6 @@ mod tests {
         let msg = PropertyMessage {
             name: "test.key".to_string(),
             value: "test.value".to_string(),
-            protocol: SetProtocol::V2,
         };
         let debug = format!("{msg:?}");
         assert!(!debug.contains("test.value"), "value leaked: {debug}");
@@ -1197,15 +1285,17 @@ mod tests {
         });
     }
 
-    /// A `persist.*` set sent as a V1 frame reaches the property area and
-    /// not the persistent properties file; the same set as a V2 frame
-    /// reaches both (init: `HandlePropertySetNoSocket` for
-    /// `PROP_MSG_SETPROP`).
+    /// A set sent as a V1 frame (`PROP_MSG_SETPROP`) is refused with
+    /// `PROP_ERROR_INVALID_CMD` and reaches neither the property area nor
+    /// the persistent properties file; the same kind of set as a V2 frame
+    /// reaches both. init applies a V1 set to the area.
     #[test]
-    fn v1_persistent_set_is_applied_and_not_stored() {
-        use rsproperties::wire::{PROP_MSG_SETPROP, PROP_NAME_MAX, PROP_VALUE_MAX};
+    fn v1_set_is_refused_and_not_applied() {
+        use rsproperties::wire::{
+            PROP_ERROR_INVALID_CMD, PROP_MSG_SETPROP, PROP_NAME_MAX, PROP_VALUE_MAX,
+        };
 
-        const TEST: &str = "tests::v1_persistent_set_is_applied_and_not_stored";
+        const TEST: &str = "tests::v1_set_is_refused_and_not_applied";
         if !is_child(TEST) {
             run_in_child(TEST);
             return;
@@ -1230,17 +1320,21 @@ mod tests {
             .unwrap();
             let socket = socket_dir.join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
 
-            let mut v1 = PROP_MSG_SETPROP.to_ne_bytes().to_vec();
-            for (field, len) in [("persist.v1.name", PROP_NAME_MAX), ("a", PROP_VALUE_MAX)] {
-                let mut buf = vec![0u8; len];
-                buf[..field.len()].copy_from_slice(field.as_bytes());
-                v1.extend_from_slice(&buf);
+            for name in ["persist.v1.name", "debug.v1.name"] {
+                let mut v1 = PROP_MSG_SETPROP.to_ne_bytes().to_vec();
+                for (field, len) in [(name, PROP_NAME_MAX), ("a", PROP_VALUE_MAX)] {
+                    let mut buf = vec![0u8; len];
+                    buf[..field.len()].copy_from_slice(field.as_bytes());
+                    v1.extend_from_slice(&buf);
+                }
+                let mut stream = UnixStream::connect(&socket).await.unwrap();
+                stream.write_all(&v1).await.unwrap();
+                assert_eq!(
+                    read_reply(&mut stream).await,
+                    Some(PROP_ERROR_INVALID_CMD),
+                    "{name}"
+                );
             }
-            let mut stream = UnixStream::connect(&socket).await.unwrap();
-            stream.write_all(&v1).await.unwrap();
-            // V1 has no reply: the service closes the connection once the
-            // set has been handled.
-            assert_eq!(read_reply(&mut stream).await, None);
 
             let (name, value) = ("persist.v2.name", "b");
             let mut v2 = PROP_MSG_SETPROP2.to_ne_bytes().to_vec();
@@ -1252,7 +1346,15 @@ mod tests {
             stream.write_all(&v2).await.unwrap();
             assert_eq!(read_reply(&mut stream).await, Some(PROP_SUCCESS));
 
-            assert_eq!(rsproperties::get::<String>("persist.v1.name").unwrap(), "a");
+            // The V2 set above was handled after both V1 requests had
+            // been answered, so a V1 set that had been applied would be
+            // visible here.
+            for name in ["persist.v1.name", "debug.v1.name"] {
+                assert!(
+                    rsproperties::get::<String>(name).is_err(),
+                    "{name} must not be set by a V1 frame"
+                );
+            }
             assert_eq!(rsproperties::get::<String>("persist.v2.name").unwrap(), "b");
             assert_eq!(
                 crate::persistent_properties::decode(&std::fs::read(&file).unwrap()).unwrap(),
@@ -1371,6 +1473,321 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+        });
+    }
+
+    /// A `ctl.*` request that a connection accepted before `shutdown`
+    /// sends after `shutdown` has returned must not reach the control
+    /// handler: the connection's task is detached and outlives the socket
+    /// service, and `ctl.*` does not pass through the properties service,
+    /// whose closed mailbox refuses every other set.
+    #[test]
+    fn ctl_request_read_after_shutdown_is_refused() {
+        const TEST: &str = "tests::ctl_request_read_after_shutdown_is_refused";
+        if !is_child(TEST) {
+            run_in_child(TEST);
+            return;
+        }
+        block_on_child(async {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let dir = TempDir(socket_test_dir(
+                "rsprops_svc_ctl_stop",
+                socket_suffix_len("sockets"),
+            ));
+            let _ = std::fs::remove_dir_all(&dir.0);
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let socket_dir = dir.0.join("sockets");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counter = calls.clone();
+            let service = run(
+                rsproperties::PropertyConfig::new()
+                    .properties_dir(dir.0.clone())
+                    .socket_dir(socket_dir.clone()),
+                ServiceOptions::new().control_handler(move |_| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    true
+                }),
+            )
+            .await
+            .expect("run");
+            let socket = socket_dir.join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
+
+            let (name, value) = ("ctl.start", "some_service");
+            let mut frame = PROP_MSG_SETPROP2.to_ne_bytes().to_vec();
+            frame.extend_from_slice(&(name.len() as u32).to_ne_bytes());
+            frame.extend_from_slice(name.as_bytes());
+            frame.extend_from_slice(&(value.len() as u32).to_ne_bytes());
+            frame.extend_from_slice(value.as_bytes());
+
+            // Connects first and sends nothing yet.
+            let mut late = UnixStream::connect(&socket).await.unwrap();
+            // Connects second, on the same listener, and gets its reply:
+            // the listener hands out connections in order, so `late` has
+            // been accepted and its task spawned by now.
+            let mut stream = UnixStream::connect(&socket).await.unwrap();
+            stream.write_all(&frame).await.unwrap();
+            assert_eq!(read_reply(&mut stream).await, Some(PROP_SUCCESS));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            service.shutdown().await.unwrap();
+
+            // A write to a connection the service already closed fails
+            // (`EPIPE`), which counts as no reply.
+            let reply = match late.write_all(&frame).await {
+                Ok(()) => read_reply(&mut late).await,
+                Err(_) => None,
+            };
+            assert!(
+                matches!(reply, None | Some(PROP_ERROR_HANDLE_CONTROL_MESSAGE)),
+                "a ctl.* request read after shutdown must be refused or dropped, got {reply:?}"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "the control handler must not be called after shutdown returned"
+            );
+        });
+    }
+
+    /// The test's side of [`blocking_handler`].
+    struct BlockedCalls {
+        /// One value per handler call, sent when the call begins.
+        entered: tokio::sync::mpsc::UnboundedReceiver<()>,
+        /// Each value sent lets one call return; dropping it lets all
+        /// return.
+        release: std::sync::mpsc::Sender<()>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        returned: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// A control handler whose calls block until the test releases them.
+    fn blocking_handler() -> (
+        impl Fn(&ControlMessage) -> bool + Send + Sync + 'static,
+        BlockedCalls,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (entered_tx, entered) = tokio::sync::mpsc::unbounded_channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let returned = Arc::new(AtomicUsize::new(0));
+        let (calls_in, returned_in) = (calls.clone(), returned.clone());
+        let handler = move |_: &ControlMessage| {
+            calls_in.fetch_add(1, Ordering::SeqCst);
+            let _ = entered_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
+            returned_in.fetch_add(1, Ordering::SeqCst);
+            true
+        };
+        (
+            handler,
+            BlockedCalls {
+                entered,
+                release,
+                calls,
+                returned,
+            },
+        )
+    }
+
+    /// A SETPROP2 frame for `ctl.start` = `some_service`.
+    fn ctl_start_frame() -> Vec<u8> {
+        let (name, value) = ("ctl.start", "some_service");
+        let mut frame = PROP_MSG_SETPROP2.to_ne_bytes().to_vec();
+        frame.extend_from_slice(&(name.len() as u32).to_ne_bytes());
+        frame.extend_from_slice(name.as_bytes());
+        frame.extend_from_slice(&(value.len() as u32).to_ne_bytes());
+        frame.extend_from_slice(value.as_bytes());
+        frame
+    }
+
+    /// `shutdown` returns only after a control handler call that was
+    /// running when it was called has returned, and no call begins after
+    /// it returned.
+    ///
+    /// The call is released by a task that first sees the sockets unlinked
+    /// and the writer lock released, which is the state in which a
+    /// `shutdown` that did not wait for the call would return. So the call
+    /// is still blocked at that point, and `shutdown` returning with the
+    /// call already counted as returned shows that it waited. No step
+    /// depends on a delay: the 10 s deadlines only end a failing run.
+    #[test]
+    fn shutdown_waits_for_running_control_handler_call() {
+        const TEST: &str = "tests::shutdown_waits_for_running_control_handler_call";
+        if !is_child(TEST) {
+            run_in_child(TEST);
+            return;
+        }
+        block_on_child(async {
+            use std::sync::atomic::Ordering;
+
+            let dir = TempDir(socket_test_dir(
+                "rsprops_svc_ctl_wait",
+                socket_suffix_len("sockets"),
+            ));
+            let _ = std::fs::remove_dir_all(&dir.0);
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let socket_dir = dir.0.join("sockets");
+            let (handler, mut blocked) = blocking_handler();
+            let service = run(
+                rsproperties::PropertyConfig::new()
+                    .properties_dir(dir.0.clone())
+                    .socket_dir(socket_dir.clone()),
+                ServiceOptions::new().control_handler(handler),
+            )
+            .await
+            .expect("run");
+            let socket = socket_dir.join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
+            let frame = ctl_start_frame();
+
+            // Connects first and sends nothing yet; accepted before
+            // `stream`, whose request reaches the handler below.
+            let mut late = UnixStream::connect(&socket).await.unwrap();
+            let mut stream = UnixStream::connect(&socket).await.unwrap();
+            stream.write_all(&frame).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), blocked.entered.recv())
+                .await
+                .expect("the handler call must begin")
+                .unwrap();
+
+            let (properties_dir, sockets, release) =
+                (dir.0.clone(), socket_dir.clone(), blocked.release);
+            let releaser = tokio::spawn(async move {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !service_is_gone(&properties_dir, &sockets) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "shutdown must unlink the sockets and release the writer lock while \
+                         the handler call is still running"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                release.send(()).unwrap();
+            });
+
+            service.shutdown().await.unwrap();
+            assert_eq!(
+                blocked.returned.load(Ordering::SeqCst),
+                1,
+                "shutdown must not return before the running handler call has returned"
+            );
+            releaser.await.unwrap();
+            assert_eq!(read_reply(&mut stream).await, Some(PROP_SUCCESS));
+
+            // A write to a connection the service already closed fails
+            // (`EPIPE`), which counts as no reply.
+            let reply = match late.write_all(&frame).await {
+                Ok(()) => read_reply(&mut late).await,
+                Err(_) => None,
+            };
+            assert!(
+                matches!(reply, None | Some(PROP_ERROR_HANDLE_CONTROL_MESSAGE)),
+                "a ctl.* request read after shutdown must be refused or dropped, got {reply:?}"
+            );
+            assert_eq!(
+                blocked.calls.load(Ordering::SeqCst),
+                1,
+                "no handler call may begin after shutdown returned"
+            );
+        });
+    }
+
+    /// A `run` that fails in the properties service returns only after a
+    /// control handler call that began while it was starting has returned.
+    /// The properties service is held before it creates the areas as in
+    /// [`send_request_while_init_blocked`], and the call is released by a
+    /// task that first sees the sockets unlinked, which is the last step
+    /// of a failed `run` that does not wait for the call.
+    #[test]
+    fn failed_run_waits_for_running_control_handler_call() {
+        const TEST: &str = "tests::failed_run_waits_for_running_control_handler_call";
+        if !is_child(TEST) {
+            run_in_child(TEST);
+            return;
+        }
+        block_on_child(async {
+            use std::sync::atomic::Ordering;
+
+            let dir = TempDir(socket_test_dir(
+                "rsprops_svc_ctl_fail",
+                socket_suffix_len("sockets"),
+            ));
+            let _ = std::fs::remove_dir_all(&dir.0);
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let fifo = dir.0.join("property_contexts.fifo");
+            rustix::fs::mkfifoat(
+                rustix::fs::CWD,
+                &fifo,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .unwrap();
+            let socket_dir = dir.0.join("sockets");
+            let (handler, mut blocked) = blocking_handler();
+            let run_task = tokio::spawn(run(
+                rsproperties::PropertyConfig::new()
+                    .properties_dir(dir.0.clone())
+                    .socket_dir(socket_dir.clone()),
+                ServiceOptions::new()
+                    .property_contexts_files([fifo.clone()])
+                    .build_prop_files([dir.0.join("missing.prop")])
+                    .control_handler(handler),
+            ));
+
+            let socket = socket_dir.join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                match UnixStream::connect(&socket).await {
+                    Ok(stream) => break stream,
+                    Err(e) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "the socket service must accept connections while the properties \
+                             service is still starting: {e}"
+                        );
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            };
+            stream.write_all(&ctl_start_frame()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), blocked.entered.recv())
+                .await
+                .expect("the handler call must begin")
+                .unwrap();
+
+            let (sockets, release) = (socket_dir.clone(), blocked.release);
+            let releaser = tokio::spawn(async move {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while [
+                    rsproperties::PROPERTY_SERVICE_SOCKET_NAME,
+                    rsproperties::PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME,
+                ]
+                .iter()
+                .any(|name| sockets.join(name).exists())
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "a failed run must unlink the sockets while the handler call is \
+                         still running"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                release.send(()).unwrap();
+            });
+
+            release_fifo(&fifo).await;
+            let err = match run_task.await.unwrap() {
+                Ok(_) => panic!("run must fail for a missing build.prop file"),
+                Err(e) => e,
+            };
+            assert_eq!(
+                blocked.returned.load(Ordering::SeqCst),
+                1,
+                "a failed run must not return before the running handler call has returned"
+            );
+            assert_eq!(err.stage(), StartupStage::PropertiesService, "{err}");
+            releaser.await.unwrap();
         });
     }
 

@@ -88,6 +88,22 @@ fn test_get_nonexistent_properties() {
     println!("✓ get returns errors for non-existent properties");
 }
 
+/// The directory `ensure_init` leaves configured: on a host this binary's
+/// store, `temp_dir()/rsprops_it_comprehensive_tests_<pid>`
+/// (`tests/common/mod.rs`); on Android the default directory, because
+/// `ensure_init` does nothing there.
+#[cfg(any(feature = "builder", target_os = "android"))]
+fn expected_properties_dir() -> std::path::PathBuf {
+    if cfg!(target_os = "android") {
+        std::path::PathBuf::from(PROP_DIRNAME)
+    } else {
+        std::env::temp_dir().join(format!(
+            "rsprops_it_comprehensive_tests_{}",
+            std::process::id()
+        ))
+    }
+}
+
 #[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_dirname_function() {
@@ -99,10 +115,11 @@ fn test_dirname_function() {
     // Should not be empty
     assert!(!dirname_str.is_empty(), "dirname should not be empty");
 
-    // Should be a valid path
-    assert!(
-        dirname_str.contains("properties") || dirname_str.starts_with("/"),
-        "dirname should be a valid path, got: {dirname_str}"
+    // Should be the directory `ensure_init` configured
+    assert_eq!(
+        dirname,
+        expected_properties_dir(),
+        "dirname should be the configured properties directory"
     );
 
     println!("✓ dirname function returns: {dirname_str}");
@@ -114,19 +131,36 @@ fn test_property_name_validation() {
     ensure_init();
 
     // Test various property name formats
+    // The second field is the value in the host store: of these names,
+    // `tests/android/*.prop` set only `ro.build.version.sdk`. `None` is a
+    // name the store does not hold.
     let valid_names = [
-        "ro.build.version.sdk",
-        "sys.boot_completed",
-        "persist.sys.timezone",
-        "test.property",
-        "a.b.c.d.e.f.g",
-        "prop123",
+        ("ro.build.version.sdk", Some("34")),
+        ("sys.boot_completed", None),
+        ("persist.sys.timezone", None),
+        ("test.property", None),
+        ("a.b.c.d.e.f.g", None),
+        ("prop123", None),
     ];
 
-    for name in &valid_names {
-        // These may or may not exist, but the names should be valid
-        let _result: Result<String, _> = rsproperties::get(name);
-        // We don't assert success/failure here since properties may or may not exist
+    for (name, stored) in &valid_names {
+        let result: Result<String, _> = rsproperties::get(name);
+        if cfg!(target_os = "android") {
+            // A device may or may not set these, but a well-formed name is
+            // either read or reported as absent.
+            assert!(
+                matches!(result, Ok(_) | Err(Error::NotFound(_))),
+                "valid name {name:?}: {result:?}"
+            );
+        } else {
+            match stored {
+                Some(value) => assert_eq!(result.as_deref().ok(), Some(*value), "{name}"),
+                None => assert!(
+                    matches!(result, Err(Error::NotFound(_))),
+                    "valid name {name:?}: {result:?}"
+                ),
+            }
+        }
         println!("Tested property name: {name}");
     }
 
@@ -167,20 +201,29 @@ fn test_thread_safety() {
     for i in 0..10 {
         let counter_clone = Arc::clone(&counter);
         let handle = thread::spawn(move || {
+            let expected_dir = expected_properties_dir();
+
             // Each thread performs multiple property operations
             for j in 0..5 {
+                // No `test.thread.*` property is stored.
                 let prop_name = format!("test.thread.{i}.{j}");
 
                 // Test get_or
-                let _result: String = rsproperties::get_or(&prop_name, "default".to_string());
+                let result: String = rsproperties::get_or(&prop_name, "default".to_string());
+                assert_eq!(result, "default", "{prop_name}");
                 counter_clone.fetch_add(1, Ordering::SeqCst);
 
-                // Test get (which will likely fail)
-                let _result: Result<String, _> = rsproperties::get(&prop_name);
+                // Test get
+                let result: Result<String, _> = rsproperties::get(&prop_name);
+                assert!(
+                    matches!(result, Err(Error::NotFound(_))),
+                    "{prop_name}: {result:?}"
+                );
                 counter_clone.fetch_add(1, Ordering::SeqCst);
 
                 // Test dirname
-                let _dirname = rsproperties::properties_dir();
+                let dirname = rsproperties::properties_dir();
+                assert_eq!(dirname, expected_dir);
                 counter_clone.fetch_add(1, Ordering::SeqCst);
             }
         });
@@ -192,6 +235,8 @@ fn test_thread_safety() {
         handle.join().expect("Thread should complete successfully");
     }
 
+    // Each increment follows a checked result, so the count is the number
+    // of verified operations.
     let final_count = counter.load(Ordering::SeqCst);
     assert_eq!(
         final_count,
@@ -205,17 +250,48 @@ fn test_thread_safety() {
 #[cfg(any(feature = "builder", target_os = "android"))]
 #[test]
 fn test_property_value_length_constraints() {
-    let max_length_value = "x".repeat(PROP_VALUE_MAX);
-    let too_long_value = "x".repeat(PROP_VALUE_MAX + 1);
+    let max_length_value = "x".repeat(PROP_VALUE_MAX - 1);
+    let too_long_value = "x".repeat(PROP_VALUE_MAX);
 
-    // Test using these values with get_with_default
     ensure_init();
 
-    let result1 = rsproperties::get_or("test.max.length", max_length_value.clone());
-    assert_eq!(result1, max_length_value);
+    // A non-`ro.` value of PROP_VALUE_MAX bytes is rejected before `set`
+    // connects. On a host, a `set` that went on to the socket would
+    // return `Error::Io` instead (see below).
+    let result = rsproperties::set("test.too.long", &too_long_value);
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{PROP_VALUE_MAX} byte value: {result:?}"
+    );
 
-    let result2 = rsproperties::get_or("test.too.long", too_long_value.clone());
-    assert_eq!(result2, too_long_value);
+    // A value of PROP_VALUE_MAX - 1 bytes passes the length check and `set`
+    // goes on to the property service socket.
+    let result = rsproperties::set("test.max.length", &max_length_value);
+
+    // Host: no property service runs on this binary's store (its socket
+    // dir is never created), so the request fails at the socket. The
+    // rsproperties-service tests check the stored value against a service.
+    #[cfg(not(target_os = "android"))]
+    assert!(
+        matches!(result, Err(Error::Io(_))),
+        "{} byte value: {result:?}",
+        PROP_VALUE_MAX - 1
+    );
+
+    // Android: init answers. It stores the value, or refuses the name for
+    // the caller's SELinux domain.
+    #[cfg(target_os = "android")]
+    match result {
+        Ok(()) => assert_eq!(
+            rsproperties::get::<String>("test.max.length").unwrap(),
+            max_length_value
+        ),
+        Err(e) => assert!(
+            matches!(e, Error::SetRejected { .. }),
+            "{} byte value: {e:?}",
+            PROP_VALUE_MAX - 1
+        ),
+    }
 
     println!("✓ Property value length constraint tests passed");
 }

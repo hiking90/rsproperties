@@ -3,15 +3,22 @@
 
 //! Lookup hot-path benchmarks.
 //!
-//! Deliberately restricted to APIs that exist unchanged since v0.5.0
-//! (`build_trie`, `PropertyInfoEntry::parse_from_file`,
-//! `SystemProperties::new_area`, `add`, `get_with_result`, `find`) so the
-//! same file can be dropped onto any tag for an A/B comparison:
+//! Uses only `build_trie`, `PropertyInfoEntry::parse_from_file`,
+//! `AreaWriterLock`, `SystemProperties::new_area`, `add`, `get` and
+//! `find`, so the file can be copied onto an older tag for an A/B
+//! comparison once the calls that tag lacks are replaced. For v0.5.0:
+//! `get` becomes `get_with_result`, `MatchKeyword::Unchecked` becomes
+//! `false`, and `property_info` is written with `File::create` (v0.5.0
+//! has no `AreaWriterLock`; run it with umask 022). Keep the worktree on
+//! disk: its `target/` does not belong on a RAM-backed `/tmp`.
 //!
 //! ```sh
-//! git worktree add /tmp/rsprops-0.5.0 v0.5.0
-//! cp -r rsproperties/benches /tmp/rsprops-0.5.0/rsproperties/
-//! # add the [[bench]] + criterion dev-dep stanza to its Cargo.toml, then
+//! git worktree add ~/.cache/rsprops-0.5.0 v0.5.0
+//! cp -r rsproperties/benches ~/.cache/rsprops-0.5.0/rsproperties/
+//! # add the [[bench]] + criterion dev-dep stanza to its Cargo.toml and
+//! # `[profile.bench] debug-assertions = true` to the workspace Cargo.toml
+//! # (v0.5.0 has neither; without the profile a non-root run fails the
+//! # root-ownership check in `new_area`), then
 //! cargo bench --features builder -p rsproperties
 //! ```
 
@@ -20,7 +27,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use rsproperties::{build_trie, MatchKeyword, PropertyInfoEntry, SystemProperties};
+use rsproperties::{build_trie, AreaWriterLock, MatchKeyword, PropertyInfoEntry, SystemProperties};
 
 fn build_property_info(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
@@ -41,9 +48,11 @@ fn build_property_info(dir: &Path) {
     assert!(errors.is_empty(), "parse errors: {errors:?}");
 
     let data = build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap();
-    File::create(dir.join("property_info"))
+    // Mode 0444 whatever the umask; `File::create` under umask 002 makes
+    // a group-writable file that readers refuse.
+    AreaWriterLock::acquire(dir)
         .unwrap()
-        .write_all(&data)
+        .publish_property_info(&data)
         .unwrap();
 }
 

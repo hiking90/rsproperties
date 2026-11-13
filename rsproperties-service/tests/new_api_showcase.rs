@@ -4,14 +4,13 @@
 //! Summary tests for newly added property APIs
 //!
 //! This test file provides a comprehensive overview of the new APIs:
-//! - get_parsed_with_default<T>() - Parse property values with fallback
-//! - get_parsed<T>() - Parse property values with error handling
+//! - get_or<T>() - Parse property values with fallback
+//! - get<T>() - Parse property values with error handling
 //! - set() - Set property with string value
 //! - set<T>() - Set property with any Display type
 //!
 //! These tests demonstrate real-world usage patterns and serve as examples.
 
-#[path = "common.rs"]
 mod common;
 use common::init_test;
 
@@ -52,7 +51,7 @@ async fn test_new_api_showcase() -> anyhow::Result<()> {
     let app_name: String = rsproperties::get("app.config.name")?;
     assert_eq!(app_name, "MyApplication");
 
-    // Parse properties to specific types using get_parsed()
+    // Parse properties to specific types using get()
     let version_code: i32 = rsproperties::get("app.config.version_code")?;
     assert_eq!(version_code, 123);
 
@@ -374,7 +373,7 @@ async fn test_complete_feature_summary() -> anyhow::Result<()> {
     assert_eq!(int_val, 42);
     assert!((float_val - 2.5).abs() < f64::EPSILON);
     assert!(bool_val);
-    println!("   ✅ Type-safe parsing with get_parsed() function");
+    println!("   ✅ Type-safe parsing with get() function");
 
     // Feature 3: Safe Defaults
     println!("🛡️ Feature 3: Safe Defaults");
@@ -383,7 +382,7 @@ async fn test_complete_feature_summary() -> anyhow::Result<()> {
 
     assert_eq!(safe_int, 999);
     assert_eq!(safe_str, "default");
-    println!("   ✅ Safe defaults with get_parsed_with_default() function");
+    println!("   ✅ Safe defaults with get_or() function");
 
     // Feature 4: Error Handling
     println!("⚠️ Feature 4: Error Handling");

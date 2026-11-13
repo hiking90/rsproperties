@@ -101,7 +101,13 @@ impl PropertyInfoEntry {
         // a whitespace-only `type_str` normalizes to the same empty type
         // as `""` and must pass identically (`parse_from_line` already
         // treats them alike).
-        let type_strings: Vec<&str> = type_str.split_whitespace().collect();
+        //
+        // Same separator set as `parse_from_line` (C `isspace`), so one
+        // `type_str` yields the same tokens through either path.
+        let type_strings: Vec<&str> = type_str
+            .split(crate::parse::is_c_space)
+            .filter(|token| !token.is_empty())
+            .collect();
         if !type_strings.is_empty() && !Self::is_type_valid(&type_strings) {
             return Err(Error::InvalidArgument(format!(
                 "Type {type_str:?} is not valid."
@@ -162,7 +168,13 @@ impl PropertyInfoEntry {
     // Example:
     //     ro.build.host u:object_r:build_prop:s0 exact string
     fn parse_from_line(line: &str, require_prefix_or_exact: bool) -> Result<PropertyInfoEntry> {
-        let mut tokenizer = line.split_whitespace();
+        // AOSP `SpaceTokenizer` splits on C `isspace` — the six ASCII
+        // bytes of `is_c_space`. `split_whitespace` would also split on
+        // Unicode White_Space (U+00A0, U+3000, ...), which AOSP keeps
+        // inside a token.
+        let mut tokenizer = line
+            .split(crate::parse::is_c_space)
+            .filter(|token| !token.is_empty());
 
         let property = tokenizer
             .next()
@@ -282,7 +294,8 @@ impl PropertyInfoEntry {
             }
 
             let line = match std::str::from_utf8(&raw_line) {
-                Ok(line) => line.trim(),
+                // libbase `Trim` strips C `isspace` bytes only.
+                Ok(line) => line.trim_matches(crate::parse::is_c_space),
                 Err(e) => {
                     warn!("Line {line_count}: skipping non-UTF-8 line: {e}");
                     // Collected entries must be self-describing: callers
@@ -553,6 +566,81 @@ mod tests {
         assert_eq!(errors.len(), 1);
         let msg = errors[0].to_string();
         assert!(msg.contains("line 3"), "{msg}");
+    }
+
+    /// AOSP splits a line with `SpaceTokenizer` and trims it with libbase
+    /// `Trim`, both on C `isspace`: space, `\t`, `\n`, `\x0b`, `\x0c`,
+    /// `\r`. U+00A0 and U+3000 are token bytes there, so they are here.
+    #[test]
+    fn only_c_isspace_separates_tokens() {
+        // Each of the six bytes separates tokens.
+        let entry = PropertyInfoEntry::parse_from_line(
+            "ro.a\tu:object_r:a:s0\x0bexact\x0cenum\ra\nb  c",
+            true,
+        )
+        .unwrap();
+        assert_eq!(entry.name, "ro.a");
+        assert_eq!(entry.context, "u:object_r:a:s0");
+        assert_eq!(entry.type_str, "enum a b c");
+        assert!(entry.exact_match);
+
+        // U+00A0 joins what looks like two tokens: the name runs up to the
+        // next C space, `exact` is read as the context and `string` as the
+        // match operation.
+        let line = "ro.foo\u{a0}u:object_r:foo_prop:s0 exact string";
+        let entry = PropertyInfoEntry::parse_from_line(line, false).unwrap();
+        assert_eq!(entry.name, "ro.foo\u{a0}u:object_r:foo_prop:s0");
+        assert_eq!(entry.context, "exact");
+        assert_eq!(entry.type_str, "");
+        assert!(!entry.exact_match);
+        let msg = PropertyInfoEntry::parse_from_line(line, true)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains(r#"Match operation "string""#), "{msg}");
+
+        // The constructors tokenize `type_str` the same way.
+        let ctx = || String::from("u:object_r:a:s0");
+        let entry = PropertyInfoEntry::exact("ro.a", ctx(), "enum\ta\x0bb").unwrap();
+        assert_eq!(entry.type_str(), "enum a b");
+        let entry = PropertyInfoEntry::exact("ro.a", ctx(), "enum a\u{a0}b").unwrap();
+        assert_eq!(entry.type_str(), "enum a\u{a0}b");
+        assert!(matches!(
+            PropertyInfoEntry::exact("ro.a", ctx(), "\u{3000}"),
+            Err(Error::InvalidArgument(_))
+        ));
+
+        // In a file: a line is blank only when it holds nothing but C
+        // spaces, and `#` starts a comment only as the first byte after
+        // those are trimmed.
+        let path = std::env::temp_dir().join(format!(
+            "rsprops_c_isspace_{}_property_contexts",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "\u{a0}# not a comment\n\
+             \u{3000}\n\
+             \x0b\x0c \t\r\n\
+             ro.c u:object_r:c:s0 exact string\u{a0}\n\
+             \t ro.d u:object_r:d:s0 exact string \x0c\n",
+        )
+        .unwrap();
+        let parsed = PropertyInfoEntry::parse_from_file(&path, MatchKeyword::Checked);
+        std::fs::remove_file(&path).unwrap();
+        let (entries, errors) = parsed.unwrap();
+
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].name(), "ro.d");
+        assert_eq!(entries[0].type_str(), "string");
+        let errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(errors[0].contains("line 1"), "{errors:?}");
+        assert!(errors[1].contains("line 2"), "{errors:?}");
+        assert!(
+            errors[1].contains("Did not find a context entry"),
+            "{errors:?}"
+        );
+        assert!(errors[2].contains("line 4"), "{errors:?}");
     }
 
     /// Every third-token class against both modes, as AOSP

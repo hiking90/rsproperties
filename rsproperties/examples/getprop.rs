@@ -65,7 +65,12 @@ fn main() {
             let value = if let Some(default) = args.default_value {
                 rsproperties::get_or(&name, default)
             } else {
-                // Missing or empty: print an empty line (toybox getprop).
+                // Every `Err` of `get` prints an empty line and exits 0,
+                // not only a missing property: a value that is not
+                // UTF-8, a property store that cannot be opened and a
+                // corrupt area do too. An empty value prints the same
+                // line. AOSP's `getprop` (toolbox) prints an empty line
+                // for a missing or empty property.
                 rsproperties::get::<String>(&name).unwrap_or_default()
             };
             // `let _ =`: a closed stdout must not turn into a panic
@@ -73,13 +78,16 @@ fn main() {
             let _ = writeln!(std::io::stdout(), "{value}");
         }
         None => {
-            // List all readable properties, sorted by name like toybox
-            // getprop: `list` reports them in trie order. A value that
-            // is not UTF-8 is listed with U+FFFD in place of those bytes.
+            // List all readable properties, sorted by name like AOSP's
+            // `getprop` (toolbox): `list` reports them in trie order. A
+            // value that is not UTF-8 is listed with U+FFFD in place of
+            // those bytes.
             let props = match rsproperties::system_properties() {
                 Ok(props) => props,
                 Err(e) => {
-                    eprintln!("getprop: {e}");
+                    // `let _ =`: with `eprintln!` a closed stderr would
+                    // panic (exit code 101) instead of exiting 1.
+                    let _ = writeln!(std::io::stderr(), "getprop: {e}");
                     std::process::exit(1);
                 }
             };
@@ -92,7 +100,7 @@ fn main() {
                 let _ = writeln!(out, "[{name}]: [{value}]");
             }
             if let Err(e) = walk {
-                eprintln!("getprop: {e}");
+                let _ = writeln!(std::io::stderr(), "getprop: {e}");
                 std::process::exit(1);
             }
         }

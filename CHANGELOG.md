@@ -92,16 +92,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the process that loaded the file);
   duplicate names are merged at load, keeping the last value; a staged
   `next_boot.<name>` whose `<name>` is neither `persist.` nor
-  `next_boot.` is applied once and not written back (init writes it and
-  then deletes the whole file on its next load). The file is loaded and
+  `next_boot.` is not written back, so its value is set at most once, by
+  the startup that loads it (init writes it and then deletes the whole
+  file on its next load). The load rewrites the file without that record
+  before the property areas are created and before the value is set, so
+  the value is lost when `run` fails after the rewrite or when the set
+  is rejected by the checks of a client set. The file is loaded and
   locked before `property_info` is published, so a missing directory or
   a held lock fails startup with the properties dir unchanged. After a
   transient read error at load (`EIO`, `EMFILE`, ...), the first
   persistent set reads the file again and keeps its records instead of
-  replacing the file with that set alone. Only a V2
-  (`PROP_MSG_SETPROP2`) set is stored, as in init: a V1
-  (`PROP_MSG_SETPROP`) set of such a name changes the property area
-  alone, and the service logs a warning that names the file.
+  replacing the file with that set alone.
 - Service: values are checked against the `property_contexts` type
   (init `CheckType`) for client sets and persistent records; build.prop
   entries are not checked (init drops a mismatching entry); `ctl.*` sets
@@ -130,12 +131,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   length AOSP init accepts.
 - Service: `StartupError` and `StartupStage`, the error type
   `rsproperties_service::run` now returns (see Changed).
+  `StartupError::into_source()` returns the cause by value.
 - Service: `ServiceHandle`, the value `run` now returns (see Changed).
   `join()` waits until the service has ended by itself and is
   cancel-safe; `shutdown()` stops the socket service, then the properties
   service, and returns after both socket files are unlinked and the
   writer lock is released; dropping the handle stops the service without
-  waiting. Both methods return `Result<(), ServiceError>`. `ServiceError`
+  waiting. Once the socket service has ended, a `ctl.*` request read
+  from an open connection — also one the client sent earlier — does not
+  reach the control handler and is refused
+  (`PROP_ERROR_HANDLE_CONTROL_MESSAGE`). `join()`
+  and `shutdown()` then wait for the handler calls whose requests were
+  read before that, running or still queued for a blocking thread: when
+  either returns, no handler call is running and none begins afterwards.
+  A `run` that fails to start returns its error after the same wait,
+  for the handler calls made while it was starting.
+  The wait has no timeout, so a handler call that does not return keeps
+  all three pending, and a handler must not wait for any of them to
+  return; dropping the handle does not wait for handler calls. The
+  handler closure and what it captured can be dropped after `join()` or
+  `shutdown()` has returned: the task of a connection accepted earlier
+  holds a clone until that task ends, which two 10 s timeouts bound from
+  the time the connection was accepted while the runtime keeps polling
+  the task. On a current-thread runtime whose thread is blocked or has
+  left `block_on`, the task keeps its clone until the runtime polls it
+  again or is dropped. Both
+  methods return `Result<(), ServiceError>`. `ServiceError`
   displays as `<part> failed: <cause>` and `source()` is the cause — in
   this version a panic in that part's task, since neither part returns an
   error once it has started.
@@ -253,7 +274,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Error::ServiceError { name, code: i32 }` is renamed to
     `Error::SetRejected { name, reason: SetRejection }`. `SetRejection`
     is a `#[non_exhaustive]` enum with one variant per
-    `wire::PROP_ERROR_*` code and `Unknown(i32)` for any other;
+    `wire::PROP_ERROR_*` code, `Unspecified` for `wire::PROP_ERROR` (-1)
+    and `Unknown(i32)` for any other;
     `reason.code()` returns the number. The old name was also the name
     of `rsproperties_service::ServiceError`, an unrelated type.
   - `SystemProperties::update` and `set` (`builder`) refuse a `ro.`
@@ -290,12 +312,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RefUnwindSafe` (it holds the control handler, a `dyn Fn`), and neither
   does `ServiceHandle`. Code that moves either into a `catch_unwind`
   closure needs `AssertUnwindSafe`.
-- Service: every V1 (`PROP_MSG_SETPROP`) set request is logged at `warn`
-  with the property name, the value length and the peer pid (0.6.0:
-  `info`, without the pid). The service sets
-  `ro.property_service.version=2`, so a client that follows bionic's
-  rule sends V2; a V1 client gets no result code and its `persist.*`
-  sets are not stored (see Added).
+- **Breaking (service, wire):** the legacy V1 command
+  (`PROP_MSG_SETPROP`) is no longer handled; the service handles
+  `PROP_MSG_SETPROP2` only. A V1 frame is answered like an unknown
+  command, with `PROP_ERROR_INVALID_CMD`; its name and value are not
+  read, nothing is set, and the request is logged at `warn` with the
+  peer pid (0.5.0 and 0.6.0 applied the set and closed the connection
+  without a reply, as AOSP init still does). A V1 client does not read a
+  reply — bionic and this workspace's client wait for the socket to
+  close and return success — so it reports `Ok` for a set that was not
+  applied. The service sets `ro.property_service.version=2`, so a client
+  that follows bionic's rule sends V2. A build.prop file that sets
+  `ro.property_service.version` to anything but a number of 2 or more
+  now makes `run` fail (see Migration).
 - Service: V2 replies carry init's error codes instead of `PROP_ERROR`
   (-1), so a client's `Error::SetRejected { reason }` names the reason
   (e.g. `SetRejection::ReadOnlyProperty` for a second set of a `ro.`
@@ -345,9 +374,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before the store existed (`rsproperties-service` started later) failed
   every read until it restarted, and never read
   `ro.property_service.version` to pick the protocol. A failure now
-  leaves nothing cached and the next access opens the store again; the
-  first failure is logged at `error`, later ones at `debug`. bionic
-  `SystemProperties::Init` does not keep a failure either.
+  leaves nothing cached and the next access opens the store again.
+  `system_properties` logs its own line at `error` for the first failure
+  and at `debug` for later ones; `SystemProperties::open`, which it
+  calls, logs `Failed to load contexts from …` at `error` on every
+  failed attempt. bionic `SystemProperties::Init` does not keep a
+  failure either.
 - `load_properties_from_file`: `import <path> <filter>` lines split the
   filter off the path and load only the selected keys, like AOSP
   `LoadProperties`. Previously the whole `<path> <filter>` string was
@@ -503,6 +535,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `import` paths and filters, like AOSP `LoadProperties`. `str::trim` also
   removed Unicode whitespace such as U+00A0 and U+3000, so
   `ro.x=foo\u{a0}` was stored as `foo`.
+- `PropertyInfoEntry::parse_from_file` trims a `property_contexts` line
+  and splits it into tokens on the C `isspace` characters only (space,
+  `\t`, `\n`, `\v`, `\f`, `\r`), like libbase `Trim` and AOSP
+  `SpaceTokenizer`; `PropertyInfoEntry::exact` / `prefix` split
+  `type_str` on the same characters. `str::trim` and
+  `str::split_whitespace` also took Unicode whitespace such as U+00A0
+  and U+3000 as a separator, so
+  `ro.foo\u{a0}u:object_r:foo_prop:s0 exact string` produced an entry
+  named `ro.foo`.
 - `load_properties_from_file` opens every prop file like AOSP init's
   `ReadFile`: with `O_NOFOLLOW`, so a symlink as the last path component
   fails to open (an error for the root file; an `import` is skipped with
@@ -543,13 +584,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   negative or out-of-range timeout still returns `None` after that one
   comparison, without waiting; bionic retries the `EINVAL` in a loop of
   `futex` syscalls until the serial changes.
-- `examples/setprop` prints nothing on success, like AOSP `setprop` (it
-  printed the name and value), and `examples/setprop`/`getprop` ignore
+- `examples/setprop` prints nothing on stdout on success (it printed the
+  name and value); AOSP `setprop` (toolbox) prints nothing on success.
+  For a name starting with `ro.` it still writes a warning to stderr
+  before the set, as in 0.6.0, which AOSP `setprop` does not print.
+  `examples/setprop`/`getprop` ignore
   errors writing their output: with stdout connected to a pipe whose
   reader had exited, setprop panicked with exit code 101 after a
-  successful `set`. `examples/getprop` prints an empty line for a missing
-  or empty property without a default, like toybox `getprop` (it printed
-  nothing). `examples/setprop` no longer applies its own length limits
+  successful `set`. `examples/getprop <name>` without a default prints
+  an empty line and exits 0 when the value is empty or `get` returns
+  any error (it printed nothing); AOSP `getprop` (toolbox) prints an
+  empty line for a missing or empty property. `examples/setprop` no
+  longer applies its own length limits
   (256-byte names, 8192-byte values); `set` checks them.
 
 Service (`rsproperties-service`, git dependency only):
@@ -733,14 +779,17 @@ Service (`rsproperties-service`, git dependency only):
   after the build.prop entries and the persistent properties (so an early
   `persist.*` set replaces the stored value). `ctl.*` sets are not
   queued: they reach the control handler as soon as they are read, before
-  the areas exist, and are not undone if startup fails. The socket service closes
+  the areas exist, and are not undone if startup fails (a `run` that
+  fails returns its error only after those handler calls have returned,
+  without a timeout). The socket service closes
   the connection without a reply after 10 s (up to 20 s when all 64
   handler slots are
   taken); a request already queued then is still applied once the areas
   exist, like one whose client gave up on its own timeout, and one not yet
-  queued (mailbox full) is dropped. A `get` in that window that is the
-  process's first fixes its reader for the process lifetime, so it fails
-  for good if `property_info` or `properties_serial` does not exist yet.
+  queued (mailbox full) is dropped. The first `get` that opens the store
+  fixes that process's reader for the process lifetime; a `get` in that
+  window that finds no `property_info` or `properties_serial` fails, and
+  the next one tries again.
   If the properties
   service fails to start, the request is not applied; a SETPROP2 client
   whose connection was already accepted gets an error reply, and one that
@@ -793,6 +842,21 @@ Service (`rsproperties-service`, git dependency only):
     rejects names of 32 bytes or more and values of 92 bytes or more
     (`InvalidArgument`), because that environment now selects V1 (see
     Changed defaults);
+  - service: a V1 (`PROP_MSG_SETPROP`) set request is refused with
+    `PROP_ERROR_INVALID_CMD` and nothing is set (0.6.0 applied it). The
+    client is not told: a V1 client reads no reply and returns success.
+    This workspace's client sends V1 only when `PROPERTY_SERVICE_VERSION`
+    is set to something other than a number of 2 or more and `set` is
+    called before the process has created its reader (after that it
+    takes the version from `ro.property_service.version`, which the
+    service sets to 2). Unset the variable, or set it to 2. A client that
+    implements V1 only cannot set properties on this service;
+  - service: a build.prop entry `ro.property_service.version` whose
+    value is not a number of 2 or more (`1`, `0`, `v2`, `2x`)
+    makes `run` fail with `StartupStage::PropertiesService` and
+    `InvalidInput`, before the properties dir is written (0.6.0 stored
+    the value). Clients that read such a value send V1, which the
+    service refuses. Remove the entry or set it to `2`;
   - `load_properties_from_file` skips a line whose key fails
     `wire::validate_property_name` (spaces, `*`, `/`, leading/trailing or
     doubled `.`), logging a warning; 0.6.0 put the key in the map, and the
@@ -808,6 +872,25 @@ Service (`rsproperties-service`, git dependency only):
     value keeps it (stored bytes differ from 0.6.0), and a key that starts
     or ends with it fails `wire::validate_property_name`, so the line is
     skipped with a warning. Remove such characters from prop files;
+  - `PropertyInfoEntry::parse_from_file` reads non-ASCII whitespace
+    (e.g. U+00A0, U+3000) in a `property_contexts` line as part of the
+    token it touches (AOSP `SpaceTokenizer` / `Trim`); 0.6.0 trimmed it
+    and split on it. A line holding only such characters, and a line
+    whose `#` follows one, were skipped and are now parsed as entry
+    lines; two fields with one between them are read as one token. Such
+    a line is returned as a per-line `Parse` error when that leaves
+    fewer than two tokens, an invalid type, or (under
+    `MatchKeyword::Checked`) an invalid match keyword; otherwise it
+    yields an entry whose name, context or type contains the character,
+    or — under `MatchKeyword::Unchecked`, when the character is in the
+    third token — an entry in which no field contains it: that token is
+    not stored, and since it is not the word `exact` the entry is a
+    prefix entry (for example `ro.a <context> exact\u{a0} string` was an
+    exact entry in 0.6.0 and is now a prefix entry, which also matches
+    `ro.ab`).
+    `PropertyInfoEntry::exact` / `prefix` (0.6.0: `new`) split
+    `type_str` the same way, so `"string\u{a0}"` is `InvalidArgument`.
+    Replace such characters with ASCII spaces;
   - a `property_info` context name starting with `.` is skipped with a
     warning (properties of that context fail with `FileValidation`).
     Rename such contexts;
@@ -925,7 +1008,9 @@ Service (`rsproperties-service`, git dependency only):
     startup (input files, `property_info`, areas), so the `Err` can arrive
     as late as a successful start would; after a properties service
     failure it waits for the socket service to stop and unlink both
-    socket names;
+    socket names. With a `ServiceOptions::control_handler` (new in this
+    version) it then also waits, without a timeout, for the handler
+    calls made during startup;
   - builder: once one property has been updated 32768 times,
     `SystemProperties::update` publishes serials whose bits 17..23 keep
     counting (0.6.0: the counter wrapped to 0), so serial values from then
@@ -953,8 +1038,9 @@ Service (`rsproperties-service`, git dependency only):
   - examples: `examples/setprop` prints nothing on stdout on success
     (0.6.0: `Property '<name>' set to '<value>'`) and passes names over
     256 bytes and values over 8192 bytes to `set` instead of rejecting
-    them itself; `examples/getprop` prints an empty line for a missing or
-    empty property without a default (0.6.0: nothing);
+    them itself; `examples/getprop <name>` without a default prints an
+    empty line when the value is empty or `get` returns any error
+    (0.6.0: nothing);
     `examples/example_service` keeps other files in its directories
     (0.6.0 deleted the directories at startup; property values still do
     not carry over to a rerun: `property_info`, the area files,
@@ -971,16 +1057,36 @@ Service (`rsproperties-service`, git dependency only):
     reply; it blocks until init replies or closes the connection, like
     bionic. Code that relied on the 2 s bound must apply its own (e.g.
     call `set` on another thread). Connect and send keep the 2 s bound;
+  - the global reader (`rsproperties::system_properties()`, 0.6.0
+    `try_system_properties()`; also behind `rsproperties::get`, `get_or`
+    and the other free functions) no longer keeps a failure (see Fixed).
+    0.6.0 stored the first result for the process lifetime, so in a
+    process started before the store existed every later call returned
+    the stored `Error::Init` without a syscall, and `get_or` returned its
+    default until the process ended. Now each call made while the store
+    cannot be opened tries to open it again (a mutex, at least one `open`
+    of `property_info`, a boxed error, and on every such call at least
+    one `error` log line — `Failed to load contexts from …`, written by
+    `SystemProperties::open` without a rate limit — besides one or two
+    `debug` lines), and the first call after the store appears returns
+    the stored value: a `get_or` result can change from the default to
+    the stored value within one process. Code that calls these functions
+    at a high
+    rate in a process that may run without a store must keep the outcome
+    itself (e.g. call `system_properties()` once and skip the reads
+    while it fails) instead of relying on the stored failure;
   - service: startup sets `ro.property_service.version=2` after the
     build.prop files and `ro.persistent_properties.ready=true` after the
     persistent properties, as init does (0.6.0 set neither). A client
     `set` of either now fails with `PROP_ERROR_READ_ONLY_PROPERTY`
     (`ro.` is write-once); put a different value in a build.prop file,
-    which is applied first. Because the property is now set, a client
+    which is applied first (for `ro.property_service.version` only a
+    number of 2 or more is accepted, see Newly rejected inputs). Because
+    the property is now set, a client
     (0.6.0 or this release) whose global reader is initialized sends V2
     frames even with `PROPERTY_SERVICE_VERSION=1` (the property takes
-    precedence over the variable) and waits for the 4-byte reply; to
-    keep V1, put `ro.property_service.version=1` in a build.prop file;
+    precedence over the variable) and waits for the 4-byte reply. V1
+    cannot be kept: the service refuses it (see Changed);
   - the global reader (`rsproperties::system_properties()`, also behind
     `rsproperties::get` and the other free functions) created while `BIONIC_APPCOMPAT_OVERRIDE` is
     set — on Linux always, on Android only when `ro.build.version.sdk` is
@@ -989,8 +1095,10 @@ Service (`rsproperties-service`, git dependency only):
     `<name>`). Unset the variable before the reader is created to read
     the original values;
   - examples: `examples/getprop` without arguments prints every property
-    and exits 0 (0.6.0: printed `Listing all properties is not yet
-    implemented.` and exited 1);
+    and exits 0, or exits 1 when the properties cannot be enumerated —
+    the property store cannot be opened, or `list` returns an error
+    after the properties collected so far are printed (0.6.0: printed
+    `Listing all properties is not yet implemented.` and exited 1);
   - service: dropping the `ServiceHandle` that `run` returns stops the
     service. A `let _ = run(..).await?;` therefore stops it at once;
     bind the handle to a name.
@@ -1180,6 +1288,12 @@ Service (`rsproperties-service`, git dependency only):
     temp files (`.area.tmp-*`, `.property_info.tmp-*`). This includes a
     dangling symlink at `property_info`, which `lstat` finds but the
     `O_NOFOLLOW` open refuses.
+  - The `Error::FileValidation` message for a misaligned object in a
+    property area reads `Misaligned object at offset <n>: required
+    align=<a>` (0.6.0: the same text followed by `, addr=0x…`, the
+    mapped address), so an ASLR address no longer reaches the error or
+    the `error` log line that prints it. Log filters written against
+    the 0.6.0 text must change.
   - Log lines that print a property name, prop-file key,
     `property_contexts` line or default context/type print it
     `Debug`-escaped, and no log line prints a property value any more
@@ -1239,12 +1353,18 @@ Service (`rsproperties-service`, git dependency only):
     client's `Error::SetRejected { reason }` carries these values as
     `SetRejection` variants. Code that matched `code: -1` (or
     `wire::PROP_ERROR`) must match those variants, or match
-    `Error::SetRejected` only.
+    `Error::SetRejected` only. A reply of -1, which a 0.6.0 service
+    still sends for every rejected set, is `SetRejection::Unspecified`.
   - service: a V2 frame that ends inside the name-length field gets the
     4-byte `PROP_ERROR_READ_DATA` (0x8) reply before the connection is
     closed (0.6.0 closed it without a reply). A client that reads the
     reply after such a frame gets `PROP_ERROR_READ_DATA` instead of
     end-of-file.
+  - service: a connection that ends inside the command word (0 to 3
+    bytes sent) gets the 4-byte `PROP_ERROR_READ_CMD` (0x4) reply before
+    it is closed, as from init (0.6.0 closed it without a reply). A
+    client that half-closes and then reads gets `PROP_ERROR_READ_CMD`
+    instead of end-of-file.
   - service: a failed start unlinks the socket names it created. A client
     that connects after binding `property_service_for_system` failed gets
     `ENOENT` (`Error::Io` of kind `NotFound`) unless an earlier run left

@@ -10,7 +10,6 @@
 //! - Setting properties (when builder feature is enabled)
 //! - Error handling
 
-#[path = "common.rs"]
 mod common;
 use common::init_test;
 
@@ -71,7 +70,7 @@ mod builder_tests {
         let retrieved_value: String = rsproperties::get(prop_name)?;
         assert_eq!(retrieved_value, prop_value);
 
-        // Also test get_with_default
+        // Also test get_or
         let retrieved_with_default = rsproperties::get_or(prop_name, "fallback".to_string());
         assert_eq!(retrieved_with_default, prop_value);
 
@@ -155,7 +154,7 @@ mod linux_specific_tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_property_persistence() -> anyhow::Result<()> {
+    async fn test_set_and_get_persist_prefix() -> anyhow::Result<()> {
         setup_test_env().await;
 
         let prop_name = "persist.test.property";

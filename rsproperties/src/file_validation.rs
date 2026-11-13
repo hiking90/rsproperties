@@ -8,8 +8,10 @@ use crate::errors::{Error, Result};
 
 /// Validates file metadata for system property files.
 ///
-/// In test and debug modes, only checks file permissions and size.
-/// In production mode, also enforces that the file is owned by root (uid=0, gid=0).
+/// Every build requires a regular file of at least `min_size` bytes with
+/// no group or other write bit. A build with `debug_assertions` on and
+/// the `strict-file-validation` feature off checks nothing else; every
+/// other build also requires the file to be owned by root (uid=0, gid=0).
 pub(crate) fn validate_file_metadata(
     metadata: &std::fs::Metadata,
     path: &std::path::Path,

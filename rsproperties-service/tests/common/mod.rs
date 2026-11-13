@@ -144,6 +144,13 @@ async fn start_service() -> ServiceHandle {
 /// Starts the service once per test binary, on its own thread and
 /// runtime, and returns when it is ready. The service runs until the
 /// process exits.
+///
+/// Before it returns, it reads `ro.property_service.version`, which creates
+/// this process's reader. From then on `rsproperties::set` takes the
+/// protocol version from that property, which the service set to 2. A `set`
+/// that no read preceded would take it from `PROPERTY_SERVICE_VERSION`:
+/// with that variable at `1` the client sends V1, the service refuses the
+/// frame, and the client still returns `Ok`.
 pub async fn init_test() {
     SERVICE
         .get_or_init(|| async {
@@ -165,7 +172,12 @@ pub async fn init_test() {
                 });
             });
 
-            receiver.await.expect("Failed to receive services")
+            receiver.await.expect("Failed to receive services");
+
+            assert_eq!(
+                rsproperties::get::<String>("ro.property_service.version").unwrap(),
+                "2"
+            );
         })
         .await;
 }

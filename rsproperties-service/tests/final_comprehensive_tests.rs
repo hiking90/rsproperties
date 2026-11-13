@@ -11,7 +11,6 @@ extern crate rsproperties;
 
 use rsproperties::{wire::PROP_VALUE_MAX, PROP_DIRNAME};
 
-#[path = "common.rs"]
 mod common;
 use common::init_test;
 
@@ -36,7 +35,7 @@ fn test_api_constants() {
 async fn test_get_with_default_comprehensive() {
     init_test().await;
 
-    // Test cases for get_with_default function
+    // Test cases for get_or function
     let test_cases = [
         ("test.simple", "default", "should handle simple case"),
         ("test.empty.default", "", "should handle empty default"),
@@ -73,7 +72,7 @@ async fn test_get_with_default_comprehensive() {
     }
 
     println!(
-        "✓ get_with_default comprehensive tests passed ({} cases)",
+        "✓ get_or comprehensive tests passed ({} cases)",
         test_cases.len()
     );
 }
@@ -113,11 +112,13 @@ async fn test_dirname_functionality() {
     let dirname = rsproperties::properties_dir();
     let dirname_str = dirname.to_string_lossy();
 
-    // Verify dirname is not empty and looks like a path
+    // Verify dirname is not empty and is the directory the service of this
+    // binary was started on
     assert!(!dirname_str.is_empty(), "dirname should not be empty");
-    assert!(
-        dirname_str.contains("properties") || dirname_str.starts_with("/"),
-        "dirname should be a valid path, got: '{dirname_str}'"
+    assert_eq!(
+        dirname,
+        common::properties_dir(),
+        "dirname should be the service's properties directory"
     );
 
     println!("✓ dirname functionality test passed");
@@ -141,11 +142,16 @@ async fn test_property_name_validation() {
         "MixedCase.Property",
     ];
 
-    // These names are valid format-wise, they may or may not exist
+    // These names are valid format-wise. No test of this binary sets them
+    // and the service does not create them at startup, so each is absent.
     for name in &valid_format_names {
-        let _result: String = rsproperties::get(name).unwrap_or_default();
-        let _default_result = rsproperties::get_or(name, "default".to_string());
-        // We don't assert success/failure since properties may or may not exist
+        let result = rsproperties::get::<String>(name);
+        assert!(
+            matches!(result, Err(rsproperties::Error::NotFound(_))),
+            "get({name:?}) must be NotFound, got {result:?}"
+        );
+        let default_result = rsproperties::get_or(name, "default".to_string());
+        assert_eq!(default_result, "default", "get_or({name:?})");
     }
 
     // Test potentially problematic property names
@@ -175,20 +181,32 @@ async fn test_property_name_validation() {
 #[tokio::test]
 async fn test_property_value_length_limits() {
     // Test maximum value length constant
-    let max_length_value = "x".repeat(PROP_VALUE_MAX);
-    assert_eq!(max_length_value.len(), PROP_VALUE_MAX);
+    let max_length_value = "x".repeat(PROP_VALUE_MAX - 1);
+    assert_eq!(max_length_value.len(), PROP_VALUE_MAX - 1);
 
-    let too_long_value = "x".repeat(PROP_VALUE_MAX + 1);
-    assert_eq!(too_long_value.len(), PROP_VALUE_MAX + 1);
+    let too_long_value = "x".repeat(PROP_VALUE_MAX);
+    assert_eq!(too_long_value.len(), PROP_VALUE_MAX);
 
     init_test().await;
 
-    // Test with get_with_default (should work regardless of length)
-    let result1 = rsproperties::get_or("test.max.length", max_length_value.to_string());
-    assert_eq!(result1, max_length_value);
+    // A non-`ro.` value of PROP_VALUE_MAX - 1 bytes is the longest the
+    // service stores; it reads back unchanged.
+    rsproperties::set("test.max.length", &max_length_value)
+        .expect("a value of PROP_VALUE_MAX - 1 bytes is accepted");
+    let read: String = rsproperties::get("test.max.length").expect("get after set");
+    assert_eq!(read, max_length_value);
 
-    let result2 = rsproperties::get_or("test.too.long", too_long_value.to_string());
-    assert_eq!(result2, too_long_value);
+    // A value of PROP_VALUE_MAX bytes is rejected by the client before it
+    // connects (`wire::validate_value_len`).
+    let result = rsproperties::set("test.too.long", &too_long_value);
+    assert!(
+        matches!(result, Err(rsproperties::Error::InvalidArgument(_))),
+        "a {PROP_VALUE_MAX}-byte value must be InvalidArgument, got {result:?}"
+    );
+
+    // The rejected set stored nothing, so get_or returns its default.
+    let result = rsproperties::get_or("test.too.long", "unset".to_string());
+    assert_eq!(result, "unset");
 
     println!("✓ Property value length limits test passed");
     println!("  PROP_VALUE_MAX = {PROP_VALUE_MAX}");
@@ -217,20 +235,26 @@ async fn test_thread_safety() {
         let handle = thread::spawn(move || {
             // Each thread performs multiple operations
             for op_id in 0..5 {
+                // No test of this binary sets a `test.thread.*` property.
                 let property_name = format!("test.thread.{thread_id}.{op_id}");
 
-                // Test get_with_default (should always succeed)
+                // Test get_or (should always succeed)
                 let result = rsproperties::get_or(&property_name, "default".to_string());
                 if result == "default" {
                     success_count_clone.fetch_add(1, Ordering::SeqCst);
                 }
 
-                // Test get (will likely fail but shouldn't crash)
-                let _result: String = rsproperties::get(&property_name).unwrap_or_default();
+                // Test get (the property is absent)
+                let result = rsproperties::get::<String>(&property_name);
+                assert!(
+                    matches!(result, Err(rsproperties::Error::NotFound(_))),
+                    "get({property_name:?}) must be NotFound, got {result:?}"
+                );
                 success_count_clone.fetch_add(1, Ordering::SeqCst);
 
-                // Test dirname (should always work)
-                let _dirname = rsproperties::properties_dir();
+                // Test dirname (the directory the service was started on)
+                let dirname = rsproperties::properties_dir();
+                assert_eq!(dirname, common::properties_dir());
                 success_count_clone.fetch_add(1, Ordering::SeqCst);
             }
         });
@@ -283,7 +307,7 @@ async fn test_performance_basic() {
 
     init_test().await;
 
-    // Test performance of get_with_default
+    // Test performance of get_or
     let start = Instant::now();
     let iterations = 1000;
 
@@ -426,7 +450,7 @@ async fn test_integration_comprehensive() {
     let dirname = rsproperties::properties_dir();
     assert!(!dirname.to_string_lossy().is_empty());
 
-    // Test multiple get_with_default calls
+    // Test multiple get_or calls
     let test_properties = [
         "integration.test.1",
         "integration.test.2",
@@ -449,6 +473,6 @@ async fn test_integration_comprehensive() {
     }
 
     println!("✓ Comprehensive integration test passed");
-    println!("  Tested constants, dirname, get_with_default, and get functions");
+    println!("  Tested constants, dirname, get_or, and get functions");
     println!("  All components working together correctly");
 }
