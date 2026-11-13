@@ -671,13 +671,9 @@ impl ContextsSerialized {
     /// entry and no default gives it one.
     #[cfg(feature = "builder")]
     pub(crate) fn property_type(&self, name: &str) -> Result<Option<&str>> {
-        let area = self.property_info_area_file.property_info_area();
-        let (_, type_index) = area.get_property_info_indexes(name);
-        if type_index == crate::property_info_parser::NO_INDEX {
-            return Ok(None);
-        }
-        let offset = area.type_offset(type_index as usize)?;
-        Ok(Some(area.cstr(offset)?.to_str()?))
+        self.property_info_area_file
+            .property_info_area()
+            .property_type(name)
     }
 
     /// Number of context slots, including slots skipped as corrupt at

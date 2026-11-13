@@ -143,12 +143,72 @@ pub fn load_properties_from_file(
     filter: Option<&str>,
     properties: &mut HashMap<String, String>,
 ) -> Result<PropFileOutcome> {
-    let mut visited = HashSet::new();
-    let mut loads = 0u32;
-    load_properties_impl(filename, filter, properties, 0, &mut visited, &mut loads)
+    load_properties_from_file_with(filename, filter, properties, |_, _| true)
 }
 
-/// What [`load_properties_from_file`] did with the file it was given.
+/// [`load_properties_from_file`] with a check of the caller's on every
+/// entry: `accept(name, value)` returns whether the entry is kept.
+///
+/// `accept` stands where AOSP init's `LoadProperties` calls
+/// `CheckPermissions`, after that function's property-name check, which
+/// the loader does itself. It is called for an entry that passed the
+/// filter, the `ctl.*` / `sys.powerctl` / `selinux.restorecon_recursive`
+/// exclusion and the name check, with the trimmed name and value, before
+/// the entry is put in `properties`. An entry it refuses is logged at
+/// `warn` (file, line and name) and dropped; a value `properties` already
+/// holds for that name stays, as in init, where a refused entry does not
+/// replace the earlier one. Entries of imported files go through the same
+/// `accept`.
+///
+/// A service that checks values against their `property_contexts` type
+/// (init `CheckType`) passes a closure over
+/// [`crate::property_type_in_trie`]:
+///
+/// ```rust,no_run
+/// use rsproperties::{load_properties_from_file_with, property_type_in_trie};
+/// use std::{collections::HashMap, path::Path};
+///
+/// # fn main() -> rsproperties::Result<()> {
+/// # let trie: Vec<u8> = Vec::new();
+/// let mut properties = HashMap::new();
+/// let _outcome = load_properties_from_file_with(
+///     Path::new("/system/build.prop"),
+///     None,
+///     &mut properties,
+///     |name, value| match property_type_in_trie(&trie, name) {
+///         // Only `int` here; init's `CheckType` covers the other types.
+///         Ok(Some(t)) if t == "int" => value.is_empty() || value.parse::<i64>().is_ok(),
+///         Ok(_) => true,
+///         Err(_) => false,
+///     },
+/// )?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The returned value and the errors are those of
+/// [`load_properties_from_file`].
+pub fn load_properties_from_file_with(
+    filename: &Path,
+    filter: Option<&str>,
+    properties: &mut HashMap<String, String>,
+    mut accept: impl FnMut(&str, &str) -> bool,
+) -> Result<PropFileOutcome> {
+    let mut visited = HashSet::new();
+    let mut loads = 0u32;
+    load_properties_impl(
+        filename,
+        filter,
+        properties,
+        0,
+        &mut visited,
+        &mut loads,
+        &mut accept,
+    )
+}
+
+/// What [`load_properties_from_file`] or
+/// [`load_properties_from_file_with`] did with the file it was given.
 ///
 /// About that file only: an `import` it names can be skipped (unreadable,
 /// group- or other-writable, nested too deep) and the result is still
@@ -157,7 +217,8 @@ pub fn load_properties_from_file(
 #[must_use = "a skipped file loads nothing; check for `SkippedWritable`"]
 pub enum PropFileOutcome {
     /// The file was read to its end. Lines the loader does not accept
-    /// (illegal names, `ctl.*`, non-UTF-8, over-long) were dropped.
+    /// (illegal names, `ctl.*`, non-UTF-8, over-long) and entries the
+    /// caller's check refused were dropped.
     Loaded,
     /// The file was not read because its mode has the group- or
     /// other-write bit (`mode & 0o022 != 0`) — AOSP init's `ReadFile`
@@ -225,9 +286,10 @@ fn expand_import_path(raw: &str, properties: &HashMap<String, String>) -> Option
     Some(out)
 }
 
-// Recursion state (depth/visited/loads) travels with every call; a params
-// struct would be re-destructured at each of the three call sites for no
-// clarity gain.
+// Recursion state (depth/visited/loads) and the caller's entry check
+// travel with every call; a params struct would be re-destructured at each
+// of the three call sites for no clarity gain. `accept` is `dyn` so the
+// recursion is compiled once, not once per closure type.
 fn load_properties_impl(
     filename: &Path,
     filter: Option<&str>,
@@ -235,6 +297,7 @@ fn load_properties_impl(
     depth: u8,
     visited: &mut HashSet<PathBuf>,
     loads: &mut u32,
+    accept: &mut dyn FnMut(&str, &str) -> bool,
 ) -> Result<PropFileOutcome> {
     if depth > MAX_IMPORT_DEPTH {
         // `Parse`, not `LimitExceeded`: the import call site swallows this
@@ -281,7 +344,7 @@ fn load_properties_impl(
     }
     // From here on every exit must pop the stack entry; wrap the body so
     // one removal covers all paths.
-    let result = load_properties_body(filename, filter, properties, depth, visited, loads);
+    let result = load_properties_body(filename, filter, properties, depth, visited, loads, accept);
     if !filtered {
         visited.remove(&canonical);
     }
@@ -333,6 +396,7 @@ fn load_properties_body(
     depth: u8,
     visited: &mut HashSet<PathBuf>,
     loads: &mut u32,
+    accept: &mut dyn FnMut(&str, &str) -> bool,
 ) -> Result<PropFileOutcome> {
     let file = match open_prop_file(filename)? {
         Ok(file) => file,
@@ -398,6 +462,7 @@ fn load_properties_body(
                             depth + 1,
                             visited,
                             loads,
+                            accept,
                         ) {
                             // A *global* budget exhaustion is not a broken
                             // import — swallowing it would keep walking the
@@ -461,6 +526,17 @@ fn load_properties_body(
         // key could be stored but never `set` again.
         if let Err(e) = crate::wire::validate_property_name(key) {
             warn!("Line {line_count} of {filename:?}: ignoring illegal property name: {e}");
+            continue;
+        }
+
+        // The rest of AOSP `CheckPermissions` (the SELinux and type
+        // checks), as far as the caller supplies it. Before the map is
+        // touched: a refused entry leaves an earlier value of the name in
+        // place, like AOSP.
+        if !accept(key, value) {
+            warn!(
+                "Line {line_count} of {filename:?}: dropping property {key:?}: refused by the caller's check"
+            );
             continue;
         }
 
@@ -732,6 +808,80 @@ mod tests {
         let mut properties = HashMap::new();
         load(&root, &mut properties);
         assert_eq!(properties.get("key"), Some(&"from_overlay".to_string()));
+    }
+
+    /// `accept` is where AOSP `LoadProperties` calls `CheckPermissions`:
+    /// it sees the trimmed name and value of every entry the loader's own
+    /// checks let through (imported files included), and an entry it
+    /// refuses neither enters the map nor replaces an earlier value.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_accept_is_called_per_entry_before_the_map_changes() {
+        use std::io::Write;
+        let tmp = TempDir::new("rsprops_accept_test");
+        let dir = &tmp.0;
+
+        let imported = dir.join("imported.prop");
+        writeln!(
+            create_prop(&imported).unwrap(),
+            "kept.then.refused=bad\nrefused.then.kept=2\nimported.refused=bad"
+        )
+        .unwrap();
+
+        let root = dir.join("root.prop");
+        {
+            let mut f = create_prop(&root).unwrap();
+            writeln!(f, "kept.then.refused=1").unwrap();
+            writeln!(f, "refused.then.kept=bad").unwrap();
+            writeln!(f, "  spaced.key \t=  spaced value \t").unwrap();
+            // Dropped by the loader before `accept`.
+            writeln!(f, "ctl.start=svc").unwrap();
+            writeln!(f, ".illegal=1").unwrap();
+            writeln!(f, "import {}", imported.display()).unwrap();
+        }
+
+        let mut seen = Vec::new();
+        let mut properties = HashMap::new();
+        let outcome = load_properties_from_file_with(&root, None, &mut properties, |key, value| {
+            seen.push((key.to_string(), value.to_string()));
+            value != "bad"
+        })
+        .unwrap();
+        assert_eq!(outcome, PropFileOutcome::Loaded);
+
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            seen,
+            [
+                pair("kept.then.refused", "1"),
+                pair("refused.then.kept", "bad"),
+                pair("spaced.key", "spaced value"),
+                pair("kept.then.refused", "bad"),
+                pair("refused.then.kept", "2"),
+                pair("imported.refused", "bad"),
+            ]
+        );
+        let mut loaded: Vec<_> = properties.into_iter().collect();
+        loaded.sort();
+        assert_eq!(
+            loaded,
+            [
+                pair("kept.then.refused", "1"),
+                pair("refused.then.kept", "2"),
+                pair("spaced.key", "spaced value"),
+            ]
+        );
+
+        // A filter is applied before `accept`.
+        let mut seen = Vec::new();
+        let mut properties = HashMap::new();
+        let _ =
+            load_properties_from_file_with(&root, Some("spaced.*"), &mut properties, |key, _| {
+                seen.push(key.to_string());
+                true
+            })
+            .unwrap();
+        assert_eq!(seen, ["spaced.key"]);
     }
 
     #[cfg(not(target_os = "android"))]

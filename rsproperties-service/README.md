@@ -256,7 +256,11 @@ The socket service implements the Android property service protocol:
   latter instead of storing it
 - **Type check**: values are checked against the `property_contexts` type
   (`bool`, `int`, `uint`, `double`, `size`, `enum ...`) as init's
-  `CheckType` does; an empty value is always accepted
+  `CheckType` does; an empty value is always accepted. This covers client
+  sets, persistent records and build.prop entries; a build.prop entry
+  that fails is logged and dropped when the file is read, so it does not
+  replace an earlier entry of the same name. A `${name}` reference in a
+  build.prop value is not expanded (init expands it before the check)
 - **`ctl.*`**: never stored; passed to `ServiceOptions::control_handler`,
   or refused without one. At most 16 handler calls are running or
   waiting for a blocking thread at once; a request beyond that gets
@@ -407,8 +411,8 @@ in the release build.
   into a `BTreeMap` before apply, so the order in which they are added
   to the area (and thus the trie layout) no longer varies per run with
   `HashMap`'s hash seed. Which file wins a key conflict does not depend
-  on this: `load_properties_from_file` overwrites in call order, so the
-  later file wins.
+  on this: `load_properties_from_file_with` overwrites in call order, so
+  the later file wins (an entry the type check drops overwrites nothing).
 
 ### Size limits
 

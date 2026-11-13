@@ -383,6 +383,40 @@ impl<'a> PropertyInfoArea<'a> {
         self.table_count(self.header().types_offset)
     }
 
+    /// AOSP `PropertyInfoAreaFile::LoadPath`'s checks of the header
+    /// against the `size` bytes it came with: a newer format, or a size
+    /// that is not the one the header records, is an error. `origin`
+    /// names the bytes in the message.
+    fn check_header(&self, size: usize, origin: std::fmt::Arguments<'_>) -> Result<()> {
+        let header = self.header();
+        if header.minimum_supported_version > 1 {
+            return Err(Error::FileValidation(format!(
+                "Unsupported property_info version in {origin}: minimum_supported_version={} (max supported 1)",
+                header.minimum_supported_version
+            )));
+        }
+        if header.size as usize != size {
+            return Err(Error::FileValidation(format!(
+                "property_info header size {} does not match file size {size} in {origin}",
+                header.size
+            )));
+        }
+        Ok(())
+    }
+
+    /// The `property_contexts` type of `name` (`"string"`, `"int"`,
+    /// `"enum a b"`, ...), or `None` when no entry and no default gives it
+    /// one.
+    #[cfg(feature = "builder")]
+    pub(crate) fn property_type(&self, name: &str) -> Result<Option<&'a str>> {
+        let (_, type_index) = self.get_property_info_indexes(name);
+        if type_index == NO_INDEX {
+            return Ok(None);
+        }
+        let offset = self.type_offset(type_index as usize)?;
+        Ok(Some(self.cstr(offset)?.to_str()?))
+    }
+
     pub(crate) fn root_node(&self) -> TrieNode<'a> {
         TrieNode::new(*self, self.header().root_offset as usize)
     }
@@ -708,20 +742,8 @@ impl PropertyInfoAreaFile {
         // future-format file parses "successfully" into garbage lookups;
         // without the size cross-check a truncated or concatenated file
         // degrades into per-lookup warnings instead of one load-time error.
-        let area = this.property_info_area();
-        let header = area.header();
-        if header.minimum_supported_version > 1 {
-            return Err(Error::FileValidation(format!(
-                "Unsupported property_info version in {path:?}: minimum_supported_version={} (max supported 1)",
-                header.minimum_supported_version
-            )));
-        }
-        if header.size as usize != size {
-            return Err(Error::FileValidation(format!(
-                "property_info header size {} does not match file size {size} in {path:?}",
-                header.size
-            )));
-        }
+        this.property_info_area()
+            .check_header(size, format_args!("{path:?}"))?;
 
         Ok(this)
     }
@@ -729,6 +751,54 @@ impl PropertyInfoAreaFile {
     pub(crate) fn property_info_area(&'_ self) -> PropertyInfoArea<'_> {
         PropertyInfoArea::new(self.mmap.bytes())
     }
+}
+
+/// The `property_contexts` type of `name` (`"string"`, `"int"`,
+/// `"enum a b"`, ...) in `trie`, the bytes [`crate::build_trie`] returns,
+/// or `None` when no entry and no default gives it one.
+///
+/// This is the lookup [`crate::SystemProperties::property_type`] does on a
+/// published `property_info`, for a trie that is not published yet: AOSP
+/// init checks each build.prop value against its type while it reads the
+/// files, and a service that reads its input files before it writes to the
+/// properties dir has only the bytes at that point (see
+/// [`crate::load_properties_from_file_with`]).
+///
+/// `trie` may start at any address. The lookup reads 4-byte aligned
+/// records in place, so bytes that are not 4-byte aligned are copied
+/// first, once per call. A `Vec<u8>` from the global allocator is aligned
+/// on the supported targets (glibc and bionic `malloc` return 8- or
+/// 16-byte aligned blocks), so `build_trie`'s result is read in place.
+///
+/// # Errors
+///
+/// `Error::FileValidation` when `trie` is shorter than its header, names a
+/// format newer than this crate reads, or records a size other than
+/// `trie.len()`; the errors of the lookup itself when an offset inside
+/// `trie` is out of range.
+#[cfg(feature = "builder")]
+pub fn property_type_in_trie(trie: &[u8], name: &str) -> Result<Option<String>> {
+    use zerocopy::IntoBytes;
+
+    if trie.len() < size_of::<PropertyInfoAreaHeader>() {
+        return Err(Error::FileValidation(format!(
+            "property_info trie of {} bytes is smaller than its header ({} bytes)",
+            trie.len(),
+            size_of::<PropertyInfoAreaHeader>()
+        )));
+    }
+    let lookup = |bytes: &[u8]| -> Result<Option<String>> {
+        let area = PropertyInfoArea::new(bytes);
+        area.check_header(bytes.len(), format_args!("the trie bytes"))?;
+        Ok(area.property_type(name)?.map(str::to_owned))
+    };
+    if trie.as_ptr().align_offset(size_of::<u32>()) == 0 {
+        return lookup(trie);
+    }
+    // `Vec<u32>` backing: its 4-byte alignment is a language guarantee.
+    let mut words = vec![0u32; trie.len().div_ceil(size_of::<u32>())];
+    words.as_mut_bytes()[..trie.len()].copy_from_slice(trie);
+    lookup(&words.as_bytes()[..trie.len()])
 }
 
 #[cfg(all(test, feature = "builder", not(target_os = "android")))]
@@ -791,6 +861,60 @@ mod tests {
                 "{err}"
             ),
             other => panic!("expected Io(ELOOP), got {other:?}"),
+        }
+    }
+
+    /// `property_type_in_trie` reads `build_trie`'s bytes as
+    /// `SystemProperties::property_type` reads the published file, at any
+    /// alignment of the slice, and refuses bytes whose length is not the
+    /// one the header records.
+    #[test]
+    fn property_type_in_trie_reads_unpublished_bytes() {
+        let entries = vec![
+            PropertyInfoEntry::prefix("typed.", "u:object_r:typed_prop:s0", "string").unwrap(),
+            PropertyInfoEntry::exact("typed.int", "u:object_r:typed_prop:s0", "int").unwrap(),
+            PropertyInfoEntry::exact("typed.enum", "u:object_r:typed_prop:s0", "enum a b").unwrap(),
+        ];
+        let trie = build_trie(&entries, "u:object_r:default_prop:s0", "double").unwrap();
+        let cases = [
+            ("typed.int", "int"),
+            ("typed.enum", "enum a b"),
+            ("typed.other", "string"),
+            // No entry: the default type.
+            ("other.name", "double"),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                property_type_in_trie(&trie, name).unwrap().as_deref(),
+                Some(expected),
+                "{name}"
+            );
+        }
+
+        // Four consecutive start addresses: at most one is 4-byte aligned,
+        // so the copying path runs for at least three of them.
+        let mut shifted = vec![0u8; trie.len() + 3];
+        for start in 0..4 {
+            shifted[start..start + trie.len()].copy_from_slice(&trie);
+            let bytes = &shifted[start..start + trie.len()];
+            for (name, expected) in cases {
+                assert_eq!(
+                    property_type_in_trie(bytes, name).unwrap().as_deref(),
+                    Some(expected),
+                    "{name} at +{start}"
+                );
+            }
+        }
+
+        for bad in [&trie[..4], &trie[..trie.len() - 4]] {
+            assert!(
+                matches!(
+                    property_type_in_trie(bad, "typed.int"),
+                    Err(Error::FileValidation(_))
+                ),
+                "{} bytes",
+                bad.len()
+            );
         }
     }
 

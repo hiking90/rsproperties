@@ -8,8 +8,8 @@ use rsproperties::wire::{
     PROP_ERROR_SET_FAILED, PROP_SUCCESS,
 };
 use rsproperties::{
-    build_trie, load_properties_from_file, AreaWriterLock, MatchKeyword, PropFileOutcome,
-    PropertyInfoEntry, SystemProperties,
+    build_trie, load_properties_from_file_with, property_type_in_trie, AreaWriterLock,
+    MatchKeyword, PropFileOutcome, PropertyInfoEntry, SystemProperties,
 };
 
 use crate::persistent_properties::{is_persistent_name, PersistentStore};
@@ -85,13 +85,38 @@ fn init_system_properties_sync(
     let data: Vec<u8> =
         build_trie(&property_infos, "u:object_r:build_prop:s0", "string").map_err(io_other)?;
 
-    // `load_properties_from_file` only accepts `&mut HashMap` (other
+    // `load_properties_from_file_with` only accepts `&mut HashMap` (other
     // callers depend on that signature). Re-collect into a `BTreeMap`
     // before the apply loop so the iteration order is fully determined
     // by the keys, not by HashMap's randomised hash seed.
     let mut properties_unordered: HashMap<String, String> = HashMap::new();
+    // init `LoadProperties` runs `CheckPermissions`, and with it
+    // `CheckType`, on every entry as it reads it, and drops an entry that
+    // fails before it can replace an earlier one of the same name. The
+    // type is read from the trie bytes: `property_info` is not published
+    // until every input file has been read. The value is not logged
+    // (value-masking policy, see `PropertyMessage`'s Debug); the loader
+    // logs the file and line of the entry it drops.
+    let mut matches_type = |key: &str, value: &str| match property_type_in_trie(&data, key) {
+        Ok(Some(property_type)) if !check_type(&property_type, value) => {
+            log::error!("build.prop entry {key:?}: value does not match type {property_type:?}");
+            false
+        }
+        Ok(_) => true,
+        Err(e) => {
+            log::error!("build.prop entry {key:?}: cannot read its type: {e}");
+            false
+        }
+    };
     for file in build_prop_files {
-        match load_properties_from_file(&file, None, &mut properties_unordered).map_err(io_other)? {
+        match load_properties_from_file_with(
+            &file,
+            None,
+            &mut properties_unordered,
+            &mut matches_type,
+        )
+        .map_err(io_other)?
+        {
             PropFileOutcome::Loaded => {}
             // Startup continues, as AOSP init does after `ReadFile`
             // refuses the file ("Couldn't load property file").
@@ -146,6 +171,9 @@ fn init_system_properties_sync(
     // logged and skipped, like AOSP init's .prop apply loop — one bad
     // vendor line must not keep the whole service from starting. The value
     // is not logged (value-masking policy, see `PropertyMessage`'s Debug).
+    // The values were checked against their types when the files were
+    // read (`matches_type` above), as init's apply loop
+    // (`PropertySetNoSocket`) does not check them again.
     for (key, value) in properties.iter() {
         if let Err(e) = system_properties.add(key.as_str(), value.as_str()) {
             log::error!("Skipping build.prop entry {key:?}: {e}");
@@ -642,6 +670,84 @@ mod tests {
         let mut sp = init_locked(vec![], vec![build_prop("kept.prop", "3")], &props).unwrap();
         assert!(apply_startup_properties(&mut sp, None).is_none());
         assert_eq!(sp.get("ro.property_service.version").unwrap(), "3");
+
+        // AOSP's `property_contexts` gives the name the type `int`. The
+        // type check then drops a value that is not an `int` when the file
+        // is read, as init does, and the service sets `2`; an `int` that
+        // selects V1 still fails init.
+        let contexts = inputs.join("property_contexts");
+        std::fs::write(
+            &contexts,
+            "ro.property_service.version u:object_r:property_service_version_prop:s0 exact int\n",
+        )
+        .unwrap();
+        let props = tmp.0.join("typed_dropped");
+        let file = build_prop("typed_dropped.prop", "v2");
+        let mut sp = init_locked(vec![contexts.clone()], vec![file], &props).unwrap();
+        assert!(sp.find("ro.property_service.version").unwrap().is_none());
+        assert!(apply_startup_properties(&mut sp, None).is_none());
+        assert_eq!(sp.get("ro.property_service.version").unwrap(), "2");
+
+        let props = tmp.0.join("typed_refused");
+        let file = build_prop("typed_refused.prop", "1");
+        let err = init_locked(vec![contexts], vec![file], &props)
+            .expect_err("an int that selects V1 must fail init");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    }
+
+    /// A build.prop entry whose value does not match its
+    /// `property_contexts` type is not stored, as init `LoadProperties`
+    /// drops it (`CheckType`); the other entries are.
+    #[test]
+    fn build_prop_entry_with_mismatched_type_is_skipped() {
+        let tmp = TempDir::new("rsprops_svc_build_prop_type");
+        let inputs = tmp.0.join("inputs");
+        std::fs::create_dir_all(&inputs).unwrap();
+        let write = |name: &str, content: &str| {
+            let path = inputs.join(name);
+            std::fs::write(&path, content).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            path
+        };
+        let contexts = write(
+            "property_contexts",
+            "ro.typed.int u:object_r:typed_prop:s0 exact int\n\
+             ro.typed.int_ok u:object_r:typed_prop:s0 exact int\n\
+             ro.typed.int_empty u:object_r:typed_prop:s0 exact int\n\
+             ro.typed.enum u:object_r:typed_prop:s0 exact enum a b\n\
+             ro.typed.kept u:object_r:typed_prop:s0 exact int\n\
+             ro.typed.replaced u:object_r:typed_prop:s0 exact int\n\
+             ro.typed.imported u:object_r:typed_prop:s0 exact int\n",
+        );
+        let imported = write("imported.prop", "ro.typed.imported=abc\n");
+        let first = write(
+            "first.prop",
+            &format!(
+                "ro.typed.int=abc\n\
+                 ro.typed.int_ok=7\n\
+                 ro.typed.int_empty=\n\
+                 ro.typed.enum=c\n\
+                 ro.typed.kept=1\n\
+                 ro.typed.replaced=abc\n\
+                 ro.untyped=abc\n\
+                 import {}\n",
+                imported.display()
+            ),
+        );
+        // The check runs on each entry as it is read: a mismatched value
+        // does not replace `ro.typed.kept=1`, and a matching one is stored
+        // after a mismatched one was dropped.
+        let second = write("second.prop", "ro.typed.kept=abc\nro.typed.replaced=2\n");
+
+        let sp = init_locked(vec![contexts], vec![first, second], &tmp.0.join("props")).unwrap();
+        for name in ["ro.typed.int", "ro.typed.enum", "ro.typed.imported"] {
+            assert!(sp.find(name).unwrap().is_none(), "{name}");
+        }
+        assert_eq!(sp.get("ro.typed.kept").unwrap(), "1");
+        assert_eq!(sp.get("ro.typed.replaced").unwrap(), "2");
+        assert_eq!(sp.get("ro.typed.int_ok").unwrap(), "7");
+        assert_eq!(sp.get("ro.typed.int_empty").unwrap(), "");
+        assert_eq!(sp.get("ro.untyped").unwrap(), "abc");
     }
 
     /// A writer lock for another directory is refused before anything is

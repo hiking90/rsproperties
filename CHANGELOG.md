@@ -70,6 +70,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SET_FAILED`).
 - `SystemProperties::property_type(name)` (`builder` feature): the
   `property_contexts` type `property_info` records for a name.
+- `property_type_in_trie(trie, name)` (`builder` feature): the same
+  lookup on the bytes `build_trie` returns, before they are published
+  as `property_info`. Bytes that are not 4-byte aligned are copied for
+  the call.
+- `load_properties_from_file_with(path, filter, properties, accept)`
+  (`builder` feature): `load_properties_from_file` with a check of the
+  caller's, `accept(name, value) -> bool`, on every entry, where init's
+  `LoadProperties` calls `CheckPermissions`. A refused entry is logged
+  and dropped, and a value the map already holds for the name stays.
 - Service: `ServiceOptions` (property_contexts files, build.prop files,
   `persistent_properties_file`, `control_handler`) and `ControlMessage`,
   with `ControlMessage::new` for testing a handler.
@@ -104,8 +113,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persistent set reads the file again and keeps its records instead of
   replacing the file with that set alone.
 - Service: values are checked against the `property_contexts` type
-  (init `CheckType`) for client sets and persistent records; build.prop
-  entries are not checked (init drops a mismatching entry); `ctl.*` sets
+  (init `CheckType`) for client sets, persistent records and build.prop
+  entries. A build.prop entry whose value does not match is logged and
+  dropped when the file is read, before it can replace an earlier entry
+  of the same name, as init does (0.6.0 stored it). With AOSP's
+  `property_contexts`, where `ro.property_service.version` is an `int`,
+  a build.prop value of that name that is not an `int` is dropped this
+  way and the service sets `2`, instead of failing `run`; `ctl.*` sets
   go to the control handler and are never stored, with at most 16
   handler calls running or queued for a blocking thread at once (a
   request beyond that gets `PROP_ERROR_HANDLE_CONTROL_MESSAGE` without

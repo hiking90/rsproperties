@@ -269,9 +269,13 @@ pub(crate) mod test_support {
 // Explicit re-export lists (not globs) so the public API surface is
 // visible here and additions to the modules don't silently become public.
 #[cfg(feature = "builder")]
-pub use build_property_parser::{load_properties_from_file, PropFileOutcome};
+pub use build_property_parser::{
+    load_properties_from_file, load_properties_from_file_with, PropFileOutcome,
+};
 #[cfg(feature = "builder")]
 pub use contexts_serialized::AreaWriterLock;
+#[cfg(feature = "builder")]
+pub use property_info_parser::property_type_in_trie;
 #[cfg(feature = "builder")]
 pub use property_info_serializer::{build_trie, MatchKeyword, PropertyInfoEntry};
 pub use property_watcher::PropertyWatcher;

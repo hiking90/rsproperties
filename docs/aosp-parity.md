@@ -34,7 +34,7 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
 | C6 | client | global reader 초기화 실패를 process 수명 동안 유지 | (c), 재시도 방식은 (a) | 이 branch에서 수정 |
 | C7 | client | 한 property의 값 cache와 변경 대기(`CachedProperty`) | (d) | 이 branch에서 추가 |
 | S1 | service | `persist.*` / `next_boot.*` 영속화 | (d) | 이 branch에서 추가 |
-| S2 | service | property type 검사(`CheckType`) | (c) | 이 branch에서 수정 |
+| S2 | service | property type 검사(`CheckType`) | (c) | 이 branch에서 수정. build.prop 값의 `${...}` 확장은 (c)로 남아 있다 |
 | S3 | service | `ctl.*`를 일반 property로 저장 | (c) | 저장은 이 branch에서 수정. 종료 뒤 `ctl.stop` 응답은 (c)로 남아 있고 owner 결정 대기 |
 | S4 | service | 실패 응답 코드가 항상 `PROP_ERROR` | (c) | 이 branch에서 수정 |
 | S5 | service | `ro.property_service.version` 미설정 | (c) | 이 branch에서 수정 |
@@ -691,15 +691,61 @@ subnormal 결과(`1e-310`)는 거부한다. bionic `strtod`(gdtoa `strtod.c`)는
 0이면 `errno = ERANGE`로 둔다(`:1074-1087`). subnormal 결과는 항상 이 경로를
 거친다. device 실측은 하지 않았다.
 
-type 검사는 client set과 persistent record(`init_set` → `apply_set`)에만
-적용한다. build.prop entry는 검사하지 않는다(c). init `LoadProperties`는
-entry마다 `CheckPermissions`를 호출하고(`property_service.cpp:803`), 그 안의
-`CheckType`(`:530-533`)이 실패하면 그 entry를 버린다. `PropertyInit`은
-`property_info`를 load한 뒤(`:1415`) `PropertyLoadBootDefaults`(`:1429`)를
-실행하므로, 이 시점에 type 정보가 있다. 이 service의
-`init_system_properties_sync`는 build.prop entry를 `add`로 바로 넣는다. 그래서
-`property_contexts`가 `int`로 정한 이름에 build.prop가 `abc`를 주면, init은 그
-property를 만들지 않고 이 service는 `abc`를 저장한다.
+type 검사는 client set, persistent record(`init_set` → `apply_set`),
+build.prop entry에 적용한다.
+
+**build.prop entry.** init `LoadProperties`는 entry마다 `CheckPermissions`를
+호출하고(`property_service.cpp:803`), 그 안의 `CheckType`(`:530-533`)이
+실패하면 그 entry를 버린다. `PropertyInit`은 `property_info`를 load한
+뒤(`:1415`) `PropertyLoadBootDefaults`(`:1429`)를 실행하므로, 이 시점에 type
+정보가 있다. 0.6.0의 이 service는 검사 없이 `add`했으므로, `property_contexts`가
+`int`로 정한 이름에 build.prop가 `abc`를 주면 `abc`를 저장했다.
+
+이 service도 init과 같은 시점, 즉 entry를 읽을 때 같은 이름의 이전 entry를
+대체하기 전에(`:803-811`) 검사한다. 이를 위해 `rsproperties`에 `builder`
+feature의 공개 함수 두 개를 추가했다.
+- `load_properties_from_file_with(path, filter, properties, accept)`. loader가
+  filter, `ctl.*` 제외, 이름 검사를 통과한 entry마다 `accept(name, value)`를
+  호출한다. 호출 위치는 init의 `CheckPermissions` 자리이며 map을 바꾸기
+  전이다. `accept`가 `false`를 반환한 entry는 `warn` log(파일, 줄 번호,
+  이름)를 남기고 버리며, map에 있던 같은 이름의 값은 그대로 둔다. `import`한
+  파일의 entry에도 같은 `accept`를 호출한다. `load_properties_from_file`은
+  항상 `true`를 반환하는 closure로 이 함수를 호출한다.
+- `property_type_in_trie(trie, name)`. `build_trie`가 반환한 byte에서 type을
+  읽는다. `SystemProperties::property_type`은 `property_info`를 게시하고 area를
+  만든 뒤에만 쓸 수 있는데, 이 service는 입력 파일을 모두 읽은 뒤에
+  properties dir에 쓴다(`build_prop_error_leaves_property_info_untouched`).
+  그래서 build.prop를 읽는 시점에는 trie byte만 있다. 함수는 header 크기,
+  version, header에 기록된 크기를 `PropertyInfoAreaFile::load_path`와 같은
+  규칙으로 검사한다. trie record는 4-byte 정렬을 전제로 읽으므로, slice의
+  시작 주소가 4-byte 정렬이 아니면 `Vec<u32>`로 복사한 뒤 조회한다. 반환
+  타입이 `Option<String>`인 이유가 이 복사 경로다.
+
+`init_system_properties_sync`는 `check_type`을 호출하는 closure를 `accept`로
+넘긴다. type이 맞지 않으면 이름과 type을 `error` log로 남긴다. area에 넣는
+loop는 type을 다시 검사하지 않는다. init의 `PropertySetNoSocket` loop
+(`:1234-1239`)도 `CheckPermissions`를 거치지 않는다.
+
+이 변경으로 `ro.property_service.version`의 결과도 달라진다. AOSP
+`plat_property_contexts`는 이 이름을 `exact int`로 정한다. build.prop 값이
+`v2`처럼 `int`가 아니면 type 검사에서 entry를 버리므로, build.prop 값
+판정(S9)에 도달하지 않고 service가 `2`를 설정한다. init의 결과와 같다. 값이
+`1`처럼 `int`이면서 V1을 고르는 경우에는 종전대로 `run`이 실패한다.
+`property_contexts`에 이 이름의 type이 없으면 `v2`도 종전대로 `run`이
+실패한다.
+
+init과 다른 점 하나는 수정하지 않았다(c). init은 값에 `ExpandProps`를
+적용하고(`:795`) 확장한 값으로 `CheckPermissions`를 호출하며, 확장에 실패한
+entry는 버린다(`:796-800`). 이 crate의 loader는 `import` 경로만 확장하고 값은
+파일에 적힌 그대로 저장한다. 그래서 값에 `${name}`이 있는 entry는 저장하는
+값도, 검사하는 값도 init과 다르다.
+
+검증: `properties_service.rs`
+`build_prop_entry_with_mismatched_type_is_skipped`(같은 이름의 두 순서와
+`import`한 파일 포함), `build_prop_version_that_selects_v1_is_refused`,
+`build_property_parser.rs`
+`test_accept_is_called_per_entry_before_the_map_changes`,
+`property_info_parser.rs` `property_type_in_trie_reads_unpublished_bytes`.
 
 ### S3. `ctl.*` 저장 — 저장 동작은 (c), dispatch 없음은 (a), 종료 뒤 `ctl.stop` 응답은 (c) 미결정
 

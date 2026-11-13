@@ -528,6 +528,15 @@ clients that want to point at a custom socket directory:
   others. Returns `PropFileOutcome`: `Loaded`, or
   `SkippedWritable { mode }` when `path` itself was skipped (a skipped
   `import` is only logged)
+- `load_properties_from_file_with(path, filter, &mut HashMap, accept)` —
+  the same load with `accept(name, value) -> bool` called on every
+  entry before it enters the map, where AOSP init's `LoadProperties`
+  calls `CheckPermissions`. An entry `accept` refuses is logged and
+  dropped; a value the map already holds for that name stays
+- `property_type_in_trie(trie, name)` — the lookup of
+  `SystemProperties::property_type` on the bytes `build_trie` returns,
+  for a trie that is not published yet (for example in an `accept`
+  closure that checks build.prop values against their types)
 - `PropertyInfoEntry::parse_from_file(path, MatchKeyword)` —
   parse a `property_contexts`-format file into
   `(Vec<PropertyInfoEntry>, Vec<Error>)` (the entries that survived
