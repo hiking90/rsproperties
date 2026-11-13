@@ -231,6 +231,32 @@ fn main() -> rsproperties::Result<()> {
 - Properties are stored in memory-mapped files
 - `ro.*` properties are write-once here too (enforced by `rsproperties-service`)
 
+#### Protocol Version
+
+`set` sends the V2 frame (`PROP_MSG_SETPROP2`) unless one of these
+selects V1 (`PROP_MSG_SETPROP`), checked in this order:
+
+1. `ro.property_service.version`, when the process has already opened
+   the global reader (an earlier `get`, `get_or` or `system_properties()`
+   call; `set` does not open it): a number of 2 or more is V2, any other
+   value is V1.
+2. The `PROPERTY_SERVICE_VERSION` environment variable, when the reader
+   is not open or the property is missing: a number of 2 or more is V2,
+   any other value is V1 (logged at `warn` when it is not a number).
+3. V2 when neither is set. bionic sends V1 when the property is missing.
+
+The first `set` after the reader is open fixes the version for the
+process; before that, each `set` checks the environment variable again.
+
+A V1 `set` takes a name of at most 31 bytes and a value of at most 91
+(`Error::InvalidArgument` otherwise) and reads no reply: it
+returns `Ok` after it has sent the frame, whether or not the value was
+applied. `rsproperties-service` refuses V1 frames, so a V1 `set` to it
+returns `Ok` and sets nothing. The service sets
+`ro.property_service.version=2` at startup: read a property before the
+first `set`, or leave `PROPERTY_SERVICE_VERSION` unset, and `set` sends
+V2.
+
 #### Property Setting Examples by Type
 
 ```rust,no_run
@@ -423,7 +449,8 @@ fn main() -> rsproperties::Result<()> {
   again only after a change; `wait_for_change(timeout)` blocks until the
   creation or the next update, `Ok(false)` on timeout. One update is one
   change (the dirty and the clean serial store are not reported
-  separately), and changes are not queued
+  separately), and changes are not queued. `name()` returns the watched
+  name
 - `PropertyIndex` — the handle `find` / `foreach` return; `Copy`, `Eq`
   and `Hash`. Two indexes are equal when the same instance returned them
   for the same entry, so an index can be a `HashMap` key
@@ -443,8 +470,12 @@ which a reader created in that process follows without extra code.
   limits; `AOSP_MAX_WIRE_STRING_LEN` — AOSP init's limit, used by the
   Android client
 - `PROP_MSG_SETPROP`, `PROP_MSG_SETPROP2` — command IDs
-- `PROP_SUCCESS`, `PROP_ERROR` — V2 response codes
-- `validate_property_name(name)` — name charset / leading-char check
+- `PROP_SUCCESS` and the `PROP_ERROR_*` codes — V2 response codes, as
+  AOSP init sends them (`SetRejection` has one variant per code).
+  `PROP_ERROR` (-1) is the generic code the 0.6.0 service sent for every
+  rejected set; init and the current service do not send it
+- `validate_property_name(name)` — name charset; no leading or trailing
+  `.`, no `..`
 - `validate_value_len(name, value)` — value-length policy with the
   long-`ro.*` exception
 
@@ -487,6 +518,10 @@ clients that want to point at a custom socket directory:
 - `SystemProperties::update(index, value)` — overwrite an existing
   entry (seqlock-guarded)
 - `SystemProperties::set(name, value)` — add-or-update
+- `SystemProperties::property_type(name)` — the `property_contexts` type
+  that `property_info` records for `name` (`"string"`, `"bool"`,
+  `"int"`, …), or the trie's default type; `Ok(None)` when there is
+  neither. `add` and `set` do not check a value against it
 - `load_properties_from_file(path, filter, &mut HashMap)` —
   parse build.prop entries; like AOSP init it opens each file with
   `O_NOFOLLOW` and skips (with a warning) a file writable by group or

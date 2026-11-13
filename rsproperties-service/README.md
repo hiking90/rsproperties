@@ -22,7 +22,10 @@ Linux emulation of the Android system property service: a tokio-based daemon tha
 
 The service consists of two main components running as separate actors.
 Both are internal: the public API is `run`, `ServiceOptions` and the
-`ServiceHandle` that `run` returns.
+`ServiceHandle` that `run` returns, with the types they use:
+`ControlMessage` (the argument of the control handler: `action`,
+`target`, `pid`), `StartupError` / `StartupStage` (a failed `run`) and
+`ServiceError` (a failure after startup).
 
 ### Properties service
 - Manages the actual property storage and retrieval
@@ -526,6 +529,8 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo test --release
 ## Dependencies
 
 - **tokio**: Async runtime and I/O
+- **tokio-stream**: The listeners as streams in the accept loop
+- **rustix**: Socket, file-mode and `flock` system calls
 - **rsactor**: Actor framework for message passing
 - **rsproperties**: Core property system implementation
 - **log**: Logging framework

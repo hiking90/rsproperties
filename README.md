@@ -222,7 +222,9 @@ that reads a second properties directory, opens its own reader with
 
 On a Linux host, `rsproperties-service` emulates the Android property
 service (it compiles only for Linux; on Android, init owns the property
-service):
+service). It handles the V2 set command (`PROP_MSG_SETPROP2`) only and
+refuses the legacy V1 command; see
+[Protocol Compatibility](rsproperties-service/README.md#protocol-compatibility).
 
 ```rust,no_run
 use rsproperties::PropertyConfig;
@@ -231,10 +233,7 @@ use rsproperties::PropertyConfig;
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `run` creates a missing properties dir (last component only, 0711) and
     // socket dir (0755, parents included), both minus the umask's bits;
-    // create them yourself to choose owner and mode.
-    std::fs::create_dir_all("./properties")?;
-
-    // Configure the service
+    // create them yourself beforehand to choose owner and mode.
     let config = PropertyConfig::new()
         .properties_dir("./properties")
         .socket_dir("./socket");
@@ -447,7 +446,8 @@ The library follows Android property naming conventions:
 
 ### Property Constraints
 - **Name length**: 31 bytes max in the V1 wire protocol
-  (`name.len() < PROP_NAME_MAX`; the 32-byte buffer includes the NUL).
+  (`name.len() < PROP_NAME_MAX`; the 32-byte buffer includes the NUL),
+  which the client can send and `rsproperties-service` refuses.
   V2 is length-prefixed; on Linux, client and service both enforce
   `wire::MAX_WIRE_NAME_LEN` (1024 bytes) on names (and
   `wire::MAX_WIRE_VALUE_LEN`, 8192 bytes, on values). On Android the
@@ -458,7 +458,7 @@ The library follows Android property naming conventions:
   (matching bionic's `__system_property_set`). `ro.*` properties may
   exceed this via the long-property out-of-line storage path.
 - **Character set**: ASCII alphanumeric plus `_`, `.`, `-`, `@`, `:`.
-  Names must not begin with `.`. See
+  A name must not begin or end with `.` or contain `..`. See
   [`rsproperties::wire::validate_property_name`] for the canonical check.
 
 [`rsproperties::wire::validate_property_name`]: https://docs.rs/rsproperties/latest/rsproperties/wire/fn.validate_property_name.html
