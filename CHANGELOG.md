@@ -339,6 +339,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that follows bionic's rule sends V2. A build.prop file that sets
   `ro.property_service.version` to anything but a number of 2 or more
   now makes `run` fail (see Migration).
+- **Breaking (`builder`, service):** `load_properties_from_file` expands
+  property references in values, as AOSP init's `LoadProperties` does
+  (`ExpandProps`; 0.6.0 expanded `import` paths only and stored values
+  as written): `${name}`, `${name:-default}`, `$$` for a `$`, and a `$`
+  at the end of the value is removed. An entry whose value cannot be
+  expanded is logged at `error` and dropped, and a value the map already
+  holds for its name stays. The expansion runs before the property-name
+  check and before `accept`, so the service checks the expanded value
+  against its `property_contexts` type. References are looked up in the
+  map being loaded (entries read earlier in the call and its imports,
+  and what the map held before the call), as for `import` paths; init
+  looks them up in the property area, where the entries of the
+  build.prop files it is loading are not stored yet, so init drops
+  `b=${a}` when `a` comes from one of those files and this loader stores
+  `b` with `a`'s value. The other cases matched init on an API 37
+  emulator (`/data/local.prop`). See Migration.
 - Service: V2 replies carry init's error codes instead of `PROP_ERROR`
   (-1), so a client's `Error::SetRejected { reason }` names the reason
   (e.g. `SetRejection::ReadOnlyProperty` for a second set of a `ro.`
@@ -875,6 +891,15 @@ Service (`rsproperties-service`, git dependency only):
     `wire::validate_property_name` (spaces, `*`, `/`, leading/trailing or
     doubled `.`), logging a warning; 0.6.0 put the key in the map, and the
     service stored it in the area. Rename such keys in prop files;
+  - `load_properties_from_file` (and the service's build.prop load)
+    drops, with an `error` log, an entry whose value has a `$` that is
+    not part of `$$`, `${name}` or `${name:-default}` and is not the
+    value's last character (`price=5$x`), a `${` without `}`, an empty
+    name, or a reference to a missing or empty property without a
+    non-empty default; 0.6.0 stored such values as written. A value that
+    does expand is stored expanded: `a$$b` as `a$b`, `abc$` as `abc`,
+    `${name}` as the value of `name`. Write `$$` for each `$` that
+    belongs to a value;
   - service: when the umask clears any bit of 0660 (e.g. 022 clears group
     write), raising the sockets to 0660 needs `/proc` (`/proc/thread-self`,
     or `/proc/self` on kernels before 3.17); without it `run` fails with

@@ -34,7 +34,7 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
 | C6 | client | global reader 초기화 실패를 process 수명 동안 유지 | (c), 재시도 방식은 (a) | 이 branch에서 수정 |
 | C7 | client | 한 property의 값 cache와 변경 대기(`CachedProperty`) | (d) | 이 branch에서 추가 |
 | S1 | service | `persist.*` / `next_boot.*` 영속화 | (d) | 이 branch에서 추가 |
-| S2 | service | property type 검사(`CheckType`) | (c) | 이 branch에서 수정. build.prop 값의 `${...}` 확장은 (c)로 남아 있다 |
+| S2 | service | property type 검사(`CheckType`) | (c) | 이 branch에서 수정. build.prop 값의 `${...}` 확장도 수정했고, 참조를 load 중인 map에서 찾는 점은 (b) |
 | S3 | service | `ctl.*`를 일반 property로 저장 | (c) | 저장은 이 branch에서 수정. 종료 뒤 `ctl.stop` 응답은 (c)로 남아 있고 owner 결정 대기 |
 | S4 | service | 실패 응답 코드가 항상 `PROP_ERROR` | (c) | 이 branch에서 수정 |
 | S5 | service | `ro.property_service.version` 미설정 | (c) | 이 branch에서 수정 |
@@ -734,17 +734,62 @@ loop는 type을 다시 검사하지 않는다. init의 `PropertySetNoSocket` loo
 `property_contexts`에 이 이름의 type이 없으면 `v2`도 종전대로 `run`이
 실패한다.
 
-init과 다른 점 하나는 수정하지 않았다(c). init은 값에 `ExpandProps`를
-적용하고(`:795`) 확장한 값으로 `CheckPermissions`를 호출하며, 확장에 실패한
-entry는 버린다(`:796-800`). 이 crate의 loader는 `import` 경로만 확장하고 값은
-파일에 적힌 그대로 저장한다. 그래서 값에 `${name}`이 있는 entry는 저장하는
-값도, 검사하는 값도 init과 다르다.
+**값 확장(`ExpandProps`).** init은 값에 `ExpandProps`를 적용하고(`:795`)
+확장한 값으로 `CheckPermissions`를 호출하며, 확장에 실패한 entry는
+버린다(`:796-800`). 이 crate의 loader는 `import` 경로만 확장하고 값은 파일에
+적힌 그대로 저장했다(c). 그래서 값에 `${name}`이 있는 entry는 저장하는 값도,
+type을 검사하는 값도 init과 달랐다.
+
+loader가 `ctl.*` 제외 뒤, 이름 검사 앞에서 값을 확장하도록 수정했다. 확장
+함수는 `import` 경로에 쓰던 것과 같다(`expand_props`, 종전 이름
+`expand_import_path`). 값에 `$`가 없으면 복사 없이 통과한다. 확장에 실패하면
+`error` log(파일, 줄 번호, 이름)를 남기고 entry를 버리며, map에 있던 같은
+이름의 값은 그대로 둔다. `accept`에는 확장한 값을 넘기므로 service의 type
+검사도 확장한 값을 대상으로 한다. init은 실패한 값을 log에 남기지만 이
+loader는 남기지 않는다(값을 log에 쓰지 않는 기존 정책).
+
+API 37 emulator(`android-17`, userdebug)에서 `/data/local.prop`으로 init의
+동작을 실측했다. `local.prop`도 `LoadProperties`를 거친다(`:870-878`).
+
+| 값 | init 결과 | 이 loader |
+|---|---|---|
+| `${ro.build.type}-x` | `userdebug-x` 저장 | 같음(이름이 map에 있을 때) |
+| `${없는 이름:-dflt}` | `dflt` 저장 | 같음 |
+| `${없는 이름:-}`, `${없는 이름}` | 버림(`property ... doesn't exist`) | 같음 |
+| `a$$b` | `a$b` 저장 | 같음 |
+| `a$b` | 버림(`using deprecated syntax`) | 같음 |
+| `abc$` | `abc` 저장 | 같음 |
+| `${ro.build.type`(닫는 `}` 없음) | 버림 | 같음 |
+| `${:-d}` | 버림(`invalid zero-length property name`) | 같음 |
+| `first` 뒤에 같은 이름으로 `${없는 이름}` | `first` 유지 | 같음 |
+| `uint` 이름에 `${ro.build.type}` | 버림. type 검사 log에 확장한 값 `userdebug`가 찍힌다 | 같음 |
+| `uint` 이름에 `${ro.build.version.sdk}` | `37` 저장 | 같음 |
+| 같은 파일의 앞선 entry를 가리키는 `${debug.rsp.plain}` | 버림(`property 'debug.rsp.plain' doesn't exist`) | 앞선 entry의 값으로 저장 |
+
+마지막 행이 남은 차이이며 의도한 것이다(b). init은 이름을 property area에서
+찾는다. `PropertyLoadBootDefaults`는 모든 파일을 map에 모은 뒤에 area에
+적용하므로(`:1234-1239`), 확장 시점의 area에는 같은 load의 entry가 없고
+kernel에서 파생한 `ro.boot.*` 등만 있다. 이 loader는 호출자가 넘긴 map에서
+찾는다. map에는 같은 호출과 그 `import`가 먼저 저장한 entry, 그리고 호출
+전에 들어 있던 값이 있다. 이 service는 빈 map으로 시작하고 build.prop를 읽는
+시점의 area도 비어 있다. init과 같은 조회 대상을 쓰면 default 없는 참조는
+모두 버리게 되므로, `import` 경로 확장이 이미 쓰던 map 조회를 값에도 그대로
+적용했다. 포기한 것은 init과의 일치다. 같은 load의 앞선 entry를 참조하는
+파일은 init에서는 그 entry가 빠지고 이 service에서는 저장된다. area에만 있는
+property를 참조하려면 호출자가 load 전에 map에 넣어야 한다.
+
+`load_properties_from_file`의 동작이 바뀌므로 0.6.0 대비 breaking change다.
+값에 든 `$`는 `$$`로 써야 하고, 그렇지 않은 entry는 확장한 값으로 저장하거나
+버린다.
 
 검증: `properties_service.rs`
-`build_prop_entry_with_mismatched_type_is_skipped`(같은 이름의 두 순서와
-`import`한 파일 포함), `build_prop_version_that_selects_v1_is_refused`,
+`build_prop_entry_with_mismatched_type_is_skipped`(같은 이름의 두 순서,
+`import`한 파일, 확장한 값의 type 검사 포함),
+`build_prop_version_that_selects_v1_is_refused`,
 `build_property_parser.rs`
 `test_accept_is_called_per_entry_before_the_map_changes`,
+`test_values_are_expanded_before_the_checks`(위 표의 `local.prop` 줄),
+`test_expand_props_aosp_parity`,
 `property_info_parser.rs` `property_type_in_trie_reads_unpublished_bytes`.
 
 ### S3. `ctl.*` 저장 — 저장 동작은 (c), dispatch 없음은 (a), 종료 뒤 `ctl.stop` 응답은 (c) 미결정

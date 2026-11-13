@@ -259,8 +259,12 @@ The socket service implements the Android property service protocol:
   `CheckType` does; an empty value is always accepted. This covers client
   sets, persistent records and build.prop entries; a build.prop entry
   that fails is logged and dropped when the file is read, so it does not
-  replace an earlier entry of the same name. A `${name}` reference in a
-  build.prop value is not expanded (init expands it before the check)
+  replace an earlier entry of the same name. A build.prop value is
+  expanded before the check, as in init (`${name}`, `${name:-default}`,
+  `$$` for a `$`); an entry whose value cannot be expanded is logged and
+  dropped. A reference is looked up among the build.prop entries read
+  so far, in `build_prop_files` order; init looks it up in the property
+  area, which does not hold those entries yet, and drops such an entry
 - **`ctl.*`**: never stored; passed to `ServiceOptions::control_handler`,
   or refused without one. At most 16 handler calls are running or
   waiting for a blocking thread at once; a request beyond that gets

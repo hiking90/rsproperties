@@ -93,6 +93,7 @@ fn init_system_properties_sync(
     // init `LoadProperties` runs `CheckPermissions`, and with it
     // `CheckType`, on every entry as it reads it, and drops an entry that
     // fails before it can replace an earlier one of the same name. The
+    // loader passes the value after `ExpandProps`, as init does. The
     // type is read from the trie bytes: `property_info` is not published
     // until every input file has been read. The value is not logged
     // (value-masking policy, see `PropertyMessage`'s Debug); the loader
@@ -717,7 +718,9 @@ mod tests {
              ro.typed.enum u:object_r:typed_prop:s0 exact enum a b\n\
              ro.typed.kept u:object_r:typed_prop:s0 exact int\n\
              ro.typed.replaced u:object_r:typed_prop:s0 exact int\n\
-             ro.typed.imported u:object_r:typed_prop:s0 exact int\n",
+             ro.typed.imported u:object_r:typed_prop:s0 exact int\n\
+             ro.typed.expanded_ok u:object_r:typed_prop:s0 exact int\n\
+             ro.typed.expanded_bad u:object_r:typed_prop:s0 exact int\n",
         );
         let imported = write("imported.prop", "ro.typed.imported=abc\n");
         let first = write(
@@ -737,12 +740,28 @@ mod tests {
         // The check runs on each entry as it is read: a mismatched value
         // does not replace `ro.typed.kept=1`, and a matching one is stored
         // after a mismatched one was dropped.
-        let second = write("second.prop", "ro.typed.kept=abc\nro.typed.replaced=2\n");
+        //
+        // The type is checked on the expanded value, as init runs
+        // `ExpandProps` before `CheckPermissions`: `${ro.typed.int_ok}` is
+        // the int 7, and `${ro.untyped}` is `abc`.
+        let second = write(
+            "second.prop",
+            "ro.typed.kept=abc\n\
+             ro.typed.replaced=2\n\
+             ro.typed.expanded_ok=${ro.typed.int_ok}\n\
+             ro.typed.expanded_bad=${ro.untyped}\n",
+        );
 
         let sp = init_locked(vec![contexts], vec![first, second], &tmp.0.join("props")).unwrap();
-        for name in ["ro.typed.int", "ro.typed.enum", "ro.typed.imported"] {
+        for name in [
+            "ro.typed.int",
+            "ro.typed.enum",
+            "ro.typed.imported",
+            "ro.typed.expanded_bad",
+        ] {
             assert!(sp.find(name).unwrap().is_none(), "{name}");
         }
+        assert_eq!(sp.get("ro.typed.expanded_ok").unwrap(), "7");
         assert_eq!(sp.get("ro.typed.kept").unwrap(), "1");
         assert_eq!(sp.get("ro.typed.replaced").unwrap(), "2");
         assert_eq!(sp.get("ro.typed.int_ok").unwrap(), "7");
