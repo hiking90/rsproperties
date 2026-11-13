@@ -17,6 +17,7 @@ use crate::contexts_serialized::ContextsSerialized;
 // through `load_acquire` (`Relaxed` load + `fence(Acquire)`),
 // property_area.rs [R-RO].
 use crate::property_area::{load_acquire, EntryOffset};
+use crate::property_watcher::PropertyWatcher;
 
 pub(crate) use crate::wire::PROP_VALUE_MAX;
 pub(crate) const PROP_TREE_FILE: &str = "/dev/__properties__/property_info";
@@ -64,10 +65,10 @@ fn with_override_name<R>(name: &str, f: impl FnOnce(&str) -> R) -> R {
 
 /// Absolute end of a caller-supplied `Option<Duration>` timeout. `None`
 /// waits forever — also for a timeout too large for `Instant`.
-struct Deadline(Option<Instant>);
+pub(crate) struct Deadline(Option<Instant>);
 
 impl Deadline {
-    fn after(timeout: Option<Duration>) -> Self {
+    pub(crate) fn after(timeout: Option<Duration>) -> Self {
         Self(timeout.and_then(|t| Instant::now().checked_add(t)))
     }
 
@@ -229,7 +230,9 @@ pub struct PropertyIndex {
 /// trie and the area files it names, mapped into this process.
 ///
 /// A read-only instance comes from [`crate::system_properties()`] (the
-/// process-wide one). With the `builder` feature, `SystemProperties::new_area`
+/// process-wide one, on the directory [`crate::init`] set) or from
+/// [`SystemProperties::open`] (any directory). With the `builder` feature,
+/// `SystemProperties::new_area`
 /// and `SystemProperties::new_area_locked` create the areas and return the
 /// writer instance.
 pub struct SystemProperties {
@@ -271,9 +274,36 @@ impl SystemProperties {
         }
     }
 
-    // Create a new system properties to read system properties from a file or a directory.
-    pub(crate) fn new(filename: &Path) -> Result<Self> {
-        let mut sp = Self::new_ro(filename, false)?;
+    /// Opens the property store of the properties directory `dir` for
+    /// reading.
+    ///
+    /// The instance is independent of the process-wide one
+    /// ([`crate::system_properties()`]): it neither needs nor changes
+    /// [`crate::init`], so one process can read several directories, or a
+    /// directory other than the one `init` latched. Each call maps the
+    /// files again; keep the instance instead of opening one per read.
+    ///
+    /// Fails when `<dir>/property_info` or `<dir>/properties_serial` cannot
+    /// be opened or is not a valid file of the store. For a directory no
+    /// property service has populated yet, [`Error::root_cause`] is an
+    /// [`Error::Io`] of kind `NotFound`.
+    ///
+    /// Like the process-wide instance, it looks up
+    /// `ro.appcompat_override.<name>` first when `BIONIC_APPCOMPAT_OVERRIDE`
+    /// is set in the environment at the time of the call (on Android: API
+    /// 37 and later).
+    ///
+    /// ```rust,no_run
+    /// use rsproperties::SystemProperties;
+    ///
+    /// # fn main() -> rsproperties::Result<()> {
+    /// let props = SystemProperties::open("/run/my_service/properties")?;
+    /// let mode = props.get("debug.my_service.mode")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
+        let mut sp = Self::new_ro(dir.as_ref(), false)?;
         sp.appcompat_override = std::env::var_os(APPCOMPAT_OVERRIDE_ENV_VAR).is_some()
             && sp.bionic_reads_override_env();
         Ok(sp)
@@ -298,7 +328,7 @@ impl SystemProperties {
         true
     }
 
-    /// [`Self::new`] with the override lookup decided by the caller
+    /// [`Self::open`] with the override lookup decided by the caller
     /// instead of the environment (tests cannot set the variable without
     /// racing the other tests of the process).
     fn new_ro(filename: &Path, appcompat_override: bool) -> Result<Self> {
@@ -672,13 +702,19 @@ impl SystemProperties {
     /// stops that area's walk without reporting it); `f` has then already
     /// run for the areas visited before.
     ///
+    /// [`Self::list`] passes the name and value instead of the index.
+    ///
     /// ```rust,no_run
     /// # fn main() -> rsproperties::Result<()> {
+    /// use std::collections::HashMap;
+    ///
+    /// // The serial of every property, to tell later which ones changed.
     /// let props = rsproperties::system_properties()?;
+    /// let mut serials = HashMap::new();
     /// props.foreach(|index| {
-    ///     let _ = props.read_index_with(index, |name, value, _serial| {
-    ///         println!("[{name}]: [{value}]");
-    ///     });
+    ///     if let Ok(serial) = props.serial(index) {
+    ///         serials.insert(index, serial);
+    ///     }
     /// })?;
     /// # Ok(())
     /// # }
@@ -686,6 +722,17 @@ impl SystemProperties {
     pub fn foreach<F>(&self, mut f: F) -> Result<()>
     where
         F: FnMut(PropertyIndex),
+    {
+        self.try_foreach(|index| {
+            f(index);
+            Ok(())
+        })
+    }
+
+    /// [`Self::foreach`] that stops at the first `Err` of `f`.
+    fn try_foreach<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(PropertyIndex) -> Result<()>,
     {
         for context_index in 0..self.contexts.context_count() {
             let Some(offsets) = self.contexts.entry_offsets_at(context_index)? else {
@@ -696,10 +743,52 @@ impl SystemProperties {
                     context_index,
                     property_index,
                     instance: self.instance,
-                });
+                })?;
             }
         }
         Ok(())
+    }
+
+    /// Calls `f` with the name and value of every property this process
+    /// can read — libcutils `property_list`, which is
+    /// `__system_property_foreach` with a `__system_property_read_callback`
+    /// per property. The properties, their order and the skipped areas are
+    /// those of [`Self::foreach`].
+    ///
+    /// Name and value are copied into two buffers this call reuses, and
+    /// `f` runs after the node's read lock is released, so it may call any
+    /// read method of this instance.
+    ///
+    /// Bytes that are not UTF-8 reach `f` as U+FFFD
+    /// (`String::from_utf8_lossy`), so one such value does not end or
+    /// shorten the listing; [`Self::read_index_with`] fails with
+    /// `Error::Utf8` for that property instead. A property that cannot be
+    /// read for another reason ends the walk with that error, as a corrupt
+    /// trie does; `f` has then run for the properties before it.
+    ///
+    /// ```rust,no_run
+    /// # fn main() -> rsproperties::Result<()> {
+    /// let props = rsproperties::system_properties()?;
+    /// props.list(|name, value| println!("[{name}]: [{value}]"))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn list<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&str, &str),
+    {
+        let mut name = String::new();
+        let mut value = String::new();
+        self.try_foreach(|index| {
+            self.read_index_bytes(index, |name_bytes, value_bytes, _serial| {
+                name.clear();
+                name.push_str(&String::from_utf8_lossy(name_bytes));
+                value.clear();
+                value.push_str(&String::from_utf8_lossy(value_bytes));
+            })?;
+            f(&name, &value);
+            Ok(())
+        })
     }
 
     /// The value of `name` — libbase `GetProperty` without its default:
@@ -796,6 +885,9 @@ impl SystemProperties {
     /// reader and a writer on the same directory are different instances.
     /// An index from another instance fails with `Error::InvalidArgument`
     /// before any area is touched.
+    ///
+    /// A `ro.` property is never updated: `Error::ReadOnlyProperty`, with
+    /// the stored value and serial unchanged.
     #[cfg(feature = "builder")]
     pub fn update(&mut self, index: PropertyIndex, value: &str) -> Result<()> {
         // Another instance's offsets address an unrelated layout.
@@ -831,12 +923,9 @@ impl SystemProperties {
                 })?
                 .to_bytes();
             if name.starts_with(b"ro.") {
-                let error_msg = format!(
-                    "Try to update the read-only property: {:?}",
-                    String::from_utf8_lossy(name)
-                );
-                log::error!("{error_msg}");
-                return Err(Error::PermissionDenied(error_msg));
+                let err = Error::ReadOnlyProperty(String::from_utf8_lossy(name).into_owned());
+                log::error!("{err}");
+                return Err(err);
             }
             // Value-length check — `update` writes the short slot only:
             // only `ro.` entries are long and they were rejected above (and
@@ -1050,11 +1139,16 @@ impl SystemProperties {
             }
         }
         #[cfg(target_os = "macos")]
-        {
-            let guard = self.contexts.prop_area_with_index(idx.context_index)?;
-            let pi = guard.property_area().property_info(idx.property_index)?;
-            Ok(load_acquire(&pi.serial))
-        }
+        self.serial_word(idx)
+    }
+
+    /// The serial word of `idx` as stored: dirty bit included, no wait —
+    /// what bionic `__system_property_serial` returns.
+    pub(crate) fn serial_word(&self, idx: PropertyIndex) -> Result<u32> {
+        self.check_index(idx)?;
+        let guard = self.contexts.prop_area_with_index(idx.context_index)?;
+        let pi = guard.property_area().property_info(idx.property_index)?;
+        Ok(load_acquire(&pi.serial))
     }
 
     /// Waits until the property at `index` (or, with `index == None`, the
@@ -1152,7 +1246,7 @@ impl SystemProperties {
 
     /// [`Self::wait`] against an absolute deadline, so `wait_for_creation`
     /// / `wait_for_value` can bound a whole loop of waits with one.
-    fn wait_until(
+    pub(crate) fn wait_until(
         &self,
         index: Option<PropertyIndex>,
         old_serial: u32,
@@ -1259,7 +1353,7 @@ impl SystemProperties {
         self.wait_for_creation_until(name, &Deadline::after(timeout))
     }
 
-    fn wait_for_creation_until(
+    pub(crate) fn wait_for_creation_until(
         &self,
         name: &str,
         deadline: &Deadline,
@@ -1329,6 +1423,27 @@ impl SystemProperties {
             }
         }
     }
+
+    /// A [`PropertyWatcher`] for `name`: the value re-read only when it
+    /// has changed, and a wait for the next change — libbase
+    /// `CachedProperty`. `name` does not have to exist yet, and nothing is
+    /// read until the watcher's first call.
+    ///
+    /// ```rust,no_run
+    /// # fn main() -> rsproperties::Result<()> {
+    /// let props = rsproperties::system_properties()?;
+    /// let mut level = props.watch("debug.my_service.log_level");
+    /// loop {
+    ///     // `None` until the property is created.
+    ///     println!("log level: {:?}", level.value()?);
+    ///     // No timeout: returns when the property is created or updated.
+    ///     level.wait_for_change(None)?;
+    /// }
+    /// # }
+    /// ```
+    pub fn watch(&self, name: &str) -> PropertyWatcher<'_> {
+        PropertyWatcher::new(self, name)
+    }
 }
 
 #[cfg(test)]
@@ -1347,7 +1462,7 @@ mod tests {
     #[cfg(target_os = "android")]
     #[test]
     fn test_system_properties() -> Result<()> {
-        let system_properties = SystemProperties::new(Path::new(crate::PROP_DIRNAME))?;
+        let system_properties = SystemProperties::open(Path::new(crate::PROP_DIRNAME))?;
 
         let handle = std::thread::spawn(move || {
             let version1 = system_properties.get(VERSION_PROPERTY).unwrap_or_default();
@@ -1366,7 +1481,7 @@ mod tests {
 /// A builder writer over a fresh properties dir with `debug.` and `ro.`
 /// contexts.
 #[cfg(all(test, feature = "builder", not(target_os = "android")))]
-mod test_fixture {
+pub(crate) mod test_fixture {
     use super::*;
     use crate::property_info::LONG_FLAG;
     use crate::{build_trie, AreaWriterLock, MatchKeyword, PropertyInfoEntry};
@@ -1382,8 +1497,8 @@ mod test_fixture {
         }
     }
 
-    pub(super) struct Fixture {
-        pub(super) sp: SystemProperties,
+    pub(crate) struct Fixture {
+        pub(crate) sp: SystemProperties,
         // Declared after `sp`, so it is dropped after the writer.
         dir: TempDir,
     }
@@ -1391,7 +1506,7 @@ mod test_fixture {
     impl Fixture {
         /// `tag` must differ between the tests of this binary: they run in
         /// parallel in one process and share the pid in the dir name.
-        pub(super) fn new(tag: &str) -> Self {
+        pub(crate) fn new(tag: &str) -> Self {
             let guard = TempDir(
                 std::env::temp_dir().join(format!("rsprops_sp_{tag}_{}", std::process::id())),
             );
@@ -1415,12 +1530,24 @@ mod test_fixture {
             Self { sp, dir: guard }
         }
 
-        pub(super) fn dir(&self) -> &Path {
+        pub(crate) fn dir(&self) -> &Path {
             &self.dir.0
         }
 
         /// What init's counter does on the 32768th update.
-        pub(super) fn set_bit16(&self, name: &str) -> PropertyIndex {
+        pub(crate) fn set_bit16(&self, name: &str) -> PropertyIndex {
+            self.set_serial_bits(name, LONG_FLAG)
+        }
+
+        /// The first store of an update: the dirty serial, with the value
+        /// and the backup slot left as they are. A reader then takes the
+        /// value from the backup slot, which holds the value before the
+        /// last completed update.
+        pub(crate) fn set_dirty(&self, name: &str) -> PropertyIndex {
+            self.set_serial_bits(name, 1)
+        }
+
+        fn set_serial_bits(&self, name: &str, bits: u32) -> PropertyIndex {
             let idx = self.sp.find(name).unwrap().expect("property exists");
             let guard = self
                 .sp
@@ -1431,11 +1558,11 @@ mod test_fixture {
                 .property_area()
                 .property_info(idx.property_index)
                 .unwrap();
-            pi.serial.fetch_or(LONG_FLAG, Ordering::SeqCst);
+            pi.serial.fetch_or(bits, Ordering::SeqCst);
             idx
         }
 
-        pub(super) fn serial_word(&self, idx: PropertyIndex) -> u32 {
+        pub(crate) fn serial_word(&self, idx: PropertyIndex) -> u32 {
             let guard = self
                 .sp
                 .contexts
@@ -1468,7 +1595,7 @@ mod long_flag_tests {
 
         assert_eq!(fx.sp.get("debug.rsp.bit16").unwrap(), "v32767");
         // A read-only instance, as the global reader opens it.
-        let reader = SystemProperties::new(fx.dir()).unwrap();
+        let reader = SystemProperties::open(fx.dir()).unwrap();
         assert_eq!(reader.get("debug.rsp.bit16").unwrap(), "v32767");
     }
 
@@ -1506,20 +1633,44 @@ mod long_flag_tests {
     }
 
     /// The `ro.` refusal of `update` (also reached by `set` on an existing
-    /// `ro.` name) prints the name `Debug`-escaped, so a name carrying a
-    /// newline cannot forge a log line.
+    /// `ro.` name) carries the name as stored and prints it
+    /// `Debug`-escaped, so a name carrying a newline cannot forge a log
+    /// line.
     #[test]
     fn ro_update_refusal_escapes_name() {
         let mut fx = Fixture::new("ro_escape");
         let name = "ro.rsp.x\nFAKE: forged";
         fx.sp.add(name, "1").unwrap();
-        match fx.sp.set(name, "2") {
-            Err(Error::PermissionDenied(msg)) => {
-                assert!(!msg.contains('\n'), "raw newline in {msg:?}");
-                assert!(msg.contains(r#""ro.rsp.x\nFAKE: forged""#), "{msg:?}");
-            }
-            other => panic!("expected PermissionDenied, got {other:?}"),
+        let err = fx.sp.set(name, "2").unwrap_err();
+        match &err {
+            Error::ReadOnlyProperty(refused) => assert_eq!(refused, name),
+            other => panic!("expected ReadOnlyProperty, got {other:?}"),
         }
+        let msg = err.to_string();
+        assert!(!msg.contains('\n'), "raw newline in {msg:?}");
+        assert!(msg.contains(r#""ro.rsp.x\nFAKE: forged""#), "{msg:?}");
+        assert_eq!(fx.sp.get(name).unwrap(), "1");
+    }
+
+    /// A write through a read-only instance is `PermissionDenied`, not
+    /// the `ro.` refusal: the service maps only the latter to
+    /// `PROP_ERROR_READ_ONLY_PROPERTY`.
+    #[test]
+    fn write_through_reader_is_permission_denied() {
+        let mut fx = Fixture::new("reader_write");
+        fx.sp.add("debug.rsp.w", "1").unwrap();
+        let mut reader = SystemProperties::open(fx.dir()).unwrap();
+        for result in [
+            reader.set("debug.rsp.w", "2"),
+            reader.set("debug.rsp.new", "2"),
+        ] {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err.root_cause(), Error::PermissionDenied(_)),
+                "{err:?}"
+            );
+        }
+        assert_eq!(fx.sp.get("debug.rsp.w").unwrap(), "1");
     }
 
     #[test]
@@ -1528,7 +1679,7 @@ mod long_flag_tests {
         let long = "x".repeat(200);
         fx.sp.add("ro.rsp.long", &long).unwrap();
         assert_eq!(fx.sp.get("ro.rsp.long").unwrap(), long);
-        let reader = SystemProperties::new(fx.dir()).unwrap();
+        let reader = SystemProperties::open(fx.dir()).unwrap();
         assert_eq!(reader.get("ro.rsp.long").unwrap(), long);
     }
 }
@@ -1553,7 +1704,7 @@ mod wait_tests {
     fn index_wait_compares_before_timeout() {
         let mut fx = Fixture::new("wait_zero");
         fx.sp.add("debug.rsp.zero", "0").unwrap();
-        let reader = SystemProperties::new(fx.dir()).unwrap();
+        let reader = SystemProperties::open(fx.dir()).unwrap();
         let idx = reader.find("debug.rsp.zero").unwrap().unwrap();
         let old = reader.serial(idx).unwrap();
         fx.sp.set("debug.rsp.zero", "1").unwrap();
@@ -1586,7 +1737,7 @@ mod wait_tests {
         let widx = fx.sp.find("debug.rsp.wake").unwrap().unwrap();
         // Another instance, as the global reader is: it maps the file
         // separately and takes none of the writer's locks.
-        let reader = SystemProperties::new(fx.dir()).unwrap();
+        let reader = SystemProperties::open(fx.dir()).unwrap();
         let idx = reader.find("debug.rsp.wake").unwrap().unwrap();
         let guard = reader
             .contexts
@@ -1738,6 +1889,44 @@ mod client_parity_tests {
             let got: BTreeMap<String, String> =
                 dump(sp).into_iter().map(|(n, (v, _))| (n, v)).collect();
             assert_eq!(got, expected);
+        }
+    }
+
+    /// `list` reports what `foreach` + `read_index_with` report, in the
+    /// same order, and its callback may read through the same instance.
+    #[test]
+    fn list_matches_foreach_and_allows_reentry() {
+        let mut fx = Fixture::new("list");
+        let long = "l".repeat(200);
+        for (name, value) in [
+            ("debug.a", "1"),
+            ("debug.b.c", ""),
+            ("ro.x", "3"),
+            ("ro.long", long.as_str()),
+            ("other.default", "4"),
+        ] {
+            fx.sp.add(name, value).unwrap();
+        }
+        let reader = SystemProperties::open(fx.dir()).unwrap();
+        for sp in [&fx.sp, &reader] {
+            let mut by_index = Vec::new();
+            sp.foreach(|idx| {
+                by_index.push(
+                    sp.read_index_with(idx, |n, v, _| (n.to_owned(), v.to_owned()))
+                        .unwrap(),
+                );
+            })
+            .unwrap();
+            assert_eq!(by_index.len(), 5);
+
+            let mut listed = Vec::new();
+            sp.list(|name, value| {
+                // Same context as the property being listed.
+                assert_eq!(sp.get(name).unwrap(), value);
+                listed.push((name.to_owned(), value.to_owned()));
+            })
+            .unwrap();
+            assert_eq!(listed, by_index);
         }
     }
 

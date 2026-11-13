@@ -1049,7 +1049,7 @@ impl PropertyAreaMap {
     /// `backup` must hold the entry's current value bytes (snapshotted by
     /// the caller before taking `&mut self`).
     ///
-    /// An entry named `ro.…` is refused with `Error::PermissionDenied`
+    /// An entry named `ro.…` is refused with `Error::ReadOnlyProperty`
     /// before any store: only `ro.` entries can be long, and `apply_write`
     /// writes the short slot \[R-UNION\].
     #[cfg(feature = "builder")]
@@ -1063,9 +1063,7 @@ impl PropertyAreaMap {
         // lookup name or by bit 16 (on a mutable name that bit is counter).
         let name = self.property_info_name(pi_offset)?;
         if name.to_bytes().starts_with(b"ro.") {
-            return Err(Error::PermissionDenied(format!(
-                "in-place update of the read-only property {name:?}"
-            )));
+            return Err(Error::ReadOnlyProperty(name.to_string_lossy().into_owned()));
         }
         let access = AreaWriteAccess::new(&self.mmap)?;
         self.set_dirty_backup_area(&access, backup)?;
@@ -1984,7 +1982,7 @@ mod tests {
 
         assert!(matches!(
             area.backup_and_apply_write(off, b"", "x"),
-            Err(Error::PermissionDenied(_))
+            Err(Error::ReadOnlyProperty(name)) if name == "ro.long"
         ));
         assert_eq!(area.long_property_value(off).unwrap(), long.as_bytes());
         assert_eq!(

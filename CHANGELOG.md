@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was denied (`EACCES`/`EPERM`) is not tried again by that instance; a
   missing area file is retried. The `getprop` example lists all
   properties when run without arguments.
+- `SystemProperties::list(|name, value| ...)`: the name and value of every
+  property the process can read (libcutils `property_list`), in `foreach`
+  order. The callback runs with no lock held. Bytes that are not UTF-8
+  are passed as U+FFFD instead of ending the listing. The `getprop`
+  example uses it.
 - `SystemProperties::read_index_with(index, |name, value, serial| ...)`:
   reads by index without a name lookup and passes the serial the value
   was read under (bionic `__system_property_read_callback`).
@@ -24,10 +29,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `wait_for_value(name, expected, timeout)` (libbase
   `WaitForPropertyCreation` / `WaitForProperty`), with
   `Option<Duration>` timeouts.
-- `parse::parse_bool`, `parse::parse_int` and the global
-  `get_bool_or` / `get_int_or`: libbase `ParseBool` / `ParseInt` /
-  `ParseUint` rules (`yes`/`on`/`1`, leading whitespace, `0x` hex, no
-  trailing characters). `get<T>` keeps Rust's `FromStr`.
+- `SystemProperties::open(dir)`: a read-only instance on a directory the
+  caller names. 0.6.0 had no public read-only constructor, so a process
+  could read only the one directory `init` latched, and a library could
+  not read a store without setting that process-wide directory.
+- `SystemProperties::watch(name)` and `PropertyWatcher` (libbase
+  `CachedProperty`): `value()` returns the current value, reading the
+  store again only when the property's serial has moved, and
+  `wait_for_change(timeout)` blocks until the property is created or
+  updated. Following one property took `find`, `read_index_with` and
+  `wait` in a loop that carried the index and the serial, and a `wait`
+  from a serial with the dirty bit set reported one update twice. The
+  watcher reports an update once and does not queue changes.
+- `parse::parse_bool` and `parse::parse_int`: libbase `ParseBool` /
+  `ParseInt` / `ParseUint` rules (`yes`/`on`/`1`, leading whitespace,
+  `0x` hex, no trailing characters).
+- `FromProperty`, the trait `get` / `get_or` / `get_or_else` convert a
+  value with (see Changed). It is implemented for `String`, `bool`
+  (`parse::parse_bool`) and `i8`–`i64`, `isize`, `u8`–`u64`, `usize`
+  (`parse::parse_int`), and can be implemented for a type of the
+  caller's.
 - Appcompat override lookup: on Android API 37+ (and on Linux), a
   read-only instance created while `BIONIC_APPCOMPAT_OVERRIDE` is set
   looks up `ro.appcompat_override.<name>` first in `find` and
@@ -128,11 +149,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instances are never equal. An index can be a `HashMap` key, for example
   to keep the serial last seen per property.
 - `PropertyConfig` implements `PartialEq` and `Eq`.
+- `PropertyConfig::get_properties_dir()` and
+  `PropertyConfig::get_socket_dir()` return the directory the value
+  holds as `Option<&Path>` (`None` when its setter was not called). The
+  `get_` prefix follows `std::process::Command::get_current_dir`: the
+  bare names are the setters. They read the config value only; the
+  directory in effect is still `rsproperties::properties_dir()` /
+  `socket_dir()`.
 - `MatchKeyword` (`builder` feature): `Checked` / `Unchecked`, the second
   argument of `PropertyInfoEntry::parse_from_file` (see Changed).
 - `PropertyInfoEntry::exact(name, context, type_str)` and
   `PropertyInfoEntry::prefix(name, context, type_str)` (`builder`
-  feature), which replace `PropertyInfoEntry::new` (see Changed).
+  feature), which replace `PropertyInfoEntry::new` (see Changed). `name`
+  and `context` are `impl Into<String>`, so string literals are passed
+  as they are.
+- `PropertyInfoEntry` implements `PartialEq` and `Eq` (`builder`
+  feature): name, context, stored type and match operation are compared,
+  so an entry built with a constructor can be compared with a parsed one.
 
 ### Changed
 
@@ -186,6 +219,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `load_properties_from_file(path, filter, properties)` loses its
     `context` argument, which was checked against nothing: on Linux no
     SELinux context is available to compare with.
+  - `load_properties_from_file` returns `Result<PropFileOutcome>` (was
+    `Result<()>`). `PropFileOutcome::SkippedWritable { mode }` reports
+    that the file given to the call was not read because its mode has
+    the group- or other-write bit; `PropFileOutcome::Loaded` reports
+    that it was read. The enum is `#[must_use]`. Before, both cases were
+    `Ok(())` and only a `warn` log line told them apart. An `import`
+    that is skipped does not change the result.
   - `PropertyInfoEntry::parse_from_file(path, MatchKeyword)` takes an
     enum instead of `require_prefix_or_exact: bool`:
     `MatchKeyword::Checked` is `true`, `MatchKeyword::Unchecked` is
@@ -196,12 +236,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `PropertyInfoEntry::new(name, context, type_str, exact_match)` is
     replaced by `PropertyInfoEntry::exact(name, context, type_str)` and
     `PropertyInfoEntry::prefix(name, context, type_str)`. The
-    `exact_match()` accessor is unchanged.
+    `exact_match()` accessor is unchanged. `name` and `context` are
+    `impl Into<String>` (0.6.0 `new`: `String`).
   - `set(name, value)` takes `value: impl Display` (0.6.0:
     `value: &T` with `T: Display + ?Sized`), so `set("a.b", 42)` compiles.
     A reference to a `Display` value is `Display`, so `set(name, &value)`
     and `set(name, "text")` compile unchanged; only a call that names the
     type parameter (`set::<str>(..)`) does not.
+  - `get`, `get_or` and `get_or_else` take `T: FromProperty` (0.6.0:
+    `T: FromStr`). `bool` and the integers are read by libbase's rules,
+    so `get_or("ro.debuggable", false)` is `true` for the value `1`
+    (0.6.0: `bool: FromStr` failed on it and `get_or` returned the
+    default). A `FromStr` type without a `FromProperty` implementation —
+    `f32`, `f64`, `i128`, `char`, `IpAddr`, … — no longer compiles with
+    these functions; read it with `SystemProperties::read_with`.
+  - `Error::ServiceError { name, code: i32 }` is renamed to
+    `Error::SetRejected { name, reason: SetRejection }`. `SetRejection`
+    is a `#[non_exhaustive]` enum with one variant per
+    `wire::PROP_ERROR_*` code and `Unknown(i32)` for any other;
+    `reason.code()` returns the number. The old name was also the name
+    of `rsproperties_service::ServiceError`, an unrelated type.
+  - `SystemProperties::update` and `set` (`builder`) refuse a `ro.`
+    property that already has a value with
+    `Error::ReadOnlyProperty(name)` (0.6.0: `Error::PermissionDenied`).
+    `PermissionDenied` is left with the two conditions that are not
+    about `ro.`: a file mode this crate refuses, and a write through an
+    instance whose areas are mapped read-only. The service maps only
+    `ReadOnlyProperty` to `PROP_ERROR_READ_ONLY_PROPERTY` (0.6.0: every
+    `PermissionDenied`); its writer reaches neither of the other two
+    conditions today, so no reply changes.
 - **Breaking (service API):** `run` is the only way to start the service,
   and no rsactor or tokio type is left in the public API:
   - `run` returns a `ServiceHandle` (see Added) instead of the tuple
@@ -234,8 +297,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule sends V2; a V1 client gets no result code and its `persist.*`
   sets are not stored (see Added).
 - Service: V2 replies carry init's error codes instead of `PROP_ERROR`
-  (-1), so a client's `Error::ServiceError { code }` names the reason
-  (e.g. `PROP_ERROR_READ_ONLY_PROPERTY` for a second set of a `ro.`
+  (-1), so a client's `Error::SetRejected { reason }` names the reason
+  (e.g. `SetRejection::ReadOnlyProperty` for a second set of a `ro.`
   property). A value that does not match its `property_contexts` type is
   now rejected (`PROP_ERROR_INVALID_VALUE`), and `ctl.*` sets are no
   longer stored.
@@ -325,7 +388,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name verbatim), to the disallowed-key `error` log of
   `load_properties_from_file`, and to the line and tokens that
   `PropertyInfoEntry::parse_from_file` logs and returns for a line it
-  cannot parse, to the `Error::PermissionDenied` that
+  cannot parse, to the `Error::ReadOnlyProperty` that
   `SystemProperties::update` (and `set` on an existing `ro.` name)
   returns and logs, and to the `build_trie` errors and log lines that
   name a property and the invalid-type error of
@@ -349,10 +412,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full property name, like the other in-area miss paths; it carried only the
   last-looked-up segment (`foo` for `ro.foo`).
 - `get::<T>` parse errors no longer include the property value (they
-  give the name and the value length), so logging the error does not
-  log the value. The message still ends with `T::Err`'s `Display`, which
-  for std's parse errors carries no input but for a third-party `T` may
-  echo part of the value.
+  give the name, the value length and the name of `T`), so logging the
+  error does not log the value.
 - The property area header's `bytes_used` is an atomic, as the module's
   shared-mmap protocol requires for fields rewritten after readers
   attach (no layout or API change).
@@ -446,8 +507,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ReadFile`: with `O_NOFOLLOW`, so a symlink as the last path component
   fails to open (an error for the root file; an `import` is skipped with
   a warning), and a file writable by group or others is skipped with a
-  warning (for the root file the call returns `Ok(())` with nothing
-  loaded). 0.6.0 followed symlinks and loaded such files.
+  warning (for the root file the call returns
+  `Ok(PropFileOutcome::SkippedWritable { mode })` with nothing loaded).
+  0.6.0 followed symlinks and loaded such files.
 - Android: `set` accepts V2 names and `ro.` values up to 65535 bytes, the limit
   AOSP init enforces (bionic `__system_property_set` sends such `ro.`
   values; init rejects lengths above 0xffff). The client rejected names
@@ -582,6 +644,22 @@ Service (`rsproperties-service`, git dependency only):
   200 ms) for the clean serial. The `serial` rustdoc lists the cases that
   return a dirty serial: the 200 ms bound expiring, a failed futex wait
   (returned at once), and macOS (no wait).
+- The Rust blocks of the three READMEs are compiled by `cargo test`:
+  `rsproperties/README.md` as a doctest of `rsproperties` (with the
+  `builder` feature), the workspace `README.md` and
+  `rsproperties-service/README.md` as doctests of `rsproperties-service`.
+  Each block is now a complete program; the ones that read the property
+  store, set a property or start the service are `no_run`. Two examples
+  did not compile as written and are corrected: the service example
+  passed `vec!["…".into()]` to `property_contexts_files` /
+  `build_prop_files` (no type to infer), and the service README's
+  error-handling block used undefined `config` / `options`. The
+  `builder` example builds its entries with `PropertyInfoEntry::prefix` /
+  `exact` instead of an empty `Vec`, and no longer gates one `use` on
+  `#[cfg(feature = "builder")]`.
+- Both READMEs told the reader to enable `builder` with a `[features]`
+  table that forwards to `rsproperties/builder`; they now show
+  `rsproperties = { version = "0.6", features = ["builder"] }`.
 - README fixes:
   - `wait` argument list, boolean parsing, `PropertyConfig`
     construction, `init`/`try_init` error contract, error-variant list,
@@ -746,7 +824,9 @@ Service (`rsproperties-service`, git dependency only):
     that read `ctl.*` values back from the area must use the handler;
   - `load_properties_from_file` skips a prop file whose mode has the
     group- or other-write bit (with a warning; for the root file the call
-    returns `Ok(())` with nothing loaded), and fails to open a prop file
+    returns `Ok(PropFileOutcome::SkippedWritable { mode })` with nothing
+    loaded; the service logs such a `build_prop_files` entry at `error`
+    and starts without it), and fails to open a prop file
     whose last path component is a symlink (`Error::Context` for the root
     file; such an `import` is skipped). Files created under umask 002
     (`File::create`, `std::fs::write`) are group-writable: create them
@@ -771,6 +851,15 @@ Service (`rsproperties-service`, git dependency only):
     (0.6.0 failed to open the path and skipped the line);
   - an `import` path ending in a lone `$` loads the path without the `$`
     (AOSP `ExpandProps`; 0.6.0 skipped the import);
+  - `get`, `get_or` and `get_or_else` read more values as a `bool` or an
+    integer: `1`/`y`/`yes`/`on` and `0`/`n`/`no`/`off` as a `bool`, and
+    for integers a value with leading C whitespace (`" 42"`) or a `0x`
+    prefix (`0x10` is 16). In 0.6.0 `get` failed with `Error::Parse` on
+    these and `get_or` returned the default. Every value `FromStr`
+    accepted for these types reads as the same value as before. Code
+    that relied on the default for such a value — `get_or(name, true)`
+    on a property set to `0` returned `true` — now gets the parsed
+    value;
   - a non-`ro.` property whose serial has bit 16 set (init's counter sets
     it during updates 32768–65535 of every 65536) can be read: `get` /
     `read_with` return its value
@@ -906,6 +995,11 @@ Service (`rsproperties-service`, git dependency only):
     service. A `let _ = run(..).await?;` therefore stops it at once;
     bind the handle to a name.
 - **Changed API**:
+  - `get::<f64>(name)` and other reads of a `FromStr` type that is not a
+    `FromProperty` type become
+    `system_properties()?.read_with(name, |v| v.parse::<f64>())?`, which
+    returns the `Result` of the parse. For a type of your own, implement
+    `FromProperty` and keep the `get` / `get_or` call;
   - `rsproperties_service::run` returns `Result<_, StartupError>` (see
     Changed error values);
   - `rsproperties_service::run(config, contexts, props)` becomes
@@ -988,7 +1082,10 @@ Service (`rsproperties-service`, git dependency only):
   - `PropertyInfoEntry::new(name, context, type_str, true)` becomes
     `PropertyInfoEntry::exact(name, context, type_str)`, and `false`
     becomes `PropertyInfoEntry::prefix(name, context, type_str)`. For a
-    `bool` known only at run time, branch on it;
+    `bool` known only at run time, branch on it. A `String`,
+    `.to_string()` or `String::from(..)` argument compiles unchanged; an
+    argument written `"ro.a".into()` no longer infers its type (E0283):
+    drop the `.into()`;
   - `set(name, &value)` keeps compiling. Where the borrowed value is a
     `Copy` value or a temporary (`set(name, &42)`,
     `set(name, &n.to_string())`), clippy's
@@ -999,6 +1096,20 @@ Service (`rsproperties-service`, git dependency only):
     `ServiceOptions::control_handler`);
   - `PropertyIndex` is 16 bytes (was 8), and only the `SystemProperties`
     instance that returned it accepts it (see Changed error values).
+  - `Error::ServiceError { name, code }` becomes
+    `Error::SetRejected { name, reason }`. A comparison
+    `code == wire::PROP_ERROR_READ_ONLY_PROPERTY` becomes
+    `reason == SetRejection::ReadOnlyProperty` (or
+    `reason.code() == wire::PROP_ERROR_READ_ONLY_PROPERTY`), and
+    `{code:#x}` in a message becomes `{reason}`, which prints the cause
+    and the code.
+  - A `builder` caller that matched `Error::PermissionDenied` to detect
+    a second set of a `ro.` property matches `Error::ReadOnlyProperty`.
+  - `load_properties_from_file(..)?;` no longer compiles without a
+    warning (`unused_must_use`). Where a file that loads nothing is a
+    failure, match the result and handle
+    `PropFileOutcome::SkippedWritable { mode }`; where it is not,
+    write `let _ = load_properties_from_file(..)?;`.
 - **Changed error values**:
   - `rsproperties_service::run` returns `StartupError` (0.6.0:
     `Box<dyn Error + Send + Sync>` holding a `Failed to start … service:`
@@ -1029,11 +1140,14 @@ Service (`rsproperties-service`, git dependency only):
     `SystemProperties::get`, `read_with`, `SystemProperties::add` and `set`)
     reads `no context for property "<name>"`, the name `Debug`-escaped
     (0.6.0: `no context for property <name>`). The `FileValidation`
-    message for a name whose context was skipped at init, and the
-    `PermissionDenied` message of `SystemProperties::update` (and `set`)
-    for an existing `ro.` name, quote the name the same way (0.6.0:
-    unquoted). Code that compared or searched these payloads for the raw
-    name must compare with the escaped form or match the variant only.
+    message for a name whose context was skipped at init quotes the name
+    the same way (0.6.0: unquoted). Code that compared or searched these
+    payloads for the raw name must compare with the escaped form or match
+    the variant only.
+  - `SystemProperties::update` (and `set`) for an existing `ro.` name
+    returns `Error::ReadOnlyProperty` with the name as its payload
+    (0.6.0: `Error::PermissionDenied` with a message). Its `Display`
+    quotes the name `Debug`-escaped.
   - The other error payloads that embed a property name, line, token or
     type string print it `Debug`-escaped (`"…"`; 0.6.0: raw or in `'…'`):
     the `InvalidArgument` of `wire::validate_property_name`, which
@@ -1045,8 +1159,8 @@ Service (`rsproperties-service`, git dependency only):
     `prefix` (0.6.0: `new`); and the
     per-line `Parse` errors of `PropertyInfoEntry::parse_from_file`
     (missing property or context entry, invalid match operation or type).
-    The `Parse` of `get::<T>` reads `Failed to parse property "<name>"
-    (<N bytes>): …` (0.6.0: `Failed to parse '<value>' for property
+    The `Parse` of `get::<T>` reads `property "<name>" (<N bytes>) is
+    not a <T>` (0.6.0: `Failed to parse '<value>' for property
     '<name>': …`). Match the variant instead of the text.
   - `SystemProperties::new_area`: the `Error::Context` messages for
     creating and sizing an area file or `properties_serial` name the temp
@@ -1122,9 +1236,10 @@ Service (`rsproperties-service`, git dependency only):
     (0xB) for a second set of an `ro.` property,
     `PROP_ERROR_HANDLE_CONTROL_MESSAGE` (0x20) for a refused `ctl.*`, and
     `PROP_ERROR_SET_FAILED` (0x24) for any other storage failure. The
-    client's `Error::ServiceError { code }` carries these values. Code
-    that matched `code: -1` (or `wire::PROP_ERROR`) must match the
-    `wire::PROP_ERROR_*` constants, or match the variant only.
+    client's `Error::SetRejected { reason }` carries these values as
+    `SetRejection` variants. Code that matched `code: -1` (or
+    `wire::PROP_ERROR`) must match those variants, or match
+    `Error::SetRejected` only.
   - service: a V2 frame that ends inside the name-length field gets the
     4-byte `PROP_ERROR_READ_DATA` (0x8) reply before the connection is
     closed (0.6.0 closed it without a reply). A client that reads the

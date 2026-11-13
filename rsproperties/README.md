@@ -30,36 +30,42 @@ Add `rsproperties` to your `Cargo.toml`:
 ```toml
 [dependencies]
 rsproperties = "0.6"
+```
 
-# Optional features
-[features]
-builder = ["rsproperties/builder"]  # Enable property database building
+Creating property areas (`SystemProperties::new_area`, `build_trie`,
+`load_properties_from_file`; Linux hosts) needs the `builder` feature:
+
+```toml
+[dependencies]
+rsproperties = { version = "0.6", features = ["builder"] }
 ```
 
 ### Basic Usage
 
-```rust
-use rsproperties;
+```rust,no_run
+fn main() {
+    // Get property with default value (no initialization needed for default configuration)
+    let sdk_version: String = rsproperties::get_or("ro.build.version.sdk", "0".to_string());
+    println!("SDK Version: {sdk_version}");
 
-// Get property with default value (no initialization needed for default configuration)
-let sdk_version: String = rsproperties::get_or("ro.build.version.sdk", "0".to_string());
-println!("SDK Version: {}", sdk_version);
+    // Get property with type parsing and default fallback
+    let sdk_version: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
+    // `bool` and the integers are read by libbase's rules: "1"/"0",
+    // "true"/"false", "y"/"n", "yes"/"no", "on"/"off" for a `bool`, and
+    // leading whitespace or a `0x` prefix for an integer.
+    let is_debuggable: bool = rsproperties::get_or("ro.debuggable", false);
+    println!("SDK {sdk_version}, debuggable: {is_debuggable}");
 
-// Get property with type parsing and default fallback
-let sdk_version: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
-// Boolean properties, by libbase's `GetBoolProperty` rules: "1"/"0",
-// "true"/"false", "y"/"n", "yes"/"no", "on"/"off".
-let is_debuggable: bool = rsproperties::get_bool_or("ro.debuggable", false);
+    // Get property with error handling
+    match rsproperties::get::<String>("ro.build.version.release") {
+        Ok(version) => println!("Android Version: {version}"),
+        Err(e) => eprintln!("Failed to get version: {e}"),
+    }
 
-// Get property with error handling
-match rsproperties::get::<String>("ro.build.version.release") {
-    Ok(version) => println!("Android Version: {}", version),
-    Err(e) => eprintln!("Failed to get version: {}", e),
-}
-
-// Set property (requires property service to be running)
-if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
-    eprintln!("Failed to set property: {}", e);
+    // Set property (requires property service to be running)
+    if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
+        eprintln!("Failed to set property: {e}");
+    }
 }
 ```
 
@@ -69,13 +75,16 @@ if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
 `system_properties` returns the global reader, or `Error::Init` when the
 store cannot be opened.
 
-```rust
+```rust,no_run
 use rsproperties::{init, system_properties, PropertyConfig};
 
-fn boot() -> rsproperties::Result<()> {
+fn main() -> rsproperties::Result<()> {
     init(PropertyConfig::new().properties_dir("/dev/__properties__"))?;
-    let props = system_properties()?;                 // &'static SystemProperties
-    let sdk: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
+    let props = system_properties()?; // &'static SystemProperties
+    let sdk: String = props.get("ro.build.version.sdk")?;
+    // The free functions read through the same global reader.
+    let sdk_or_zero: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
+    println!("SDK {sdk} ({sdk_or_zero})");
     Ok(())
 }
 ```
@@ -97,92 +106,116 @@ but if you want raw access to the validated value without parsing,
 `SystemProperties::read_with` hands you a `&str` borrowed from the
 seqlock-protected mmap buffer:
 
-```rust
-let props = rsproperties::system_properties()?;
+```rust,no_run
+fn main() -> rsproperties::Result<()> {
+    let props = rsproperties::system_properties()?;
 
-// Compute over the value without ever allocating a String.
-let prefix_len: rsproperties::Result<usize> =
-    props.read_with("ro.build.version.release", |v| v.split('.').next().map(str::len).unwrap_or(0));
+    // Compute over the value without ever allocating a String.
+    let major_len: usize = props.read_with("ro.build.version.release", |v| {
+        v.split('.').next().map_or(0, str::len)
+    })?;
+    println!("the major version is {major_len} bytes long");
 
-// Borrow into a stack buffer; the callback runs while the bytes are
-// still seqlock-validated, so keep it cheap and non-blocking.
-let mut buf = String::new();
-props.read_with("ro.product.model", |v| buf.push_str(v))?;
+    // Append to a buffer the caller reuses; the callback runs while the
+    // bytes are still seqlock-validated, so keep it cheap and non-blocking.
+    let mut buf = String::new();
+    props.read_with("ro.product.model", |v| buf.push_str(v))?;
+    println!("model: {buf}");
+    Ok(())
+}
 ```
 
 This mirrors bionic's `__system_property_read_callback` pattern.
 
 ### Property Monitoring
 
-```rust
-use rsproperties;
+Wait once for a value (libbase `WaitForProperty`):
 
-let system_properties = rsproperties::system_properties()?;
+```rust,no_run
+use std::time::Duration;
 
-// Wait for any property change (no timeout: `Ok(Some(serial))` or `Err`).
-// `old_serial` is the serial the caller last saw: a change made between
-// `area_serial()` and `wait` returns at once instead of being missed.
-std::thread::spawn(move || {
-    let old_serial = system_properties.area_serial();
-    if let Ok(Some(new_serial)) = system_properties.wait(None, old_serial, None) {
-        println!("Properties changed, new serial: {}", new_serial);
+fn main() -> rsproperties::Result<()> {
+    let props = rsproperties::system_properties()?;
+    // Returns when the property exists and equals "1"; `false` is a timeout.
+    if !props.wait_for_value("sys.boot_completed", "1", Some(Duration::from_secs(30)))? {
+        eprintln!("not booted after 30 s");
     }
-});
+    Ok(())
+}
+```
 
-// Wait for a specific property change, at most 30 s
-std::thread::spawn(move || {
-    if let Ok(Some(prop_index)) = system_properties.find("sys.boot_completed") {
-        println!("Waiting for boot completion...");
-        let Ok(old_serial) = system_properties.serial(prop_index) else {
-            return;
-        };
-        let timeout = Some(std::time::Duration::from_secs(30));
-        if let Ok(Some(_)) = system_properties.wait(Some(prop_index), old_serial, timeout) {
-            println!("System boot completed!");
-        }
-    }
-});
+Follow one property through every change with a `PropertyWatcher`
+(libbase `CachedProperty`). It keeps the property's index, the serial of
+the value it last read and that value, so the loop has no index or serial
+to carry:
 
-// Or wait for a value directly (libbase `WaitForProperty`)
-let booted = system_properties
-    .wait_for_value("sys.boot_completed", "1", Some(std::time::Duration::from_secs(30)));
-
-// Monitor multiple properties
-let monitored_props = vec![
-    "sys.boot_completed",
-    "dev.bootcomplete",
-    "service.bootanim.exit"
-];
-
-for prop_name in monitored_props {
-    match system_properties.get(prop_name) {
-        Ok(value) => println!("{}: {}", prop_name, value),
-        Err(_) => println!("{}: <not set>", prop_name),
+```rust,no_run
+fn main() -> rsproperties::Result<()> {
+    let props = rsproperties::system_properties()?;
+    let mut level = props.watch("debug.my_service.log_level");
+    loop {
+        // `None` until the property is created. The store is read again
+        // only after a change.
+        println!("log level: {:?}", level.value()?);
+        // Blocks until the property is created or updated. A change made
+        // since the `value()` above returns at once, so none is missed.
+        level.wait_for_change(None)?;
     }
 }
 ```
+
+One update is reported as one change, also when it stores the value the
+property already had; updates that land between two calls are reported as
+one change with the latest value.
+
+Wait for a change to any property on the global serial:
+
+```rust,no_run
+use std::time::Duration;
+
+fn main() -> rsproperties::Result<()> {
+    let props = rsproperties::system_properties()?;
+    // `old_serial` is the serial the caller last saw: a change made
+    // between `area_serial()` and `wait` returns at once.
+    let mut serial = props.area_serial();
+    loop {
+        match props.wait(None, serial, Some(Duration::from_secs(60)))? {
+            Some(new_serial) => {
+                println!("a property changed, serial {new_serial}");
+                serial = new_serial;
+            }
+            None => println!("no change for 60 s"),
+        }
+    }
+}
+```
+
+The watcher is built on `find`, `read_index_with` and
+`wait(Some(index), old_serial, timeout)`; they stay public for a caller
+that keeps its own index and serial.
 
 ### Setting Properties
 
 Setting properties requires a running property service (like `rsproperties-service`):
 
-```rust
-use rsproperties;
+```rust,no_run
+fn main() -> rsproperties::Result<()> {
+    // Basic property setting
+    if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
+        eprintln!("Failed to set property: {e}");
+    }
 
-// Basic property setting
-if let Err(e) = rsproperties::set("debug.my_app.enabled", "true") {
-    eprintln!("Failed to set property: {}", e);
+    // Set application configuration. The value is any `Display` type.
+    rsproperties::set("debug.my_app.log_level", "verbose")?;
+    rsproperties::set("debug.my_app.port", 8080)?;
+
+    // Set system properties (may require elevated permissions)
+    rsproperties::set("sys.my_service.ready", 1)?;
+
+    // Set persistent properties (survive reboots on Android)
+    rsproperties::set("persist.my_app.config", "production")?;
+    Ok(())
 }
-
-// Set application configuration
-rsproperties::set("debug.my_app.log_level", "verbose")?;
-rsproperties::set("debug.my_app.port", "8080")?;
-
-// Set system properties (may require elevated permissions)
-rsproperties::set("sys.my_service.ready", "1")?;
-
-// Set persistent properties (survive reboots on Android)
-rsproperties::set("persist.my_app.config", "production")?;
 ```
 
 #### Property Setting Requirements
@@ -200,21 +233,24 @@ rsproperties::set("persist.my_app.config", "production")?;
 
 #### Property Setting Examples by Type
 
-```rust
-// Debug properties - usually writable by applications
-rsproperties::set("debug.my_app.trace", "enabled")?;
-rsproperties::set("debug.my_app.verbose", "true")?;
+```rust,no_run
+fn main() -> rsproperties::Result<()> {
+    // Debug properties - usually writable by applications
+    rsproperties::set("debug.my_app.trace", "enabled")?;
+    rsproperties::set("debug.my_app.verbose", "true")?;
 
-// Vendor properties - device-specific configuration
-rsproperties::set("vendor.my_app.hw_config", "v2")?;
+    // Vendor properties - device-specific configuration
+    rsproperties::set("vendor.my_app.hw_config", "v2")?;
 
-// Custom application properties
-rsproperties::set("my.company.app.version", "1.2.3")?;
-rsproperties::set("my.company.app.api_key", "abc123")?;
+    // Custom application properties
+    rsproperties::set("my.company.app.version", "1.2.3")?;
+    rsproperties::set("my.company.app.api_key", "abc123")?;
 
-// System state properties
-rsproperties::set("sys.my_service.status", "running")?;
-rsproperties::set("sys.my_service.pid", "1234")?;
+    // System state properties
+    rsproperties::set("sys.my_service.status", "running")?;
+    rsproperties::set("sys.my_service.pid", std::process::id())?;
+    Ok(())
+}
 ```
 
 ### Error Handling
@@ -240,8 +276,9 @@ fn set_app_config() -> Result<()> {
     ] {
         if let Err(e) = rsproperties::set(key, value) {
             match e.root_cause() {
-                // Rejected by the service: `code` is a `wire::PROP_ERROR_*`.
-                Error::ServiceError { code, .. } => eprintln!("{key} rejected: {code:#x}"),
+                // Rejected by the service: `reason` is a `SetRejection`,
+                // e.g. `SetRejection::ReadOnlyProperty`.
+                Error::SetRejected { reason, .. } => eprintln!("{key} rejected: {reason}"),
                 // No service socket, a closed connection, a timeout.
                 Error::Io(io) => eprintln!("{key}: I/O failure: {io}"),
                 _ => eprintln!("{key}: {e}"),
@@ -258,16 +295,34 @@ fn set_app_config() -> Result<()> {
 
 > **Warning**: Do not use custom configuration on Android devices. Custom configuration is only intended for Linux environments or development/testing purposes.
 
-```rust
+```rust,no_run
 use rsproperties::PropertyConfig;
 
-// Both directories, or only the one to change. A directory already set
-// to a different path makes `init` fail with `AlreadyInitialized`.
-rsproperties::init(
-    PropertyConfig::new()
-        .properties_dir("/custom/properties")
-        .socket_dir("/custom/socket"),
-)?;
+fn main() -> rsproperties::Result<()> {
+    // Both directories, or only the one to change. A directory already set
+    // to a different path makes `init` fail with `AlreadyInitialized`.
+    rsproperties::init(
+        PropertyConfig::new()
+            .properties_dir("/custom/properties")
+            .socket_dir("/custom/socket"),
+    )?;
+    Ok(())
+}
+```
+
+A library that must not set the process-wide directories, or a process
+that reads a second properties directory, opens its own reader instead.
+It is independent of `init` and of the global reader:
+
+```rust,no_run
+use rsproperties::SystemProperties;
+
+fn main() -> rsproperties::Result<()> {
+    let props = SystemProperties::open("/custom/properties")?;
+    let sdk: String = props.get("ro.build.version.sdk")?;
+    println!("SDK {sdk}");
+    Ok(())
+}
 ```
 
 ## Platform Support
@@ -298,6 +353,9 @@ rsproperties::init(
 
 - `PropertyConfig::new().properties_dir(dir).socket_dir(dir)` — the
   directories to set; either may be left out
+- `PropertyConfig::get_properties_dir()` / `get_socket_dir()` — the
+  directory a config value holds (`Option<&Path>`), without touching the
+  process-wide setting
 - `init(config)` — set them once per process; `Ok` again for the same
   paths, `Err(AlreadyInitialized)` for a different one
 - `properties_dir()` — currently-configured properties directory
@@ -307,12 +365,16 @@ rsproperties::init(
 
 ### Property Operations
 
-- `get<T>(name)` — parse-typed read; `Err` on missing / parse failure
-- `get_or<T>(name, default)` — infallible read with fallback
-- `get_bool_or(name, default)` / `get_int_or::<T>(name, default)` — read
-  with AOSP libbase's `GetBoolProperty` / `GetIntProperty` rules
+- `get<T>(name)` — typed read; `Err` on missing / a value that is not a `T`
+- `get_or<T>(name, default)` / `get_or_else<T>(name, || default)` —
+  infallible read with fallback (missing, empty, not a `T`, failed read)
+- `FromProperty` — the trait behind `T`. `String` is the value unchanged;
+  `bool` and `i8`–`i64`, `isize`, `u8`–`u64`, `usize` follow AOSP
+  libbase's `GetBoolProperty` / `GetIntProperty` rules
   (`parse::parse_bool` / `parse::parse_int`: `yes`/`on`/`1`…, leading
-  whitespace, `0x` hex); `get<T>` uses Rust's `FromStr` instead
+  whitespace, `0x` hex). Implement it for a type of your own; read a
+  float or another `FromStr` type with
+  `system_properties()?.read_with(name, |v| v.parse::<f64>())`
 - `set(name, value)` — `value: impl Display` (`set("a.b", 42)`,
   `set("a.b", "text")`, `set("a.b", &owned)`); the formatted value is
   sent to the property service over the socket; V2 names and `ro.` values may be up to 65535
@@ -327,6 +389,10 @@ rsproperties::init(
 
 ### `SystemProperties` (read side)
 
+- `SystemProperties::open(dir)` — a read-only instance on `dir`,
+  independent of `init` and of the global reader: for a second properties
+  directory in one process, or a library that must not set the
+  process-wide one
 - `read_with(name, |&str| -> R)` — zero-alloc callback reader
 - `get(name)` — the value as a `String`; `Err(NotFound)` when missing
 - `find(name)` — `Result<Option<PropertyIndex>>`; `Ok(None)` for a
@@ -338,6 +404,9 @@ rsproperties::init(
   (bionic `__system_property_read_callback`)
 - `foreach(|index| ...)` — every readable property's index (bionic
   `__system_property_foreach`); areas the process may not open are skipped
+- `list(|name, value| ...)` — every readable property's name and value
+  (libcutils `property_list`), in `foreach` order; bytes that are not
+  UTF-8 arrive as U+FFFD
 - `serial(index)` / `area_serial()` — a property's serial / the global
   serial that any change advances (bionic `__system_property_area_serial`)
 - `wait(index, old_serial, timeout)` — futex-wait until the serial
@@ -349,6 +418,12 @@ rsproperties::init(
 - `wait_for_creation(name, timeout)` / `wait_for_value(name, expected,
   timeout)` — libbase `WaitForPropertyCreation` / `WaitForProperty`;
   a timeout is `Ok(None)` / `Ok(false)`, a failure is `Err`
+- `watch(name)` — a `PropertyWatcher` (libbase `CachedProperty`):
+  `value()` is `Ok(None)` until the property exists and reads the store
+  again only after a change; `wait_for_change(timeout)` blocks until the
+  creation or the next update, `Ok(false)` on timeout. One update is one
+  change (the dirty and the clean serial store are not reported
+  separately), and changes are not queued
 - `PropertyIndex` — the handle `find` / `foreach` return; `Copy`, `Eq`
   and `Hash`. Two indexes are equal when the same instance returned them
   for the same entry, so an index can be a `HashMap` key
@@ -384,8 +459,13 @@ clients that want to point at a custom socket directory:
 
 - `Error` — non-exhaustive enum (`Io`, `NotFound`, `Utf8`, `Parse`,
   `FileValidation`, `InvalidArgument`, `AlreadyInitialized`,
-  `LimitExceeded`, `ServiceError`, `PermissionDenied`, `FileSize`,
-  `AreaFull`, `FileOwnership`, `Lock`, `Init`, `Context`)
+  `LimitExceeded`, `SetRejected`, `ReadOnlyProperty`, `PermissionDenied`,
+  `FileSize`, `AreaFull`, `FileOwnership`, `Lock`, `Init`, `Context`)
+- `SetRejection` — why the service rejected a set, in
+  `Error::SetRejected { name, reason }`: a non-exhaustive enum with one
+  variant per `wire::PROP_ERROR_*` code (`ReadOnlyProperty`,
+  `InvalidName`, `InvalidValue`, `PermissionDenied`, …) and
+  `Unknown(i32)`; `code()` returns the number
 - `Error::root_cause()` — the error under the `Context` / `Init` layers
 - `Result<T>` = `Result<T, Error>`
 
@@ -410,7 +490,9 @@ clients that want to point at a custom socket directory:
 - `load_properties_from_file(path, filter, &mut HashMap)` —
   parse build.prop entries; like AOSP init it opens each file with
   `O_NOFOLLOW` and skips (with a warning) a file writable by group or
-  others
+  others. Returns `PropFileOutcome`: `Loaded`, or
+  `SkippedWritable { mode }` when `path` itself was skipped (a skipped
+  `import` is only logged)
 - `PropertyInfoEntry::parse_from_file(path, MatchKeyword)` —
   parse a `property_contexts`-format file into
   `(Vec<PropertyInfoEntry>, Vec<Error>)` (the entries that survived
@@ -420,7 +502,8 @@ clients that want to point at a custom socket directory:
   `MatchKeyword::Unchecked` takes such a line as a prefix match
 - `PropertyInfoEntry::exact(name, context, type_str)` /
   `PropertyInfoEntry::prefix(name, context, type_str)` — build an entry
-  without a file
+  without a file; `name` and `context` take a `&str` or a `String`.
+  Entries compare with `==`
 - `build_trie(entries, default_context, default_type)` — serialize a
   property-info trie
 
@@ -428,68 +511,79 @@ clients that want to point at a custom socket directory:
 
 All operations are thread-safe and can be used concurrently:
 
-```rust
+```rust,no_run
 use std::thread;
 
-// Multiple threads can safely access properties
-let handles: Vec<_> = (0..10).map(|i| {
-    thread::spawn(move || {
-        let prop_name = format!("debug.thread.{}", i);
-        let value: String = rsproperties::get_or(&prop_name, "default".to_string());
-        println!("Thread {}: {} = {}", i, prop_name, value);
-    })
-}).collect();
+fn main() {
+    // Multiple threads can safely access properties
+    let handles: Vec<_> = (0..10)
+        .map(|i| {
+            thread::spawn(move || {
+                let prop_name = format!("debug.thread.{i}");
+                let value: String = rsproperties::get_or(&prop_name, "default".to_string());
+                println!("Thread {i}: {prop_name} = {value}");
+            })
+        })
+        .collect();
 
-for handle in handles {
-    handle.join().unwrap();
+    for handle in handles {
+        handle.join().unwrap();
+    }
 }
 ```
 
 ### Building Property Databases (with `builder` feature)
 
-```rust
-#[cfg(feature = "builder")]
+```rust,no_run
 use rsproperties::{
-    build_trie, load_properties_from_file, AreaWriterLock, MatchKeyword, PropertyConfig,
-    PropertyInfoEntry, SystemProperties,
+    build_trie, load_properties_from_file, AreaWriterLock, MatchKeyword, PropFileOutcome,
+    PropertyConfig, PropertyInfoEntry, SystemProperties,
 };
 use std::collections::HashMap;
 use std::path::Path;
 
-// Load properties from Android build.prop files
-let mut properties = HashMap::new();
-load_properties_from_file(
-    Path::new("system_build.prop"),
-    None,
-    &mut properties
-)?;
+fn main() -> rsproperties::Result<()> {
+    // Load properties from Android build.prop files. A file writable by group
+    // or others (0664 from a umask 002 checkout) is not read: the call then
+    // returns `PropFileOutcome::SkippedWritable { mode }`.
+    let mut properties = HashMap::new();
+    let outcome =
+        load_properties_from_file(Path::new("system_build.prop"), None, &mut properties)?;
+    assert_eq!(outcome, PropFileOutcome::Loaded);
 
-// Take the directory's writer lock first, then publish the context trie as
-// `<dir>/property_info` and create the areas under that lock. Do not write
-// `property_info` with `std::fs::write`: readers map it, so it must only be
-// replaced by rename (see below). Release builds (no `debug-assertions`)
-// and the `strict-file-validation` feature require `property_info` to be
-// owned by root (uid 0, gid 0).
-let (entries, _errors) = PropertyInfoEntry::parse_from_file(
-    Path::new("property_contexts"),
-    MatchKeyword::Unchecked,
-)?;
-let trie_data = build_trie(&entries, "u:object_r:build_prop:s0", "string")?;
-let lock = AreaWriterLock::acquire(Path::new("./test_props"))?;
-lock.publish_property_info(&trie_data)?;
+    // Take the directory's writer lock first, then publish the context trie as
+    // `<dir>/property_info` and create the areas under that lock. Do not write
+    // `property_info` with `std::fs::write`: readers map it, so it must only be
+    // replaced by rename (see below). Release builds (no `debug-assertions`)
+    // and the `strict-file-validation` feature require `property_info` to be
+    // owned by root (uid 0, gid 0).
+    let (mut entries, _errors) =
+        PropertyInfoEntry::parse_from_file(Path::new("property_contexts"), MatchKeyword::Unchecked)?;
+    // An entry can also be built without a file.
+    entries.push(PropertyInfoEntry::prefix(
+        "debug.my_app.",
+        "u:object_r:debug_prop:s0",
+        "string",
+    )?);
+    let trie_data = build_trie(&entries, "u:object_r:build_prop:s0", "string")?;
+    let lock = AreaWriterLock::acquire(Path::new("./test_props"))?;
+    lock.publish_property_info(&trie_data)?;
 
-// Create a system properties area for testing or service
-let mut system_properties = SystemProperties::new_area_locked(lock)?;
+    // Create a system properties area for testing or service
+    let mut system_properties = SystemProperties::new_area_locked(lock)?;
 
-// Add loaded properties to the area
-for (key, value) in properties {
-    system_properties.add(&key, &value)?;
+    // Add loaded properties to the area
+    for (key, value) in properties {
+        system_properties.add(&key, &value)?;
+    }
+
+    // Point the global reader at the same directory (before any read),
+    // then properties can be read normally
+    rsproperties::init(PropertyConfig::new().properties_dir("./test_props"))?;
+    let sdk_version: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
+    println!("SDK {sdk_version}");
+    Ok(())
 }
-
-// Point the global reader at the same directory (before any read),
-// then properties can be read normally
-rsproperties::init(PropertyConfig::new().properties_dir("./test_props"))?;
-let sdk_version: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
 ```
 
 `property_info` is replaced only by rename. Readers map it read-only and

@@ -74,7 +74,8 @@ fn main() {
         }
         None => {
             // List all readable properties, sorted by name like toybox
-            // getprop: `foreach` reports them in trie order.
+            // getprop: `list` reports them in trie order. A value that
+            // is not UTF-8 is listed with U+FFFD in place of those bytes.
             let props = match rsproperties::system_properties() {
                 Ok(props) => props,
                 Err(e) => {
@@ -83,16 +84,8 @@ fn main() {
                 }
             };
             let mut all = std::collections::BTreeMap::new();
-            let walk = props.foreach(|index| {
-                match props.read_index_with(index, |name, value, _serial| {
-                    (name.to_owned(), value.to_owned())
-                }) {
-                    Ok((name, value)) => {
-                        all.insert(name, value);
-                    }
-                    // e.g. a non-UTF-8 value: skip it, keep listing.
-                    Err(e) => log::warn!("skipping a property: {e}"),
-                }
+            let walk = props.list(|name, value| {
+                all.insert(name.to_owned(), value.to_owned());
             });
             let mut out = std::io::stdout().lock();
             for (name, value) in &all {

@@ -105,7 +105,28 @@ pub(crate) fn read_bounded_line(
 /// `ReadFile`: with `O_NOFOLLOW`, so a symlink as the last path component
 /// fails to open (an error for the root file; a skipped import otherwise),
 /// and a file writable by group or others is skipped with a warning —
-/// for the root file this returns `Ok(())` with nothing loaded.
+/// for the root file this returns
+/// `Ok(`[`PropFileOutcome::SkippedWritable`]`)` with `properties`
+/// unchanged. A checkout under umask 002 leaves files with mode 0664, so
+/// check the returned value where a file that loads nothing is a
+/// failure:
+///
+/// ```rust,no_run
+/// use rsproperties::{load_properties_from_file, PropFileOutcome};
+/// use std::{collections::HashMap, path::Path};
+///
+/// # fn main() -> rsproperties::Result<()> {
+/// let path = Path::new("/system/build.prop");
+/// let mut properties = HashMap::new();
+/// match load_properties_from_file(path, None, &mut properties)? {
+///     PropFileOutcome::Loaded => {}
+///     PropFileOutcome::SkippedWritable { mode } => {
+///         eprintln!("{path:?} not loaded: mode {mode:o} allows group or other writes");
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
 ///
 /// On error (I/O failure reading the root file, or more than
 /// `MAX_TOTAL_LOADS` file loads across the whole pass), entries parsed
@@ -121,10 +142,30 @@ pub fn load_properties_from_file(
     filename: &Path,
     filter: Option<&str>,
     properties: &mut HashMap<String, String>,
-) -> Result<()> {
+) -> Result<PropFileOutcome> {
     let mut visited = HashSet::new();
     let mut loads = 0u32;
     load_properties_impl(filename, filter, properties, 0, &mut visited, &mut loads)
+}
+
+/// What [`load_properties_from_file`] did with the file it was given.
+///
+/// About that file only: an `import` it names can be skipped (unreadable,
+/// group- or other-writable, nested too deep) and the result is still
+/// [`PropFileOutcome::Loaded`]; those are logged at `warn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a skipped file loads nothing; check for `SkippedWritable`"]
+pub enum PropFileOutcome {
+    /// The file was read to its end. Lines the loader does not accept
+    /// (illegal names, `ctl.*`, non-UTF-8, over-long) were dropped.
+    Loaded,
+    /// The file was not read because its mode has the group- or
+    /// other-write bit (`mode & 0o022 != 0`) — AOSP init's `ReadFile`
+    /// rule. `properties` is unchanged.
+    SkippedWritable {
+        /// The file's permission bits (`st_mode & 0o7777`).
+        mode: u32,
+    },
 }
 
 /// Expands property references in an import path against the entries
@@ -194,7 +235,7 @@ fn load_properties_impl(
     depth: u8,
     visited: &mut HashSet<PathBuf>,
     loads: &mut u32,
-) -> Result<()> {
+) -> Result<PropFileOutcome> {
     if depth > MAX_IMPORT_DEPTH {
         // `Parse`, not `LimitExceeded`: the import call site swallows this
         // (log + skip, AOSP parity) — only the *global* loads budget below
@@ -234,7 +275,9 @@ fn load_properties_impl(
     let filtered = filter.is_some_and(|f| !f.is_empty());
     if !filtered && !visited.insert(canonical.clone()) {
         warn!("{filename:?} is already being loaded (import cycle) — skipping");
-        return Ok(());
+        // Only an import gets here (the stack is empty for the root
+        // file), and the import call site does not read the outcome.
+        return Ok(PropFileOutcome::Loaded);
     }
     // From here on every exit must pop the stack entry; wrap the body so
     // one removal covers all paths.
@@ -248,7 +291,8 @@ fn load_properties_impl(
 /// Opens a prop file the way AOSP init's `ReadFile` does
 /// (`init/util.cpp`): `O_NOFOLLOW`, so a symlink as the last path
 /// component fails the open (`ELOOP`), and a file whose mode has the
-/// group- or other-write bit is skipped with a warning (`Ok(None)`).
+/// group- or other-write bit is skipped with a warning (`Ok(Err(mode))`,
+/// the permission bits).
 /// rsproperties-service's `persistent_properties::read_file` applies the
 /// same rule to the persistent properties file; change both together.
 ///
@@ -258,7 +302,7 @@ fn load_properties_impl(
 /// time, so they can differ from what `canonicalize` saw if one is
 /// swapped in between; the depth/loads caps bound the effect on cycle
 /// detection, the same window the canonical-path open had.
-fn open_prop_file(filename: &Path) -> Result<Option<File>> {
+fn open_prop_file(filename: &Path) -> Result<std::result::Result<File, u32>> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     // std adds O_CLOEXEC itself.
     let file = std::fs::OpenOptions::new()
@@ -270,16 +314,16 @@ fn open_prop_file(filename: &Path) -> Result<Option<File>> {
         .metadata()
         .context_with_location(format!("Failed to stat {filename:?}"))?
         .permissions()
-        .mode();
+        .mode()
+        & 0o7777;
     // 0o022 = S_IWGRP | S_IWOTH, the bits init's `ReadFile` refuses.
     if mode & 0o022 != 0 {
         warn!(
-            "{filename:?}: skipping group- or world-writable prop file (mode {:o}), like AOSP init",
-            mode & 0o7777
+            "{filename:?}: skipping group- or world-writable prop file (mode {mode:o}), like AOSP init"
         );
-        return Ok(None);
+        return Ok(Err(mode));
     }
-    Ok(Some(file))
+    Ok(Ok(file))
 }
 
 fn load_properties_body(
@@ -289,9 +333,10 @@ fn load_properties_body(
     depth: u8,
     visited: &mut HashSet<PathBuf>,
     loads: &mut u32,
-) -> Result<()> {
-    let Some(file) = open_prop_file(filename)? else {
-        return Ok(());
+) -> Result<PropFileOutcome> {
+    let file = match open_prop_file(filename)? {
+        Ok(file) => file,
+        Err(mode) => return Ok(PropFileOutcome::SkippedWritable { mode }),
     };
     let mut reader = BufReader::new(file);
     let filter = filter.filter(|s| !s.is_empty());
@@ -435,7 +480,7 @@ fn load_properties_body(
         }
     }
 
-    Ok(())
+    Ok(PropFileOutcome::Loaded)
 }
 
 #[cfg(test)]
@@ -449,10 +494,21 @@ mod tests {
         let tmp = TempDir::new("rsprops_fixture_test");
         let file = crate::test_support::copy_android_fixture("system_build.prop", &tmp.0);
         let mut properties = HashMap::new();
-        load_properties_from_file(&file, None, &mut properties).unwrap();
+        load(&file, &mut properties);
         assert_eq!(
             properties.get("persist.sys.usb.config"),
             Some(&"adb".to_string())
+        );
+    }
+
+    /// An unfiltered load that must read `path` itself.
+    #[cfg(not(target_os = "android"))]
+    #[track_caller]
+    fn load(path: &Path, properties: &mut HashMap<String, String>) {
+        assert_eq!(
+            load_properties_from_file(path, None, properties).unwrap(),
+            PropFileOutcome::Loaded,
+            "{path:?}"
         );
     }
 
@@ -513,7 +569,7 @@ mod tests {
         }
 
         let mut properties = HashMap::new();
-        load_properties_from_file(&path, None, &mut properties).unwrap();
+        load(&path, &mut properties);
         assert_eq!(
             properties.get("ro.nbsp.value").map(String::as_str),
             Some("foo\u{a0}")
@@ -561,7 +617,7 @@ mod tests {
             link.display()
         )
         .unwrap();
-        load_properties_from_file(&root, None, &mut properties).unwrap();
+        load(&root, &mut properties);
         assert_eq!(properties.get("from.target"), None);
         assert_eq!(
             properties.get("after.import").map(String::as_str),
@@ -570,8 +626,9 @@ mod tests {
     }
 
     /// AOSP init skips a prop file with `S_IWGRP` or `S_IWOTH` set
-    /// ("Skipping insecure file"). The root file is skipped with `Ok(())`;
-    /// an import is skipped and the importing file still loads.
+    /// ("Skipping insecure file"). The root file is skipped with
+    /// `Ok(SkippedWritable)`, which carries its permission bits; an import
+    /// is skipped and the importing file still loads and reports `Loaded`.
     #[cfg(not(target_os = "android"))]
     #[test]
     fn test_group_or_world_writable_prop_file_is_skipped() {
@@ -599,17 +656,27 @@ mod tests {
         set_mode(&other_w, 0o646);
 
         let mut properties = HashMap::new();
-        load_properties_from_file(&root, None, &mut properties).unwrap();
+        load(&root, &mut properties);
         assert_eq!(
             properties.keys().map(String::as_str).collect::<Vec<_>>(),
             ["in.root"]
         );
 
+        // A skipped root leaves what the map already holds.
         set_mode(&root, 0o620);
-        properties.clear();
-        load_properties_from_file(&root, None, &mut properties)
-            .expect("an insecure root file is skipped, not an error");
-        assert!(properties.is_empty(), "{properties:?}");
+        let before = properties.clone();
+        assert_eq!(
+            load_properties_from_file(&root, None, &mut properties)
+                .expect("an insecure root file is skipped, not an error"),
+            PropFileOutcome::SkippedWritable { mode: 0o620 }
+        );
+        assert_eq!(properties, before);
+
+        // The filter does not change the rule.
+        assert_eq!(
+            load_properties_from_file(&root, Some("in.*"), &mut properties).unwrap(),
+            PropFileOutcome::SkippedWritable { mode: 0o620 }
+        );
     }
 
     #[cfg(not(target_os = "android"))]
@@ -633,7 +700,7 @@ mod tests {
         }
 
         let mut properties = HashMap::new();
-        load_properties_from_file(&root, None, &mut properties).unwrap();
+        load(&root, &mut properties);
         assert_eq!(properties.get("from.import"), Some(&"1".to_string()));
         assert_eq!(properties.get("after.import"), Some(&"2".to_string()));
     }
@@ -663,7 +730,7 @@ mod tests {
         }
 
         let mut properties = HashMap::new();
-        load_properties_from_file(&root, None, &mut properties).unwrap();
+        load(&root, &mut properties);
         assert_eq!(properties.get("key"), Some(&"from_overlay".to_string()));
     }
 
@@ -729,7 +796,7 @@ mod tests {
         }
 
         let mut properties = HashMap::new();
-        load_properties_from_file(&root, None, &mut properties).unwrap();
+        load(&root, &mut properties);
         assert_eq!(properties.get("ro.vendor.a"), Some(&"1".to_string()));
         assert_eq!(properties.get("ro.vendor.b"), Some(&"2".to_string()));
         assert_eq!(properties.get("exact.key"), Some(&"4".to_string()));
@@ -774,7 +841,7 @@ mod tests {
         // The cycle is cut by the visited set at first re-entry (logged +
         // skipped), and the rest of each file still loads.
         let mut properties = HashMap::new();
-        load_properties_from_file(&a, None, &mut properties).unwrap();
+        load(&a, &mut properties);
         assert_eq!(properties.get("key"), Some(&"v".to_string()));
     }
 
@@ -793,7 +860,7 @@ mod tests {
         writeln!(create_prop(&b).unwrap(), "k=2\nimport {} k", a.display()).unwrap();
 
         let mut properties = HashMap::new();
-        load_properties_from_file(&a, None, &mut properties).unwrap();
+        load(&a, &mut properties);
         assert_eq!(properties.get("k"), Some(&"1".to_string()));
     }
 }

@@ -48,7 +48,7 @@ pub const PROP_ERROR: i32 = -1;
 
 // V2 error response codes, as AOSP init sends them (bionic
 // `sys/system_properties.h`). The client reports any non-zero code as
-// `Error::ServiceError { code }`.
+// `Error::SetRejected`, with the code as a `SetRejection`.
 
 /// Reading the command word failed.
 pub const PROP_ERROR_READ_CMD: i32 = 0x0004;

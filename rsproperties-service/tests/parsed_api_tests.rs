@@ -70,10 +70,16 @@ async fn test_get_parsed_with_default_invalid_parsing() -> anyhow::Result<()> {
 async fn test_get_parsed_with_default_booleans() -> anyhow::Result<()> {
     setup_test_env().await;
 
-    // Test boolean parsing - Rust's bool::from_str() is case-sensitive
+    // `bool` reads with libbase `ParseBool`, which is case-sensitive.
     let valid_cases = [
         ("test.bool.true", "true", true),
         ("test.bool.false", "false", false),
+        ("test.bool.one", "1", true),
+        ("test.bool.zero", "0", false),
+        ("test.bool.yes", "yes", true),
+        ("test.bool.no", "no", false),
+        ("test.bool.on", "on", true),
+        ("test.bool.off", "off", false),
     ];
 
     let invalid_cases = [
@@ -81,16 +87,15 @@ async fn test_get_parsed_with_default_booleans() -> anyhow::Result<()> {
         ("test.bool.true_all_upper", "TRUE"),
         ("test.bool.false_upper", "False"),
         ("test.bool.false_all_upper", "FALSE"),
-        ("test.bool.one", "1"),
-        ("test.bool.zero", "0"),
-        ("test.bool.yes", "yes"),
-        ("test.bool.no", "no"),
+        ("test.bool.two", "2"),
+        ("test.bool.enabled", "enabled"),
     ];
 
-    // Test valid boolean strings
+    // Test valid boolean strings. The default is the opposite of the
+    // expected value, so a fallback cannot pass for a parsed value.
     for (prop_name, prop_value, expected) in valid_cases.iter() {
         rsproperties::set(prop_name, prop_value)?;
-        let result: bool = rsproperties::get_or(prop_name, false);
+        let result: bool = rsproperties::get_or(prop_name, !*expected);
         assert_eq!(
             result, *expected,
             "Failed for valid boolean property {prop_name} with value {prop_value}"
@@ -118,10 +123,12 @@ async fn test_get_parsed_with_default_floats() -> anyhow::Result<()> {
     let test_value = std::f64::consts::PI;
     rsproperties::set(prop_name, test_value)?;
 
-    let parsed_f32: f32 = rsproperties::get_or(prop_name, 0.0f32);
+    // `f32`/`f64` are not `FromProperty` types: a float is read with
+    // `read_with` and `FromStr`.
+    let parsed_f32: f32 = common::read_parsed(prop_name)?;
     assert!((parsed_f32 - test_value as f32).abs() < f32::EPSILON);
 
-    let parsed_f64: f64 = rsproperties::get_or(prop_name, 0.0f64);
+    let parsed_f64: f64 = common::read_parsed(prop_name)?;
     assert!((parsed_f64 - test_value).abs() < f64::EPSILON);
 
     Ok(())
@@ -195,8 +202,24 @@ async fn test_get_parsed_empty_property() -> anyhow::Result<()> {
         matches!(result, Err(rsproperties::Error::Parse(_))),
         "{result:?}"
     );
+    // The message names the property, the value's length and the type —
+    // never the value.
     let error_msg = result.unwrap_err().to_string();
-    assert!(error_msg.contains("cannot parse integer from empty string"));
+    assert!(
+        error_msg.contains(prop_name)
+            && error_msg.contains("<0 bytes>")
+            && error_msg.contains("i32"),
+        "{error_msg}"
+    );
+
+    // `String` reads the empty value as it is; `get_or` counts empty as
+    // unset for every type.
+    assert_eq!(rsproperties::get::<String>(prop_name)?, "");
+    assert_eq!(rsproperties::get_or(prop_name, 7i32), 7);
+    assert_eq!(
+        rsproperties::get_or(prop_name, "default".to_owned()),
+        "default"
+    );
 
     Ok(())
 }
@@ -281,7 +304,7 @@ async fn test_parsed_api_type_safety() -> anyhow::Result<()> {
     let as_i32: i32 = rsproperties::get(prop_name)?;
     let as_u32: u32 = rsproperties::get(prop_name)?;
     let as_i64: i64 = rsproperties::get(prop_name)?;
-    let as_f64: f64 = rsproperties::get(prop_name)?;
+    let as_f64: f64 = common::read_parsed(prop_name)?;
 
     assert_eq!(as_i32, 42);
     assert_eq!(as_u32, 42);

@@ -59,7 +59,8 @@ async fn test_new_api_showcase() -> anyhow::Result<()> {
     let version_minor: u8 = rsproperties::get("app.config.version_minor")?;
     assert_eq!(version_minor, 4);
 
-    let memory_limit: f64 = rsproperties::get("app.config.memory_limit")?;
+    // `f64` is not a `FromProperty` type: read it with `read_with`.
+    let memory_limit: f64 = common::read_parsed("app.config.memory_limit")?;
     assert!((memory_limit - 512.5).abs() < f64::EPSILON);
 
     let debug_enabled: bool = rsproperties::get("app.config.debug_enabled")?;
@@ -174,8 +175,8 @@ async fn test_type_conversion_showcase() -> anyhow::Result<()> {
     assert_eq!(as_u64, 42);
 
     // Parse as floating point
-    let as_f32: f32 = rsproperties::get("config.numeric_value")?;
-    let as_f64: f64 = rsproperties::get("config.numeric_value")?;
+    let as_f32: f32 = common::read_parsed("config.numeric_value")?;
+    let as_f64: f64 = common::read_parsed("config.numeric_value")?;
 
     assert_eq!(as_f32, 42.0);
     assert_eq!(as_f64, 42.0);
@@ -186,7 +187,7 @@ async fn test_type_conversion_showcase() -> anyhow::Result<()> {
 
     // Set floating point and parse back
     rsproperties::set("config.pi", std::f64::consts::PI)?;
-    let pi_back: f64 = rsproperties::get("config.pi")?;
+    let pi_back: f64 = common::read_parsed("config.pi")?;
     assert!((pi_back - std::f64::consts::PI).abs() < 1e-10);
 
     // Set boolean values
@@ -194,10 +195,14 @@ async fn test_type_conversion_showcase() -> anyhow::Result<()> {
     let flag_value: String = rsproperties::get("config.feature_flag")?;
     assert_eq!(flag_value, "true");
 
-    // Note: Parsing "true"/"false" strings as bool works with Rust's FromStr
+    // A `bool` reads "true"/"false" and libbase's other spellings ("1",
+    // "0", "yes", "no", "on", "off", "y", "n").
     rsproperties::set("config.bool_string", "false")?;
     let bool_parsed: bool = rsproperties::get("config.bool_string")?;
     assert!(!bool_parsed);
+    rsproperties::set("config.bool_string", "1")?;
+    let bool_parsed: bool = rsproperties::get("config.bool_string")?;
+    assert!(bool_parsed);
 
     println!("✅ Type conversion showcase completed successfully!");
 
@@ -292,7 +297,7 @@ async fn test_performance_and_concurrency() -> anyhow::Result<()> {
                     }
                     1 => {
                         rsproperties::set(&prop_name, i as f64 * 1.5)?;
-                        let value: f64 = rsproperties::get(&prop_name)?;
+                        let value: f64 = common::read_parsed(&prop_name)?;
                         assert!((value - (i as f64 * 1.5)).abs() < f64::EPSILON);
                     }
                     2 => {
@@ -362,7 +367,7 @@ async fn test_complete_feature_summary() -> anyhow::Result<()> {
     println!("📊 Feature 2: Type-Safe Property Parsing");
     let string_val: String = rsproperties::get("demo.string_prop")?;
     let int_val: i32 = rsproperties::get("demo.int_prop")?;
-    let float_val: f64 = rsproperties::get("demo.float_prop")?;
+    let float_val: f64 = common::read_parsed("demo.float_prop")?;
     let bool_val: bool = rsproperties::get("demo.bool_prop")?;
 
     assert_eq!(string_val, "Hello World");

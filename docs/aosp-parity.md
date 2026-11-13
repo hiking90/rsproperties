@@ -32,6 +32,7 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
 | C4 | client | `WaitForProperty` / `WaitForPropertyCreation` | (d) | 이 branch에서 추가 |
 | C5 | client | `GetBoolProperty` / `GetIntProperty` 파싱 규칙 | (d), (c) | 이 branch에서 추가 |
 | C6 | client | global reader 초기화 실패를 process 수명 동안 유지 | (c), 재시도 방식은 (a) | 이 branch에서 수정 |
+| C7 | client | 한 property의 값 cache와 변경 대기(`CachedProperty`) | (d) | 이 branch에서 추가 |
 | S1 | service | `persist.*` / `next_boot.*` 영속화 | (d) | 이 branch에서 추가 |
 | S2 | service | property type 검사(`CheckType`) | (c) | 이 branch에서 수정 |
 | S3 | service | `ctl.*`를 일반 property로 저장 | (c) | 이 branch에서 수정 |
@@ -39,6 +40,7 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
 | S5 | service | `ro.property_service.version` 미설정 | (c) | 이 branch에서 수정 |
 | S6 | service | 변경 알림 hook 없음 | (a) | 검토 대상 아님 |
 | S7 | service | properties dir writer lock(`AreaWriterLock`) | (a), 해제 방식은 (b) | lock은 0.6.0부터 있음, 해제 방식은 이 branch에서 수정 |
+| S8 | service, builder | prop 파일을 읽지 못했을 때의 반환값 | open 실패로 시작 실패는 (b) | 시작 실패는 0.6.0부터 있음, skip 반환값은 이 branch에서 추가 |
 
 ## Client
 
@@ -81,8 +83,28 @@ exit 1로 끝난다.
   않고 `Err`를 반환한다. 이 crate는 손상과 부재를 구분한다는 정책을 따른다.
   손상된 context보다 앞서 순회한 context의 index는 이미 callback에 전달된
   상태다.
+- `SystemProperties::list(|name, value| ...)`를 추가한다. libcutils
+  `property_list`(`libcutils/properties.cpp:103-115`)에 대응하며, `foreach`의
+  index마다 값을 읽어 callback에 넘긴다. 열거 대상, 순서, 건너뛰는 area는
+  `foreach`와 같다.
+  - 이름과 값을 호출 1회당 `String` 두 개에 복사하고, node read lock을 놓은
+    뒤에 callback을 호출한다. `property_list`는 `read_callback` 안에서, 즉
+    값을 읽는 도중에 callback을 호출한다. 이 crate에서 그렇게 하면 callback이
+    같은 instance의 read API를 호출할 때 같은 `RwLock`의 read lock을 두 번
+    잡는다. 복사 비용은 property마다 `memcpy` 두 번이고, buffer를 재사용하므로
+    할당은 값 길이가 늘어날 때만 생긴다.
+  - 다른 점(a): UTF-8이 아닌 byte는 U+FFFD로 바꿔 넘긴다
+    (`String::from_utf8_lossy`). `property_list`는 C 문자열을 그대로 넘기지만
+    callback 인자가 `&str`이므로 같은 방식은 쓸 수 없다. `Error::Utf8`로
+    순회를 끝내면 그런 값 하나 때문에 나머지 property를 열거하지 못한다.
+    건너뛰면 호출자가 그 property의 존재를 알 수 없다. 값을 byte 그대로
+    받으려는 호출자를 위한 API는 두지 않았다.
+  - 그 밖의 read 오류는 순회를 끝내고 `Err`로 반환한다(trie 손상과 같은 규칙).
+  - 검증: `client_parity_tests::list_matches_foreach_and_allows_reentry`(Linux,
+    writer와 reader instance 양쪽). UTF-8이 아닌 값을 쓰는 writer가 없어
+    U+FFFD 치환 경로는 test하지 못했다.
 - `getprop` 예제는 인자가 없으면 toybox `getprop`처럼 이름순으로
-  `[name]: [value]`를 출력한다.
+  `[name]: [value]`를 출력한다. 열거는 `list`를 쓴다.
 - 검증: API 36 emulator의 adb shell(SELinux `shell` domain)에서 이 예제의
   출력과 toybox `getprop` 출력이 531줄 모두 일치했다. Linux에서는
   `example_service` + `setprop`으로 넣은 4개 property(`ro.` long value
@@ -309,11 +331,22 @@ override가 켜진 프로세스에서는 같은 property에 대해 libc
   `parse_int::<T>(&str) -> Option<T>`를 추가한다. 둘 다 libbase 규칙을 따른다.
   `T`는 sealed trait `parse::Integer`로 제한하며, libbase가 instantiate하는
   `i8..i64`, `u8..u64`에 `isize`, `usize`를 더한다.
-- 전역 함수 `get_bool_or(name, default)`와 `get_int_or::<T>(name, default)`를
-  추가한다. `GetBoolProperty`, 범위 인자를 생략한 `GetIntProperty` /
+- 전역 함수 `get`, `get_or`, `get_or_else`의 bound를 `FromStr`에서 trait
+  `FromProperty`로 바꾼다. `bool`은 `parse_bool`, 정수는 `parse_int`,
+  `String`은 값 그대로 읽는다. `get_or(name, false)`가 `GetBoolProperty`에,
+  `get_or(name, 0)`이 범위 인자를 생략한 `GetIntProperty` /
   `GetUintProperty`에 대응한다.
-- 기존 `get::<T>`의 `FromStr` 동작은 바꾸지 않는다. 바꾸면 이미 배포된
-  호출자의 결과가 달라진다.
+- 처음에는 `get::<T>`의 `FromStr` 동작을 유지하고 `get_bool_or` /
+  `get_int_or`를 따로 두었다. 이 구성에서는 `get_or("ro.debuggable", false)`가
+  compile되고 값 `1`에 대해 default를 반환하므로, 함수 이름을 잘못 고른
+  호출부를 compiler도 test도 찾지 못한다. 그래서 타입 하나에 규칙 하나만
+  남기고 두 함수를 제거했다(둘 다 0.6.0에 없던 함수다).
+- 0.6.0 호출자의 결과가 달라지는 입력은 `FromStr`이 거부하던 값뿐이다.
+  `FromStr`이 받는 입력을 `FromProperty`가 같은 값으로 읽는지는
+  `from_property.rs`의 `accepts_what_from_str_accepted` test가 확인한다.
+- `f32`/`f64`는 `FromProperty`를 구현하지 않는다. libbase에 float getter가
+  없어 따를 규칙이 없다. `SystemProperties::read_with`에 `str::parse`를 넘겨
+  읽는다.
 - libcutils 규칙(8진수, 뒤에 남은 문자 허용)은 따르지 않는다. libbase가 더
   나중에 나온 API이고, libcutils 소스도 8진수 허용을 결함으로 적는다.
 
@@ -347,6 +380,61 @@ version을 env var나 기본값으로만 골랐다.
 - `init`도 이미 설정된 것과 같은 경로를 다시 받으면 성공한다. bionic `Init`이
   재호출을 성공으로 처리하는 것과 같다. 다른 경로는 `AlreadyInitialized`다.
   bionic은 경로를 바꿀 수 없으므로 이 경우에 대응하는 동작이 없다.
+
+### C7. `CachedProperty` — (d)
+
+**AOSP** (`libbase/properties.cpp:294-370`). `CachedProperty`는 `prop_info*`,
+마지막으로 읽은 property serial, 값 buffer(`PROP_VALUE_MAX`)를 보관한다.
+- `Get(bool* changed)`: `prop_info*`가 없으면, global serial이 지난 조회 때와
+  다를 때만 `__system_property_find`를 다시 호출한다. `prop_info*`가 있으면,
+  `__system_property_serial`이 보관한 serial과 다를 때만 `read_callback`으로
+  값과 serial을 다시 읽는다.
+- `WaitForChange(timeout)`: `prop_info*`가 없으면 `WaitForPropertyCreation`으로
+  생성을 기다린다. 있으면 보관한 serial을 넘겨 `__system_property_wait`를
+  호출한다. 그 뒤 `Get`을 호출해 값을 반환한다. timeout이면 `nullptr`를
+  반환한다.
+
+**rsproperties.** 대응하는 타입이 없다. property 하나의 변경을 계속 읽으려면
+호출자가 `find`, `read_index_with`, `wait`를 loop로 묶고 index와 serial을 직접
+보관해야 한다. README의 예제는 이 조합을 잘못 썼다. `find`가 `None`을
+반환하면 기다리지 않고 끝났고, 변경 1회를 값 확인 없이 "boot completed"로
+출력했다.
+
+**변경.** `SystemProperties::watch(name) -> PropertyWatcher<'_>`를 추가한다.
+`value()`가 `Get`에, `wait_for_change(timeout)`이 `WaitForChange`에 대응한다.
+- `value()`의 반환 타입은 `Result<Option<&str>>`이고, property가 없으면
+  `Ok(None)`이다(b). libbase `Get`은 property가 없을 때 빈 문자열을 반환하므로
+  호출자가 빈 값과 부재를 구분하지 못한다.
+- `wait_for_change`의 반환 타입은 `Result<bool>`이다. timeout은 `Ok(false)`,
+  lookup 실패와 futex 실패는 `Err`다(b, C4와 같은 규칙).
+- update 1회를 변경 1회로 보고한다(b). writer는 dirty serial, 값, clean serial
+  순서로 store하고 futex wake는 clean store 뒤에 한다. `__system_property_wait`는
+  dirty 구간에 진입하면 dirty serial을 반환한다. libbase는 이때 `Get`을 호출해
+  backup slot의 이전 값과 dirty serial을 보관하므로, 다음 `WaitForChange`가 같은
+  update의 clean store에서 한 번 더 반환한다. watcher는 dirty bit를 지운 serial을
+  보관한다. `wait`가 반환한 뒤 읽은 serial에서 dirty bit를 지운 값이 보관한
+  serial과 같으면 그 dirty serial부터 다시 기다린다.
+- 같은 값을 다시 쓴 update도 변경으로 보고한다(libbase와 같다). serial은
+  update마다 증가하고, area에는 이전 값이 남지 않으므로 비교할 대상이 없다.
+- 변경을 queue에 쌓지 않는다(libbase와 같다). 두 호출 사이에 일어난 update
+  여러 번은 변경 1회이고, 값은 마지막 값이다.
+- 값 buffer는 watcher마다 `String` 하나다. libbase는 `ro.` 값을 복사하지 않고
+  mapping 안의 pointer를 반환한다. 이 crate의 read는 node read lock을 잡은
+  동안에만 유효한 `&str`을 넘기므로 `ro.` 값도 복사한다. `ro.` property는
+  serial이 바뀌지 않으므로 복사는 한 번이다.
+- UTF-8이 아닌 값은 `Error::Utf8`이다. 이때 watcher는 serial을 기록하지
+  않는다. 그래서 property가 다시 바뀔 때까지 `value()`는 호출마다 같은 오류를
+  반환하고, `wait_for_change`는 기다리지 않고 같은 오류를 반환한다. 오류를
+  한 번만 보고하려면 watcher가 오류 상태를 따로 보관해야 하는데, 그 경로를
+  재현할 test 수단(UTF-8이 아닌 값을 쓰는 writer)이 없어 넣지 않았다.
+- free 함수 `rsproperties::watch`는 두지 않는다. `system_properties()?.watch(name)`이
+  같은 호출이고, global reader를 열지 못한 오류(`Error::Init`)가 `watch`가 아닌
+  `system_properties()`에서 반환된다.
+- 검증: `property_watcher.rs`의 unit test(Linux, `builder` feature). dirty store는
+  writer mapping의 serial word에 bit 0을 직접 세워 재현한다.
+  `tests/property_change_wait_tests.rs`의
+  `test_watcher_follows_creation_and_update`는 Android에서 init을 상대로 생성
+  1회와 update 1회를 확인한다.
 
 ## Service (Linux)
 
@@ -646,8 +734,7 @@ init은 control message를 queue에 넣고 main thread의 `HandleControlMessage`
 **변경 전(main).** service는 실패하면 항상 `PROP_ERROR(-1)`를 보낸다. init은
 `PROP_ERROR_READ_ONLY_PROPERTY`, `INVALID_NAME`, `INVALID_VALUE`,
 `PERMISSION_DENIED`, `SET_FAILED`, `HANDLE_CONTROL_MESSAGE` 등을 구분한다.
-client의 `Error::ServiceError { code }`(`errors.rs:80`)에는 Linux에서 항상
--1만 들어온다.
+client의 `Error::ServiceError { code }`에는 Linux에서 항상 -1만 들어온다.
 
 **변경.** `wire::PROP_ERROR_*`에 bionic의 code 값을 추가하고, 아래 "init과
 다른 점"을 제외하면 init과 같은 조건에서 같은 code를 보낸다.
@@ -667,6 +754,33 @@ V2 field의 NUL·UTF-8 오류는 읽을 때 발견하지만 두 field를 다 읽
 보류한다. 그래서 두 번째 field를 읽지 못하면 `READ_DATA`, 이름과 값이 둘 다
 잘못되면(예: 이름 `.bad`, 값에 NUL) 이름이 먼저 걸려 `INVALID_NAME`이다
 (`property_service.cpp:500-502`). 공개 `PROP_ERROR`(-1) 상수는 그대로 두었다.
+
+client는 응답 code를 `Error::SetRejected { name, reason: SetRejection }`으로
+반환한다(변경 전 이름은 `Error::ServiceError { name, code: i32 }`).
+- bionic `__system_property_set`은 code를 호출자에게 넘기지 않는다. log에
+  `__prop_error_to_string(result)`와 code를 남기고 -1을 반환한다
+  (`system_property_set.cpp:258-327`). libbase `SetProperty`는 `bool`이다. code를
+  호출자에게 넘기는 것은 이 crate가 추가한 동작이다(b).
+- `SetRejection`은 `__prop_error_to_string`이 구분하는 code 9개에 variant를
+  하나씩 둔 `#[non_exhaustive]` enum이다. `PROP_ERROR`(-1)는 `Unspecified`,
+  그 밖의 값은 `Unknown(i32)`이고, `code()`가 원래 숫자를 반환한다. `i32`를
+  그대로 두면 호출자가 `wire::PROP_ERROR_*` 상수와 직접 비교해야 하고,
+  `Debug`·`Display` 출력에 숫자만 나온다. `Unknown(n)`의 `n`이 나중 version에서
+  variant를 얻으면 `Unknown(n)`을 match하던 코드는 그 arm에 도달하지 않는다.
+  그래서 특정 숫자를 비교할 때는 `code()`를 쓰라고 문서에 적었다.
+- 이름을 바꾼 이유는 `rsproperties_service::ServiceError`(service 종료 원인)와
+  이름이 같았기 때문이다. 두 타입은 관계가 없다.
+
+service는 writer의 오류 중 `Error::ReadOnlyProperty`만 `READ_ONLY_PROPERTY`로
+바꾼다. 변경 전에는 `ro.` 거부가 `Error::PermissionDenied`였고, 이 variant는
+파일 mode 거부와 read-only mapping에 대한 쓰기에도 쓰였다. service는 variant
+전체를 `READ_ONLY_PROPERTY`로 바꿨으므로, 뒤의 두 조건이 `set` 중에 발생하면
+client는 `ro.` 거부로 보고받는다. 현재 코드에서 service의 writer는 두 조건에
+도달하지 않는다. writer는 시작할 때 모든 area를 `PropertyAreaMap::new_rw`로
+열고, 파일 mode 검사는 `new_ro`와 `property_info` load에만 있다. 따라서 이
+변경으로 service의 응답이 달라지는 경우는 없고, 변환 대상을 `ro.` 거부로
+한정한 것이다. 두 조건이 `set` 경로에 생기면 응답은 `SET_FAILED`다.
+
 init과 다른 점은 다음과 같다.
 - (c) `sys.powerctl`과 `selinux.restorecon_recursive`의 분기가 없다. init
   `HandlePropertySet`은 `sys.powerctl`=`reboot,userspace`에
@@ -751,6 +865,43 @@ temp 파일에 쓴 뒤 rename으로 교체하므로 `O_EXCL`로는 두 번째 wr
   유지된다. child의 fd 사본은 child가 종료하거나 fd를 닫을 때 없어진다.
 - `LOCK_UN`이 실패하면 `warn!`을 남긴다. 이 경우 lock은 fd 사본이 모두 닫힐 때
   풀린다.
+
+### S8. prop 파일을 읽지 못했을 때의 반환값 — open 실패로 시작 실패는 (b)
+
+**AOSP.** init의 `load_properties_from_file`은 `Result<void>`를 반환한다
+(`property_service.cpp:823-836`). `ReadFile`이 실패하면 원인을 구분하지 않고
+`Error()`를 반환한다. 원인은 파일 없음, 마지막 path component가 symlink인
+경우(`O_NOFOLLOW`), group 또는 other write bit가 있는 경우
+(`util.cpp:179-180`, "Skipping insecure file")다. 호출부는 세 곳에서만 log를
+남긴다: second stage ramdisk prop(`:844`, `WARNING`), recovery의
+`/prop.default`(`:1155`, `ERROR`), `/system/build.prop`(`:1207`, `WARNING`).
+partition별 파일은 반환값을 읽지 않거나, `.ok()`로 legacy 경로를 시도할지만
+정한다(`:1167`, `:1213-1220`). 어느 호출부도 부팅을 중단하지 않는다.
+
+**rsproperties.** `load_properties_from_file`은 두 경우를 다른 값으로
+반환한다.
+
+- open 또는 read 실패는 `Err`다. service는 `build_prop_files`의 파일 하나가
+  `Err`이면 `property_info`를 게시하기 전에 시작을 중단한다
+  (`StartupStage::PropertiesService`). 0.6.0도 같은 동작이다. init과 다른
+  점이며 (b)로 분류한다. init의 경로 목록에는 기기 구성에 따라 없는 partition
+  파일이 들어 있지만, `build_prop_files`는 호출자가 직접 지정한 경로다.
+- group 또는 other write bit가 있는 파일은 읽지 않고
+  `Ok(PropFileOutcome::SkippedWritable { mode })`를 반환한다. 이 branch
+  이전에는 `Ok(())`였고, 읽은 경우와 구분할 수단은 `warn` log뿐이었다.
+  umask 002로 checkout한 저장소의 파일은 mode가 0664여서 이 경우에 해당한다.
+  이 crate의 test는 그래서 `tests/android/*.prop`의 0644 사본을 만들어
+  load한다(`copy_fixture_0644`).
+  service는 이 값을 받으면 `error` log를 남기고 그 파일 없이 시작한다. 계속
+  진행한다는 점은 init과 같다.
+- `import`한 파일의 실패(open 실패, write bit, depth 초과)는 반환값에 반영하지
+  않고 `warn` log만 남긴다. init의 `LoadProperties`도 import 실패를
+  `LOG(WARNING)`으로만 남긴다(`:764-767`).
+
+**포기한 것.** write bit가 있는 파일을 `Err`로 바꾸면 init의 `Result<void>`와
+형태가 같아진다. 그렇게 하지 않은 이유는 service 호출부가 `?`로 전파하므로
+0664 파일 하나 때문에 service가 시작하지 못하게 되기 때문이다. 대신 enum에
+`#[must_use]`를 붙여 반환값을 읽지 않는 호출부가 compile 경고를 받게 했다.
 
 ## 누락으로 보지 않는 것
 

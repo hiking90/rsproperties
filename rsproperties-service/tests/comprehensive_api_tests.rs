@@ -75,7 +75,7 @@ async fn test_float_precision_round_trip() -> anyhow::Result<()> {
         let prop_name = format!("test.float_precision.{name}");
 
         rsproperties::set(&prop_name, original_value)?;
-        let parsed_value: f64 = rsproperties::get(&prop_name)?;
+        let parsed_value: f64 = common::read_parsed(&prop_name)?;
 
         // For floating point, we need to account for string representation precision
         let diff = (parsed_value - original_value).abs();
@@ -148,7 +148,7 @@ async fn test_property_type_overwriting() -> anyhow::Result<()> {
 
     // Overwrite with float
     rsproperties::set(prop_name, 3.14f64)?;
-    let as_float: f64 = rsproperties::get(prop_name)?;
+    let as_float: f64 = common::read_parsed(prop_name)?;
     assert!((as_float - 3.14).abs() < f64::EPSILON);
 
     // Overwrite with boolean
@@ -240,7 +240,7 @@ async fn test_concurrent_mixed_operations() -> anyhow::Result<()> {
                             // Set and parse float
                             let value = (task_id as f64) + (op_id as f64) * 0.1;
                             rsproperties::set(&prop_name, value)?;
-                            let parsed: f64 = rsproperties::get(&prop_name)?;
+                            let parsed: f64 = common::read_parsed(&prop_name)?;
                             assert!((parsed - value).abs() < f64::EPSILON);
                         }
                         2 => {
@@ -313,22 +313,32 @@ async fn test_numeric_edge_cases() -> anyhow::Result<()> {
 async fn test_boolean_string_variations() -> anyhow::Result<()> {
     setup_test_env().await;
 
-    // Note: Rust's bool::from_str() only accepts "true" and "false" (case-sensitive)
-    let valid_true_cases = [("lowercase_true", "true", true)];
+    // `bool` reads with libbase `ParseBool`: five spellings each way,
+    // case-sensitive.
+    let valid_true_cases = [
+        ("lowercase_true", "true", true),
+        ("numeric_one", "1", true),
+        ("y", "y", true),
+        ("yes", "yes", true),
+        ("on", "on", true),
+    ];
 
-    let valid_false_cases = [("lowercase_false", "false", false)];
+    let valid_false_cases = [
+        ("lowercase_false", "false", false),
+        ("numeric_zero", "0", false),
+        ("n", "n", false),
+        ("no", "no", false),
+        ("off", "off", false),
+    ];
 
     let invalid_cases = [
         ("uppercase_true", "TRUE"),
         ("uppercase_false", "FALSE"),
         ("mixed_case_true", "True"),
         ("mixed_case_false", "False"),
-        ("numeric_one", "1"),
-        ("numeric_zero", "0"),
-        ("yes", "yes"),
-        ("no", "no"),
-        ("on", "on"),
-        ("off", "off"),
+        ("numeric_two", "2"),
+        ("enabled", "enabled"),
+        ("padded_one", " 1"),
     ];
 
     // Test valid true cases
@@ -387,8 +397,8 @@ async fn test_type_safety() -> anyhow::Result<()> {
     let as_u16: u16 = rsproperties::get(prop_name)?;
     let as_u32: u32 = rsproperties::get(prop_name)?;
     let as_u64: u64 = rsproperties::get(prop_name)?;
-    let as_f32: f32 = rsproperties::get(prop_name)?;
-    let as_f64: f64 = rsproperties::get(prop_name)?;
+    let as_f32: f32 = common::read_parsed(prop_name)?;
+    let as_f64: f64 = common::read_parsed(prop_name)?;
     let as_string: String = rsproperties::get(prop_name)?;
 
     assert_eq!(as_i8, 42);

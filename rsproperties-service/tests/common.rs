@@ -108,6 +108,19 @@ fn sweep_dead_fixtures(base: &Path, prefix: &str) {
     }
 }
 
+/// Reads `name` with `T`'s `FromStr`.
+///
+/// `rsproperties::get` converts with `FromProperty`, which `f32`/`f64` do
+/// not implement; `read_with` plus `FromStr` is how a caller reads those.
+#[allow(dead_code)]
+pub fn read_parsed<T>(name: &str) -> anyhow::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    Ok(rsproperties::system_properties()?.read_with(name, |value| value.parse::<T>())??)
+}
+
 async fn start_service() -> ServiceHandle {
     let _ = env_logger::builder().is_test(true).try_init();
 

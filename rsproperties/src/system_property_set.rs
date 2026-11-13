@@ -790,9 +790,9 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
                 // socket round-trip succeeded. A dedicated variant so callers
                 // can tell a permanent policy denial from a retryable
                 // `Error::Io`.
-                return Err(Error::ServiceError {
+                return Err(Error::SetRejected {
                     name: name.to_owned(),
-                    code: res,
+                    reason: crate::SetRejection::from_code(res),
                 });
             }
         }

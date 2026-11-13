@@ -100,10 +100,10 @@ async fn test_floating_point_special_values() -> anyhow::Result<()> {
         let prop_name = format!("test.float_special.{name}");
         rsproperties::set(&prop_name, special_value)?;
 
-        let result: Result<f64, _> = rsproperties::get(&prop_name);
+        let result: anyhow::Result<f64> = common::read_parsed(&prop_name);
 
-        // The service stores the value unchanged, `get` does not trim it,
-        // and `f64::from_str` accepts "inf", "-inf" and "NaN".
+        // The service stores the value unchanged, `read_with` hands it over
+        // untrimmed, and `f64::from_str` accepts "inf", "-inf" and "NaN".
         match *name {
             "infinity" => {
                 let val: f64 = result?;
@@ -155,8 +155,9 @@ async fn test_string_parsing_edge_cases() -> anyhow::Result<()> {
 
         // Try parsing as integer
         let int_result: Result<i32, _> = rsproperties::get(&prop_name);
-        // The property was just set, so `get` finds it; a `FromStr`
-        // failure is reported as `Error::Parse`, never as another variant.
+        // The property was just set, so `get` finds it; a value that is
+        // not an `i32` is reported as `Error::Parse`, never as another
+        // variant.
         let is_error = matches!(int_result, Err(rsproperties::Error::Parse(_)));
         assert!(
             is_error || int_result.is_ok(),
@@ -414,7 +415,7 @@ async fn test_memory_usage_patterns() -> anyhow::Result<()> {
 
         // Overwrite with different types
         rsproperties::set(&prop_name, i as f64 * 1.5)?;
-        let _as_float: f64 = rsproperties::get(&prop_name)?;
+        let _as_float: f64 = common::read_parsed(&prop_name)?;
 
         rsproperties::set(&prop_name, format!("string_{i}"))?;
         let _as_string: String = rsproperties::get(&prop_name)?;
@@ -531,21 +532,21 @@ async fn test_type_conversion_boundaries() -> anyhow::Result<()> {
 }
 
 /// The service replies with init's codes, which the client reports as
-/// `ServiceError { code }`; `ctl.*` is refused (no control handler in the
+/// `SetRejected { reason }`; `ctl.*` is refused (no control handler in the
 /// test service) and never stored.
 #[tokio::test]
 async fn test_service_rejections_carry_init_codes() -> anyhow::Result<()> {
-    use rsproperties::wire::{PROP_ERROR_HANDLE_CONTROL_MESSAGE, PROP_ERROR_READ_ONLY_PROPERTY};
+    use rsproperties::SetRejection;
     setup_test_env().await;
 
-    let code_of = |result: rsproperties::Result<()>| match result {
-        Err(rsproperties::Error::ServiceError { code, .. }) => Some(code),
+    let reason_of = |result: rsproperties::Result<()>| match result {
+        Err(rsproperties::Error::SetRejected { reason, .. }) => Some(reason),
         _ => None,
     };
 
     assert_eq!(
-        code_of(rsproperties::set("ctl.start", "some_service")),
-        Some(PROP_ERROR_HANDLE_CONTROL_MESSAGE)
+        reason_of(rsproperties::set("ctl.start", "some_service")),
+        Some(SetRejection::ControlMessage)
     );
     assert!(matches!(
         rsproperties::get::<String>("ctl.start"),
@@ -554,8 +555,8 @@ async fn test_service_rejections_carry_init_codes() -> anyhow::Result<()> {
 
     rsproperties::set("ro.test.codes.once", "1")?;
     assert_eq!(
-        code_of(rsproperties::set("ro.test.codes.once", "2")),
-        Some(PROP_ERROR_READ_ONLY_PROPERTY)
+        reason_of(rsproperties::set("ro.test.codes.once", "2")),
+        Some(SetRejection::ReadOnlyProperty)
     );
 
     // Set by the service at startup, like init.
