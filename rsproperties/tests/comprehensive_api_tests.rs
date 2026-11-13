@@ -195,13 +195,19 @@ fn test_thread_safety() {
 
                 // Each thread performs multiple property operations
                 for i in 0..iterations {
+                    // No `thread.*` property is stored.
                     let prop_name = format!("thread.{thread_id}.property.{i}");
 
-                    // Test get_or (should not crash)
-                    let _result = rsproperties::get_or(&prop_name, "default".to_string());
+                    // Test get_or (should return the default)
+                    let result = rsproperties::get_or(&prop_name, "default".to_string());
+                    assert_eq!(result, "default", "{prop_name}");
 
                     // Test get (should return error for non-existent property)
-                    let _result: Result<String, _> = rsproperties::get(&prop_name);
+                    let result: Result<String, _> = rsproperties::get(&prop_name);
+                    assert!(
+                        matches!(result, Err(Error::NotFound(_))),
+                        "{prop_name}: {result:?}"
+                    );
                 }
             })
         })

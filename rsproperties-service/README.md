@@ -35,7 +35,7 @@ Both are internal: the public API is `run`, `ServiceOptions` and the
 - Provides Unix domain socket interface
 - Handles client connections and commands
 - Implements Android-compatible property service protocol
-- Supports SETPROP2 (V2) and legacy SETPROP (V1) commands for property setting
+- Handles the SETPROP2 (V2) command for property setting; the legacy SETPROP (V1) command is refused
 - Manages concurrent client sessions
 
 ## Installation
@@ -165,9 +165,27 @@ that called `run` until the handle stops it:
 
 | Call | Effect |
 |---|---|
-| `service.join().await` | Waits until the service has ended by itself (a failure after startup). Takes `&mut self` and is cancel-safe, so it can be an arm of `tokio::select!`. By the time it returns, both socket files are unlinked and the writer lock is released. |
-| `service.shutdown().await` | Stops the socket service, then the properties service, and waits for both. Sets already queued are applied first. Returns the failure the service had ended with, if any. |
-| dropping the handle | Stops the service without waiting: the sockets are unlinked and the lock is released later, by tasks on the runtime. Call `shutdown` when the next step depends on them (starting the service again on the same directories, for example). |
+| `service.join().await` | Waits until the service has ended by itself (a failure after startup). Takes `&mut self` and is cancel-safe, so it can be an arm of `tokio::select!`. By the time it returns, both socket files are unlinked, the writer lock is released and no control handler call is running (as for `shutdown`). |
+| `service.shutdown().await` | Stops the socket service, then the properties service, and waits for both. Sets already queued are applied first. A `ctl.*` request read from an open connection afterwards (also one the client sent earlier) is refused (`HANDLE_CONTROL_MESSAGE` to a V2 client). Then waits for the control handler calls whose requests were read before that, running or still queued for a blocking thread: when `shutdown` returns, no handler call is running and none begins afterwards. There is no timeout, so a handler call that does not return keeps `shutdown` pending (the sockets are unlinked and the lock is released by then), and a handler must not wait for `shutdown` or `join`. Returns the failure the service had ended with, if any. |
+| dropping the handle | Stops the service without waiting: the sockets are unlinked and the lock is released later, by tasks on the runtime, and control handler calls that have begun or are queued keep running. Call `shutdown` when the next step depends on them (starting the service again on the same directories, for example). |
+
+A `run` that fails to start waits the same way before it returns its
+error: the socket service accepts requests while the properties service
+is still starting, so a control handler call can begin before `run`
+returns, and a failed `run` returns only after those calls have
+returned, without a timeout. A handler must not wait for `run` to
+return either.
+
+The handler closure and what it captured can be dropped after `join` or
+`shutdown` has returned. The task of a connection accepted earlier holds
+a clone of the handler until that task ends, which two 10 s timeouts
+bound from the time the connection was accepted (the wait for a
+connection slot, then the exchange with the client). The bound holds
+while the runtime keeps polling that task. On a `current_thread` runtime
+whose thread is blocked, or has left `block_on`, the task is not polled
+and keeps its clone until the runtime polls it again or is dropped, so
+code that waits for a captured value to be dropped must not do so by
+blocking that thread.
 
 `join` and `shutdown` return `Result<(), ServiceError>`. `ServiceError`
 displays as `<part> failed: <cause>` (`socket service` or
@@ -206,11 +224,18 @@ runtime.
 The socket service implements the Android property service protocol:
 
 - **Socket Names**: Uses standard Android socket names (`property_service`, `property_service_for_system`)
-- **Commands**: Supports `PROP_MSG_SETPROP2` (0x00020001) and the legacy V1 `PROP_MSG_SETPROP` (1), which gets no reply (AOSP V1 behavior)
-- **V1 sets**: a V1 set of a `persist.` / `next_boot.` name changes the
-  property area and is not written to the persistent properties file, as
-  in init, so the value is gone after a restart. Every V1 request is
-  logged at `warn`; clients should send V2
+- **Commands**: `PROP_MSG_SETPROP2` (0x00020001) only
+- **V1 is not supported**: the legacy V1 `PROP_MSG_SETPROP` (1) is
+  answered like an unknown command, with `PROP_ERROR_INVALID_CMD`; its
+  name and value are not read, nothing is set, and the request is logged
+  at `warn` with the peer pid. AOSP init still applies a V1 set. A V1
+  client does not read a reply (bionic and this workspace's client wait
+  for the socket to close and then report success), so the client sees
+  `Ok` for a set that was not applied. Clients choose V2 when
+  `ro.property_service.version` is 2 or more, which the service sets at
+  startup; this workspace's client sends V1 only when
+  `PROPERTY_SERVICE_VERSION` selects it and the process has not opened
+  the property area yet
 - **Response Codes**: `PROP_SUCCESS` (0) or init's error codes
   (`rsproperties::wire::PROP_ERROR_*`): `READ_CMD` when the command word
   cannot be read, `READ_DATA` for an unreadable
@@ -235,7 +260,11 @@ The socket service implements the Android property service protocol:
   `HANDLE_CONTROL_MESSAGE` without using a blocking thread
 - **Startup properties**: `ro.property_service.version=2`, the persistent
   properties, then `ro.persistent_properties.ready=true`, after the
-  build.prop entries
+  build.prop entries. A build.prop file that sets
+  `ro.property_service.version` to anything but a number of 2 or more
+  makes `run` fail (`StartupStage::PropertiesService`, `InvalidInput`)
+  before the properties dir is written: `ro.` names are write-once, so
+  that value would stay and tell clients to send V1
 - **Message Format**: Compatible with Android's binary protocol
 
 ## Error Handling
@@ -387,8 +416,8 @@ and enforced after the bytes arrive:
 
 - **Names**: `validate_property_name` — ASCII alphanumeric plus
   `_ . - @ :`, no leading or trailing `.`, no `..`; at most 31 bytes
-  (`PROP_NAME_MAX - 1`, the 32-byte buffer includes the NUL) on the V1
-  wire path.
+  (`PROP_NAME_MAX - 1`, the 32-byte buffer includes the NUL) on the
+  client's V1 wire path, which this service does not handle.
 - **Values**: `validate_value_len` — `PROP_VALUE_MAX = 92` is the
   buffer size including the trailing NUL, so user content is capped
   at 91 bytes for non-`ro.*` properties. `ro.*` properties may exceed

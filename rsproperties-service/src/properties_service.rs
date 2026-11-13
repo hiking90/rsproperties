@@ -14,7 +14,6 @@ use rsproperties::{
 
 use crate::persistent_properties::{is_persistent_name, PersistentStore};
 use crate::property_type::check_type;
-use crate::SetProtocol;
 
 /// What [`spawn`] starts the properties service with.
 pub(crate) struct PropertiesServiceArgs {
@@ -102,6 +101,27 @@ fn init_system_properties_sync(
         }
     }
     let properties: BTreeMap<String, String> = properties_unordered.into_iter().collect();
+
+    // `ro.` is write-once, so a build.prop value of this property stays
+    // (`apply_startup_properties` sets `2` after these entries, as init
+    // does). bionic and the rsproperties client send the V1 command when
+    // the value is not a number of 2 or more; the socket service refuses
+    // V1, and such a client reports success for a set that was not made.
+    // The test is the rsproperties client's (`protocol_version`); every
+    // value it accepts also selects V2 in bionic (`atoll(value) >= 2`).
+    const VERSION: &str = "ro.property_service.version";
+    if let Some(value) = properties.get(VERSION) {
+        if !value.trim().parse::<u32>().is_ok_and(|v| v >= 2) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "a build.prop file sets {VERSION} to {value:?}: clients that read it would \
+                     send PROP_MSG_SETPROP (V1), which this service does not support. Remove \
+                     the entry (the service sets 2) or set it to 2"
+                ),
+            ));
+        }
+    }
 
     // First write to `dir` since the lock was taken (which created
     // `.writer_lock`): everything above only read files.
@@ -327,15 +347,13 @@ impl rsactor::Message<crate::PropertyMessage> for PropertiesService {
         _actor_ref: &ActorRef<Self>,
     ) -> Self::Reply {
         log::debug!("Handling property message: {message:?}");
-        self.client_set(&message.name, message.value, message.protocol)
-            .await
+        self.client_set(&message.name, message.value).await
     }
 }
 
 impl PropertiesService {
-    /// One set from a client: [`apply_set`], then, for a V2 set, the
-    /// persistent file.
-    async fn client_set(&mut self, name: &str, value: String, protocol: SetProtocol) -> i32 {
+    /// One set from a client: [`apply_set`], then the persistent file.
+    async fn client_set(&mut self, name: &str, value: String) -> i32 {
         let code = apply_set(&mut self.system_properties, name, &value);
         if code != PROP_SUCCESS || !is_persistent_name(name.as_bytes()) {
             return code;
@@ -343,22 +361,7 @@ impl PropertiesService {
         let Some(store) = self.persistent.as_mut() else {
             return code;
         };
-        // init `PropertySet` writes the file only when the set came with a
-        // socket to answer on (`socket && persistent_properties_loaded &&
-        // need_persist`), and the V1 command calls it without one
-        // (`HandlePropertySetNoSocket`). The store's records are left as
-        // they are too: init's next write starts from the file, which does
-        // not hold this value (docs/aosp-parity.md S1).
-        if protocol == SetProtocol::V1 {
-            log::warn!(
-                "{name:?} was set with the V1 command (PROP_MSG_SETPROP): the value is in the \
-                 property area only and is not written to {:?}, as in init; it is lost when the \
-                 service restarts. Set it with PROP_MSG_SETPROP2 to store it",
-                store.path()
-            );
-            return code;
-        }
-        // A V2 set of a `persist.` / `next_boot.` name is written to the
+        // A set of a `persist.` / `next_boot.` name is written to the
         // file before the reply. The write runs on the blocking pool;
         // awaiting it keeps this actor's sets, and so the file writes, in
         // order.
@@ -601,6 +604,46 @@ mod tests {
         assert!(sp.get("ro.from.writable").is_err());
     }
 
+    /// A build.prop value of `ro.property_service.version` that makes
+    /// clients send V1 fails init before anything is written to the
+    /// properties dir; a value that selects V2 is kept.
+    #[test]
+    fn build_prop_version_that_selects_v1_is_refused() {
+        let tmp = TempDir::new("rsprops_svc_build_prop_version");
+        let inputs = tmp.0.join("inputs");
+        std::fs::create_dir_all(&inputs).unwrap();
+        let build_prop = |file: &str, value: &str| {
+            let path = inputs.join(file);
+            std::fs::write(&path, format!("ro.property_service.version={value}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            path
+        };
+
+        // "2x": bionic's `atoll` reads 2, the rsproperties client reads
+        // "not a number" and sends V1.
+        for (i, value) in ["1", "0", "v2", "2x", "-2"].into_iter().enumerate() {
+            let props = tmp.0.join(format!("refused_{i}"));
+            let file = build_prop(&format!("refused_{i}.prop"), value);
+            let err = init_locked(vec![], vec![file], &props)
+                .expect_err("a version that selects V1 must fail init");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{value}: {err}"
+            );
+            assert!(
+                err.to_string().contains("ro.property_service.version"),
+                "{err}"
+            );
+            assert!(!props.join("property_info").exists(), "{value}");
+        }
+
+        let props = tmp.0.join("kept");
+        let mut sp = init_locked(vec![], vec![build_prop("kept.prop", "3")], &props).unwrap();
+        assert!(apply_startup_properties(&mut sp, None).is_none());
+        assert_eq!(sp.get("ro.property_service.version").unwrap(), "3");
+    }
+
     /// A writer lock for another directory is refused before anything is
     /// written to either directory.
     #[test]
@@ -757,9 +800,9 @@ mod tests {
     }
 
     impl PropertiesService {
-        /// A set that arrived as `PROP_MSG_SETPROP2`.
-        async fn set_v2(&mut self, name: &str, value: &str) -> i32 {
-            self.client_set(name, value.into(), SetProtocol::V2).await
+        /// A client set.
+        async fn set(&mut self, name: &str, value: &str) -> i32 {
+            self.client_set(name, value.into()).await
         }
     }
 
@@ -779,18 +822,15 @@ mod tests {
         let on_disk = || decode(&std::fs::read(&path).unwrap_or_default()).unwrap();
         let rec = |n: &str, v: &str| (n.as_bytes().to_vec(), v.as_bytes().to_vec());
 
-        assert_eq!(service.set_v2("persist.x", "1").await, PROP_SUCCESS);
+        assert_eq!(service.set("persist.x", "1").await, PROP_SUCCESS);
         assert_eq!(on_disk(), vec![rec("persist.x", "1")]);
-        assert_eq!(service.set_v2("debug.y", "1").await, PROP_SUCCESS);
+        assert_eq!(service.set("debug.y", "1").await, PROP_SUCCESS);
         assert_eq!(
-            service.set_v2("persist.int", "bad").await,
+            service.set("persist.int", "bad").await,
             PROP_ERROR_INVALID_VALUE
         );
-        assert_eq!(service.set_v2("persist.x", "2").await, PROP_SUCCESS);
-        assert_eq!(
-            service.set_v2("next_boot.persist.z", "9").await,
-            PROP_SUCCESS
-        );
+        assert_eq!(service.set("persist.x", "2").await, PROP_SUCCESS);
+        assert_eq!(service.set("next_boot.persist.z", "9").await, PROP_SUCCESS);
         assert_eq!(
             on_disk(),
             vec![rec("persist.x", "2"), rec("next_boot.persist.z", "9")]
@@ -807,72 +847,6 @@ mod tests {
             on_disk(),
             vec![rec("persist.x", "2"), rec("persist.z", "9")]
         );
-    }
-
-    /// init `PropertySet` writes the file for a V2 set only (`socket &&`):
-    /// a V1 set of a `persist.` / `next_boot.` name changes the area and
-    /// neither the file nor the records a later V2 write starts from.
-    #[tokio::test]
-    async fn v1_set_is_not_written_to_persistent_file() {
-        use crate::persistent_properties::decode;
-        let tmp = TempDir::new("rsprops_svc_client_persist_v1");
-        let mut sp = typed_properties(&tmp);
-        let path = tmp.0.join("persistent_properties");
-        let persistent = startup_at(&mut sp, Some(&path)).unwrap();
-        let mut service = PropertiesService {
-            system_properties: sp,
-            persistent,
-        };
-        let on_disk = || decode(&std::fs::read(&path).unwrap_or_default()).unwrap();
-        let rec = |n: &str, v: &str| (n.as_bytes().to_vec(), v.as_bytes().to_vec());
-
-        assert_eq!(service.set_v2("persist.x", "1").await, PROP_SUCCESS);
-        for (name, value) in [
-            ("persist.x", "2"),
-            ("persist.v1only", "a"),
-            ("next_boot.persist.s", "5"),
-        ] {
-            assert_eq!(
-                service
-                    .client_set(name, value.into(), SetProtocol::V1)
-                    .await,
-                PROP_SUCCESS,
-                "{name}"
-            );
-            assert_eq!(service.system_properties.get(name).unwrap(), value);
-        }
-        assert_eq!(on_disk(), vec![rec("persist.x", "1")]);
-        // A type mismatch is rejected for V1 as for V2.
-        assert_eq!(
-            service
-                .client_set("persist.int", "bad".into(), SetProtocol::V1)
-                .await,
-            PROP_ERROR_INVALID_VALUE
-        );
-
-        // A V2 write of another name does not carry the V1 values along.
-        assert_eq!(service.set_v2("persist.y", "1").await, PROP_SUCCESS);
-        assert_eq!(
-            on_disk(),
-            vec![rec("persist.x", "1"), rec("persist.y", "1")]
-        );
-        // A V2 set of the value the area already has (from V1) is written:
-        // the file's record, not the area, decides whether it changed.
-        assert_eq!(service.set_v2("persist.x", "2").await, PROP_SUCCESS);
-        assert_eq!(
-            on_disk(),
-            vec![rec("persist.x", "2"), rec("persist.y", "1")]
-        );
-
-        // The V1-only values are gone after a restart.
-        drop(service);
-        let tmp2 = TempDir::new("rsprops_svc_client_persist_v1_restart");
-        let mut sp = typed_properties(&tmp2);
-        startup_at(&mut sp, Some(&path)).unwrap();
-        assert_eq!(sp.get("persist.x").unwrap(), "2");
-        assert!(sp.find("persist.v1only").unwrap().is_none());
-        assert!(sp.find("persist.s").unwrap().is_none());
-        assert!(sp.find("next_boot.persist.s").unwrap().is_none());
     }
 
     /// After `load` hit a transient read error, the first persistent set
@@ -897,8 +871,8 @@ mod tests {
             persistent: Some(store),
         };
 
-        assert_eq!(service.set_v2("persist.b", "new").await, PROP_SUCCESS);
-        assert_eq!(service.set_v2("persist.c", "3").await, PROP_SUCCESS);
+        assert_eq!(service.set("persist.b", "new").await, PROP_SUCCESS);
+        assert_eq!(service.set("persist.c", "3").await, PROP_SUCCESS);
         assert_eq!(
             decode(&std::fs::read(&path).unwrap()).unwrap(),
             vec![

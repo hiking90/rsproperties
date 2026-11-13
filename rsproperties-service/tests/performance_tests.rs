@@ -11,7 +11,6 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[path = "common.rs"]
 mod common;
 use common::init_test;
 
@@ -42,8 +41,9 @@ async fn test_property_get_performance() -> Result<()> {
     let start = Instant::now();
 
     for i in 0..iterations {
-        let prop_name = &test_props[i % test_props.len()].0;
-        let _value: String = rsproperties::get(prop_name).unwrap_or_default();
+        let (prop_name, expected) = test_props[i % test_props.len()];
+        let value: String = rsproperties::get(prop_name)?;
+        assert_eq!(value, expected, "{prop_name}");
     }
 
     let elapsed = start.elapsed();
@@ -345,7 +345,8 @@ async fn test_property_name_patterns() -> Result<()> {
         // Measure get performance for this pattern
         let start = Instant::now();
         for _ in 0..iterations {
-            let _value: String = rsproperties::get(prop_name).unwrap_or_default();
+            let value: String = rsproperties::get(prop_name)?;
+            assert_eq!(value, *prop_value, "{prop_name}");
         }
         let elapsed = start.elapsed();
 

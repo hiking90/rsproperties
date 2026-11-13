@@ -35,12 +35,13 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
 | C7 | client | 한 property의 값 cache와 변경 대기(`CachedProperty`) | (d) | 이 branch에서 추가 |
 | S1 | service | `persist.*` / `next_boot.*` 영속화 | (d) | 이 branch에서 추가 |
 | S2 | service | property type 검사(`CheckType`) | (c) | 이 branch에서 수정 |
-| S3 | service | `ctl.*`를 일반 property로 저장 | (c) | 이 branch에서 수정 |
+| S3 | service | `ctl.*`를 일반 property로 저장 | (c) | 저장은 이 branch에서 수정. 종료 뒤 `ctl.stop` 응답은 (c)로 남아 있고 owner 결정 대기 |
 | S4 | service | 실패 응답 코드가 항상 `PROP_ERROR` | (c) | 이 branch에서 수정 |
 | S5 | service | `ro.property_service.version` 미설정 | (c) | 이 branch에서 수정 |
 | S6 | service | 변경 알림 hook 없음 | (a) | 검토 대상 아님 |
 | S7 | service | properties dir writer lock(`AreaWriterLock`) | (a), 해제 방식은 (b) | lock은 0.6.0부터 있음, 해제 방식은 이 branch에서 수정 |
 | S8 | service, builder | prop 파일을 읽지 못했을 때의 반환값 | open 실패로 시작 실패는 (b) | 시작 실패는 0.6.0부터 있음, skip 반환값은 이 branch에서 추가 |
+| S9 | service | V1(`PROP_MSG_SETPROP`) 미지원 | (b), owner 지시 | 이 branch에서 변경(0.5.0–0.6.0은 V1을 처리했다) |
 
 ## Client
 
@@ -103,10 +104,19 @@ exit 1로 끝난다.
   - 검증: `client_parity_tests::list_matches_foreach_and_allows_reentry`(Linux,
     writer와 reader instance 양쪽). UTF-8이 아닌 값을 쓰는 writer가 없어
     U+FFFD 치환 경로는 test하지 못했다.
-- `getprop` 예제는 인자가 없으면 toybox `getprop`처럼 이름순으로
+- `getprop` 예제는 인자가 없으면 AOSP `getprop`(toolbox,
+  `system/core/toolbox/getprop.cpp:54`의 `std::sort`)처럼 이름순으로
   `[name]: [value]`를 출력한다. 열거는 `list`를 쓴다.
+  - 다른 점(b): 열거가 실패하면 이 예제는 exit 1로 끝난다.
+    `system_properties()`가 `Err`이면 stderr에 오류만 출력하고, `list`가
+    `Err`이면 그때까지 모은 property를 출력한 뒤 stderr에 오류를 출력한다.
+    AOSP `PrintAllProperties`는 `__system_property_foreach`의 반환값을 쓰지
+    않고(`getprop.cpp:41`) 모은 항목만 출력하며, `getprop_main`은 그 뒤에
+    0을 반환한다(`:149-152`). 그래서 AOSP `getprop`은 area를 하나도 읽지
+    못해도 출력 없이 exit 0으로 끝난다. 이 crate는 손상과 부재를 구분한다는
+    정책(위 `foreach` 항목)에 따라 실패를 exit code로 알린다.
 - 검증: API 36 emulator의 adb shell(SELinux `shell` domain)에서 이 예제의
-  출력과 toybox `getprop` 출력이 531줄 모두 일치했다. Linux에서는
+  출력과 toolbox `getprop` 출력이 531줄 모두 일치했다. Linux에서는
   `example_service` + `setprop`으로 넣은 4개 property(`ro.` long value
   포함)가 모두 출력되었다.
 
@@ -191,16 +201,16 @@ mount를 하지 않고 reload 함수만 호출한다(`:1842-1847`). init과 writ
     `BIONIC_APPCOMPAT_OVERRIDE` 문자열은 없다.
   - root로 `debug.rsp.ac=orig`, `ro.appcompat_override.debug.rsp.ac=ovr`를
     설정하고 `BIONIC_APPCOMPAT_OVERRIDE=1 getprop debug.rsp.ac`를 실행하면
-    toybox(bionic)는 `orig`를 출력한다.
+    toolbox `getprop`(bionic)은 `orig`를 출력한다.
   - `/dev/__properties__/appcompat_override`가 있고 파일은 355개다
     (`/dev/__properties__`는 이 directory를 포함해 356개).
   - 새 mount namespace에서 이 directory를 `/dev/__properties__` 위에 bind
-    mount하면 toybox와 이 crate의 `getprop` example이 모두 override 값을
+    mount하면 toolbox `getprop`과 이 crate의 `getprop` example이 모두 override 값을
     읽는다(`debug.rsp.ac` → `ovr`, 원래 값보다 긴 `ro.*` override와 짧은
     `ro.*` override 포함). `ro.appcompat_override.debug.rsp.ac`라는 이름은 이
     namespace에서 둘 다 찾지 못한다.
   - mutable property의 override가 원래 값보다 길면 결과가 다르다.
-    `debug.rsp.grow=ab`, override `abcdefgh`에서 toybox는 `abc`, 이 crate는
+    `debug.rsp.grow=ab`, override `abcdefgh`에서 toolbox `getprop`은 `abc`, 이 crate는
     `abcdefgh`를 출력한다. bionic `ReadMutablePropertyValue`는 serial의 길이로
     `len + 1` byte만 복사하는데(`:184-198`), 위 `Add`가 serial을 바꾸지 않아서
     길이가 원래 값 기준이다. 복사한 buffer에는 NUL이 없으므로 bionic 출력은
@@ -214,7 +224,7 @@ mount를 하지 않고 reload 함수만 호출한다(`:1842-1847`). init과 writ
     mount가 없다. crash 원인은 확인 필요다.
 - API 37 emulator(`CE2A.260420.019`, userdebug, `ro.build.version.sdk=37`):
   - libc.so에 `BIONIC_APPCOMPAT_OVERRIDE` 문자열이 있다.
-  - 같은 두 property를 설정하면 toybox와 이 crate 모두 환경변수가 없을 때
+  - 같은 두 property를 설정하면 toolbox `getprop`과 이 crate 모두 환경변수가 없을 때
     `orig`, 있을 때(빈 값 포함) `ovr`를 출력한다. override entry가 없는
     이름(`ro.build.version.release`)은 둘 다 원래 값을 출력한다.
   - `/dev/__properties__/appcompat_override`가 있다(파일 384개).
@@ -245,9 +255,9 @@ override가 켜진 프로세스에서는 같은 property에 대해 libc
 - Linux에서는 API level 조건 없이 환경변수만 본다. 기준은 현재 bionic이며,
   Linux에서는 사용자가 직접 설정하지 않는 한 이 변수가 없다.
 - 검증: API 36 emulator에서 수정 전 binary는 환경변수가 있으면 `ovr`를
-  읽어 toybox(`orig`)와 달랐다. 이 결과에 따라 API 37 조건을 추가했다.
+  읽어 toolbox `getprop`(`orig`)과 달랐다. 이 결과에 따라 API 37 조건을 추가했다.
   API 37 emulator(`rsbinder-a17`, android-37.0 google_apis)에서는 수정 후
-  binary가 toybox와 같은 값을 읽는다(위 실측). 이 AVD는 `-memory 4096`으로
+  binary가 toolbox `getprop`과 같은 값을 읽는다(위 실측). 이 AVD는 `-memory 4096`으로
   띄워야 한다. AVD 설정값인 1536M에서는 guest가 kernel panic으로 재부팅을
   반복해서 adb가 `offline`과 `device`를 오간다.
 - API 37 test suite: 같은 image에서 `envsetup.sh`의 `ndk_prepare`,
@@ -373,8 +383,10 @@ version을 env var나 기본값으로만 골랐다.
   다시 연다(a: 이 crate의 service는 client보다 늦게 시작할 수 있다). area
   파일이 없을 때 다음 접근에서 다시 여는 기존 정책(`ContextNode::property_area`)과
   같다.
-- 실패 상태에서는 호출마다 `property_info` open이 한 번 이상 일어난다. 첫
-  실패만 `error`로, 이후는 `debug`로 log를 남긴다.
+- 실패 상태에서는 호출마다 `property_info` open이 한 번 이상 일어난다.
+  `system_properties`는 자신의 log 줄을 첫 실패에만 `error`로, 이후는
+  `debug`로 남긴다. 그 함수가 호출하는 `SystemProperties::open`은 실패할
+  때마다 `Failed to load contexts from …`를 `error`로 남긴다.
 - bionic처럼 명시적 호출에서만 다시 시도하는 방식은 택하지 않았다. 그러려면
   API(`reload` 등)가 늘고, caller가 그 호출 시점을 알아야 한다.
 - `init`도 이미 설정된 것과 같은 경로를 다시 받으면 성공한다. bionic `Init`이
@@ -614,40 +626,38 @@ init과 다른 점은 다음과 같다.
   정해져 있지 않다. 여기서는 파일에 나온 순서를 따른다.
 - (b) 대상 이름이 `persist.`/`next_boot.`로 시작하지 않는 staged record
   (`next_boot.foo` → `foo`)는 load할 때 area에 한 번 적용하고 파일에는 쓰지
-  않는다. init은 `foo`를 파일에 쓰고, 다음 부팅의 load가 prefix 검사에
-  실패해 파일 전체를 지운다. device에서는 `property_contexts`가
+  않는다. init은 `foo`를 파일에 쓰고, 다음 load(다음 부팅, 또는 같은 부팅의
+  다음 persistent write)가 prefix 검사에 실패해 파일 전체를 지운다.
+  device에서는 `property_contexts`가
   `next_boot.*`를 set할 수 있는 주체를 제한하지만, 이 service는
   per-property 인가를 하지 않는다. init처럼 파일에 썼다면 socket에 접근할 수
   있는 client는 누구나 set 한 번과 재시작 두 번으로 모든 `persist.*` 값을
   지울 수 있었다. 여기서는 그 record를 파일에 쓰지 않으므로 그 경로가 없다.
   area에 남는 값은 init과 같다. 이런 record를 area에도 적용하지 않는 방법도 있으나,
   그러면 첫 재시작 후 area 결과가 init과 달라진다.
+  - 파일 재기록(`PersistentStore::load`)은 area 생성
+    (`init_system_properties_sync`)과 set(`apply_startup_properties`)보다
+    먼저 실행된다. init도 파일을 먼저 쓴다
+    (`persistent_properties.cpp:315-321`). 재기록 뒤에 `run`이 실패하거나
+    그 set이 client set과 같은 검사에서 거부되면, 이 record의 값은 파일에도
+    area에도 남지 않는다. 대상 이름이 `persist.`로 시작하는 staged record는
+    재기록된 파일에 `persist.<name>`으로 남으므로 다음 시작에서 적용된다.
+    init에서는 `foo`가 파일에 남지만 다음 load(다음 부팅, 또는 같은 부팅의
+    다음 persistent write)가 파일 전체를 지우므로 그 값이 다시 적용되지
+    않는다. 이 조건은 `run` rustdoc의
+    "Properties set at startup"에 적었다.
 - 손상된 파일은 owner 결정에 따라 init처럼 삭제한다.
-- V1(`PROP_MSG_SETPROP`) set은 init과 같이 area에만 반영하고 파일에는 기록하지
-  않는다. init의 기록 조건은
+- V1(`PROP_MSG_SETPROP`) set은 이 service가 처리하지 않는다(S9). 따라서 V1
+  set이 area나 persistent properties file에 반영되는 경로가 없다. init은 V1
+  set을 area에만 반영하고 파일에는 기록하지 않는다. init의 기록 조건은
   `socket && persistent_properties_loaded && need_persist`(`:417`)이고, V1은
-  `HandlePropertySetNoSocket`(socket 없음)을 거치므로 기록되지 않는다. API 36
+  `HandlePropertySetNoSocket`(socket 없음)을 거치기 때문이다. API 36
   emulator에서 V1 frame으로 `persist.*`를 set하면 area 값은 바뀌고 파일에는
-  record가 생기지 않는다. 이 service에서는 socket service가 frame의 command를
-  `SetProtocol`로 넘기고, `client_set`은 `SetProtocol::V1`이면 `apply_set` 뒤에
-  바로 반환한다. `PersistentStore`의 record도 고치지 않는다. init의 다음 쓰기는
-  파일을 다시 읽은 내용에서 시작하므로 V1 값이 들어가지 않는데, 메모리 방식에서
-  같은 결과를 내려면 record에 V1 값이 없어야 한다. V1로 set한 값을 그 뒤에 V2로
-  다시 set하면 파일에 기록된다. `update`가 area가 아니라 record의 값과 비교해서
-  변경 여부를 정하기 때문이다(init도 이 경우 파일에 쓴다).
+  record가 생기지 않는다.
   - init의 조건에 `socket &&`가 들어간 것은 `0af9ab330`(2022-10-07, "init:
     Allow persistent properties to be written asynchronously")부터다. V1
     호출부는 그 전에도 socket 없이 호출했으므로, 그 이전 init은 V1
     `persist.*`도 파일에 기록했다. commit message에는 V1에 대한 언급이 없다.
-    이 service는 현재 init의 동작을 따른다.
-- (b) V1 요청을 받을 때마다 `warn` level로 log를 남긴다. init은 수락한 V1 set을
-  log에 남기지 않는다. socket service가 요청마다 이름, value 길이, peer pid를
-  기록한다. persistent properties file이 설정된 상태에서 `persist.`/`next_boot.`
-  이름이 V1로 set되면, properties service가 그 값이 area에만 있고 파일에
-  기록되지 않았다는 log를 파일 경로와 함께 한 번 더 남긴다. 이 service가
-  `ro.property_service.version=2`를 set하므로(S5) bionic 규칙을 따르는 client는
-  V1을 보내지 않는다. V1을 보내는 client는 응답을 받지 않으므로, set이
-  거부되었는지와 값이 파일에 기록되지 않았는지를 알 방법이 service의 log뿐이다.
 - `run`이 반환되기 전에 도착한 V2 `persist.*` set은 load한 값을 덮어쓰고 파일에도
   기록된다. mailbox에서 기다린 set은 `on_start`가 persistent record까지 적용한
   뒤(`apply_startup_properties`) 처리되기 때문이다. init은 load 전의 set을
@@ -691,7 +701,7 @@ entry마다 `CheckPermissions`를 호출하고(`property_service.cpp:803`), 그 
 `property_contexts`가 `int`로 정한 이름에 build.prop가 `abc`를 주면, init은 그
 property를 만들지 않고 이 service는 `abc`를 저장한다.
 
-### S3. `ctl.*` 저장 — 저장 동작은 (c), dispatch 없음은 (a)
+### S3. `ctl.*` 저장 — 저장 동작은 (c), dispatch 없음은 (a), 종료 뒤 `ctl.stop` 응답은 (c) 미결정
 
 init은 `ctl.*`를 area에 저장하지 않는다. 권한을 검사한 뒤 control
 message로 처리한다(`:505-512`, `:548-549`).
@@ -728,6 +738,33 @@ init은 control message를 queue에 넣고 main thread의 `HandleControlMessage`
   message 수를 세고, 이 service는 실행 중인 handler 호출 수를 센다.
 - init이 하는 권한 검사(`CheckControlPropertyPerms`)는 하지 않는다. 다른
   property와 같은 access model이다.
+
+**service 종료 뒤의 `ctl.*`.** init에는 control message 수신을 끊는 경로가
+있다. `HandlePowerctlMessage`가 `StopSendingMessages()`를 호출하면
+(`init/reboot.cpp:1173-1175`) `accept_messages`가 `false`가 되고
+(`property_service.cpp:141-144`), 그 뒤 `SendControlMessage`는 message를
+queue에 넣지 않는다(`property_service.cpp:439-449`).
+- (a) 종료 뒤 수신 차단. `SocketService`의 `Drop`이 handler 호출 상한용
+  semaphore를 닫는다. 그 뒤에 읽은 `ctl.*` 요청은 handler를 호출하지 않고
+  `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 받는다.
+- (a) handler 호출 대기. `ServiceHandle::shutdown`과 `join`은 두 actor의 task가
+  끝난 뒤, semaphore가 닫히기 전에 permit을 받은 handler 호출(실행 중인 호출과
+  blocking thread를 기다리는 호출)이 모두 끝날 때까지 기다린다. 반환 시점에는
+  실행 중인 handler 호출이 없고 그 뒤에 시작하는 호출도 없다. timeout은 없다.
+  반환하지 않는 handler 호출이 있으면 `shutdown`과 `join`도 반환하지 않는다.
+  이때 socket 파일 unlink와 lock 해제는 이미 끝난 상태다. init도 control
+  function을 main thread에서 실행하고(`init/init.cpp:625-649`, main loop
+  `:1337`) timeout을 두지 않는다. 시작에 실패한 `run`도 같은 대기를 거친 뒤
+  `Err`을 반환한다. handle을 drop하는 경로는 기다리지 않는다.
+- (c) 종료 뒤 `ctl.stop`의 응답. init은 `accept_messages`가 `false`일 때
+  `ctl.stop`에 `PROP_SUCCESS`를 반환하고(`property_service.cpp:445`,
+  issuetracker 336223505), 나머지 `ctl.*`에 `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를
+  반환한다. 이 service는 action을 구분하지 않고 모든 `ctl.*`에
+  `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 반환한다. 응답은 바꾸지 않았다. init의
+  예외는 기기 shutdown 중에 service를 멈추려는 client를 위한 것이고, 이
+  service의 종료는 기기 shutdown이 아니라 service process의 종료일 수 있으므로
+  `ctl.stop`의 대상이 실제로 멈춘다고 볼 근거가 없다. init과 같은 응답으로
+  맞출지는 owner 결정이 필요하다(확인 필요).
 
 ### S4. 실패 응답 코드 — (c)
 
@@ -822,8 +859,9 @@ service는 설정하지 않는다. 이 crate의 client는 값이 없으면
 reader가 초기화되어 있으면 이 property를 env var보다 먼저 읽는다. v0.6.0
 client도 순서가 같다. 그래서 `PROPERTY_SERVICE_VERSION=1`로 V1을 고르던
 client는 global reader가 먼저 초기화된 process에서 V2 frame을 보내고 4-byte
-응답을 기다린다. V1을 유지하려면 build.prop에
-`ro.property_service.version=1`을 넣는다.
+응답을 기다린다. service가 V1을 처리하지 않으므로(S9) build.prop의
+`ro.property_service.version=1`로 V1을 유지하는 방법은 없다. 그 entry가 있으면
+`run`이 실패한다.
 S1의 persist load 뒤에는 `ro.persistent_properties.ready=true`를 설정한다.
 persist 파일을 지정하지 않아도 설정한다. init이 항상 설정하기 때문이다.
 
@@ -902,6 +940,64 @@ partition별 파일은 반환값을 읽지 않거나, `.ok()`로 legacy 경로�
 형태가 같아진다. 그렇게 하지 않은 이유는 service 호출부가 `?`로 전파하므로
 0664 파일 하나 때문에 service가 시작하지 못하게 되기 때문이다. 대신 enum에
 `#[must_use]`를 붙여 반환값을 읽지 않는 호출부가 compile 경고를 받게 했다.
+
+### S9. V1(`PROP_MSG_SETPROP`) 미지원 — (b), owner 지시
+
+**AOSP.** `handle_property_set_fd`는 `PROP_MSG_SETPROP`(`:621`)와
+`PROP_MSG_SETPROP2`(`:651`)를 모두 처리한다. V1 frame은 command word 뒤에
+name `PROP_NAME_MAX`(32) byte와 value `PROP_VALUE_MAX`(92) byte가 고정 길이로
+이어진다. init은 V1 set을 `HandlePropertySetNoSocket`으로 적용하고 응답 없이
+connection을 닫는다. 그 밖의 command word에는 `PROP_ERROR_INVALID_CMD`를
+보낸다(`:685-686`).
+
+**변경 전(0.5.0–0.6.0).** service가 V1 frame을 읽어 set을 적용하고 응답 없이
+connection을 닫았다.
+
+**변경.** owner 지시에 따라 V1 처리를 제거했다. socket service
+(`socket_service.rs` `handle_client`)는 command word가 `PROP_MSG_SETPROP`이면
+name과 value를 읽지 않고 `PROP_ERROR_INVALID_CMD`를 보낸 뒤 connection을
+닫는다. 아무것도 set하지 않고, peer pid를 넣은 `warn` log를 남긴다. 응답
+코드는 init이 알 수 없는 command word에 보내는 코드와 같다. `SetProtocol`
+enum과 `handle_setprop_v1`은 삭제했다.
+
+- V1 client가 받는 결과. V1 client는 응답을 읽지 않는다. bionic은 socket이
+  닫히기를 250 ms까지 기다린 뒤 0을 반환한다
+  (`bionic/libc/bionic/system_property_set.cpp:210`). 이 crate의 client
+  (`wait_for_socket_close`)도 수신한 byte를 버리고, `ECONNRESET`은 log에만
+  남기고 `Ok`를 반환한다. 따라서 V1 client는 적용되지 않은 set에 성공을
+  반환한다. 거부 사실이 남는 곳은 service의 `warn` log뿐이다. debug build의
+  `example_service`에 `PROPERTY_SERVICE_VERSION=1`로 실행한 `setprop`
+  example을 연결해 확인했다. `setprop`은 exit code 0으로 끝났고, service는
+  거부 log를 남겼고, 그 이름은 area에 없었다.
+- V1을 보내는 client. bionic은 `ro.property_service.version`을 `atoll`로 읽어
+  2 이상이면 V2를 보낸다(`:246`). service가 이 값을 2로 설정하므로(S5)
+  bionic 규칙을 따르는 client는 V1을 보내지 않는다. 이 crate의 client는 그
+  process가 global reader를 만들기 전에 `set`을 호출했고
+  `PROPERTY_SERVICE_VERSION`이 2 이상의 숫자가 아닐 때만 V1을 보낸다
+  (`system_property_set.rs` `protocol_version`).
+- (b) build.prop 값 검사. build.prop가 `ro.property_service.version`을 2 이상의
+  숫자가 아닌 값으로 정하면 `run`이 `InvalidInput`으로 실패한다
+  (`StartupStage::PropertiesService`, properties dir에 쓰기 전;
+  `properties_service.rs` `init_system_properties_sync`). `ro.` 이름은
+  write-once이므로 그 값이 area에 남고, 그 값을 읽은 client는 V1을 보내며,
+  service는 그 frame을 거부하는데 client는 성공을 반환하기 때문이다. init에는
+  이 검사가 없다. 판정식은 이 crate의 client와 같은
+  `trim().parse::<u32>()`이다. `"2x"`는 bionic의 `atoll`로는 2이지만 이
+  crate의 client는 V1로 판정하므로 이 검사에서 거부한다.
+
+**포기한 것.** V1만 구현한 client(Android O 이전 libc와 같은 규칙)는 이
+service에 set을 적용할 수 없다. V1 frame을 끝까지 읽은 뒤 닫는 방법도 있으나
+그렇게 하지 않았다. 읽지 않은 124 byte가 수신 queue에 남은 채 닫으면 client의
+다음 read가 `ECONNRESET`을 받을 수 있지만, V1 client는 그 error를 실패로
+취급하지 않고 응답 4 byte는 그 전에 queue에 들어가 있다. build.prop 값 검사
+대신 error log만 남기는 방법, build.prop보다 먼저 2를 set해 값을 고정하는
+방법도 있다. 전자는 client가 성공을 반환하는 상태로 service가 시작되고,
+후자는 build.prop에 적힌 값과 area의 값이 달라진다.
+
+**test.** `socket_service.rs` `protocol_errors_get_init_codes`(V1 frame →
+`PROP_ERROR_INVALID_CMD`), `lib.rs` `v1_set_is_refused_and_not_applied`,
+`properties_service.rs` `build_prop_version_that_selects_v1_is_refused`,
+`tests/v1_protocol_tests.rs` `test_v1_setprop_is_refused`.
 
 ## 누락으로 보지 않는 것
 

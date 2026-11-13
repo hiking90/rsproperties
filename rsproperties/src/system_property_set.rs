@@ -119,20 +119,41 @@ const SERVICE_IO_TIMEOUT: Duration = Duration::from_secs(2);
 /// Budget for the V2 status reply after the request was sent in full.
 ///
 /// Android: `None` — wait without a timeout, like bionic
-/// `__system_property_set` (`recv(MSG_WAITALL)` with no timeout). init's
-/// single property thread serves connections in order and may spend up to
-/// 2 s receiving each one, and a `persist.` set with async persist writes
-/// replies only after a 1 s sleep plus the file write, so a reply later
-/// than 2 s is normal there. A client timeout would report failure for a
+/// `__system_property_set` (`recv(MSG_WAITALL)` with no timeout). init
+/// serves the connections of a property socket in order on one thread
+/// (`android-14.0.0_r1` has one socket and one thread;
+/// `android-15.0.0_r1`, `android-16.0.0_r1` and `android-17.0.0_r1` have
+/// two sockets, each with its own thread) and may spend up to
+/// `kDefaultSocketTimeout` receiving each one (5 s in `android-16.0.0_r1`
+/// and `android-17.0.0_r1`, 2 s in `android-14.0.0_r1` and
+/// `android-15.0.0_r1`), and a `persist.` set replies only after the
+/// file is written and synced (with async persist writes
+/// `android-14.0.0_r1` also slept 1 s first; `android-17.0.0_r1` does
+/// not), so a reply later than 2 s is not a failure there. A client
+/// timeout would report failure for a
 /// set that init still applies. The cost: a hung init blocks the caller,
 /// as it blocks every bionic caller.
 ///
 /// Elsewhere: [`SERVICE_IO_TIMEOUT`], unchanged from 0.6.0. The peer is
-/// this crate's service, which receives each connection in its own
-/// handler task and writes no persist files, so its reply takes 2 s only
-/// when the service is stalled or out of handler slots; the bound keeps
-/// such a service from blocking the caller's thread. The outcome of a set
-/// that hits this timeout is unknown (see [`SERVICE_IO_TIMEOUT`]).
+/// this crate's service. Its reply is the set's result code, which the
+/// connection's handler task writes as soon as it has that code. Before
+/// that, the service accepts the connection, the connection gets a
+/// handler slot and the task reads the request; then, for a `ctl.*`
+/// set, the control handler call ends, and for any other set the
+/// properties service handles it. The properties service handles sets
+/// one at a time and only after its own startup has finished (see
+/// `rsproperties_service::run`); handling one set includes any read of
+/// the persistent properties file, and any write and sync of it, that
+/// the set leads to. A step can also end the exchange early, with an
+/// error code or by closing the connection. The wait therefore times
+/// out whenever 2 s pass before these steps have written the reply or
+/// closed the connection, whichever of them the time is spent in — for
+/// example a control handler or a file sync that takes that long,
+/// earlier sets that are still being handled, a service that is still
+/// starting, or one that has stalled. The bound exists so that a
+/// service that never replies cannot block the caller's thread. The
+/// outcome of a set that hits this timeout is unknown (see
+/// [`SERVICE_IO_TIMEOUT`]).
 #[cfg(target_os = "android")]
 const RESPONSE_TIMEOUT: Option<Duration> = None;
 #[cfg(not(target_os = "android"))]
@@ -560,8 +581,9 @@ impl PropertyMessage {
 /// 3. default: **V2**, a deliberate deviation from bionic's v1 default
 ///    for the *unset* case. V1 frames cannot carry names of
 ///    `PROP_NAME_MAX` (32) bytes or more — which modern property names
-///    routinely exceed — and this crate's own service dispatches both
-///    protocols by the leading command word. When talking to a
+///    routinely exceed — and `rsproperties-service` handles V2 only (it
+///    refuses a V1 frame, which this client cannot observe: the V1 arm
+///    reads no reply and returns `Ok`). When talking to a
 ///    pre-Android-O init that only understands V1, expose the property or
 ///    set the env var.
 ///

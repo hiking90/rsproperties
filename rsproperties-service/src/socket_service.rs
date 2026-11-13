@@ -23,14 +23,13 @@ use rsproperties::wire::{
     validate_property_name, MAX_WIRE_NAME_LEN, MAX_WIRE_VALUE_LEN,
     PROP_ERROR_HANDLE_CONTROL_MESSAGE, PROP_ERROR_INVALID_CMD, PROP_ERROR_INVALID_NAME,
     PROP_ERROR_INVALID_VALUE, PROP_ERROR_READ_CMD, PROP_ERROR_READ_DATA, PROP_ERROR_SET_FAILED,
-    PROP_MSG_SETPROP, PROP_MSG_SETPROP2, PROP_NAME_MAX, PROP_SUCCESS, PROP_VALUE_MAX,
+    PROP_MSG_SETPROP, PROP_MSG_SETPROP2, PROP_SUCCESS,
 };
 use rsproperties::{
     Error, Result, PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME, PROPERTY_SERVICE_SOCKET_NAME,
 };
 
 use crate::properties_service::PropertiesService;
-use crate::SetProtocol;
 
 /// The error types [`ContextWithLocation`] wraps: `rustix`'s `Errno`, a
 /// `std::io::Error` (both become `Error::Io`) or an `Error`.
@@ -468,8 +467,9 @@ fn bind_service_sockets_at(dir: &Path, dirfd: OwnedFd) -> Result<BoundSockets> {
 pub(crate) struct SocketServiceArgs {
     pub(crate) socket_dir: PathBuf,
     pub(crate) properties_service: ActorRef<PropertiesService>,
-    /// Handles `ctl.*` sets; `None` refuses them.
-    pub(crate) control_handler: Option<crate::ControlHandler>,
+    /// Handles `ctl.*` sets; `None` refuses them. Built by the caller,
+    /// which keeps its [`ControlCalls::drain`].
+    pub(crate) control: Option<ControlCalls>,
 }
 
 /// Spawns the socket service actor with `args`.
@@ -567,7 +567,7 @@ impl Actor for SocketService {
             connection_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS)),
             waiting_sem: Arc::new(Semaphore::new(MAX_WAITING_CLIENTS)),
             _socket_files: entries,
-            control: args.control_handler.map(ControlCalls::new),
+            control: args.control,
         })
     }
 
@@ -641,9 +641,7 @@ impl Actor for SocketService {
                 // connection's request is usually already in the socket
                 // buffer, and AOSP init keeps pending connections in its
                 // listen backlog without a timer and applies every request
-                // it receives in full. Dropping at the client's budget
-                // would also discard V1 requests whose clients (bionic:
-                // success after a 250 ms poll) already reported them set.
+                // it receives in full.
                 match tokio::time::timeout(CLIENT_TIMEOUT, sem.acquire_owned()).await {
                     Ok(Ok(p)) => p,
                     Ok(Err(_)) => {
@@ -710,17 +708,114 @@ impl rsactor::Message<crate::ReadyMessage> for SocketService {
 /// for a blocking thread until `handler` returns or panics — not until its
 /// connection ends — and a request over the cap is refused without using a
 /// blocking thread.
+///
+/// `in_flight` counts the same calls for [`ControlCallsDrain::wait`]. The
+/// semaphore cannot serve that wait: [`SocketService`]'s `Drop` closes it,
+/// and a closed semaphore fails `acquire_many` at once instead of waiting
+/// for the permits that are still out.
 #[derive(Clone)]
-struct ControlCalls {
+pub(crate) struct ControlCalls {
     handler: crate::ControlHandler,
     calls: Arc<Semaphore>,
+    in_flight: Arc<InFlight>,
 }
 
 impl ControlCalls {
-    fn new(handler: crate::ControlHandler) -> Self {
+    pub(crate) fn new(handler: crate::ControlHandler) -> Self {
         Self {
             handler,
             calls: Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_CALLS)),
+            in_flight: Arc::new(InFlight {
+                count: std::sync::atomic::AtomicUsize::new(0),
+                idle: tokio::sync::Notify::new(),
+            }),
+        }
+    }
+
+    /// The handle that waits for this handler's calls to end.
+    pub(crate) fn drain(&self) -> ControlCallsDrain {
+        ControlCallsDrain(Arc::clone(&self.in_flight))
+    }
+}
+
+/// The number of [`InFlightGuard`]s alive, and the wakeup for the task
+/// that waits for it to reach zero.
+struct InFlight {
+    count: std::sync::atomic::AtomicUsize,
+    /// `notify_waiters` each time `count` drops to zero.
+    idle: tokio::sync::Notify,
+}
+
+impl InFlight {
+    fn enter(self: &Arc<Self>) -> InFlightGuard {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        InFlightGuard(Arc::clone(self))
+    }
+}
+
+/// One `ctl.*` request, from before [`SocketService::handle_control`]
+/// asks for its permit until the request is refused or its handler call
+/// has returned, panicked, or been dropped unrun by the runtime.
+struct InFlightGuard(Arc<InFlight>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self
+            .0
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+/// Waits for the control handler calls of one [`ControlCalls`]; kept by
+/// `crate::ServiceHandle`.
+pub(crate) struct ControlCallsDrain(Arc<InFlight>);
+
+impl ControlCallsDrain {
+    /// Returns once no [`InFlightGuard`] is alive.
+    ///
+    /// Called after the socket service's task has been joined, this means
+    /// that no handler call is running or queued for a blocking thread and
+    /// that none begins later. Joining the task drops the
+    /// [`SocketService`], whose `Drop` closes the semaphore, so no permit
+    /// is handed out from then on; a call that got its permit before that
+    /// created its guard earlier still (`handle_control` counts the
+    /// request first and asks for the permit second), so the count read
+    /// here includes it until its handler call has ended. Called before
+    /// the semaphore is closed, it only reports a moment without calls.
+    ///
+    /// Cancel-safe: it changes nothing, so a later call waits for the
+    /// calls still in flight then.
+    pub(crate) async fn wait(&self) {
+        loop {
+            // Created before the count is read: `notify_waiters` wakes a
+            // `Notified` that already exists, polled or not, so a guard
+            // dropped between the read and the await is not missed.
+            let idle = self.0.idle.notified();
+            if self.0.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
+impl Drop for SocketService {
+    /// The connection tasks spawned by `on_idle` are detached, so they
+    /// outlive the actor, each with a clone of `control`. A `ctl.*`
+    /// request does not pass through the properties service, whose closed
+    /// mailbox refuses every other set once the service has stopped;
+    /// closing the semaphore makes [`SocketService::handle_control`]
+    /// refuse a request that one of those tasks reads from now on. A
+    /// handler call that already holds a permit is not affected and runs
+    /// to completion; [`ControlCallsDrain::wait`] waits for those.
+    fn drop(&mut self) {
+        if let Some(control) = &self.control {
+            control.calls.close();
         }
     }
 }
@@ -760,9 +855,20 @@ impl SocketService {
         debug!("Received command: 0x{cmd:08X}");
 
         match cmd {
+            // The V1 command is not supported, unlike in init, which still
+            // handles it. It gets the reply of an unknown command, and the
+            // rest of its frame (name and value) is not read. A V1 client
+            // does not read a reply (bionic waits for the socket to close
+            // and then reports success), so this log line is the only
+            // place the refusal shows.
             PROP_MSG_SETPROP => {
-                trace!("Processing SETPROP (V1) command");
-                Self::handle_setprop_v1(&mut stream, service, control, pid).await?;
+                let peer =
+                    pid.map_or_else(|| "an unknown pid".to_owned(), |pid| format!("pid {pid}"));
+                warn!(
+                    "Refused a V1 set request (PROP_MSG_SETPROP) from {peer}: this service \
+                     handles PROP_MSG_SETPROP2 only, and nothing was set"
+                );
+                Self::send_response(&mut stream, PROP_ERROR_INVALID_CMD).await?;
             }
             PROP_MSG_SETPROP2 => {
                 trace!("Processing SETPROP2 command");
@@ -783,12 +889,9 @@ impl SocketService {
     /// never stored (init: `HandlePropertySet` sends it to
     /// `SendControlMessage`); any other name goes to the properties
     /// service, whose reply is the code ([`crate::PropertiesService`]).
-    /// `protocol` is the command the set arrived in; the properties
-    /// service stores a persistent name for V2 only.
     async fn dispatch<A>(
         name: String,
         value: String,
-        protocol: SetProtocol,
         pid: Option<i32>,
         service: ActorRef<A>,
         control: Option<ControlCalls>,
@@ -799,11 +902,7 @@ impl SocketService {
         if name.starts_with("ctl.") {
             return Self::handle_control(name, value, pid, control).await;
         }
-        let message = crate::PropertyMessage {
-            name,
-            value,
-            protocol,
-        };
+        let message = crate::PropertyMessage { name, value };
         match service.ask(message).await {
             Ok(code) => code,
             Err(e) => {
@@ -821,7 +920,10 @@ impl SocketService {
     /// still runs to completion, but its client gets no reply. A request
     /// beyond `MAX_CONCURRENT_CONTROL_CALLS` running or queued calls gets
     /// `PROP_ERROR_HANDLE_CONTROL_MESSAGE` without reaching the blocking
-    /// pool ([`ControlCalls`]).
+    /// pool ([`ControlCalls`]), and so does a request read after the socket
+    /// service was dropped. A request is counted in `ControlCalls::in_flight`
+    /// from before it asks for its permit until it is refused or its
+    /// handler call has ended.
     async fn handle_control(
         name: String,
         value: String,
@@ -836,9 +938,23 @@ impl SocketService {
             warn!("No control handler; refusing {name:?}");
             return PROP_ERROR_HANDLE_CONTROL_MESSAGE;
         };
-        let Ok(permit) = control.calls.try_acquire_owned() else {
-            warn!("{MAX_CONCURRENT_CONTROL_CALLS} control handler calls are pending; refusing {name:?}");
-            return PROP_ERROR_HANDLE_CONTROL_MESSAGE;
+        // Counted before the permit is asked for, not after: a request
+        // that gets its permit just before the semaphore is closed is
+        // then already visible to `ControlCallsDrain::wait`, which runs
+        // after the close. A refused request is counted until the
+        // `return` below.
+        let in_flight = control.in_flight.enter();
+        let permit = match control.calls.try_acquire_owned() {
+            Ok(permit) => permit,
+            // Closed when the socket service is dropped (`Drop`).
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                warn!("The service has stopped; refusing {name:?}");
+                return PROP_ERROR_HANDLE_CONTROL_MESSAGE;
+            }
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                warn!("{MAX_CONCURRENT_CONTROL_CALLS} control handler calls are pending; refusing {name:?}");
+                return PROP_ERROR_HANDLE_CONTROL_MESSAGE;
+            }
         };
         let handler = control.handler;
         let message = crate::ControlMessage {
@@ -847,7 +963,10 @@ impl SocketService {
             pid,
         };
         match tokio::task::spawn_blocking(move || {
-            // Released when the handler returns or panics.
+            // Both end when the handler returns or panics; when the
+            // runtime shuts down before a blocking thread took this
+            // closure, they end with the closure.
+            let _in_flight = in_flight;
             let _permit = permit;
             handler(&message)
         })
@@ -868,80 +987,6 @@ impl SocketService {
         }
     }
 
-    /// Handles the legacy V1 SETPROP command: after the already-consumed
-    /// command word, a fixed-size payload of `PROP_NAME_MAX` name bytes and
-    /// `PROP_VALUE_MAX` value bytes, both NUL-padded.
-    ///
-    /// V1 clients (bionic included) never read a status reply — closing the
-    /// connection is the implicit ack — so failures are logged and the
-    /// connection is closed without a response. Validation still happens in
-    /// `PropertiesService::handle`, identical to the V2 path.
-    ///
-    /// Every V1 request is logged at `warn!`: init sets
-    /// `ro.property_service.version` to 2 and so does this service, so a
-    /// client that follows bionic's rule sends V2. A V1 frame comes from a
-    /// client that does not read that property, and such a client cannot
-    /// learn that its set was rejected, nor that a `persist.` /
-    /// `next_boot.` value was not stored ([`SetProtocol::V1`]). init does
-    /// not log an accepted V1 set.
-    async fn handle_setprop_v1<A>(
-        stream: &mut UnixStream,
-        service: ActorRef<A>,
-        control: Option<ControlCalls>,
-        pid: Option<i32>,
-    ) -> Result<()>
-    where
-        A: rsactor::Message<crate::PropertyMessage, Reply = i32>,
-    {
-        trace!("Handling SETPROP (V1) request");
-
-        let mut name_buf = [0u8; PROP_NAME_MAX];
-        stream.read_exact(&mut name_buf).await?;
-        let mut value_buf = [0u8; PROP_VALUE_MAX];
-        stream.read_exact(&mut value_buf).await?;
-        // AOSP V1 parity: init forces the last byte of both fields to NUL
-        // before use (`prop_name[PROP_NAME_MAX-1] = 0`), capping names at
-        // 31 chars and values at 91 bytes. Without this a non-bionic client
-        // could submit a 32-char name that AOSP would have truncated.
-        name_buf[PROP_NAME_MAX - 1] = 0;
-        value_buf[PROP_VALUE_MAX - 1] = 0;
-
-        let name = Self::string_from_fixed(&name_buf)?;
-        let value = Self::string_from_fixed(&value_buf)?;
-        let peer = pid.map_or_else(|| "an unknown pid".to_owned(), |pid| format!("pid {pid}"));
-        warn!(
-            "V1 set request (PROP_MSG_SETPROP) for {name:?} ({} bytes) from {peer}: this legacy \
-             command gives the client no result code, and a persist. / next_boot. value set \
-             with it is not stored. The client should send PROP_MSG_SETPROP2",
-            value.len()
-        );
-
-        // The property name was already logged by the `warn!` above.
-        let code = Self::dispatch(name, value, SetProtocol::V1, pid, service, control).await;
-        if code != PROP_SUCCESS {
-            warn!("V1 property was rejected: error code {code:#x}");
-        }
-
-        Ok(())
-    }
-
-    /// Decodes a fixed-size NUL-padded V1 wire field into a `String`.
-    ///
-    /// Truncation at the first NUL is inherent to the V1 format — padding
-    /// and interior NULs are indistinguishable in a fixed buffer, and
-    /// bionic decodes identically (strlen). The rsproperties client
-    /// rejects NUL-carrying names/values before sending; a foreign V1
-    /// client sending them gets the same truncation AOSP would apply.
-    fn string_from_fixed(buf: &[u8]) -> Result<String> {
-        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        // `Utf8(e.utf8_error())`, not a `FromUtf8Error` passthrough: the
-        // owned-error form retains the failed bytes — which here may be a
-        // property *value* — and would leak them into any `{e:?}` log,
-        // against this file's don't-log-values policy. `Utf8Error` keeps
-        // the position diagnostics and the source chain without the bytes.
-        String::from_utf8(buf[..end].to_vec()).map_err(|e| Error::Utf8(e.utf8_error()))
-    }
-
     /// Handles SETPROP2 command
     async fn handle_setprop2<A>(
         stream: &mut UnixStream,
@@ -954,10 +999,12 @@ impl SocketService {
     {
         trace!("Handling SETPROP2 request");
 
-        // Protocol consistency: every V2 failure after the command word
+        // Protocol consistency: every V2 failure this function returns
         // answers with a status code before closing — a bare connection
         // close left the client's `recv_i32` to diagnose an EOF instead of
-        // a definite error. The codes are init's: a field that cannot be
+        // a definite error. Not covered: `CLIENT_TIMEOUT` in `on_idle`
+        // drops this future and closes the connection without a reply.
+        // The codes are init's: a field that cannot be
         // read (including a length over the limit, which init's
         // `RecvString` also refuses) is `PROP_ERROR_READ_DATA`.
         // (`send_response` results are ignored: the peer may already be
@@ -1052,7 +1099,7 @@ impl SocketService {
         // result of sending the reply. A client that gave up waiting
         // (`TimedOut`) may therefore find its set applied; checking the
         // peer here would narrow that window, not close it.
-        let code = Self::dispatch(name, value, SetProtocol::V2, pid, service, control).await;
+        let code = Self::dispatch(name, value, pid, service, control).await;
         if code != PROP_SUCCESS {
             warn!("Property set was rejected: error code {code:#x}");
         }
@@ -1090,8 +1137,11 @@ impl SocketService {
             ));
         }
 
-        // See `string_from_fixed`: drop the failed bytes (possibly a
-        // sensitive value), keep the positional diagnostics + source chain.
+        // `Utf8(e.utf8_error())`, not a `FromUtf8Error` passthrough: the
+        // owned-error form retains the failed bytes — which here may be a
+        // property *value* — and would leak them into any `{e:?}` log,
+        // against this file's don't-log-values policy. `Utf8Error` keeps
+        // the position diagnostics and the source chain without the bytes.
         String::from_utf8(buf).map_err(|e| Error::Utf8(e.utf8_error()))
     }
 
@@ -1602,6 +1652,22 @@ pub(crate) mod tests {
             exchange(&unknown, service.clone(), None).await,
             PROP_ERROR_INVALID_CMD
         );
+        // A whole V1 frame (command word, `PROP_NAME_MAX` name bytes,
+        // `PROP_VALUE_MAX` value bytes): refused like an unknown command,
+        // where init applies it.
+        let mut v1 = PROP_MSG_SETPROP.to_ne_bytes().to_vec();
+        for (field, len) in [
+            ("test.v1.refused", rsproperties::wire::PROP_NAME_MAX),
+            ("1", rsproperties::wire::PROP_VALUE_MAX),
+        ] {
+            let mut buf = vec![0u8; len];
+            buf[..field.len()].copy_from_slice(field.as_bytes());
+            v1.extend_from_slice(&buf);
+        }
+        assert_eq!(
+            exchange(&v1, service.clone(), None).await,
+            PROP_ERROR_INVALID_CMD
+        );
         assert_eq!(
             exchange(&v2_frame("a\0b", "1"), service.clone(), None).await,
             PROP_ERROR_INVALID_NAME
@@ -1752,6 +1818,96 @@ pub(crate) mod tests {
             PROP_SUCCESS,
             "permits are released on return"
         );
+    }
+
+    /// [`ControlCallsDrain::wait`] returns only after both kinds of pending
+    /// call have returned: the one that is running and the one that is
+    /// still queued for a blocking thread when the wait is first polled.
+    /// The runtime's pool has one thread, held by the first call until the
+    /// gate opens, so the second call cannot begin before that.
+    #[test]
+    fn drain_waits_for_running_and_queued_control_calls() {
+        use std::future::Future;
+        use std::sync::atomic::AtomicBool;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let returned = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(std::sync::RwLock::new(()));
+        let closed = gate.write().unwrap();
+        let (entered_in, returned_in, inner_gate) =
+            (entered.clone(), returned.clone(), gate.clone());
+        let calls = ControlCalls::new(Arc::new(move |_: &crate::ControlMessage| {
+            entered_in.fetch_add(1, Ordering::SeqCst);
+            drop(inner_gate.read().unwrap());
+            returned_in.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        let drain = calls.drain();
+        let call = |calls: ControlCalls| {
+            SocketService::handle_control(
+                "ctl.start".to_owned(),
+                "svc".to_owned(),
+                None,
+                Some(calls),
+            )
+        };
+
+        let tasks = [
+            runtime.spawn(call(calls.clone())),
+            runtime.spawn(call(calls.clone())),
+        ];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while entered.load(Ordering::SeqCst) < 1 || calls.in_flight.count.load(Ordering::SeqCst) < 2
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "one call must be running and both must be counted"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // The task reports the number of returned calls at the moment the
+        // wait completed, and `polled` once the wait has been polled.
+        let polled = Arc::new(AtomicBool::new(false));
+        let (polled_in, returned_at_end) = (polled.clone(), returned.clone());
+        let waiter = runtime.spawn(async move {
+            let mut wait = std::pin::pin!(drain.wait());
+            std::future::poll_fn(|cx| {
+                let poll = wait.as_mut().poll(cx);
+                polled_in.store(true, Ordering::SeqCst);
+                poll
+            })
+            .await;
+            returned_at_end.load(Ordering::SeqCst)
+        });
+        while !polled.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the wait was not polled"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "the second call must still be queued for the blocking thread"
+        );
+
+        drop(closed);
+        assert_eq!(
+            runtime.block_on(waiter).unwrap(),
+            2,
+            "the wait must end after the running and the queued call have returned"
+        );
+        for task in tasks {
+            assert_eq!(runtime.block_on(task).unwrap(), PROP_SUCCESS);
+        }
     }
 
     /// init answers `PROP_ERROR_READ_CMD` when the command word cannot be

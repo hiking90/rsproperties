@@ -4,11 +4,10 @@
 //! Tests for parsed property API functions
 //!
 //! These tests verify the functionality of the newly added parsed property APIs:
-//! - get_parsed_with_default() - Parse property values with default fallback
-//! - get_parsed() - Parse property values with error handling
+//! - get_or() - Parse property values with default fallback
+//! - get() - Parse property values with error handling
 //! - Type safety and parsing validation
 
-#[path = "common.rs"]
 mod common;
 use common::init_test;
 
@@ -336,7 +335,7 @@ async fn test_parsed_api_with_real_world_properties() -> anyhow::Result<()> {
         let with_default: i32 = rsproperties::get_or(prop_name, 999);
         assert_eq!(
             with_default, *expected,
-            "get_parsed_with_default failed for property {prop_name}"
+            "get_or failed for property {prop_name}"
         );
     }
 
