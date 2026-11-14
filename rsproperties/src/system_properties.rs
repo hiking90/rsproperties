@@ -18,6 +18,7 @@ use crate::contexts_serialized::ContextsSerialized;
 // property_area.rs [R-RO].
 use crate::property_area::{load_acquire, EntryOffset};
 use crate::property_watcher::PropertyWatcher;
+use crate::wait_step::{drive, CreationWait, SerialWait, ValueWait, WaitOn};
 
 pub(crate) use crate::wire::PROP_VALUE_MAX;
 pub(crate) const PROP_TREE_FILE: &str = "/dev/__properties__/property_info";
@@ -63,18 +64,33 @@ fn with_override_name<R>(name: &str, f: impl FnOnce(&str) -> R) -> R {
     f(joined)
 }
 
-/// Absolute end of a caller-supplied `Option<Duration>` timeout. `None`
-/// waits forever — also for a timeout too large for `Instant`.
-pub(crate) struct Deadline(Option<Instant>);
+/// Absolute end of a caller-supplied `Option<Duration>` timeout.
+pub(crate) enum Deadline {
+    /// No timeout — also for a timeout too large for `Instant`.
+    Never,
+    /// `Duration::ZERO`: expired from the start. Kept apart from `At` so a
+    /// zero-timeout check reads no clock (`Instant::now` is a
+    /// `clock_gettime` call, about as long as a whole uncontended check).
+    Expired,
+    At(Instant),
+}
 
 impl Deadline {
     pub(crate) fn after(timeout: Option<Duration>) -> Self {
-        Self(timeout.and_then(|t| Instant::now().checked_add(t)))
+        match timeout {
+            None => Self::Never,
+            Some(t) if t.is_zero() => Self::Expired,
+            Some(t) => Instant::now().checked_add(t).map_or(Self::Never, Self::At),
+        }
     }
 
     /// Time left (zero once expired), or `None` for no deadline.
     fn left(&self) -> Option<Duration> {
-        self.0.map(|d| d.saturating_duration_since(Instant::now()))
+        match self {
+            Self::Never => None,
+            Self::Expired => Some(Duration::ZERO),
+            Self::At(d) => Some(d.saturating_duration_since(Instant::now())),
+        }
     }
 
     /// [`Self::left`] as the relative `Timespec` the futex takes.
@@ -89,7 +105,7 @@ impl Deadline {
 /// Runs a deadline-bounded wait with no deadline, for the wait methods
 /// without a timeout. Without a deadline those waits do not return
 /// `Ok(None)` — the futex gets no timeout, and an expired per-property
-/// slice is waited again inside `wait_until` — so the closure runs once.
+/// slice is waited again inside `wait_word` — so the closure runs once.
 /// An `Ok(None)` is waited again rather than unwrapped, so the methods
 /// have no panic path.
 pub(crate) fn wait_forever<T>(mut wait: impl FnMut(&Deadline) -> Result<Option<T>>) -> Result<T> {
@@ -122,33 +138,28 @@ fn futex_wake(_addr: &AtomicU32) -> Result<usize> {
 /// is `Err`; the callers' wait loops stop on it instead of retrying, which
 /// would turn a persistent futex error into a busy loop.
 ///
-/// Callers compare the serial before calling: once the deadline has passed
-/// this returns `Ok(None)` without the syscall's value comparison.
-/// `_timeout` comes from [`Deadline::remaining`], so it is never negative.
+/// The word is compared at least once: by the kernel, or — once `_deadline`
+/// has passed, where a syscall would only report the comparison — by a
+/// load here. A change made before the call is therefore reported even
+/// with an expired deadline, as bionic's `FUTEX_WAIT` with a zero timeout
+/// reports it (`EAGAIN`).
 ///
 /// On macOS there is no futex; fails immediately — see
 /// `SystemProperties::wait`.
-fn futex_wait(
-    _serial: &AtomicU32,
-    _value: u32,
-    _timeout: Option<&Timespec>,
-) -> Result<Option<u32>> {
+fn futex_wait(_serial: &AtomicU32, _value: u32, _deadline: &Deadline) -> Result<Option<u32>> {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     {
         use rustix::io::Errno;
         // Linux futex_wait takes a *relative* timeout. Spurious wakes restart
-        // the syscall, so we track a deadline and shrink the remaining timeout
-        // each iteration to keep the total wait bounded by the caller-supplied
-        // value. An unrepresentable deadline (`Instant + Duration` overflow)
-        // degrades to an infinite wait, like bionic, which passes the value
-        // to the futex untouched.
-        let deadline = Deadline(_timeout.and_then(|t| {
-            Instant::now().checked_add(Duration::new(t.tv_sec as u64, t.tv_nsec as u32))
-        }));
+        // the syscall with the time left to the same deadline, so the total
+        // wait stays bounded by the caller-supplied value. An unrepresentable
+        // deadline (`Instant + Duration` overflow) is `Deadline::Never`, like
+        // bionic, which passes the value to the futex untouched.
         loop {
-            let remaining_ts = deadline.remaining();
+            let remaining_ts = _deadline.remaining();
             if remaining_ts.is_some_and(|t| t.tv_sec == 0 && t.tv_nsec == 0) {
-                return Ok(None);
+                let new_serial = load_acquire(_serial);
+                return Ok((new_serial != _value).then_some(new_serial));
             }
             match futex::wait(
                 _serial,
@@ -191,7 +202,7 @@ fn futex_wait(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (_serial, _value, _timeout);
+        let _ = (_serial, _value, _deadline);
         Err(no_futex())
     }
 }
@@ -678,7 +689,7 @@ impl SystemProperties {
     }
 
     /// [`Self::read_index_with`] on raw bytes: entry name, value, serial.
-    fn read_index_bytes<R, F>(&self, index: PropertyIndex, f: F) -> Result<R>
+    pub(crate) fn read_index_bytes<R, F>(&self, index: PropertyIndex, f: F) -> Result<R>
     where
         F: FnOnce(&[u8], &[u8], u32) -> R,
     {
@@ -1136,7 +1147,7 @@ impl SystemProperties {
                     return Ok(serial);
                 }
                 let slice = Deadline::after(Some(remaining.min(DIRTY_SLICE)));
-                match futex_wait(&pi.serial, serial, slice.remaining().as_ref()) {
+                match futex_wait(&pi.serial, serial, &slice) {
                     Ok(Some(s)) if !serial_dirty(s) => return Ok(s),
                     // Still dirty (writer burst) or slice expired: drop the
                     // guard at the end of this iteration and re-acquire.
@@ -1239,7 +1250,7 @@ impl SystemProperties {
     /// Global-serial waits (`index == None`) take no lock and are not
     /// sliced.
     pub fn wait(&self, index: Option<PropertyIndex>, old_serial: u32) -> Result<u32> {
-        wait_forever(|deadline| self.wait_until(index, old_serial, deadline))
+        wait_forever(|deadline| drive(SerialWait::new(self, index, old_serial), deadline))
     }
 
     /// [`Self::wait`] bounded by `timeout`: `Ok(Some(new_serial))` on a
@@ -1265,19 +1276,34 @@ impl SystemProperties {
         old_serial: u32,
         timeout: Duration,
     ) -> Result<Option<u32>> {
-        self.wait_until(index, old_serial, &Deadline::after(Some(timeout)))
+        drive(
+            SerialWait::new(self, index, old_serial),
+            &Deadline::after(Some(timeout)),
+        )
     }
 
-    /// [`Self::wait`] against an absolute deadline, so `wait_for_creation`
-    /// / `wait_for_value` can bound a whole loop of waits with one.
-    pub(crate) fn wait_until(
+    /// Blocks until the word `on` names differs from `old_serial` —
+    /// `Ok(Some(new))` — or `deadline` passes — `Ok(None)`: the wait the
+    /// sync driver ([`crate::wait_step::drive`]) runs for a
+    /// [`Wait`](crate::wait_step::Wait). The deadline is
+    /// absolute, so one bounds a whole loop of steps.
+    ///
+    /// `old_serial` is a value the caller has just read from that word, as
+    /// every step does before it returns `Wait`. The caller's read is the
+    /// comparison before the deadline applies ([`Self::wait_timeout`]), so
+    /// a per-property wait does not take the lock to compare again: with
+    /// the deadline already passed it returns `Ok(None)` at once, and
+    /// otherwise the futex's own comparison reports a change made since
+    /// the caller's read. A per-property wait is sliced as
+    /// [`Self::wait`]'s # Locking says.
+    pub(crate) fn wait_word(
         &self,
-        index: Option<PropertyIndex>,
+        on: WaitOn,
         old_serial: u32,
         deadline: &Deadline,
     ) -> Result<Option<u32>> {
-        // No index → wait on the global serial (lock-free, no slicing).
-        let Some(idx) = index else {
+        // Global serial: lock-free, no slicing.
+        let WaitOn::Property(idx) = on else {
             let serial_pa = self.contexts.serial_prop_area().serial();
             // Documented already-changed fast path, checked BEFORE the
             // futex: on Linux it merely pre-empts the syscall's EAGAIN,
@@ -1287,7 +1313,7 @@ impl SystemProperties {
             if current != old_serial {
                 return Ok(Some(current));
             }
-            return futex_wait(serial_pa, old_serial, deadline.remaining().as_ref());
+            return futex_wait(serial_pa, old_serial, deadline);
         };
         // Covers both platform branches below.
         self.check_index(idx)?;
@@ -1300,42 +1326,27 @@ impl SystemProperties {
             /// cause.
             const LOCK_SLICE: Duration = Duration::from_millis(100);
 
-            let mut first = true;
             loop {
-                // The slice is computed BEFORE the lock is (re-)taken. The
-                // first iteration always takes the lock and compares
-                // `old_serial` before the timeout applies, like bionic,
-                // whose FUTEX_WAIT reports a changed word for a zero
-                // timeout (EAGAIN) and is followed by a reload. That lock
-                // wait is bounded only as the rustdoc says (another
-                // thread's first open of this area). Later iterations
-                // return without the lock once the deadline has passed:
-                // the previous comparison was the last one, as after
-                // bionic's ETIMEDOUT, and blocking on the lock after
-                // expiry would overshoot the caller's timeout.
+                // The slice is computed BEFORE the lock is (re-)taken, and
+                // an expired deadline returns without the lock: the last
+                // comparison was the caller's read (first iteration) or
+                // the previous slice's futex, as after bionic's ETIMEDOUT,
+                // and blocking on the lock after expiry would overshoot
+                // the caller's timeout.
                 let slice = match deadline.left() {
-                    None => Some(LOCK_SLICE),
-                    Some(r) if r.is_zero() && !first => return Ok(None),
-                    Some(r) if r.is_zero() => None,
-                    Some(r) => Some(r.min(LOCK_SLICE)),
+                    None => LOCK_SLICE,
+                    Some(r) if r.is_zero() => return Ok(None),
+                    Some(r) => r.min(LOCK_SLICE),
                 };
-                first = false;
                 // (Re-)acquire the node lock for this slice only.
                 let guard = self.contexts.prop_area_with_index(idx.context_index)?;
                 let pi = guard.property_area().property_info(idx.property_index)?;
-                // The serial may have changed while the lock was released
-                // between slices — the futex wake fired with no waiter, so
-                // this re-check is what closes that window.
-                let current = load_acquire(&pi.serial);
-                if current != old_serial {
-                    return Ok(Some(current));
-                }
-                // Expired timeout: the comparison above was the only one.
-                let Some(slice) = slice else {
-                    return Ok(None);
-                };
+                // No load before the futex: its comparison covers a change
+                // since the caller's read and one made while the lock was
+                // released between slices (the wake then fired with no
+                // waiter), returning `EAGAIN` and the reloaded serial.
                 let slice = Deadline::after(Some(slice));
-                if let Some(s) = futex_wait(&pi.serial, old_serial, slice.remaining().as_ref())? {
+                if let Some(s) = futex_wait(&pi.serial, old_serial, &slice)? {
                     return Ok(Some(s));
                 }
                 // Slice expired: fall through, dropping `guard` at the end of
@@ -1369,7 +1380,7 @@ impl SystemProperties {
     /// On an instance with the appcompat override on, the override name
     /// counts as `name` existing (see [`Self::read_with`]).
     pub fn wait_for_creation(&self, name: &str) -> Result<PropertyIndex> {
-        wait_forever(|deadline| self.wait_for_creation_until(name, deadline))
+        wait_forever(|deadline| drive(CreationWait::new(self, name), deadline))
     }
 
     /// [`Self::wait_for_creation`] bounded by `timeout`, which covers the
@@ -1381,29 +1392,10 @@ impl SystemProperties {
         name: &str,
         timeout: Duration,
     ) -> Result<Option<PropertyIndex>> {
-        self.wait_for_creation_until(name, &Deadline::after(Some(timeout)))
-    }
-
-    pub(crate) fn wait_for_creation_until(
-        &self,
-        name: &str,
-        deadline: &Deadline,
-    ) -> Result<Option<PropertyIndex>> {
-        loop {
-            // Sampled BEFORE `find`: an add that lands between the lookup
-            // and the wait has already moved the global serial, so the
-            // wait returns at once instead of missing it.
-            let serial = self.area_serial();
-            if let Some(index) = self.find(name)? {
-                return Ok(Some(index));
-            }
-            let changed = self
-                .wait_until(None, serial, deadline)
-                .with_context_location(|| format!("waiting for property {name:?}"))?;
-            if changed.is_none() {
-                return Ok(None);
-            }
-        }
+        drive(
+            CreationWait::new(self, name),
+            &Deadline::after(Some(timeout)),
+        )
     }
 
     /// Waits until `name` exists and its value equals `expected` — libbase
@@ -1426,11 +1418,7 @@ impl SystemProperties {
     /// # }
     /// ```
     pub fn wait_for_value(&self, name: &str, expected: &str) -> Result<()> {
-        wait_forever(|deadline| {
-            Ok(self
-                .wait_for_value_until(name, expected, deadline)?
-                .then_some(()))
-        })
+        wait_forever(|deadline| drive(ValueWait::new(self, name, expected), deadline))
     }
 
     /// [`Self::wait_for_value`] bounded by `timeout`, which covers the
@@ -1455,32 +1443,11 @@ impl SystemProperties {
         expected: &str,
         timeout: Duration,
     ) -> Result<bool> {
-        self.wait_for_value_until(name, expected, &Deadline::after(Some(timeout)))
-    }
-
-    fn wait_for_value_until(
-        &self,
-        name: &str,
-        expected: &str,
-        deadline: &Deadline,
-    ) -> Result<bool> {
-        let Some(index) = self.wait_for_creation_until(name, deadline)? else {
-            return Ok(false);
-        };
-        loop {
-            let (matches, serial) = self.read_index_bytes(index, |_, value, serial| {
-                (value == expected.as_bytes(), serial)
-            })?;
-            if matches {
-                return Ok(true);
-            }
-            let changed = self
-                .wait_until(Some(index), serial, deadline)
-                .with_context_location(|| format!("waiting for property {name:?}"))?;
-            if changed.is_none() {
-                return Ok(false);
-            }
-        }
+        let done = drive(
+            ValueWait::new(self, name, expected),
+            &Deadline::after(Some(timeout)),
+        )?;
+        Ok(done.is_some())
     }
 
     /// A [`PropertyWatcher`] for `name`: the value re-read only when it

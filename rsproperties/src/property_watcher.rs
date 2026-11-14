@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::errors::*;
 use crate::system_properties::{wait_forever, Deadline, PropertyIndex, SystemProperties};
+use crate::wait_step::{creation, drive, Step, Wait, WaitOn, WaitStep};
 
 /// Bit 0 of a property serial: set by a writer's first store of an update
 /// and cleared by its last.
@@ -155,7 +156,7 @@ impl<'a> PropertyWatcher<'a> {
     /// that is not UTF-8 therefore fails every call until the property is
     /// updated. On macOS a call that would have to block fails (no futex).
     pub fn wait_for_change(&mut self) -> Result<()> {
-        wait_forever(|deadline| Ok(self.wait_for_change_until(deadline)?.then_some(())))
+        wait_forever(|deadline| drive(ChangeWait::new(self), deadline))
     }
 
     /// [`Self::wait_for_change`] bounded by `timeout`, which covers the
@@ -164,35 +165,8 @@ impl<'a> PropertyWatcher<'a> {
     /// reports whether the property changed since the last read (or, for
     /// a watcher that has not read it yet, whether it exists).
     pub fn wait_for_change_timeout(&mut self, timeout: Duration) -> Result<bool> {
-        self.wait_for_change_until(&Deadline::after(Some(timeout)))
-    }
-
-    fn wait_for_change_until(&mut self, deadline: &Deadline) -> Result<bool> {
-        let Some(Seen { index, serial }) = self.seen else {
-            let Some(index) = self.props.wait_for_creation_until(&self.name, deadline)? else {
-                return Ok(false);
-            };
-            self.read(index)?;
-            return Ok(true);
-        };
-        let mut old_serial = serial;
-        loop {
-            let changed = self
-                .props
-                .wait_until(Some(index), old_serial, deadline)
-                .with_context_location(|| format!("waiting for property {:?}", self.name))?;
-            if changed.is_none() {
-                return Ok(false);
-            }
-            let word = self.read(index)?;
-            if word & !DIRTY != serial {
-                return Ok(true);
-            }
-            // The dirty serial of an update in progress: the value read is
-            // the backup of the one already reported. Wait from the dirty
-            // serial for that update's clean store.
-            old_serial = word;
-        }
+        let done = drive(ChangeWait::new(self), &Deadline::after(Some(timeout)))?;
+        Ok(done.is_some())
     }
 
     /// Reads value and serial in one seqlock-validated read and records
@@ -210,6 +184,75 @@ impl<'a> PropertyWatcher<'a> {
             serial: word & !DIRTY,
         });
         Ok(word)
+    }
+}
+
+/// [`PropertyWatcher::wait_for_change`]'s [`WaitStep`]. The serial it
+/// waits from is its own, and a step writes the watcher only when it
+/// reports the change (it reads the new value then), so a wait dropped
+/// between steps leaves the watcher as it was.
+pub(crate) struct ChangeWait<'w, 'a> {
+    watcher: &'w mut PropertyWatcher<'a>,
+    /// What the watcher had read when the wait started (`None`: nothing,
+    /// so the change is the creation), and the serial to wait from:
+    /// `seen.serial`, then the dirty serial of an update in progress.
+    from: Option<(Seen, u32)>,
+}
+
+impl<'w, 'a> ChangeWait<'w, 'a> {
+    pub(crate) fn new(watcher: &'w mut PropertyWatcher<'a>) -> Self {
+        let from = watcher.seen.map(|seen| (seen, seen.serial));
+        Self { watcher, from }
+    }
+}
+
+impl WaitStep for ChangeWait<'_, '_> {
+    type Output = ();
+
+    fn step(&mut self) -> Result<Step<()>> {
+        let watcher = &mut *self.watcher;
+        let Some((seen, old)) = &mut self.from else {
+            return Ok(match creation(watcher.props, &watcher.name)? {
+                Step::Done(index) => {
+                    watcher.read(index)?;
+                    Step::Done(())
+                }
+                Step::Wait(w) => Step::Wait(w),
+            });
+        };
+        let index = seen.index;
+        let mut word = watcher
+            .props
+            .serial_word(index)
+            .with_context_location(|| format!("waiting for property {:?}", watcher.name))?;
+        if word != *old {
+            // The dirty serial of an update to the value already reported:
+            // a read would copy that value again from the backup slot.
+            // Wait from the dirty serial for the update's clean store.
+            if word & !DIRTY != seen.serial {
+                word = watcher.read(index)?;
+                if word & !DIRTY != seen.serial {
+                    return Ok(Step::Done(()));
+                }
+                // Only a serial back at the reported version gets here:
+                // the writers of this crate and of bionic advance the
+                // update counter on every update, so that takes a counter
+                // wrap. It is waited from, not reported.
+            }
+            *old = word;
+        }
+        Ok(Step::Wait(Wait {
+            on: WaitOn::Property(index),
+            old: *old,
+        }))
+    }
+
+    fn props(&self) -> &SystemProperties {
+        self.watcher.props
+    }
+
+    fn name(&self) -> Option<&str> {
+        Some(&self.watcher.name)
     }
 }
 
@@ -369,6 +412,70 @@ mod tests {
         assert!(watcher.wait_for_change_timeout(NO_WAIT).unwrap());
         assert_eq!(watcher.value().unwrap(), Some("v2"));
         assert!(!watcher.wait_for_change_timeout(NO_WAIT).unwrap());
+    }
+
+    /// A watcher on "v1", with the backup slot holding "v1" too (two
+    /// rewrites), so a read during a dirty serial returns "v1".
+    fn watcher_on_v1(fx: &mut Fixture) -> SystemProperties {
+        fx.sp.add("debug.rsp.step", "v1").unwrap();
+        fx.sp.set("debug.rsp.step", "v1").unwrap();
+        fx.sp.set("debug.rsp.step", "v1").unwrap();
+        SystemProperties::open(fx.dir()).unwrap()
+    }
+
+    fn wait_on(seen: Seen, old: u32) -> Step<()> {
+        Step::Wait(Wait {
+            on: WaitOn::Property(seen.index),
+            old,
+        })
+    }
+
+    /// One step object, stepped again and again as the async driver does:
+    /// it waits from the dirty serial on every call while the update is in
+    /// progress, and reports the update once, when the clean serial lands.
+    #[test]
+    fn change_step_repeats_through_an_update() {
+        let mut fx = Fixture::new("watch_step");
+        let reader = watcher_on_v1(&mut fx);
+        let mut watcher = reader.watch("debug.rsp.step");
+        assert_eq!(watcher.value().unwrap(), Some("v1"));
+        let seen = watcher.seen.unwrap();
+
+        let mut wait = ChangeWait::new(&mut watcher);
+        assert_eq!(wait.step().unwrap(), wait_on(seen, seen.serial));
+        assert_eq!(wait.step().unwrap(), wait_on(seen, seen.serial));
+        fx.set_dirty("debug.rsp.step");
+        assert_eq!(wait.step().unwrap(), wait_on(seen, seen.serial | DIRTY));
+        assert_eq!(wait.step().unwrap(), wait_on(seen, seen.serial | DIRTY));
+        fx.sp.set("debug.rsp.step", "v2").unwrap();
+        assert_eq!(wait.step().unwrap(), Step::Done(()));
+        assert_eq!(watcher.value().unwrap(), Some("v2"));
+    }
+
+    /// A step dropped at the dirty serial leaves the watcher as it was; a
+    /// new step waits from the dirty serial again and reports the update
+    /// once it completes.
+    #[test]
+    fn change_step_dropped_at_dirty_serial() {
+        let mut fx = Fixture::new("watch_step_drop");
+        let reader = watcher_on_v1(&mut fx);
+        let mut watcher = reader.watch("debug.rsp.step");
+        assert_eq!(watcher.value().unwrap(), Some("v1"));
+        let seen = watcher.seen.unwrap();
+
+        fx.set_dirty("debug.rsp.step");
+        {
+            let mut wait = ChangeWait::new(&mut watcher);
+            assert_eq!(wait.step().unwrap(), wait_on(seen, seen.serial | DIRTY));
+        }
+        assert_eq!(watcher.seen.unwrap().serial, seen.serial);
+        assert_eq!(watcher.value().unwrap(), Some("v1"));
+
+        let mut wait = ChangeWait::new(&mut watcher);
+        assert_eq!(wait.step().unwrap(), wait_on(seen, seen.serial | DIRTY));
+        fx.sp.set("debug.rsp.step", "v2").unwrap();
+        assert_eq!(wait.step().unwrap(), Step::Done(()));
+        assert_eq!(watcher.value().unwrap(), Some("v2"));
     }
 
     /// A watcher on a `'static` reader can be moved to another thread.
