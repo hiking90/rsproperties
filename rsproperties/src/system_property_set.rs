@@ -161,7 +161,7 @@ const RESPONSE_TIMEOUT: Option<Duration> = Some(SERVICE_IO_TIMEOUT);
 
 /// Maps a read/write-timeout expiry to a clearly-labelled `TimedOut` error
 /// (preserving the original as text); passes every other error through.
-/// Shared by `recv_i32` and `ServiceWriter::send` so both directions of
+/// Shared by `recv_i32` and `ServiceConnection::send` so both directions of
 /// the protocol report timeouts the same way.
 fn map_timeout_err(e: std::io::Error, doing: &str) -> Error {
     if matches!(
@@ -284,23 +284,24 @@ struct ServiceConnection {
 }
 
 impl ServiceConnection {
-    fn new(name: &str) -> Result<Self> {
+    fn connect(route: Route) -> Result<Self> {
         let property_service_socket = get_property_service_socket();
 
         // Try the system-property socket for `sys.powerctl`, falling back to
         // the regular service socket if connection fails. Connect itself is
-        // the only authoritative check — `fs::metadata` would race the open.
-        let stream = if name == "sys.powerctl" {
-            let system_socket = get_property_service_for_system_socket();
-            connect_with_timeout(&system_socket, SERVICE_IO_TIMEOUT)
-                .or_else(|first_err| {
-                    log::warn!(
-                        "Connect to {system_socket:?} failed ({first_err}); falling back to {property_service_socket:?}"
-                    );
-                    connect_with_timeout(&property_service_socket, SERVICE_IO_TIMEOUT)
-                })?
-        } else {
-            connect_with_timeout(&property_service_socket, SERVICE_IO_TIMEOUT)?
+        // the only check that does not race the open (`fs::metadata` would).
+        let stream = match route {
+            Route::ForSystemFirst => {
+                let system_socket = get_property_service_for_system_socket();
+                connect_with_timeout(&system_socket, SERVICE_IO_TIMEOUT)
+                    .or_else(|first_err| {
+                        log::warn!(
+                            "Connect to {system_socket:?} failed ({first_err}); falling back to {property_service_socket:?}"
+                        );
+                        connect_with_timeout(&property_service_socket, SERVICE_IO_TIMEOUT)
+                    })?
+            }
+            Route::Default => connect_with_timeout(&property_service_socket, SERVICE_IO_TIMEOUT)?,
         };
 
         // Failure to arm the timeouts would silently drop the no-hang
@@ -370,60 +371,9 @@ impl ServiceConnection {
         // been shut down") depending on FIN arrival timing.
         Ok(i32::from_ne_bytes(buf))
     }
-}
 
-/// One wire fragment: caller-borrowed payload bytes, or a 4-byte word the
-/// writer materialised itself (command ids, length prefixes).
-enum WireBuf<'a> {
-    Borrowed(&'a [u8]),
-    Word([u8; 4]),
-}
-
-impl WireBuf<'_> {
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            WireBuf::Borrowed(b) => b,
-            WireBuf::Word(w) => w,
-        }
-    }
-}
-
-struct ServiceWriter<'a> {
-    // Raw byte fragments; `send` joins them into one contiguous frame
-    // before writing (see the SIGPIPE note there).
-    buffers: Vec<WireBuf<'a>>,
-}
-
-impl<'a> ServiceWriter<'a> {
-    fn new() -> Self {
-        Self {
-            buffers: Vec::with_capacity(4),
-        }
-    }
-
-    /// Appends a length-prefixed string. The writer derives the prefix from
-    /// the payload itself, so a mismatched pair — which would silently
-    /// desynchronise the frame — is unrepresentable at this API.
-    fn write_str(mut self, value: &'a str) -> Result<Self> {
-        let len = u32::try_from(value.len()).map_err(|_| {
-            Error::InvalidArgument(format!("string too long for wire: {} bytes", value.len()))
-        })?;
-        self.buffers.push(WireBuf::Word(len.to_ne_bytes()));
-        self.buffers.push(WireBuf::Borrowed(value.as_bytes()));
-        Ok(self)
-    }
-
-    fn write_u32(mut self, value: u32) -> Self {
-        self.buffers.push(WireBuf::Word(value.to_ne_bytes()));
-        self
-    }
-
-    fn write_bytes(mut self, value: &'a [u8]) -> Self {
-        self.buffers.push(WireBuf::Borrowed(value));
-        self
-    }
-
-    fn send(self, conn: &mut ServiceConnection) -> Result<()> {
+    /// Sends the whole `frame`, within [`SERVICE_IO_TIMEOUT`] in total.
+    fn send(&mut self, frame: &[u8]) -> Result<()> {
         // A single `write` may write fewer bytes than requested
         // (signal after a partial transfer, full socket buffer). Loop until
         // every byte is on the wire — a short write would otherwise
@@ -445,16 +395,11 @@ impl<'a> ServiceWriter<'a> {
         // because it is a plain `write(2)` on older std (1.77 through at
         // least 1.86, inside this crate's `rust-version` range). Apple
         // targets get the guarantee from SO_NOSIGPIPE (set in
-        // `connect_with_timeout`). The copy is at most one V2 frame
-        // (12 + name + value bytes). A regression to std's `write` passes
+        // `connect_with_timeout`). A regression to std's `write` passes
         // on current stable; the CI `msrv` job runs this module's tests on
         // 1.77 to catch it.
         let deadline = Instant::now() + SERVICE_IO_TIMEOUT;
-        let total: usize = self.buffers.iter().map(|b| b.as_slice().len()).sum();
-        let mut frame = Vec::with_capacity(total);
-        for buf in &self.buffers {
-            frame.extend_from_slice(buf.as_slice());
-        }
+        let total = frame.len();
         let mut written = 0usize;
         while written < total {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -474,18 +419,18 @@ impl<'a> ServiceWriter<'a> {
             // The connect-time static timeout stays armed as the
             // per-syscall bound, and the deadline check above still bounds
             // the total.
-            let _ = conn.stream.set_write_timeout(Some(remaining));
+            let _ = self.stream.set_write_timeout(Some(remaining));
             // SO_SNDTIMEO expiry is EAGAIN -> `WouldBlock` (handled by
             // `map_timeout_err`); EINTR -> `Interrupted` (retried below).
             #[cfg(any(target_os = "linux", target_os = "android"))]
             let r = rustix::net::send(
-                &conn.stream,
+                &self.stream,
                 &frame[written..],
                 rustix::net::SendFlags::NOSIGNAL,
             )
             .map_err(std::io::Error::from);
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            let r = conn.stream.write(&frame[written..]);
+            let r = self.stream.write(&frame[written..]);
             match r {
                 Ok(0) => {
                     return Err(Error::Io(std::io::Error::new(
@@ -498,7 +443,7 @@ impl<'a> ServiceWriter<'a> {
                 Err(e) => return Err(map_timeout_err(e, "sending property service request")),
             }
         }
-        conn.stream.flush()?;
+        self.stream.flush()?;
         Ok(())
     }
 }
@@ -725,13 +670,44 @@ fn check_wire_caps(name: &str, value: &str, (max_name, max_value): (usize, usize
     Ok(())
 }
 
-/// Sets a system property via the property service socket.
-///
-/// An `Error::Io` of kind `TimedOut` from the V2 response wait (outside
-/// Android; the message starts with "timed out waiting for property
-/// service response") does not mean the property was not set: see
-/// [`SERVICE_IO_TIMEOUT`]. On Android the response wait has no timeout.
-pub(crate) fn set(name: &str, value: &str) -> Result<()> {
+/// How long the V1 arm waits for init to close the connection, its ack —
+/// bionic's 250 ms `poll`. The outcome is not reported either way.
+const V1_CLOSE_WAIT: Duration = Duration::from_millis(250);
+
+/// The sockets a request tries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// [`PROPERTY_SERVICE_SOCKET_NAME`].
+    Default,
+    /// `sys.powerctl`: [`PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME`], then
+    /// the default socket if that connect fails — on V1 as well as V2, as
+    /// bionic's `PropertyServiceConnection` routes by the property name.
+    ForSystemFirst,
+}
+
+/// What the service answers a request with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reply {
+    /// V1: nothing; init closes the connection.
+    V1Close,
+    /// V2: a 4-byte status code.
+    V2Status,
+}
+
+/// A request that passed every check `set` makes before it connects: the
+/// frame to send, where to send it and what comes back. The transports
+/// (this module's blocking one, the async one) take it from here.
+struct SetRequest {
+    frame: Vec<u8>,
+    route: Route,
+    reply: Reply,
+}
+
+/// The checks and the frame of a set — everything before the socket.
+/// Opens no socket; [`protocol_version`]'s first call after the store is
+/// initialized reads `ro.property_service.version`, which can open and
+/// map that context's area.
+fn prepare(name: &str, value: &str) -> Result<SetRequest> {
     // Validate name and value up front, for BOTH protocol versions. This
     // is load-bearing for interior NUL bytes in particular: the server
     // decodes both wire formats as C strings, so a NUL-carrying `&str`
@@ -745,6 +721,11 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
     crate::wire::validate_value_len(name, value)
         .inspect_err(|e| log::error!("setprop reject: {e}"))?;
 
+    let route = if name == "sys.powerctl" {
+        Route::ForSystemFirst
+    } else {
+        Route::Default
+    };
     match protocol_version() {
         ProtocolVersion::V1 => {
             if name.len() >= PROP_NAME_MAX {
@@ -771,56 +752,85 @@ pub(crate) fn set(name: &str, value: &str) -> Result<()> {
                 )));
             }
 
-            // Pass the *property name* — `ServiceConnection::new` routes
-            // `sys.powerctl` to the for_system socket by name, on V1 as
-            // well as V2 (bionic's `send_prop_msg` constructs its V1
-            // connection from `msg->name` the same way).
-            let mut conn = ServiceConnection::new(name)?;
             let prop_msg = PropertyMessage::new(PROP_MSG_SETPROP, name, value)?;
-
-            ServiceWriter::new()
-                .write_bytes(prop_msg.as_bytes())
-                .send(&mut conn)?;
-
-            wait_for_socket_close(&mut conn.stream, Duration::from_millis(250));
+            Ok(SetRequest {
+                frame: prop_msg.as_bytes().to_vec(),
+                route,
+                reply: Reply::V1Close,
+            })
         }
         ProtocolVersion::V2 => {
-            // (Name/value policy is validated at the top of `set` — shared
-            // with the V1 arm. Length prefixes are derived inside
-            // `write_str`, so no separate truncation hazard here.)
+            // (Name/value policy is validated at the top — shared with the
+            // V1 arm. The length prefixes are taken from the strings
+            // themselves, so a prefix cannot disagree with its payload.)
             check_wire_caps(name, value, CLIENT_WIRE_CAPS)?;
-
-            let mut conn = ServiceConnection::new(name)?;
-
-            ServiceWriter::new()
-                .write_u32(PROP_MSG_SETPROP2)
-                .write_str(name)?
-                .write_str(value)?
-                .send(&mut conn)?;
-
-            let res = conn.recv_i32(RESPONSE_TIMEOUT)?;
-
-            if res != PROP_SUCCESS {
-                // Do not log/report the value: property values can carry
-                // sensitive data (tokens, identifiers) — same policy as the
-                // service side's masked logging.
-                log::error!(
-                    "Property service returned error for {name:?} (<{} bytes>): 0x{res:X}",
-                    value.len()
-                );
-                // A protocol-level rejection, not a transport failure — the
-                // socket round-trip succeeded. A dedicated variant so callers
-                // can tell a permanent policy denial from a retryable
-                // `Error::Io`.
-                return Err(Error::SetRejected {
-                    name: name.to_owned(),
-                    reason: crate::SetRejection::from_code(res),
-                });
-            }
+            Ok(SetRequest {
+                frame: v2_frame(name, value)?,
+                route,
+                reply: Reply::V2Status,
+            })
         }
     }
+}
 
-    Ok(())
+/// `PROP_MSG_SETPROP2`, then `name` and `value`, each with its length.
+fn v2_frame(name: &str, value: &str) -> Result<Vec<u8>> {
+    let mut frame = Vec::with_capacity(12 + name.len() + value.len());
+    frame.extend_from_slice(&PROP_MSG_SETPROP2.to_ne_bytes());
+    for s in [name, value] {
+        let len = u32::try_from(s.len()).map_err(|_| {
+            Error::InvalidArgument(format!("string too long for wire: {} bytes", s.len()))
+        })?;
+        frame.extend_from_slice(&len.to_ne_bytes());
+        frame.extend_from_slice(s.as_bytes());
+    }
+    Ok(frame)
+}
+
+/// The blocking transport: connect, send, then the V2 status (`Some`) or
+/// the V1 close wait (`None`).
+fn transport(request: &SetRequest) -> Result<Option<i32>> {
+    let mut conn = ServiceConnection::connect(request.route)?;
+    conn.send(&request.frame)?;
+    match request.reply {
+        Reply::V1Close => {
+            wait_for_socket_close(&mut conn.stream, V1_CLOSE_WAIT);
+            Ok(None)
+        }
+        Reply::V2Status => conn.recv_i32(RESPONSE_TIMEOUT).map(Some),
+    }
+}
+
+/// The V2 status as the set's result.
+fn finish(name: &str, value_len: usize, status: i32) -> Result<()> {
+    if status == PROP_SUCCESS {
+        return Ok(());
+    }
+    // Do not log/report the value: property values can carry sensitive
+    // data (tokens, identifiers) — same policy as the service side's
+    // masked logging.
+    log::error!("Property service returned error for {name:?} (<{value_len} bytes>): 0x{status:X}");
+    // A protocol-level rejection, not a transport failure — the socket
+    // round-trip succeeded. A dedicated variant so callers can tell a
+    // permanent policy denial from a retryable `Error::Io`.
+    Err(Error::SetRejected {
+        name: name.to_owned(),
+        reason: crate::SetRejection::from_code(status),
+    })
+}
+
+/// Sets a system property via the property service socket.
+///
+/// An `Error::Io` of kind `TimedOut` from the V2 response wait (outside
+/// Android; the message starts with "timed out waiting for property
+/// service response") does not mean the property was not set: see
+/// [`SERVICE_IO_TIMEOUT`]. On Android the response wait has no timeout.
+pub(crate) fn set(name: &str, value: &str) -> Result<()> {
+    let request = prepare(name, value)?;
+    match transport(&request)? {
+        Some(status) => finish(name, value.len(), status),
+        None => Ok(()),
+    }
 }
 
 #[cfg(all(test, not(target_os = "android")))]
@@ -896,13 +906,13 @@ mod tests {
     }
 
     /// The Android mode (`budget = None`) waits past SERVICE_IO_TIMEOUT,
-    /// including the static read timeout `ServiceConnection::new` arms: the
+    /// including the static read timeout `ServiceConnection::connect` arms: the
     /// reply here arrives after ~2.5 s and must be returned, not
     /// `TimedOut` (init applies the set regardless of the client's wait).
     #[test]
     fn test_recv_i32_without_budget_outlasts_service_io_timeout() {
         let (client, mut server) = UnixStream::pair().unwrap();
-        // Same static timeout `ServiceConnection::new` sets.
+        // Same static timeout `ServiceConnection::connect` sets.
         client.set_read_timeout(Some(SERVICE_IO_TIMEOUT)).unwrap();
 
         let feeder = std::thread::spawn(move || {
@@ -984,10 +994,10 @@ mod tests {
             let (client, server) = UnixStream::pair().unwrap();
             drop(server);
             let mut conn = ServiceConnection { stream: client };
-            let err = ServiceWriter::new()
-                .write_u32(PROP_MSG_SETPROP2)
-                .write_bytes(&[0u8; 64])
-                .send(&mut conn)
+            let mut frame = PROP_MSG_SETPROP2.to_ne_bytes().to_vec();
+            frame.extend_from_slice(&[0u8; 64]);
+            let err = conn
+                .send(&frame)
                 .expect_err("peer-closed socket must error");
             assert!(
                 matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::BrokenPipe),
