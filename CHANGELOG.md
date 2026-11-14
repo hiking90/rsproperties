@@ -80,8 +80,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LoadProperties` calls `CheckPermissions`. A refused entry is logged
   and dropped, and a value the map already holds for the name stays.
 - Service: `ServiceOptions` (property_contexts files, build.prop files,
-  `persistent_properties_file`, `control_handler`) and `ControlMessage`,
-  with `ControlMessage::new` for testing a handler.
+  `persistent_properties_file`, `control_handler`), `ControlMessage`
+  (`action`, `target`, and the sender's `pid`, `uid`, `gid` from
+  `SO_PEERCRED`) and `ControlReply`. The control handler is
+  `Fn(ControlMessage, ControlReply)`: it gets each `ctl.*` request with
+  the reply that answers its client, and `reply.send(true)` is
+  `PROP_SUCCESS`, `reply.send(false)`
+  `PROP_ERROR_HANDLE_CONTROL_MESSAGE`. The reply owns the client's
+  connection, as init passes the client's fd on with the control
+  message and answers on it once the message has been handled; `send`
+  does not wait and needs no runtime, so the host answers in the
+  handler call or after it, from any thread or task. A reply dropped
+  without an answer (a handler that panics, a host task that ends) is a
+  failure, or `PROP_SUCCESS` for `ctl.stop` once the handler calls are
+  stopped. For testing a handler: `ControlMessage::new` and
+  `with_uid_gid`, and `ControlReply::for_test`, which returns the reply
+  with a `ControlReplyProbe` that reports the answer.
+- Service: `ServiceOptions::powerctl_handler`, `PowerctlMessage`
+  (`command`, `pid`, `uid`, `gid`; `PowerctlMessage::new` and
+  `with_uid_gid` for testing a handler) and `PowerctlOutcome`, which
+  the handler returns. A `sys.powerctl` set that passes the checks is
+  answered with `PROP_SUCCESS` and then passed to the handler on the
+  blocking pool; the reply does not wait for the handler, as init's
+  does not wait for its shutdown code. As init does, the service keeps
+  one pending command (a later set replaces one the handler has not
+  been called for) and passes it before the next `ctl.*` request. A
+  handler that returns `PowerctlOutcome::ShuttingDown` stops the
+  handler calls as `stop_handler_calls` does, where init's
+  `HandlePowerctlMessage` calls `StopSendingMessages`; `Ignored` is for
+  a command the host does not act on. A request read after the service
+  has stopped gets `PROP_ERROR_SET_FAILED`. `ServiceHandle::shutdown`
+  and `join` wait for the call as they do for a control handler call,
+  so a handler must hand the command to another task and return.
+- Service: `ServiceHandle::stop_handler_calls`, init's
+  `StopSendingMessages`, for a host that goes down without a
+  `sys.powerctl` set. After it, a request reaches no handler and is
+  answered as init answers it during shutdown: `ctl.stop` with
+  `PROP_SUCCESS` (init's `c9d44b84f`, issuetracker 336223505), every
+  other `ctl.*` action with `PROP_ERROR_HANDLE_CONTROL_MESSAGE`, and a
+  `sys.powerctl` set that passes the checks with `PROP_SUCCESS`; other
+  sets are still applied. The `ctl.*` replies stay the same for
+  requests read after `shutdown`; a set read once the properties
+  service has ended, `sys.powerctl` included, gets
+  `PROP_ERROR_SET_FAILED`. It cannot be undone. The handler call that is
+  running is not affected; `ctl.*` requests that were waiting for their
+  call get the same replies without one (init leaves those unanswered),
+  and so does a request whose `ControlReply` the host drops afterwards.
+  Without the call, a service that stops refuses `ctl.*` and
+  `sys.powerctl` as before: a service that ends is not a device that
+  shuts down, so nothing says the target of a `ctl.stop` is being
+  stopped.
+- Service: the control and powerctl handlers are called by one task,
+  one call at a time, in the order init's main thread handles the same
+  requests: `ctl.*` requests in the order they were read, a
+  `sys.powerctl` command before the next of them. A call that blocks
+  delays the calls behind it, as in init. A host that answers a
+  `ctl.*` request in its call handles the requests one at a time, as
+  init does; one that passes the message and its `ControlReply` on
+  decides the order in which they are handled. A `ctl.*` request that
+  finds 102 others unanswered (queued, in their call, or held by the
+  host) gets `PROP_ERROR_HANDLE_CONTROL_MESSAGE`; init refuses a
+  message when 101 are queued, whether or not one is being handled (the
+  limits agree while a control message is in its call). An unanswered
+  request holds its client's connection and no connection slot of the
+  service, and the service sets no time limit for its reply (init sets
+  none for its control functions; an `rsproperties` client outside
+  Android gives up after 2 s). The README section "Answering as init
+  does" lists what a host does and answers for each request to match
+  init.
 - `PropertyIndex` is exported at the crate root. `find`, `foreach` and
   the index methods returned and took it before, but it could not be
   named outside the crate (stored in a struct field, or written in a
@@ -119,11 +185,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the same name, as init does (0.6.0 stored it). With AOSP's
   `property_contexts`, where `ro.property_service.version` is an `int`,
   a build.prop value of that name that is not an `int` is dropped this
-  way and the service sets `2`, instead of failing `run`; `ctl.*` sets
-  go to the control handler and are never stored, with at most 16
-  handler calls running or queued for a blocking thread at once (a
-  request beyond that gets `PROP_ERROR_HANDLE_CONTROL_MESSAGE` without
-  using a blocking thread); `ro.property_service.version=2` and
+  way and the service sets `2` (0.6.0 stored it); `ctl.*` sets
+  go to the control handler and are never stored;
+  `ro.property_service.version=2` and
   `ro.persistent_properties.ready=true` are set at startup. A command
   word that cannot be read is answered with `PROP_ERROR_READ_CMD`, and a
   V2 request is checked after both fields are read, name first, as init
@@ -154,22 +218,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waiting. Once the socket service has ended, a `ctl.*` request read
   from an open connection — also one the client sent earlier — does not
   reach the control handler and is refused
-  (`PROP_ERROR_HANDLE_CONTROL_MESSAGE`). `join()`
-  and `shutdown()` then wait for the handler calls whose requests were
-  read before that, running or still queued for a blocking thread: when
-  either returns, no handler call is running and none begins afterwards.
+  (`PROP_ERROR_HANDLE_CONTROL_MESSAGE`), and so are the `ctl.*`
+  requests that were still waiting for their handler call. `join()`
+  and `shutdown()` then wait for the handler call that is running (and
+  for the powerctl handler call of a set answered before that): when
+  either returns, no handler call is running, none begins afterwards,
+  and the service holds no clone of a handler, so the closures and what
+  they captured have been dropped unless the caller kept the
+  `ServiceOptions`.
   A `run` that fails to start returns its error after the same wait,
-  for the handler calls made while it was starting.
+  for a handler call made while it was starting.
   The wait has no timeout, so a handler call that does not return keeps
   all three pending, and a handler must not wait for any of them to
-  return; dropping the handle does not wait for handler calls. The
-  handler closure and what it captured can be dropped after `join()` or
-  `shutdown()` has returned: the task of a connection accepted earlier
-  holds a clone until that task ends, which two 10 s timeouts bound from
-  the time the connection was accepted while the runtime keeps polling
-  the task. On a current-thread runtime whose thread is blocked or has
-  left `block_on`, the task keeps its clone until the runtime polls it
-  again or is dropped. Both
+  return; dropping the handle does not wait for a handler call. None of
+  them waits for a `ControlReply` the host holds: it keeps its client's
+  connection and can be answered after the service has stopped. Both
   methods return `Result<(), ServiceError>`. `ServiceError`
   displays as `<part> failed: <cause>` and `source()` is the cause — in
   this version a panic in that part's task, since neither part returns an
@@ -370,7 +433,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (e.g. `SetRejection::ReadOnlyProperty` for a second set of a `ro.`
   property). A value that does not match its `property_contexts` type is
   now rejected (`PROP_ERROR_INVALID_VALUE`), and `ctl.*` sets are no
-  longer stored.
+  longer stored. `sys.powerctl` = `reboot,userspace` is rejected with
+  `PROP_ERROR_INVALID_VALUE`, as Android 17's init does ("Userspace
+  reboot is deprecated"; 0.6.0 stored it). Other `sys.powerctl` values
+  are no longer stored either, as in init: they go to
+  `ServiceOptions::powerctl_handler` (see Added), and without a handler
+  the set is answered with `PROP_SUCCESS`, logged at `warn` and has no
+  effect. See Migration.
 - `rsproperties_service::run` returns `Result<_, StartupError>` instead of
   `Box<dyn Error + Send + Sync>`. `StartupError::stage()` names the step
   that failed (`Config` for `init`, `WriterLock`, `PropertiesService`,
@@ -824,7 +893,8 @@ Service (`rsproperties-service`, git dependency only):
   without a timeout). The socket service closes
   the connection without a reply after 10 s (up to 20 s when all 64
   handler slots are
-  taken); a request already queued then is still applied once the areas
+  taken; not a `ctl.*` request that has reached the handler queue, whose
+  connection the `ControlReply` owns); a request already queued then is still applied once the areas
   exist, like one whose client gave up on its own timeout, and one not yet
   queued (mailbox full) is dropped. The first `get` that opens the store
   fixes that process's reader for the process lifetime; a `get` in that
@@ -918,6 +988,13 @@ Service (`rsproperties-service`, git dependency only):
     belongs to a value. A file tree whose expanded values total more
     than 4 MiB in one call fails the call with `Error::LimitExceeded`
     (in the service, `run` fails with `StartupStage::PropertiesService`);
+  - service: a set of `sys.powerctl` to `reboot,userspace` is refused
+    with `PROP_ERROR_INVALID_VALUE` (0.6.0 stored it);
+  - service: `sys.powerctl` is no longer stored in the area, so
+    `get("sys.powerctl")` finds no value and a `wait` on it does not
+    return (0.6.0 stored the last value set). Pass
+    `ServiceOptions::powerctl_handler` to receive the command; code
+    that read the value back from the area must use the handler;
   - service: when the umask clears any bit of 0660 (e.g. 022 clears group
     write), raising the sockets to 0660 needs `/proc` (`/proc/thread-self`,
     or `/proc/self` on kernels before 3.17); without it `run` fails with

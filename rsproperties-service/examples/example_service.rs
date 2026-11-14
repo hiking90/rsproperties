@@ -85,12 +85,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .property_contexts_files(args.property_contexts)
         .build_prop_files(args.build_prop)
         // No services to control here: log ctl.* requests and refuse them.
-        .control_handler(|msg| {
+        .control_handler(|msg, reply| {
             println!(
                 "ctl.{} {:?} from pid {:?}: refused",
                 msg.action, msg.target, msg.pid
             );
-            false
+            reply.send(false);
         });
     if let Some(path) = args.persistent_properties_file {
         options = options.persistent_properties_file(path);

@@ -244,10 +244,13 @@ fn init_set(system_properties: &mut SystemProperties, name: &str, value: &str) {
 ///    never stored);
 /// 3. value not matching the `property_contexts` type
 ///    ([`check_type`]) → `PROP_ERROR_INVALID_VALUE`;
-/// 4. value too long or containing NUL → `PROP_ERROR_INVALID_VALUE`;
-/// 5. `ro.` property that already has a value →
+/// 4. `sys.powerctl` = `reboot,userspace` → `PROP_ERROR_INVALID_VALUE`;
+///    value too long or containing NUL → `PROP_ERROR_INVALID_VALUE`;
+/// 5. `sys.powerctl` → `PROP_SUCCESS` without being stored (the socket
+///    service then passes it to the powerctl handler);
+/// 6. `ro.` property that already has a value →
 ///    `PROP_ERROR_READ_ONLY_PROPERTY`;
-/// 6. any other storage failure (e.g. a full area) →
+/// 7. any other storage failure (e.g. a full area) →
 ///    `PROP_ERROR_SET_FAILED`.
 ///
 /// No per-property access check: see the access model on the socket
@@ -272,9 +275,27 @@ fn apply_set(system_properties: &mut SystemProperties, name: &str, value: &str) 
             return PROP_ERROR_SET_FAILED;
         }
     }
+    // init `HandlePropertySet` (android-17) refuses this one value, after
+    // `CheckPermissions` and before `PropertySet`: "Userspace reboot is
+    // deprecated".
+    let is_powerctl = name == crate::POWERCTL_PROPERTY;
+    if is_powerctl && value == "reboot,userspace" {
+        log::error!("Rejected setprop {name:?}: userspace reboot is deprecated");
+        return PROP_ERROR_INVALID_VALUE;
+    }
     if let Err(e) = validate_value_len(name, value) {
         log::error!("Rejected setprop: {e}");
         return PROP_ERROR_INVALID_VALUE;
+    }
+    // init `PropertySet` does not write `sys.powerctl` to the area ("No
+    // action here - NotifyPropertyChange will trigger the appropriate
+    // action") and returns `PROP_SUCCESS`. The notification is the socket
+    // service's part (`notify_powerctl`), which knows the sender; a set
+    // made at startup gets none, as in init, which notifies nothing
+    // before `StartSendingMessages`.
+    if is_powerctl {
+        log::info!("Accepted {name:?} (<{} bytes>); not stored", value.len());
+        return PROP_SUCCESS;
     }
     // `set` encapsulates find → update-or-add, including the `ro.`
     // rejection (`ReadOnlyProperty`). Every other failure, including
@@ -829,10 +850,24 @@ mod tests {
             ("debug.long", &"x".repeat(100), PROP_ERROR_INVALID_VALUE),
             ("ro.once", "1", PROP_SUCCESS),
             ("ro.once", "2", PROP_ERROR_READ_ONLY_PROPERTY),
+            // As init on an API 37 emulator: only this value is refused.
+            ("sys.powerctl", "reboot", PROP_SUCCESS),
+            ("sys.powerctl", "reboot,userspace", PROP_ERROR_INVALID_VALUE),
+            ("sys.powerctl", "reboot,userspace,x", PROP_SUCCESS),
+            ("sys.powerctl", &"x".repeat(100), PROP_ERROR_INVALID_VALUE),
+            ("debug.other", "reboot,userspace", PROP_SUCCESS),
+            // init stores the path once its restorecon thread is done, and
+            // an empty value at once.
+            ("selinux.restorecon_recursive", "/data/x", PROP_SUCCESS),
         ];
         for &(name, value, code) in cases {
-            assert_eq!(apply_set(&mut sp, name, value), code, "{name:?}");
+            assert_eq!(apply_set(&mut sp, name, value), code, "{name:?} {value:?}");
         }
+        assert!(
+            sp.find("sys.powerctl").unwrap().is_none(),
+            "an accepted sys.powerctl is not stored, as in init"
+        );
+        assert_eq!(sp.get("selinux.restorecon_recursive").unwrap(), "/data/x");
         assert_eq!(sp.get("debug.int").unwrap(), "");
         assert_eq!(sp.get("debug.enum").unwrap(), "b");
         assert_eq!(sp.get("ro.once").unwrap(), "1");

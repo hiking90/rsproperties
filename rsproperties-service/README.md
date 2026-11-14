@@ -23,9 +23,14 @@ Linux emulation of the Android system property service: a tokio-based daemon tha
 The service consists of two main components running as separate actors.
 Both are internal: the public API is `run`, `ServiceOptions` and the
 `ServiceHandle` that `run` returns, with the types they use:
-`ControlMessage` (the argument of the control handler: `action`,
-`target`, `pid`), `StartupError` / `StartupStage` (a failed `run`) and
-`ServiceError` (a failure after startup).
+`ControlMessage` (the first argument of the control handler: `action`,
+`target`, and the sender's `pid`, `uid`, `gid`), `ControlReply` (its
+second argument, which answers the client that sent the message; with
+`ControlReplyProbe` for tests of a handler), `PowerctlMessage` (the
+argument of the powerctl handler: `command`, `pid`, `uid`, `gid`),
+`PowerctlOutcome` (what the powerctl handler returns), `StartupError` /
+`StartupStage` (a failed `run`) and `ServiceError` (a failure after
+startup).
 
 ### Properties service
 - Manages the actual property storage and retrieval
@@ -141,14 +146,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Start services with configuration files. `persist.*` properties are
     // kept in an AOSP-format persistent_properties file (its directory must
-    // exist); `ctl.*` sets go to the handler instead of being stored.
+    // exist); `ctl.*` and `sys.powerctl` sets go to the handlers instead
+    // of being stored.
     let options = rsproperties_service::ServiceOptions::new()
         .property_contexts_files(property_contexts)
         .build_prop_files(build_props)
         .persistent_properties_file("/data/property/persistent_properties")
-        .control_handler(|msg| {
-            eprintln!("ctl.{} {} from pid {:?}", msg.action, msg.target, msg.pid);
-            false // no services to control: report failure
+        .control_handler(|msg, reply| {
+            eprintln!(
+                "ctl.{} {} from pid {:?}, uid {:?}",
+                msg.action, msg.target, msg.pid, msg.uid
+            );
+            // No services to control: report failure. A host that has
+            // some passes `msg` and `reply` on to the code that starts
+            // and stops them, which answers when it is done.
+            reply.send(false);
+        })
+        .powerctl_handler(|msg| {
+            // The client already has its reply; hand the command to the
+            // code that reboots or powers off, and return what was done
+            // with it. See "Answering as init does" below.
+            eprintln!("sys.powerctl {} from pid {:?}", msg.command, msg.pid);
+            rsproperties_service::PowerctlOutcome::Ignored
         });
     let mut service = rsproperties_service::run(config, options).await?;
 
@@ -169,27 +188,127 @@ that called `run` until the handle stops it:
 
 | Call | Effect |
 |---|---|
-| `service.join().await` | Waits until the service has ended by itself (a failure after startup). Takes `&mut self` and is cancel-safe, so it can be an arm of `tokio::select!`. By the time it returns, both socket files are unlinked, the writer lock is released and no control handler call is running (as for `shutdown`). |
-| `service.shutdown().await` | Stops the socket service, then the properties service, and waits for both. Sets already queued are applied first. A `ctl.*` request read from an open connection afterwards (also one the client sent earlier) is refused (`HANDLE_CONTROL_MESSAGE` to a V2 client). Then waits for the control handler calls whose requests were read before that, running or still queued for a blocking thread: when `shutdown` returns, no handler call is running and none begins afterwards. There is no timeout, so a handler call that does not return keeps `shutdown` pending (the sockets are unlinked and the lock is released by then), and a handler must not wait for `shutdown` or `join`. Returns the failure the service had ended with, if any. |
-| dropping the handle | Stops the service without waiting: the sockets are unlinked and the lock is released later, by tasks on the runtime, and control handler calls that have begun or are queued keep running. Call `shutdown` when the next step depends on them (starting the service again on the same directories, for example). |
+| `service.join().await` | Waits until the service has ended by itself (a failure after startup). Takes `&mut self` and is cancel-safe, so it can be an arm of `tokio::select!`. By the time it returns, both socket files are unlinked, the writer lock is released and no control or powerctl handler call is running (as for `shutdown`). |
+| `service.stop_handler_calls()` | Ends the control and powerctl handler calls while the service keeps running; init's `StopSendingMessages`, which init calls when it begins a shutdown or reboot. A request read afterwards reaches no handler and is answered as init answers it during shutdown: `ctl.stop` with `PROP_SUCCESS` (also without a control handler), every other `ctl.*` action with `HANDLE_CONTROL_MESSAGE`, `sys.powerctl` with `PROP_SUCCESS` once it has passed the checks. Other sets are applied as before. Cannot be undone. A powerctl handler that returns `PowerctlOutcome::ShuttingDown` has the same effect, so call this only when the host goes down without a `sys.powerctl` set. The call that is running is not affected and at most one more begins (the one the service was about to make); `ctl.*` requests that were waiting for their call get the replies above without one. A `ControlReply` the host already holds is the host's to answer; one it drops from then on gets the replies above as well. |
+| `service.shutdown().await` | Stops the socket service, then the properties service, and waits for both. Sets already queued are applied first. A `ctl.*` request read from an open connection afterwards (also one the client sent earlier) is refused (`HANDLE_CONTROL_MESSAGE` to a V2 client), and so is a `sys.powerctl` request (`SET_FAILED`); after `stop_handler_calls` the `ctl.*` requests get the replies of that row instead, and a `sys.powerctl` request gets them only until the properties service has ended (`SET_FAILED` afterwards, as for every set). `ctl.*` requests that were still waiting for their handler call are refused in the same way, without a call. Then waits for the handler call that is running, and for the powerctl handler call of a `sys.powerctl` set that was answered before that: when `shutdown` returns, no handler call is running, none begins afterwards, and the service has dropped both handlers. A `ControlReply` that the host got from a call and has not answered is not waited for: it keeps its client's connection and can be answered or dropped after `shutdown` has returned. There is no timeout, so a handler call that does not return keeps `shutdown` pending (the sockets are unlinked and the lock is released by then), and a handler must not wait for `shutdown` or `join`. Returns the failure the service had ended with, if any. |
+| dropping the handle | Stops the service without waiting: the sockets are unlinked and the lock is released later, by tasks on the runtime, and a control or powerctl handler call that is running keeps running. A `ControlReply` the host holds stays usable. Call `shutdown` when the next step depends on them (starting the service again on the same directories, for example). |
 
 A `run` that fails to start waits the same way before it returns its
 error: the socket service accepts requests while the properties service
 is still starting, so a control handler call can begin before `run`
-returns, and a failed `run` returns only after those calls have
+returns, and a failed `run` returns only after that call has
 returned, without a timeout. A handler must not wait for `run` to
-return either.
+return either. (A powerctl handler call begins only after the
+properties service has checked the request, so none begins in a `run`
+whose properties service failed to start.)
 
-The handler closure and what it captured can be dropped after `join` or
-`shutdown` has returned. The task of a connection accepted earlier holds
-a clone of the handler until that task ends, which two 10 s timeouts
-bound from the time the connection was accepted (the wait for a
-connection slot, then the exchange with the client). The bound holds
-while the runtime keeps polling that task. On a `current_thread` runtime
-whose thread is blocked, or has left `block_on`, the task is not polled
-and keeps its clone until the runtime polls it again or is dropped, so
-code that waits for a captured value to be dropped must not do so by
-blocking that thread.
+A powerctl handler that ends the service must not do it inside the
+call: `shutdown` and `join` wait for the call to return. Send the
+command to the task that owns the `ServiceHandle` (a channel) and
+return `PowerctlOutcome::ShuttingDown`. That task stops the processes
+of the host, calls `shutdown` and then reboots or powers off. From the
+return of the handler until `shutdown`, a client that stops a process
+with `ctl.stop` gets `PROP_SUCCESS`, as it does from init during
+shutdown, instead of reaching a control handler whose targets are
+already being stopped. The `PROP_SUCCESS` is sent without anything
+having been stopped, so return `ShuttingDown` (or call
+`stop_handler_calls`) only when the host is stopping those processes.
+
+Once `join`, `shutdown` or a failed `run` has returned, the service
+holds no clone of either handler: one task owns both handlers and makes
+every call, and the three wait for that task to end. Unless the caller
+kept a clone of the `ServiceOptions`, the closures and what they
+captured (a channel sender, a clone of an `Arc`) have been dropped by
+then. The `ControlReply` values the host has not answered are not part
+of this: each keeps the connection of its client until it is answered
+or dropped.
+
+### Answering as init does
+
+The service makes the handler calls in the order in which init's main
+thread handles the same requests, one call at a time: `ctl.*` requests
+in the order they were read, and a `sys.powerctl` command before the
+next `ctl.*` request. A call that blocks delays every call behind it;
+init has the same property, since its control functions run on its main
+thread.
+
+A `ctl.*` client is answered when the host answers the `ControlReply`
+of its request: `reply.send(true)` is `PROP_SUCCESS`,
+`reply.send(false)` is `HANDLE_CONTROL_MESSAGE`. `send` does not wait
+and needs no runtime, so the host can call it in the handler call or
+later, from any thread or task. init answers a control message when its
+main thread has handled it (`init.cpp` `HandleControlMessages`), and a
+host does the same in one of two ways:
+
+- answer in the handler call. The messages are then handled one at a
+  time, in the order they were read, as in init;
+- pass the message and the reply on to a task or thread of the host and
+  return. The service then calls the handler for the next request at
+  once, and the host decides in which order the messages are handled
+  and answered. One task that reads them from a channel keeps the order
+  of the calls.
+
+A reply that is dropped without an answer is a failure
+(`HANDLE_CONTROL_MESSAGE`), so a handler that panics, or a host task
+that ends with requests it has not handled, leaves no client waiting.
+Once the handler calls are stopped, a dropped reply for `ctl.stop` is
+`PROP_SUCCESS`, the reply a `ctl.stop` request read after the stop
+gets.
+
+The service sets no time limit for the reply. It refuses a request that
+finds 102 others unanswered (queued for their call, in their call, or
+held by the host) with `HANDLE_CONTROL_MESSAGE`; init refuses a control
+message when 101 are queued, whether or not one is being handled, so
+the two limits agree while a control message is in its call. An unanswered
+request holds one fd (the connection of its client) and none of the
+connection permits under [Backpressure](#hardening-highlights), so
+other sets are served meanwhile.
+
+What handling a message means is the host's part. A host that
+is to be indistinguishable from init for the clients of `ctl.*` and
+`sys.powerctl` (`android::base::SetProperty("ctl.stop", ...)`,
+`WaitForProperty("init.svc.<name>", "stopped")`, `reboot`) follows these
+rules, which are init's (`init.cpp` `HandleControlMessage`,
+`service.cpp` `StopOrReset` / `NotifyStateChange`, `reboot.cpp`
+`HandlePowerctlMessage`, Android 17). "Handler result" is the argument
+of `ControlReply::send` for a `ctl.*` row and the return value of the
+powerctl handler for a `sys.powerctl` row:
+
+| Request | What init does | Handler result |
+|---|---|---|
+| `ctl.start` = `<name>` | Starts the process of the service and sets `init.svc.<name>` to `running`. Does not wait for the process to be ready. A service that is already running is left as it is. | `true`, also when it was already running; `false` when the process could not be started |
+| `ctl.stop` = `<name>`, running | Records that the service must not be restarted, sends `SIGKILL` to its process group and sets `init.svc.<name>` to `stopping`. Does not wait for the process to exit; when it has been reaped, sets `init.svc.<name>` to `stopped`. | `true` |
+| `ctl.stop` = `<name>`, not running | Sets `init.svc.<name>` to `stopped`. | `true` |
+| `ctl.restart` = `<name>` | As `ctl.stop`, but the service is started again when the process has been reaped (at once when it was not running). | `true` |
+| `ctl.interface_start` / `interface_stop` / `interface_restart` = `<interface>` | The same for the service that declares the interface. | as above |
+| `ctl.sigstop_on` / `sigstop_off` / `oneshot_on` / `oneshot_off` = `<name>` | Changes one flag of the service. | `true` |
+| a name that is no service, or any other action | Logs the message. | `false` |
+| `sys.powerctl` = `shutdown[,<reason>]` or `reboot[,<target>[,...]]` | Stops accepting control messages, then stops every service (`SIGTERM`, then `SIGKILL` after a timeout) and reboots or powers off. | `PowerctlOutcome::ShuttingDown` |
+| `sys.powerctl` = anything else | Logs `unrecognized command`. | `PowerctlOutcome::Ignored` |
+
+None of init's control functions waits for a process: the reply to
+`ctl.stop` follows the `SIGKILL`, not the exit. A host that answers
+only when the process has exited keeps the client waiting for that
+time (an `rsproperties` client outside Android gives up after 2 s with
+`TimedOut`), which init does not.
+
+The host sets `init.svc.<name>` itself, with `rsproperties::set` from a
+thread that may block (the handler runs on tokio's blocking pool, so the
+handler may do it); the service gives the name no special treatment and
+any client that can connect can set it as well. The values init uses
+are `running`, `stopping`, `stopped` and `restarting`. With `running`
+init also sets `ro.boottime.<name>` (once) and
+`init.svc_debug_pid.<name>`.
+
+What the service cannot reproduce: init checks with SELinux whether the
+sender may set the `ctl.*` name for that target
+(`CheckControlPropertyPerms`) and answers `HANDLE_CONTROL_MESSAGE`
+before the message is queued. Here every sender that can connect
+reaches the handler, which can refuse by the sender's `uid`, `gid` or
+`pid` (it has no SELinux context to check) with `reply.send(false)`;
+its client then gets the same `HANDLE_CONTROL_MESSAGE`. Such a request
+counts toward the 102 until it is answered, where init refuses it
+before its queue.
 
 `join` and `shutdown` return `Result<(), ServiceError>`. `ServiceError`
 displays as `<part> failed: <cause>` (`socket service` or
@@ -251,10 +370,29 @@ The socket service implements the Android property service protocol:
   `HANDLE_CONTROL_MESSAGE` (`ctl.*` refused or failed), `SET_FAILED`.
   Both V2 fields are read before either is checked, and the name is
   checked first, as in init
-- **Not mirrored**: `sys.powerctl` and `selinux.restorecon_recursive` are
-  stored like any property; init does not store `sys.powerctl`, answers
-  `reboot,userspace` with `INVALID_VALUE`, and runs a restorecon for the
-  latter instead of storing it
+- **`sys.powerctl`**: never stored, as in init, so a `get` finds no
+  value. `reboot,userspace` is answered with `INVALID_VALUE`, as in
+  init (Android 17). Any other value that passes the checks every set
+  gets (name, length, UTF-8, `property_contexts` type) is answered with
+  `PROP_SUCCESS` and passed to `ServiceOptions::powerctl_handler` with
+  the sender's pid. The reply does not wait for the handler and does
+  not say whether the command was recognized: init also accepts
+  `sys.powerctl=anything` and only logs `unrecognized command`.
+  Without a handler the set is answered with `PROP_SUCCESS`, logged at
+  `warn`, and has no effect. As init does, the service keeps one
+  pending command: a set made before the handler was called for the
+  previous one replaces it, and the command is passed to the handler
+  before the next `ctl.*` request. A handler that returns
+  `PowerctlOutcome::ShuttingDown` stops the handler calls, as init's
+  `HandlePowerctlMessage` does for a command it acts on; after that, or
+  after `ServiceHandle::stop_handler_calls`, a set that passes the
+  checks is answered with `PROP_SUCCESS` and reaches no handler, as in
+  init once it has begun a shutdown. A request read after the service
+  has stopped gets `SET_FAILED`. The value is not logged (init logs it)
+- **`selinux.restorecon_recursive`**: stored like any property. init
+  runs a recursive restorecon on the path and stores the path when that
+  is done, so a client that waits for the property to equal the path it
+  set sees the same result; no restorecon runs here
 - **Type check**: values are checked against the `property_contexts` type
   (`bool`, `int`, `uint`, `double`, `size`, `enum ...`) as init's
   `CheckType` does; an empty value is always accepted. This covers client
@@ -265,15 +403,36 @@ The socket service implements the Android property service protocol:
   `$$` for a `$`); an entry whose value cannot be expanded is logged and
   dropped. A reference is looked up among the build.prop entries read
   so far, in `build_prop_files` order; init looks it up in the property
-- **`ctl.*`**: never stored; passed to `ServiceOptions::control_handler`,
-  or refused without one. At most 16 handler calls are running or
-  waiting for a blocking thread at once; a request beyond that gets
-  `HANDLE_CONTROL_MESSAGE` without using a blocking thread
   area, which does not hold those entries yet, and drops such an entry.
   An expanded value longer than 64 KiB is dropped like one that cannot
   be expanded. A `build_prop_files` entry (its imports included) whose
   expanded values total more than 4 MiB fails `run`
   (`StartupStage::PropertiesService`) instead.
+- **`ctl.*`**: never stored; passed to `ServiceOptions::control_handler`
+  with a `ControlReply`, or refused without a handler. The handler is
+  called for one request at a time, in the order the requests were
+  read, as init handles control messages on its main thread, and the
+  client is answered when the host answers the reply (in the call or
+  after it) or drops it. A request that finds 102 others unanswered
+  gets `HANDLE_CONTROL_MESSAGE`; init refuses a message when 101 are
+  queued, whether or not one is being handled (the limits agree while a
+  control message is in its call). The service sets no time limit for
+  the reply, as init sets none for its control functions. Once the
+  handler calls are stopped (a powerctl handler
+  returned `PowerctlOutcome::ShuttingDown`, or
+  `ServiceHandle::stop_handler_calls`) no handler is called: `ctl.stop`
+  is answered with `PROP_SUCCESS` and every other action
+  (`ctl.interface_stop` included) with `HANDLE_CONTROL_MESSAGE`, as in
+  init during shutdown. **Not mirrored**: init leaves the messages
+  still in its queue unanswered from then on, so their clients wait
+  until the device goes down; here they get the same replies as a
+  request read after the stop, and so does a request whose reply the
+  host drops afterwards. init handles the messages in the order it
+  read them; here that holds for the handler calls, and a host that
+  passes the messages on to code of its own decides the order in which
+  they are handled. init also checks the sender with
+  SELinux before it queues a message, which is left to the handler
+  here; see [Answering as init does](#answering-as-init-does)
 - **Startup properties**: `ro.property_service.version=2`, the persistent
   properties, then `ro.persistent_properties.ready=true`, after the
   build.prop entries. A build.prop file that sets
@@ -398,7 +557,13 @@ in the release build.
   connection is closed immediately. The spawned task then waits up to
   `CLIENT_TIMEOUT` (10 s) for one of `MAX_CONCURRENT_CLIENTS` (64)
   handler permits and drops the connection on timeout. The accept loop
-  never parks, and accepted fds are capped at 64 + 256.
+  never parks, and accepted fds are capped at 64 + 256. A `ctl.*`
+  request gives its handler permit back once it is queued for the
+  control handler: its connection then belongs to the `ControlReply`,
+  and at
+  most 102 of those exist (see
+  [Answering as init does](#answering-as-init-does)), so the service
+  holds at most 64 + 256 + 102 client fds.
 - **`TimedOut` has an unknown outcome**: like AOSP init, the service
   applies every request it received in full, also when the client has
   already stopped waiting. The Linux client waits at most 2 s for the
@@ -407,9 +572,13 @@ in the release build.
   the request was not delivered). Retrying with the same value is
   harmless except for `ro.*`, where the retry gets
   `rsproperties::Error::SetRejected` (`SetRejection::ReadOnlyProperty`)
-  if the first attempt was applied, and `ctl.*`, whose handler runs once per
-  request (a handler call outlives the client's `TimedOut`, so a retry
-  can run the action twice).
+  if the first attempt was applied, and `ctl.*`, whose handler is
+  called once per request also when the client has stopped waiting (a
+  request stays queued after the client's `TimedOut`, and one the host
+  holds stays with the host, so a retry can run the action twice). The
+  service does not time a `ctl.*` reply out, so for `ctl.*` the 2 s are
+  the time the host has to answer such a client; an answer sent later
+  is discarded.
 - **`accept()` back-off**: a 100 ms sleep is inserted after an `accept()`
   error so an `EMFILE`/`ENFILE` storm cannot spin the worker and flood
   the log.
@@ -450,7 +619,10 @@ and enforced after the bytes arrive:
   dir's permissions are the only access control. Any peer that can
   connect may set any non-`ro.` property, and any `ro.` property that
   has no value yet (the first writer fixes it), and send any `ctl.*`
-  control message to the configured control handler.
+  control message to the configured control handler and any
+  `sys.powerctl` command to the configured powerctl handler. A handler
+  that reboots the host must check the sender (`uid`, `gid`, `pid` from
+  `SO_PEERCRED`) or the command itself.
 - **Socket dir contract**: the service opens the socket dir once at
   startup and changes only entries directly in it named
   `property_service`, `property_service_for_system`, or
