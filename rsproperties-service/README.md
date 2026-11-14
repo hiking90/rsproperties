@@ -125,8 +125,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         PathBuf::from("/vendor/etc/selinux/vendor_property_contexts"),
     ];
 
-    // Configure build.prop files. A missing or unreadable file fails
-    // startup; a file writable by group or others is logged at `error`
+    // Configure build.prop files. A missing or unreadable file, or one
+    // whose expanded values total more than 4 MiB, fails startup; a file
+    // writable by group or others is logged at `error`
     // and not loaded, and the service starts without its properties.
     let build_props = vec![
         PathBuf::from("/system/build.prop"),
@@ -264,18 +265,27 @@ The socket service implements the Android property service protocol:
   `$$` for a `$`); an entry whose value cannot be expanded is logged and
   dropped. A reference is looked up among the build.prop entries read
   so far, in `build_prop_files` order; init looks it up in the property
-  area, which does not hold those entries yet, and drops such an entry
 - **`ctl.*`**: never stored; passed to `ServiceOptions::control_handler`,
   or refused without one. At most 16 handler calls are running or
   waiting for a blocking thread at once; a request beyond that gets
   `HANDLE_CONTROL_MESSAGE` without using a blocking thread
+  area, which does not hold those entries yet, and drops such an entry.
+  An expanded value longer than 64 KiB is dropped like one that cannot
+  be expanded. A `build_prop_files` entry (its imports included) whose
+  expanded values total more than 4 MiB fails `run`
+  (`StartupStage::PropertiesService`) instead.
 - **Startup properties**: `ro.property_service.version=2`, the persistent
   properties, then `ro.persistent_properties.ready=true`, after the
   build.prop entries. A build.prop file that sets
-  `ro.property_service.version` to anything but a number of 2 or more
-  makes `run` fail (`StartupStage::PropertiesService`, `InvalidInput`)
-  before the properties dir is written: `ro.` names are write-once, so
-  that value would stay and tell clients to send V1
+  `ro.property_service.version` to a value that passes the name's
+  `property_contexts` type check (any value when the name has no type)
+  but is not a decimal number from 2 to 4294967295 makes `run` fail
+  (`StartupStage::PropertiesService`, `InvalidInput`) before the
+  properties dir is written: `ro.` names are write-once, so that value
+  would stay and tell clients to send V1. Under the `int` type of AOSP's
+  `property_contexts` that includes `1`, an empty value, `0x10` and
+  `4294967296`; a value the type check refuses, such as `v2`, is
+  dropped instead and the service sets `2`
 - **Message Format**: Compatible with Android's binary protocol
 
 ## Error Handling

@@ -34,8 +34,8 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
 | C6 | client | global reader 초기화 실패를 process 수명 동안 유지 | (c), 재시도 방식은 (a) | 이 branch에서 수정 |
 | C7 | client | 한 property의 값 cache와 변경 대기(`CachedProperty`) | (d) | 이 branch에서 추가 |
 | S1 | service | `persist.*` / `next_boot.*` 영속화 | (d) | 이 branch에서 추가 |
-| S2 | service | property type 검사(`CheckType`) | (c) | 이 branch에서 수정. build.prop 값의 `${...}` 확장도 수정했고, 참조를 load 중인 map에서 찾는 점은 (b) |
 | S3 | service | `ctl.*`를 일반 property로 저장 | (c) | 저장은 이 branch에서 수정. 종료 뒤 `ctl.stop` 응답은 (c)로 남아 있고 owner 결정 대기 |
+| S2 | service | property type 검사(`CheckType`) | (c) | 이 branch에서 수정. build.prop 값의 `${...}` 확장도 수정했고, 참조를 load 중인 map에서 찾는 점, 확장 결과의 64 KiB 상한, 호출 하나의 확장 값 합계 4 MiB 상한은 (b) |
 | S4 | service | 실패 응답 코드가 항상 `PROP_ERROR` | (c) | 이 branch에서 수정 |
 | S5 | service | `ro.property_service.version` 미설정 | (c) | 이 branch에서 수정 |
 | S6 | service | 변경 알림 hook 없음 | (a) | 검토 대상 아님 |
@@ -748,6 +748,42 @@ loader가 `ctl.*` 제외 뒤, 이름 검사 앞에서 값을 확장하도록 수
 검사도 확장한 값을 대상으로 한다. init은 실패한 값을 log에 남기지만 이
 loader는 남기지 않는다(값을 log에 쓰지 않는 기존 정책).
 
+확장 결과의 길이 상한(b). init `ExpandProps`는 결과 길이를 제한하지 않는다.
+init에서는 확장한 값이 같은 load의 다음 줄 조회 대상이 되지 않으므로(아래
+표의 마지막 행), 한 줄의 결과는 그 줄의 참조 개수와 area에 이미 있는 값의
+길이로 정해진다. 이 loader는 확장한 값을 map에 저장하고 다음 줄이 그 값을
+참조하므로, 각 줄이 `${x}`를 여러 번 반복하면 `x`의 길이가 줄마다 그 배수로
+커진다. 64 KiB 이하의 줄 세 개(`x=` + 약 65,500 byte, `x=` + `${x}` 16,383회
+두 줄)로 두 번째 줄에서 약 1 GB, 세 번째 줄에서 약 16 TB 할당을 요구하고,
+할당 실패는 `handle_alloc_error`로 process를 abort한다. 그래서 `expand_props`는
+결과가 `MAX_LINE_LEN`(64 KiB, 줄 길이 상한)을 넘으면 그 시점에 확장 실패로
+처리한다. 확장에 실패한 다른 경우와 같이 entry를 버리고, `import` 경로라면
+그 import를 건너뛴다. 상한을 줄 길이로 정한 이유는 map에 저장되는 값의 상한을
+확장 전후로 같게 두기 위해서다. `PROP_VALUE_MAX`(92)는 쓰지 않았다. `ro.`
+값은 92 byte 이상도 저장되므로(long property), 그 상한은 init이 저장하는
+`ro.` 값을 버린다. 포기한 것은 64 KiB를 넘는 확장 결과다. init은 저장을
+시도한다.
+
+확장한 값의 합계 상한(b). 줄 하나의 상한은 map 전체 크기를 제한하지 않는다.
+여러 key가 같은 긴 값을 참조하면 key마다 그 값의 사본을 저장하기 때문이다.
+root 파일에 `x=` + 약 65,500 byte 한 줄과 약 10 byte짜리 `kN=${x}` 줄 100만
+개(파일 약 10 MB)를 두면, 줄마다 결과는 64 KiB 이하지만 map은 약 64 GB를
+요구하고 할당 실패로 process가 abort된다. 확장이 없으면 map 크기는 읽은 파일의
+byte 수에 비례하는데, 이 경로에서는 입력 1 byte당 약 6,000 byte를 저장한다.
+init에서는 참조 대상인 area에 같은 load의 entry가 없으므로 이 증폭이 생기지
+않는다. 증폭의 원인은 map 조회(아래 표의 마지막 행)다. 그래서 loader는
+`load_properties_from_file` 호출 하나(그 `import` 포함)에서 확장한 값의 길이를
+더하고, 합계가 `MAX_EXPANDED_BYTES`(4 MiB)를 넘으면 `MAX_TOTAL_LOADS`와 같이
+`Error::LimitExceeded`로 그 호출을 중단한다. 그 전에 저장한 entry는 map에
+남는다. service에서는 `run`이 `StartupStage::PropertiesService`로 실패한다.
+초과한 entry만 버리고 계속하는 방식은 택하지 않았다. 그 방식에서는 이후의
+확장 entry가 줄마다 error log를 남기고 모두 빠지는데도 load가 `Ok`로 끝난다.
+4 MiB는 최대 길이 결과 64개에 해당한다. 실제 build에서 `${...}`를 쓰는 값의
+합계는 이보다 훨씬 작다고 보았다(기기별 실측은 확인 필요). 상한은 호출 하나에
+적용되므로, build.prop 파일마다 호출하는 service에서 map에 든 확장 값의 합계는
+파일 수 × 4 MiB까지 커질 수 있다. 포기한 것은 확장한 값의 합계가 4 MiB를 넘는
+파일 tree의 load다. init은 이런 tree도 읽는다.
+
 API 37 emulator(`android-17`, userdebug)에서 `/data/local.prop`으로 init의
 동작을 실측했다. `local.prop`도 `LoadProperties`를 거친다(`:870-878`).
 
@@ -790,6 +826,9 @@ property를 참조하려면 호출자가 load 전에 map에 넣어야 한다.
 `test_accept_is_called_per_entry_before_the_map_changes`,
 `test_values_are_expanded_before_the_checks`(위 표의 `local.prop` 줄),
 `test_expand_props_aosp_parity`,
+`test_expand_props_result_is_bounded`,
+`test_chained_expansion_stops_at_the_line_bound`,
+`test_expanded_values_are_bounded_per_pass`,
 `property_info_parser.rs` `property_type_in_trie_reads_unpublished_bytes`.
 
 ### S3. `ctl.*` 저장 — 저장 동작은 (c), dispatch 없음은 (a), 종료 뒤 `ctl.stop` 응답은 (c) 미결정
@@ -1074,7 +1113,15 @@ enum과 `handle_setprop_v1`은 삭제했다.
   service는 그 frame을 거부하는데 client는 성공을 반환하기 때문이다. init에는
   이 검사가 없다. 판정식은 이 crate의 client와 같은
   `trim().parse::<u32>()`이다. `"2x"`는 bionic의 `atoll`로는 2이지만 이
-  crate의 client는 V1로 판정하므로 이 검사에서 거부한다.
+  crate의 client는 V1로 판정한다. 이 검사는 load 중 type 검사(S2)를 통과해
+  map에 남은 값에만 적용된다. 그래서 `run`이 실패하는 값은 type 검사를
+  통과하고(이름에 type이 없으면 모든 값이 통과한다) 2부터 4294967295까지의
+  10진수가 아닌 값이다. type이 없으면 `"1"`, `"v2"`, `"2x"`가 모두 여기에
+  해당한다. `int` type(AOSP `plat_property_contexts`)에서는 `"1"`, `"0"`,
+  빈 값, `"0x10"`, `"4294967296"`이 해당한다. `check_type`은 빈 값을 type과
+  무관하게 통과시키고, `int`를 `0x` 16진수와 `i64` 범위로 판정하기 때문이다.
+  type 검사가 거부하는 값(`int`에서 `"v2"`, `"2x"`)은 load 중 버려져 이 검사에
+  도달하지 않고, service가 `2`를 설정한다(S2).
 
 **포기한 것.** V1만 구현한 client(Android O 이전 libc와 같은 규칙)는 이
 service에 set을 적용할 수 없다. V1 frame을 끝까지 읽은 뒤 닫는 방법도 있으나

@@ -38,8 +38,19 @@ use crate::parse::is_c_space;
 /// Bound on one line's in-memory size. Real prop-file lines are a few
 /// hundred bytes; the cap exists so a crafted newline-less file cannot
 /// grow a single `read_until` buffer without bound — the same threat
-/// model as [`MAX_IMPORT_DEPTH`] / [`MAX_TOTAL_LOADS`].
+/// model as [`MAX_IMPORT_DEPTH`] / [`MAX_TOTAL_LOADS`]. [`expand_props`]
+/// bounds an expansion result by the same value.
 pub(crate) const MAX_LINE_LEN: usize = 64 * 1024;
+
+/// Bound on the total length of the expanded values in one
+/// `load_properties_from_file` call. [`MAX_LINE_LEN`] bounds one result,
+/// but every key that references the same long value stores its own
+/// copy, so a file of short `kN=${x}` lines would make the map thousands
+/// of times larger than the file. Without expansion the map grows with
+/// the bytes read; this budget keeps the expanded values to a fixed
+/// amount on top. A real build's values that use `${...}` total a few
+/// KiB; 4 MiB is 64 results of the maximum length.
+const MAX_EXPANDED_BYTES: usize = 4 * 1024 * 1024;
 
 /// `read_until(b'\n')` with `MAX_LINE_LEN` as a hard memory bound.
 /// Returns `(bytes_read_this_line, truncated)`; `(0, false)` is EOF. An
@@ -107,8 +118,9 @@ pub(crate) fn read_bounded_line(
 /// `properties` holds for `name`, `${name:-default}` becomes `default`
 /// when that value is missing or empty, `$$` becomes `$`, and a `$` at the
 /// end of the value is removed. An entry whose value cannot be expanded
-/// (a `$` followed by anything else, no closing `}`, an empty name, or a
-/// missing or empty property without a non-empty default) is logged at
+/// (a `$` followed by anything else, no closing `}`, an empty name, a
+/// missing or empty property without a non-empty default, or a result
+/// longer than the 64 KiB line bound; AOSP sets no bound) is logged at
 /// `error` and dropped, and a value `properties` already holds for its
 /// name stays. Write `$$` for a `$` that is part of a value.
 ///
@@ -149,8 +161,9 @@ pub(crate) fn read_bounded_line(
 /// # }
 /// ```
 ///
-/// On error (I/O failure reading the root file, or more than
-/// `MAX_TOTAL_LOADS` file loads across the whole pass), entries parsed
+/// On error (I/O failure reading the root file, more than
+/// `MAX_TOTAL_LOADS` file loads across the whole pass, or expanded values
+/// totalling more than 4 MiB across the whole pass), entries parsed
 /// before the failure remain in `properties` — the map is an accumulator,
 /// not a transaction.
 ///
@@ -217,6 +230,7 @@ pub fn load_properties_from_file_with(
 ) -> Result<PropFileOutcome> {
     let mut visited = HashSet::new();
     let mut loads = 0u32;
+    let mut expanded_bytes = 0usize;
     load_properties_impl(
         filename,
         filter,
@@ -224,6 +238,7 @@ pub fn load_properties_from_file_with(
         0,
         &mut visited,
         &mut loads,
+        &mut expanded_bytes,
         &mut accept,
     )
 }
@@ -270,14 +285,29 @@ pub enum PropFileOutcome {
 ///   without a non-empty default is an error → `None` (AOSP returns
 ///   `Error()` for each; the caller logs and skips the import or the
 ///   entry).
+///
+/// A result longer than [`MAX_LINE_LEN`] is also an error → `None`; AOSP
+/// sets no bound. Expanded values go into the map that later lines expand
+/// against, so without the bound a few lines that each repeat `${x}`
+/// multiply the size of `x` per line until the allocation aborts the
+/// process. With it, no stored value is longer than a line can be. The
+/// total over many keys is [`MAX_EXPANDED_BYTES`]', checked where the
+/// values are stored.
 fn expand_props(raw: &str, properties: &HashMap<String, String>) -> Option<String> {
+    fn push(out: &mut String, s: &str) -> Option<()> {
+        if out.len() + s.len() > MAX_LINE_LEN {
+            return None;
+        }
+        out.push_str(s);
+        Some(())
+    }
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
     while let Some(dollar) = rest.find('$') {
-        out.push_str(&rest[..dollar]);
+        push(&mut out, &rest[..dollar])?;
         let after = &rest[dollar + 1..];
         if let Some(tail) = after.strip_prefix('$') {
-            out.push('$');
+            push(&mut out, "$")?;
             rest = tail;
             continue;
         }
@@ -298,21 +328,23 @@ fn expand_props(raw: &str, properties: &HashMap<String, String>) -> Option<Strin
             return None;
         }
         match properties.get(name).map(String::as_str) {
-            Some(value) if !value.is_empty() => out.push_str(value),
+            Some(value) if !value.is_empty() => push(&mut out, value)?,
             // Missing and empty collapse to the default, like AOSP; an
             // empty default (`${x:-}`) counts as no default there.
-            _ => out.push_str(default.filter(|d| !d.is_empty())?),
+            _ => push(&mut out, default.filter(|d| !d.is_empty())?)?,
         }
         rest = &body[end + 1..];
     }
-    out.push_str(rest);
+    push(&mut out, rest)?;
     Some(out)
 }
 
-// Recursion state (depth/visited/loads) and the caller's entry check
-// travel with every call; a params struct would be re-destructured at each
-// of the three call sites for no clarity gain. `accept` is `dyn` so the
-// recursion is compiled once, not once per closure type.
+// Recursion state (depth/visited/loads/expanded_bytes) and the caller's
+// entry check travel with every call; a params struct would be
+// re-destructured at each of the three call sites for no clarity gain.
+// `accept` is `dyn` so the recursion is compiled once, not once per
+// closure type.
+#[allow(clippy::too_many_arguments)]
 fn load_properties_impl(
     filename: &Path,
     filter: Option<&str>,
@@ -320,6 +352,7 @@ fn load_properties_impl(
     depth: u8,
     visited: &mut HashSet<PathBuf>,
     loads: &mut u32,
+    expanded_bytes: &mut usize,
     accept: &mut dyn FnMut(&str, &str) -> bool,
 ) -> Result<PropFileOutcome> {
     if depth > MAX_IMPORT_DEPTH {
@@ -367,7 +400,16 @@ fn load_properties_impl(
     }
     // From here on every exit must pop the stack entry; wrap the body so
     // one removal covers all paths.
-    let result = load_properties_body(filename, filter, properties, depth, visited, loads, accept);
+    let result = load_properties_body(
+        filename,
+        filter,
+        properties,
+        depth,
+        visited,
+        loads,
+        expanded_bytes,
+        accept,
+    );
     if !filtered {
         visited.remove(&canonical);
     }
@@ -412,6 +454,7 @@ fn open_prop_file(filename: &Path) -> Result<std::result::Result<File, u32>> {
     Ok(Ok(file))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_properties_body(
     filename: &Path,
     filter: Option<&str>,
@@ -419,6 +462,7 @@ fn load_properties_body(
     depth: u8,
     visited: &mut HashSet<PathBuf>,
     loads: &mut u32,
+    expanded_bytes: &mut usize,
     accept: &mut dyn FnMut(&str, &str) -> bool,
 ) -> Result<PropFileOutcome> {
     let file = match open_prop_file(filename)? {
@@ -485,6 +529,7 @@ fn load_properties_body(
                             depth + 1,
                             visited,
                             loads,
+                            expanded_bytes,
                             accept,
                         ) {
                             // A *global* budget exhaustion is not a broken
@@ -551,7 +596,18 @@ fn load_properties_body(
         // (AOSP logs it).
         let value: Cow<'_, str> = if value.contains('$') {
             match expand_props(value, properties) {
-                Some(expanded) => Cow::Owned(expanded),
+                Some(expanded) => {
+                    // A pass budget like `loads`: aborting reports the
+                    // truncated load instead of dropping every later
+                    // expanded entry with a log line each.
+                    *expanded_bytes += expanded.len();
+                    if *expanded_bytes > MAX_EXPANDED_BYTES {
+                        return Err(Error::LimitExceeded(format!(
+                            "expanded values longer than {MAX_EXPANDED_BYTES} bytes in total in one pass at line {line_count} of {filename:?}"
+                        )));
+                    }
+                    Cow::Owned(expanded)
+                }
                 None => {
                     error!(
                         "Line {line_count} of {filename:?}: dropping property {key:?}: couldn't expand its value"
@@ -1023,6 +1079,98 @@ mod tests {
             .collect();
         expected.sort();
         assert_eq!(loaded, expected);
+    }
+
+    /// An expansion result longer than `MAX_LINE_LEN` fails, whichever
+    /// part of the input pushes it over.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_expand_props_result_is_bounded() {
+        let near = "a".repeat(MAX_LINE_LEN - 1);
+        let props = HashMap::from([("a".to_string(), near.clone())]);
+        assert_eq!(
+            expand_props("${a}b", &props).map(|s| s.len()),
+            Some(MAX_LINE_LEN)
+        );
+        assert_eq!(expand_props("${a}bc", &props), None);
+        assert_eq!(
+            expand_props("${a}$$", &props).map(|s| s.len()),
+            Some(MAX_LINE_LEN)
+        );
+        assert_eq!(expand_props("${a}$$$$", &props), None);
+        assert_eq!(expand_props("${a}${miss:-xy}", &props), None);
+        assert_eq!(expand_props("${a}${a}", &props), None);
+        assert_eq!(expand_props(&format!("{near}bc"), &props), None);
+    }
+
+    /// Expanded values are stored and later lines expand against them, so
+    /// lines that each double a value must stop at the bound instead of
+    /// growing it per line until the allocation aborts.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_chained_expansion_stops_at_the_line_bound() {
+        use std::io::Write;
+        let tmp = TempDir::new("rsprops_expansion_bound_test");
+        let root = tmp.0.join("root.prop");
+        let seed = "a".repeat(MAX_LINE_LEN / 2 + 1);
+        {
+            let mut f = create_prop(&root).unwrap();
+            writeln!(f, "debug.rsp.x={seed}").unwrap();
+            writeln!(f, "debug.rsp.x=${{debug.rsp.x}}${{debug.rsp.x}}").unwrap();
+            writeln!(f, "debug.rsp.y=${{debug.rsp.x}}").unwrap();
+        }
+        let mut properties = HashMap::new();
+        load(&root, &mut properties);
+        // The doubling line is dropped; the earlier value stays and is
+        // still usable for a later reference.
+        assert_eq!(properties.get("debug.rsp.x"), Some(&seed));
+        assert_eq!(properties.get("debug.rsp.y"), Some(&seed));
+    }
+
+    /// Many keys that each copy the same long value stay within one line
+    /// bound apiece, so the total is bounded per pass instead: the pass
+    /// aborts with `LimitExceeded` once the expanded values exceed
+    /// `MAX_EXPANDED_BYTES`, counting the entries of imported files.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_expanded_values_are_bounded_per_pass() {
+        use std::io::Write;
+        let tmp = TempDir::new("rsprops_expansion_budget_test");
+        let root = tmp.0.join("root.prop");
+        let child = tmp.0.join("child.prop");
+        let seed = "a".repeat(MAX_LINE_LEN - 100);
+        let fit = MAX_EXPANDED_BYTES / seed.len();
+        // The root's expansions use part of the budget, so the child
+        // reaches it earlier than it would on its own.
+        let half = fit / 2;
+        {
+            let mut f = create_prop(&root).unwrap();
+            writeln!(f, "debug.rsp.x={seed}").unwrap();
+            for n in 0..half {
+                writeln!(f, "debug.rsp.r{n}=${{debug.rsp.x}}").unwrap();
+            }
+            writeln!(f, "import {}", child.display()).unwrap();
+            writeln!(f, "debug.rsp.after=1").unwrap();
+            let mut f = create_prop(&child).unwrap();
+            for n in 0..fit + 10 {
+                writeln!(f, "debug.rsp.k{n}=${{debug.rsp.x}}").unwrap();
+            }
+        }
+        let mut properties = HashMap::new();
+        let err = load_properties_from_file(&root, None, &mut properties).unwrap_err();
+        assert!(matches!(err, Error::LimitExceeded(_)), "{err:?}");
+        // Entries before the failure stay; the one over the budget and
+        // everything after it in the pass are not loaded.
+        assert_eq!(
+            properties.get(&format!("debug.rsp.r{}", half - 1)),
+            Some(&seed)
+        );
+        assert_eq!(
+            properties.get(&format!("debug.rsp.k{}", fit - half - 1)),
+            Some(&seed)
+        );
+        assert_eq!(properties.get(&format!("debug.rsp.k{}", fit - half)), None);
+        assert_eq!(properties.get("debug.rsp.after"), None);
     }
 
     /// AOSP `LoadProperties`: `import <path> <filter>` loads only the keys

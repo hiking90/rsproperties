@@ -337,8 +337,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   close and return success — so it reports `Ok` for a set that was not
   applied. The service sets `ro.property_service.version=2`, so a client
   that follows bionic's rule sends V2. A build.prop file that sets
-  `ro.property_service.version` to anything but a number of 2 or more
-  now makes `run` fail (see Migration).
+  `ro.property_service.version` to a value that passes the name's
+  `property_contexts` type check (any value when the name has no type)
+  but is not a decimal number from 2 to 4294967295 now makes `run`
+  fail; a value the type check refuses is dropped instead (see
+  Migration).
 - **Breaking (`builder`, service):** `load_properties_from_file` expands
   property references in values, as AOSP init's `LoadProperties` does
   (`ExpandProps`; 0.6.0 expanded `import` paths only and stored values
@@ -354,7 +357,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build.prop files it is loading are not stored yet, so init drops
   `b=${a}` when `a` comes from one of those files and this loader stores
   `b` with `a`'s value. The other cases matched init on an API 37
-  emulator (`/data/local.prop`). See Migration.
+  emulator (`/data/local.prop`). Because later lines expand against the
+  stored values, an expansion result longer than 64 KiB (the prop-file
+  line bound) is an expansion failure, and a call whose expanded values
+  total more than 4 MiB (imports included) fails with
+  `Error::LimitExceeded`, keeping the entries stored before it, so many
+  keys that copy one long value cannot grow the map without bound; init
+  sets neither bound, and its lookup does not see the values it is
+  loading. See Migration.
 - Service: V2 replies carry init's error codes instead of `PROP_ERROR`
   (-1), so a client's `Error::SetRejected { reason }` names the reason
   (e.g. `SetRejection::ReadOnlyProperty` for a second set of a `ro.`
@@ -882,11 +892,16 @@ Service (`rsproperties-service`, git dependency only):
     service sets to 2). Unset the variable, or set it to 2. A client that
     implements V1 only cannot set properties on this service;
   - service: a build.prop entry `ro.property_service.version` whose
-    value is not a number of 2 or more (`1`, `0`, `v2`, `2x`)
-    makes `run` fail with `StartupStage::PropertiesService` and
+    value passes the name's `property_contexts` type check (or the name
+    has no type) but is not a decimal number from 2 to 4294967295 makes
+    `run` fail with `StartupStage::PropertiesService` and
     `InvalidInput`, before the properties dir is written (0.6.0 stored
-    the value). Clients that read such a value send V1, which the
-    service refuses. Remove the entry or set it to `2`;
+    the value). That is an empty value under any type; under AOSP's
+    `int` type also `1`, `0`, `-1`, `0x10` and `4294967296`; with no type
+    every such value (`1`, `v2`, `2x`). A value the type check refuses
+    (`v2` under `int`) is dropped instead (see the type entry below).
+    Clients that read such a value send V1, which the service refuses.
+    Remove the entry or set it to `2`;
   - `load_properties_from_file` skips a line whose key fails
     `wire::validate_property_name` (spaces, `*`, `/`, leading/trailing or
     doubled `.`), logging a warning; 0.6.0 put the key in the map, and the
@@ -896,10 +911,13 @@ Service (`rsproperties-service`, git dependency only):
     not part of `$$`, `${name}` or `${name:-default}` and is not the
     value's last character (`price=5$x`), a `${` without `}`, an empty
     name, or a reference to a missing or empty property without a
-    non-empty default; 0.6.0 stored such values as written. A value that
+    non-empty default, or a value longer than 64 KiB (the prop-file line
+    bound) once expanded; 0.6.0 stored such values as written. A value that
     does expand is stored expanded: `a$$b` as `a$b`, `abc$` as `abc`,
     `${name}` as the value of `name`. Write `$$` for each `$` that
-    belongs to a value;
+    belongs to a value. A file tree whose expanded values total more
+    than 4 MiB in one call fails the call with `Error::LimitExceeded`
+    (in the service, `run` fails with `StartupStage::PropertiesService`);
   - service: when the umask clears any bit of 0660 (e.g. 022 clears group
     write), raising the sockets to 0660 needs `/proc` (`/proc/thread-self`,
     or `/proc/self` on kernels before 3.17); without it `run` fails with
@@ -937,8 +955,12 @@ Service (`rsproperties-service`, git dependency only):
     `property_contexts` type (`int`, `uint`, `double`, `bool`, `size`,
     `enum …`; init `CheckType`) is rejected with
     `PROP_ERROR_INVALID_VALUE`, and a persistent record with such a value
-    is skipped at startup with an `error` log line (0.6.0 stored any
-    value). Fix the value, or the type in `property_contexts`;
+    is skipped at startup with an `error` log line, and a build.prop
+    entry with such a value is dropped when the file is read, so an
+    earlier entry of the same name stays (0.6.0 stored any value). With
+    AOSP's `property_contexts` this drops a non-`int`
+    `ro.property_service.version` (`v2`, `2x`) and the service sets `2`.
+    Fix the value, or the type in `property_contexts`;
   - service: a `ctl.*` set is no longer stored in the area. Without a
     control handler it gets `PROP_ERROR_HANDLE_CONTROL_MESSAGE` (0.6.0
     stored it and replied `PROP_SUCCESS`). Pass
