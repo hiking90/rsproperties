@@ -149,7 +149,11 @@ fn futex_wake(_addr: &AtomicU32) -> Result<usize> {
 ///
 /// On macOS there is no futex; fails immediately — see
 /// `SystemProperties::wait`.
-fn futex_wait(_serial: &AtomicU32, _value: u32, _deadline: &Deadline) -> Result<Option<u32>> {
+pub(crate) fn futex_wait(
+    _serial: &AtomicU32,
+    _value: u32,
+    _deadline: &Deadline,
+) -> Result<Option<u32>> {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     {
         use rustix::io::Errno;
@@ -212,7 +216,7 @@ fn futex_wait(_serial: &AtomicU32, _value: u32, _deadline: &Deadline) -> Result<
 
 /// The error of a wait that would have to block on macOS (no futex).
 #[cfg(target_os = "macos")]
-fn no_futex() -> Error {
+pub(crate) fn no_futex() -> Error {
     Error::Io(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "property waits need futex, which macOS does not have",
@@ -1602,6 +1606,23 @@ pub(crate) mod test_fixture {
                 .property_info(idx.property_index)
                 .unwrap();
             pi.serial.load(Ordering::SeqCst)
+        }
+
+        /// Moves the global serial without `FUTEX_WAKE`: a writer that
+        /// does not wake, which only a timed futex wait observes.
+        pub(crate) fn bump_global_serial(&self) {
+            self.sp
+                .contexts
+                .serial_prop_area()
+                .serial()
+                .fetch_add(1, Ordering::SeqCst);
+        }
+
+        /// `reader`'s `properties_serial` mapping, as its waiter holds it.
+        pub(crate) fn serial_area_of(
+            reader: &SystemProperties,
+        ) -> std::sync::Arc<crate::property_area::PropertyAreaMap> {
+            std::sync::Arc::clone(reader.contexts.serial_area_map())
         }
     }
 }

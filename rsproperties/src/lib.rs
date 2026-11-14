@@ -131,6 +131,7 @@ mod trie_node_arena;
 #[cfg(feature = "builder")]
 mod trie_serializer;
 mod wait_step;
+mod waiter;
 
 // Compiles the crate README's Rust blocks as doctests, so an example that
 // no longer matches the API fails `cargo test`. One block uses the
