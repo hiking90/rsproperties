@@ -104,6 +104,7 @@ impl PropertyConfig {
     }
 }
 
+pub mod asynchronous;
 mod errors;
 mod from_property;
 pub mod parse;

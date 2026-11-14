@@ -737,12 +737,6 @@ impl ContextsSerialized {
 
     /// The `properties_serial` mapping itself, for the waiter thread to
     /// share (`waiter.rs`).
-    // Used by the waiter's tests (Linux, `builder`) until the async waits
-    // use it.
-    #[cfg_attr(
-        not(all(test, feature = "builder", target_os = "linux")),
-        allow(dead_code)
-    )]
     pub(crate) fn serial_area_map(&self) -> &Arc<PropertyAreaMap> {
         &self.serial_property_area_map
     }

@@ -27,11 +27,8 @@
 //! - Not supported: a child forked without exec has no thread but a
 //!   registry that says one is running, so its async waits are not woken.
 
-// Used by its tests (Linux, `builder`) until the async waits use it.
-#![cfg_attr(
-    not(all(test, feature = "builder", target_os = "linux")),
-    allow(dead_code)
-)]
+// macOS has no futex: `register` fails before any thread code runs.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -129,7 +126,7 @@ impl Waiter {
         Self::with_slice(serial, SLICE)
     }
 
-    pub(crate) fn with_slice(serial: Arc<PropertyAreaMap>, slice: Duration) -> Self {
+    fn with_slice(serial: Arc<PropertyAreaMap>, slice: Duration) -> Self {
         Self {
             shared: Arc::new(Shared {
                 registry: Mutex::new(Registry::default()),
@@ -162,17 +159,17 @@ impl Waiter {
             .context_with_location("Failed to start the property waiter thread")
     }
 
-    #[cfg(test)]
-    fn registered(&self) -> usize {
+    #[cfg(all(test, feature = "builder", target_os = "linux"))]
+    pub(crate) fn registered(&self) -> usize {
         self.shared.lock().wakers.len()
     }
 
-    #[cfg(test)]
-    fn started_from(&self) -> Option<u32> {
+    #[cfg(all(test, feature = "builder", target_os = "linux"))]
+    pub(crate) fn started_from(&self) -> Option<u32> {
         self.shared.lock().started_from
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "builder", target_os = "linux"))]
     fn before_first_wait(&self, hook: impl FnOnce() + Send + 'static) {
         *self.shared.before_first_wait.lock().unwrap() = Some(Box::new(hook));
     }

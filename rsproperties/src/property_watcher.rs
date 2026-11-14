@@ -101,6 +101,11 @@ impl<'a> PropertyWatcher<'a> {
         &self.name
     }
 
+    /// The instance this watcher reads.
+    pub(crate) fn props(&self) -> &'a SystemProperties {
+        self.props
+    }
+
     /// The property's current value, or `None` while it does not exist.
     ///
     /// Once the property has been found, a call costs the context node's

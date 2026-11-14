@@ -19,6 +19,7 @@ use crate::contexts_serialized::ContextsSerialized;
 use crate::property_area::{load_acquire, EntryOffset};
 use crate::property_watcher::PropertyWatcher;
 use crate::wait_step::{drive, CreationWait, SerialWait, ValueWait, WaitOn};
+use crate::waiter::Waiter;
 
 pub(crate) use crate::wire::PROP_VALUE_MAX;
 pub(crate) const PROP_TREE_FILE: &str = "/dev/__properties__/property_info";
@@ -278,6 +279,9 @@ pub struct SystemProperties {
     /// `Init`; writer instances look up names as given, like bionic's
     /// `AreaInit`.
     appcompat_override: bool,
+    /// Wake source of this instance's async waits. Its thread starts at
+    /// the first async wait that has to block.
+    waiter: Waiter,
 }
 
 /// Prints the instance id and the lookup mode only: no property name or
@@ -294,6 +298,7 @@ impl std::fmt::Debug for SystemProperties {
 impl SystemProperties {
     fn with_contexts(contexts: ContextsSerialized, appcompat_override: bool) -> Self {
         Self {
+            waiter: Waiter::new(std::sync::Arc::clone(contexts.serial_area_map())),
             contexts,
             appcompat_override,
             instance: {
@@ -305,6 +310,30 @@ impl SystemProperties {
                 id
             },
         }
+    }
+
+    /// This instance with the async wait methods: the same instance, so
+    /// a [`PropertyIndex`] from either type works with both, and the
+    /// mapping and the async waits' thread are shared. See
+    /// [`crate::asynchronous`].
+    ///
+    /// ```rust,no_run
+    /// # async fn run() -> rsproperties::Result<()> {
+    /// let props = rsproperties::SystemProperties::open("/run/my_service/properties")?;
+    /// props.as_async().wait_for_value("debug.my_service.ready", "1").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn as_async(&self) -> &crate::asynchronous::SystemProperties {
+        // SAFETY: `asynchronous::SystemProperties` is a
+        // `#[repr(transparent)]` struct whose only field is a `Self`, so
+        // the two have the same layout and validity, and the cast
+        // reference has the same lifetime as `self`.
+        unsafe { &*(self as *const Self as *const crate::asynchronous::SystemProperties) }
+    }
+
+    pub(crate) fn waiter(&self) -> &Waiter {
+        &self.waiter
     }
 
     /// Opens the property store of the properties directory `dir` for

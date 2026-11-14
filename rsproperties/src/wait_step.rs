@@ -138,6 +138,47 @@ impl WaitStep for SerialWait<'_> {
     }
 }
 
+/// The async [`serial`](crate::asynchronous::SystemProperties::serial):
+/// the property's serial once it is clean. The sync `serial` waits for that
+/// at most 200 ms and then returns the dirty one; this has no bound (docs
+/// 2.8, item 4).
+pub(crate) struct CleanSerialWait<'a> {
+    props: &'a SystemProperties,
+    index: PropertyIndex,
+}
+
+impl<'a> CleanSerialWait<'a> {
+    pub(crate) fn new(props: &'a SystemProperties, index: PropertyIndex) -> Self {
+        Self { props, index }
+    }
+}
+
+impl WaitStep for CleanSerialWait<'_> {
+    type Output = u32;
+
+    fn step(&mut self) -> Result<Step<u32>> {
+        /// Bit 0 of a property serial: set during an update.
+        const DIRTY: u32 = 1;
+        let word = self.props.serial_word(self.index)?;
+        Ok(if word & DIRTY == 0 {
+            Step::Done(word)
+        } else {
+            Step::Wait(Wait {
+                on: WaitOn::Property(self.index),
+                old: word,
+            })
+        })
+    }
+
+    fn props(&self) -> &SystemProperties {
+        self.props
+    }
+
+    fn name(&self) -> Option<&str> {
+        None
+    }
+}
+
 /// One lookup of `name`: its index, or the global serial sampled before
 /// the lookup to wait from. Sampled first, so an add that lands between
 /// the lookup and the wait has already moved it.
