@@ -2585,7 +2585,15 @@ pub(crate) mod tests {
             "a panic must not end the worker"
         );
         assert_eq!(most_at_once.load(Ordering::SeqCst), 1);
-        assert_eq!(handlers.shared.replies.unanswered(), 0);
+        // The worker's thread uncounts a reply after sending it, so the
+        // client can read the last reply before the count drops.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while handlers.shared.replies.unanswered() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every reply must be uncounted once it is sent");
     }
 
     /// The reply is the host's to send: the client waits after the handler
