@@ -195,6 +195,50 @@ The watcher is built on `find`, `read_index_with` and
 `wait(Some(index), old_serial)`; they stay public for a caller that keeps
 its own index and serial.
 
+### Async Waits and Set
+
+`rsproperties::asynchronous` has the same waits as `async fn`s, with the
+same arguments and no timeout argument (wrap the future in your runtime's
+timeout; dropping it cancels the wait). They need no feature and no
+particular runtime:
+
+```rust,no_run
+async fn follow() -> rsproperties::Result<()> {
+    let props = rsproperties::asynchronous::system_properties()?;
+    props.wait_for_value("sys.boot_completed", "1").await?;
+
+    let mut level = props.watch("debug.my_service.log_level");
+    loop {
+        println!("log level: {:?}", level.value()?);
+        level.wait_for_change().await?;
+    }
+}
+```
+
+A futex has no fd an executor could poll, so the first async wait of an
+instance that has to block starts one thread for that instance. It waits on
+the global serial and wakes the waiting futures; a wait whose condition
+already holds returns on its first poll and starts nothing.
+`SystemProperties::as_async()` gives the async view of any instance.
+
+With the `tokio` feature, `asynchronous::set` sets a property without
+blocking a thread on the property service:
+
+```toml
+[dependencies]
+rsproperties = { version = "0.6", features = ["tokio"] }
+```
+
+```rust,no_run
+async fn configure() -> rsproperties::Result<()> {
+    rsproperties::asynchronous::set("debug.my_service.workers", 4).await?;
+    Ok(())
+}
+```
+
+Unlike `rsproperties::set`, it waits for the service's reply without a
+bound on Linux as well; use `tokio::time::timeout` to bound it.
+
 ### Custom Configuration
 
 > **Warning**: Do not use custom configuration on Android devices. Custom configuration is only intended for Linux environments or development/testing purposes.

@@ -9,7 +9,10 @@
 //!
 //! - Get system properties.
 //! - Set system properties.
-//! - Wait for system properties.
+//! - Wait for system properties, blocking the thread or, through
+//!   [`asynchronous`], as `async fn`s on any executor.
+//! - Set system properties from tokio without blocking a thread
+//!   (`asynchronous::set`, `tokio` feature).
 //! - Serialize/deserialize the property-info trie (requires the `builder`
 //!   feature).
 //!
@@ -136,8 +139,10 @@ mod waiter;
 
 // Compiles the crate README's Rust blocks as doctests, so an example that
 // no longer matches the API fails `cargo test`. One block uses the
-// `builder` API, hence the feature gate.
-#[cfg(all(doctest, feature = "builder"))]
+// `builder` API and one `asynchronous::set`, hence the feature gate. A
+// workspace `cargo test --features builder` has `tokio` on as well:
+// rsproperties-service's dev-dependency enables it.
+#[cfg(all(doctest, feature = "builder", feature = "tokio"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 

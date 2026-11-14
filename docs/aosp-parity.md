@@ -142,7 +142,7 @@ lookup을 다시 한다. callback은 value만 받는다. `PropertyIndex`로 값�
   `pi->name`으로 판정하는 것과 같다. 기존 `read_with`는 lookup에 쓴 이름으로
   판정하지만, index로 읽을 때는 lookup 이름이 없다.
 - serial 의미는 bionic과 같다. mutable property의 serial에는 dirty bit가
-  켜져 있을 수 있다. 이 serial을 `wait(idx, Some(serial), ..)`에 넘기면 같은
+  켜져 있을 수 있다. 이 serial을 `wait(Some(idx), serial)`에 넘기면 같은
   update의 clean store를 변경 한 번으로 보고한다.
 - 다른 instance의 index는 `Error::InvalidArgument`로 거부한다. `update`와
   같은 규칙이다.
@@ -292,25 +292,39 @@ override가 켜진 프로세스에서는 같은 property에 대해 libc
 **rsproperties.** serial 단위 `wait`만 있다. 같은 동작을 사용자가 직접
 조합해야 한다.
 
-**변경.** `SystemProperties::wait_for_creation(name, timeout)`과
-`wait_for_value(name, expected, timeout)`를 추가한다. timeout은
-`Option<Duration>`이며 `None`은 무기한이다.
-- `wait_for_creation`은 `Ok(Some(PropertyIndex))`를 반환한다. libbase는
+**변경.** `SystemProperties::wait_for_creation(name)`과
+`wait_for_value(name, expected)`를 추가한다. timeout이 있는 형태는
+`wait_for_creation_timeout(name, timeout)`과
+`wait_for_value_timeout(name, expected, timeout)`이고, `timeout`은
+`Duration`이다. libbase는 `timeout`의 기본값이
+`std::chrono::milliseconds::max()`이고(`properties.h:63`, `:70`), 이 값을
+`time_t` 최대값으로 자른 timespec으로 넘긴다(`properties.cpp:228`). 그래서
+기본값 호출은 기한 없이 기다린다. 이 crate는 기한 없는 대기를 timeout 인자가
+없는 method로 나눴다.
+`Option<Duration>` 인자 하나로 두면 `None`으로 호출해도 결과 type에 timeout
+case(`None` / `false`)가 남아, 호출자가 일어날 수 없는 분기를 처리해야 한다.
+- `wait_for_creation`은 `Ok(PropertyIndex)`를 반환한다
+  (`wait_for_creation_timeout`은 `Ok(Some(PropertyIndex))`). libbase는
   `bool`을 반환하지만, index를 돌려주면 호출자가 `find`를 다시 하지 않아도
-  된다.
+  된다. `wait_for_value`는 `Ok(())`, `wait_for_value_timeout`은 `Ok(bool)`을
+  반환한다.
 - libbase는 timeout과 futex 실패를 구분하지 않는다. 이 crate는 futex 실패와
   lookup 실패를 `Err`로 반환하고, timeout만 `Ok(None)` / `Ok(false)`로
-  반환한다(b). `wait`도 같은 형태로 바꾼다. timeout은 `Option<Duration>`이고
-  결과는 `Result<Option<u32>>`다. bionic `__system_property_wait`의 `bool`도
+  반환한다(b). `wait`도 같은 형태로 바꾼다. `wait(index, old_serial)`은
+  `Result<u32>`를, `wait_timeout(index, old_serial, timeout)`은
+  `Result<Option<u32>>`를 반환한다. bionic `__system_property_wait`의 `bool`도
   실패를 timeout과 구분하지 않는다.
+- `_timeout` method의 `timeout`은 호출 전체에 적용된다. libbase처럼 시작
+  시각부터 잰 deadline 하나로 생성 대기와 값 대기를 함께 제한한다.
+  `Duration::ZERO`면 기다리지 않고 현재 상태만 확인한다.
 - `wait`의 `old_serial`은 bionic `__system_property_wait`와 같이 필수
   인자(`u32`)다. 0.6.0은 `Option<u32>`였고 `None`이면 `wait` 안에서 현재
   serial을 읽었으므로, 호출 전에 일어난 변경은 반환하지 않았다. bionic에는
   이 형태가 없다.
 - bionic이 deprecated로 둔 `__system_property_wait_any(old_serial)`
   (`system_properties.h:125`)은 `Wait(nullptr, old_serial, &new_serial,
-  nullptr)`다. 대응하던 `wait_any()`는 삭제했고, `wait(None, old_serial,
-  None)`이 같은 호출이다. 이때 `old_serial`은 `area_serial()`
+  nullptr)`다. 대응하던 `wait_any()`는 삭제했고, `wait(None, old_serial)`이
+  같은 호출이다. 이때 `old_serial`은 `area_serial()`
   (`__system_property_area_serial`, `system_properties.h:150`)에서 얻는다.
   0.6.0의 `wait_any()`는 인자가 없어 bionic 함수와 signature가 달랐다.
 - 값 비교는 byte 단위로 한다. 값이 UTF-8이 아니면 `expected`와 같지 않은
@@ -414,11 +428,14 @@ version을 env var나 기본값으로만 골랐다.
 출력했다.
 
 **변경.** `SystemProperties::watch(name) -> PropertyWatcher<'_>`를 추가한다.
-`value()`가 `Get`에, `wait_for_change(timeout)`이 `WaitForChange`에 대응한다.
+`value()`가 `Get`에, `wait_for_change()`와
+`wait_for_change_timeout(timeout)`이 `WaitForChange`에 대응한다. timeout을
+나눈 이유는 C4와 같다.
 - `value()`의 반환 타입은 `Result<Option<&str>>`이고, property가 없으면
   `Ok(None)`이다(b). libbase `Get`은 property가 없을 때 빈 문자열을 반환하므로
   호출자가 빈 값과 부재를 구분하지 못한다.
-- `wait_for_change`의 반환 타입은 `Result<bool>`이다. timeout은 `Ok(false)`,
+- `wait_for_change`의 반환 타입은 `Result<()>`이고,
+  `wait_for_change_timeout`은 `Result<bool>`이다. timeout은 `Ok(false)`,
   lookup 실패와 futex 실패는 `Err`다(b, C4와 같은 규칙).
 - update 1회를 변경 1회로 보고한다(b). writer는 dirty serial, 값, clean serial
   순서로 store하고 futex wake는 clean store 뒤에 한다. `__system_property_wait`는

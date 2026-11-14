@@ -194,6 +194,34 @@ The watcher is built on `find`, `read_index_with` and
 `wait(Some(index), old_serial)`; they stay public for a caller that keeps
 its own index and serial.
 
+### Async Waits
+
+`rsproperties::asynchronous` has the same waits as `async fn`s, with the
+same arguments and no timeout argument (wrap the future in your runtime's
+timeout; dropping it cancels the wait). They need no feature and no
+particular runtime:
+
+```rust,no_run
+async fn follow() -> rsproperties::Result<()> {
+    let props = rsproperties::asynchronous::system_properties()?;
+    props.wait_for_value("sys.boot_completed", "1").await?;
+
+    let mut level = props.watch("debug.my_service.log_level");
+    loop {
+        println!("log level: {:?}", level.value()?);
+        level.wait_for_change().await?;
+    }
+}
+```
+
+A futex has no fd an executor could poll, so the first async wait of an
+instance that has to block starts one thread for that instance. It waits on
+the global serial and wakes the waiting futures; a wait whose condition
+already holds returns on its first poll and starts nothing.
+`SystemProperties::as_async()` gives the async view of any instance. See
+the `asynchronous` module docs for where the return conditions differ from
+the blocking waits.
+
 ### Setting Properties
 
 Setting properties requires a running property service (like `rsproperties-service`):
@@ -256,6 +284,38 @@ returns `Ok` and sets nothing. The service sets
 `ro.property_service.version=2` at startup: read a property before the
 first `set`, or leave `PROPERTY_SERVICE_VERSION` unset, and `set` sends
 V2.
+
+#### Setting from tokio (`tokio` feature)
+
+`rsproperties::set` blocks the calling thread on the socket. With the
+`tokio` feature, `asynchronous::set` runs the same request on tokio's I/O
+and time drivers and returns a `Send + 'static` future:
+
+```toml
+[dependencies]
+rsproperties = { version = "0.6", features = ["tokio"] }
+```
+
+```rust,no_run
+async fn configure() -> rsproperties::Result<()> {
+    rsproperties::asynchronous::set("debug.my_app.workers", 4).await?;
+    // The future owns its request, so it can be spawned.
+    tokio::spawn(rsproperties::asynchronous::set("debug.my_app.mode", "fast"));
+    Ok(())
+}
+```
+
+- The name and value are checked, and the protocol version chosen, as
+  `set` does, when `asynchronous::set` is called; a refused request fails
+  at the `await` with the same error and does not connect.
+- Connect and send keep the 2 s bounds. The reply wait has no bound on
+  Linux either (`set`: 2 s); wrap the future in `tokio::time::timeout` to
+  bound it.
+- Dropping the future before the request is sent in full leaves the
+  property unchanged. Dropped after that, the service applies the request
+  and the outcome is not reported.
+- The first poll panics outside a tokio runtime that has its I/O and time
+  drivers enabled.
 
 #### Property Setting Examples by Type
 
@@ -409,7 +469,9 @@ fn main() -> rsproperties::Result<()> {
   On Linux it waits at most 2 s for the reply, and a `TimedOut` from that
   wait does not mean the property was not set; on Android it waits for
   init's reply without a timeout, like bionic, while connecting and
-  sending keep the 2 s bound (bionic has none)
+  sending keep the 2 s bound (bionic has none).
+  `asynchronous::set` (`tokio` feature) is the same request without
+  blocking the thread
 - `system_properties()` — `&'static SystemProperties` or `Err`
   (`Error::Init`); a failure is retried by the next call
 
@@ -467,6 +529,36 @@ AOSP `android-17.0.0_r1` sources and returned the same values as
 `getprop` on an API 37 emulator.
 On API 35–36 the override is a bind mount over `/dev/__properties__`,
 which a reader created in that process follows without extra code.
+
+### `rsproperties::asynchronous`
+
+- `asynchronous::system_properties()` — the global reader's async view
+  (`&'static asynchronous::SystemProperties`)
+- `SystemProperties::as_async()` / `asynchronous::SystemProperties::as_sync()`
+  — the async / blocking view of one instance; the same instance, not a
+  copy, so a `PropertyIndex` works with both
+- `wait(index, old_serial)`, `wait_for_creation(name)`,
+  `wait_for_value(name, expected)` and `watch(name)` with an async
+  `PropertyWatcher::wait_for_change()` — the blocking waits as
+  `async fn`s with the same arguments and results. There is no `_timeout`
+  form: wrap the future in the runtime's timeout. Dropping the future
+  cancels the wait; a dropped `wait_for_change` leaves the watcher as it
+  was
+- `serial(index)` — `async fn`: the clean serial, waiting without the
+  blocking `serial`'s 200 ms bound
+- `read_with`, `read_index_with`, `foreach`, `list`, `get`, `find`,
+  `area_serial` and (`builder` feature) `property_type` — the blocking
+  reads, unchanged
+- `asynchronous::set(name, value)` (`tokio` feature) — `set` on tokio; see
+  "Setting from tokio" above
+
+The futures are `Send`. The first wait of an instance that has to block
+starts that instance's waiter thread: the global reader's thread runs
+until the process exits, another instance's ends within about a second of
+the instance's drop. A per-property wait wakes on the global serial's
+`FUTEX_WAKE`, and a change whose writer did not wake the futex is seen
+within about a second. A child forked without exec has no waiter thread,
+so its waits that have to block are never woken (not supported).
 
 ### Wire-protocol constants & validators (`rsproperties::wire`)
 

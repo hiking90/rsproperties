@@ -239,8 +239,12 @@ static NEXT_INSTANCE: std::sync::Mutex<u64> = std::sync::Mutex::new(1);
 /// reader and a writer on the same directory are different instances, and
 /// so are two instances created one after the other on the same directory.
 /// [`SystemProperties::read_index_with`], [`SystemProperties::serial`],
-/// [`SystemProperties::wait`] and (`builder` feature)
-/// `SystemProperties::update` reject an index from another instance.
+/// [`SystemProperties::wait`], [`SystemProperties::wait_timeout`], their
+/// [`asynchronous`](crate::asynchronous::SystemProperties) forms and
+/// (`builder` feature) `SystemProperties::update` reject an index from
+/// another instance. The async view of an instance
+/// ([`SystemProperties::as_async`]) is that instance, so an index works
+/// with both.
 ///
 /// Two indexes are equal when the same instance returned them for the same
 /// entry, as two `const prop_info*` are in bionic: `find` on one name

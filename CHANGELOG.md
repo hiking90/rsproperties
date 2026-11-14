@@ -43,6 +43,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `wait` in a loop that carried the index and the serial, and a `wait`
   from a serial with the dirty bit set reported one update twice. The
   watcher reports an update once and does not queue changes.
+- `rsproperties::asynchronous`: the waits as `async fn`s, without a
+  feature or a runtime. `asynchronous::SystemProperties` and
+  `asynchronous::PropertyWatcher` are views of the crate root's types
+  (`SystemProperties::as_async()` / `as_sync()` convert a reference
+  without a copy, `asynchronous::system_properties()` is the process-wide
+  reader), so a `PropertyIndex` works with both. `wait`,
+  `wait_for_creation`, `wait_for_value`, `serial` and
+  `PropertyWatcher::wait_for_change` take the sync methods' arguments and
+  no timeout: wrap the future in the runtime's timeout, and drop it to
+  cancel the wait. The futures are `Send` and use only the waker, so they
+  run on any executor. A futex has no fd to poll, so the first wait of
+  an instance that has to block starts one thread per instance; it
+  futex-waits on the global serial and wakes the registered futures,
+  which check their condition again. A wait already satisfied returns on
+  its first poll and starts no thread. The process-wide reader's thread
+  runs until the process exits; another instance's thread ends within
+  about a second of the instance's drop. Return conditions are the sync
+  methods', except that a per-property wait returns after the writer's
+  global `FUTEX_WAKE`, a writer that moves a serial without a wake is
+  seen within about a second, and async `serial` waits for the clean
+  serial without the sync method's 200 ms bound. A child forked without
+  exec has no thread: its waits that have to block are never woken (not
+  supported).
+- `asynchronous::set(name, value)` (`tokio` feature): `set` on tokio's
+  I/O and time drivers. The future is `Send + 'static`, for
+  `tokio::spawn`. Name and value are checked when `set` is called; a
+  refused request fails at the `await` with `rsproperties::set`'s error
+  and does not connect. Connect and send keep the 2 s bounds of
+  `rsproperties::set`, and a connect that finds the listen backlog full
+  is retried within them. The V2 reply wait has no bound on any platform
+  (`rsproperties::set`: 2 s outside Android); bound it with
+  `tokio::time::timeout`. Dropped before the request is sent in full,
+  the future leaves the property unchanged; dropped after, the service
+  applies the request and the outcome is not reported. The first poll
+  panics outside a tokio runtime that has its I/O and time drivers
+  enabled. The feature adds `tokio` with `net` and `time` only and no
+  default features (5 crates in the dependency tree: `tokio`, `mio`,
+  `socket2`, `pin-project-lite`, `libc`).
 - `parse::parse_bool` and `parse::parse_int`: libbase `ParseBool` /
   `ParseInt` / `ParseUint` rules (`yes`/`on`/`1`, leading whitespace,
   `0x` hex, no trailing characters).
@@ -1161,12 +1199,12 @@ Service (`rsproperties-service`, git dependency only):
     counting (0.6.0: the counter wrapped to 0), so serial values from then
     on differ from 0.6.0's. Code that only compares serials for equality
     needs no change;
-  - `SystemProperties::wait(Some(index), Some(old), Some(Duration::ZERO))`
+  - `SystemProperties::wait_timeout(Some(index), old, Duration::ZERO)`
     returns `Ok(Some(serial))` when the serial already differs from `old`
-    (0.6.0: `None` for a zero timeout, and for a negative or out-of-range
-    one, which `Duration` cannot express). With an unchanged serial it
-    returns `Ok(None)` without waiting. Any `wait` with an index and a zero
-    timeout (also with `old_serial` `None`) now takes
+    (0.6.0: `wait` returned `None` for a zero timeout, and for a negative
+    or out-of-range one, which `Duration` cannot express). With an
+    unchanged serial it returns `Ok(None)` without waiting. A
+    `wait_timeout` with an index and a zero timeout takes
     the context node's read lock (0.6.0 returned before taking it), so it
     can wait for that lock while another thread of the same instance is
     opening that area for the first time;
@@ -1291,16 +1329,19 @@ Service (`rsproperties-service`, git dependency only):
     `PropertyConfig::builder()…build()` drops `builder()` / `build()`
     (`PropertyConfig::new()…`); reading `config.properties_dir` /
     `config.socket_dir` is no longer possible — keep the paths yourself;
-  - `wait(index, old, Some(&Timespec { .. }))` becomes
-    `wait(index, old, Some(Duration::..))`, and its result
+  - `wait(index, old, None)` becomes `wait(index, old)`, and its result
+    `Option<u32>` becomes `Result<u32>`: `Some(s)` → `Ok(s)`, a failure
+    → `Err`. `wait(index, old, Some(&Timespec { .. }))` becomes
+    `wait_timeout(index, old, Duration::..)`, and its result
     `Option<u32>` becomes `Result<Option<u32>>`: `Some(s)` →
     `Ok(Some(s))`, a timeout → `Ok(None)`, a failure → `Err` (0.6.0
     returned `None` for both); `rsproperties::Timespec` is gone;
-  - `wait`'s `old_serial` is a `u32`: `wait(index, Some(old), t)` becomes
-    `wait(index, old, t)`. `wait(Some(&index), None, t)` becomes
-    `wait(Some(index), props.serial(index)?, t)`, and
-    `wait(None, None, t)` or `wait_any()` becomes
-    `wait(None, props.area_serial(), t)` (`t = None` for `wait_any`).
+  - `wait`'s `old_serial` is a `u32`: `wait(index, Some(old), ..)`
+    becomes `wait(index, old)`. `wait(Some(&index), None, ..)` becomes
+    `wait(Some(index), props.serial(index)?)`, and
+    `wait(None, None, ..)` or `wait_any()` becomes
+    `wait(None, props.area_serial())`; a call that passed a timeout
+    takes the same arguments in `wait_timeout` with the `Duration` last.
     Read the serial before the check that decides to wait, not right
     before `wait`: a change made between the two then returns at once;
   - `context_serial()` becomes `area_serial()`;
