@@ -24,6 +24,8 @@ tokio-stream.workspace = true
 rsactor.workspace = true
 
 [dev-dependencies]
+# `asynchronous::set` against a running service.
+rsproperties = { path = "../rsproperties", features = ["builder", "tokio"] }
 env_logger.workspace = true
 ctrlc.workspace = true
 anyhow.workspace = true

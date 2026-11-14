@@ -13,8 +13,9 @@
 //! works with both. The reads that do not wait are here too, as plain
 //! `fn`s.
 //!
-//! No runtime is needed. The futures are `Send`, and a waker is all they
-//! use, so they run on any executor.
+//! The waits need no runtime: their futures are `Send`, and a waker is all
+//! they use, so they run on any executor. `set` (`tokio` feature) talks
+//! to the property service on tokio's I/O and time drivers.
 //!
 //! - **No timeout argument.** Wrap a future in the runtime's timeout
 //!   (`tokio::time::timeout`, for one). Dropping the future cancels it.
@@ -59,6 +60,49 @@ use crate::property_watcher::ChangeWait;
 use crate::wait_step::{CleanSerialWait, CreationWait, SerialWait, Step, ValueWait, WaitStep};
 use crate::waiter::Waiter;
 use crate::PropertyIndex;
+
+/// [`crate::set`] without blocking the thread on the property service:
+/// connect, send and the reply wait run on tokio's I/O and time drivers
+/// (`tokio` feature).
+///
+/// The name and value are checked, and the request is built, when this is
+/// called; a refused one fails at the `await` with the error
+/// [`crate::set`] returns, without a connect. The future owns what it
+/// needs (`'static`) and is `Send`, so it can go to `tokio::spawn`.
+///
+/// Differences from [`crate::set`]:
+///
+/// - **No bound on the reply wait.** [`crate::set`] gives up after 2 s
+///   outside Android (on Android it waits as long as this does). A
+///   service whose handler takes longer — a `ctl.*` request, a persistent
+///   write — is answered here. Wrap the future in `tokio::time::timeout`
+///   to bound it. Connect and send keep their 2 s bounds.
+/// - **Cancellation.** Dropping the future before the request is sent in
+///   full leaves the property unchanged: the service applies only a
+///   complete request. Dropped after that, the service applies it and the
+///   outcome is not reported, as after [`crate::set`]'s reply timeout.
+///
+/// # Panics
+///
+/// On its first poll, when that is outside a tokio runtime or in one built
+/// without its I/O or time driver (`enable_io`, `enable_time`). Calling
+/// `set` itself uses no tokio, and tokio has no way to ask whether the
+/// time driver is on, so this is not checked beforehand.
+///
+/// ```rust,no_run
+/// # async fn run() -> rsproperties::Result<()> {
+/// rsproperties::asynchronous::set("debug.my_service.mode", "fast").await?;
+/// rsproperties::asynchronous::set("debug.my_service.workers", 4).await?;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "tokio")]
+pub fn set(
+    name: &str,
+    value: impl std::fmt::Display,
+) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
+    crate::system_property_set::tokio_transport::set(name, &value.to_string())
+}
 
 /// The process-wide reader ([`crate::system_properties()`]) with the async
 /// waits.

@@ -159,6 +159,46 @@ const RESPONSE_TIMEOUT: Option<Duration> = None;
 #[cfg(not(target_os = "android"))]
 const RESPONSE_TIMEOUT: Option<Duration> = Some(SERVICE_IO_TIMEOUT);
 
+/// The exchange of `asynchronous::set` on tokio. A child module so the
+/// two transports share this module's private stages and messages.
+#[cfg(feature = "tokio")]
+pub(crate) mod tokio_transport;
+
+/// A connect that did not finish within `timeout`.
+fn connect_timed_out(path: &Path, timeout: Duration) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("timed out connecting to {path:?} ({timeout:?})"),
+    )
+}
+
+/// A send that did not finish within [`SERVICE_IO_TIMEOUT`].
+fn send_timed_out(written: usize, total: usize) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "timed out sending property service request \
+             ({SERVICE_IO_TIMEOUT:?} total, {written}/{total} bytes sent)"
+        ),
+    ))
+}
+
+/// A send that wrote nothing: the peer closed.
+fn write_zero() -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::WriteZero,
+        "property service socket closed mid-write",
+    ))
+}
+
+/// The V2 reply ended before its 4 bytes.
+fn early_eof() -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "property service closed before sending a full response",
+    ))
+}
+
 /// Maps a read/write-timeout expiry to a clearly-labelled `TimedOut` error
 /// (preserving the original as text); passes every other error through.
 /// Shared by `recv_i32` and `ServiceConnection::send` so both directions of
@@ -192,12 +232,7 @@ fn connect_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<UnixS
     use rustix::io::Errno;
     use rustix::net as rnet;
 
-    let timed_out = || {
-        std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("timed out connecting to {path:?} ({timeout:?})"),
-        )
-    };
+    let timed_out = || connect_timed_out(path, timeout);
 
     let addr = rnet::SocketAddrUnix::new(path)?;
     // CLOEXEC: `UnixStream::connect` would set it automatically; going
@@ -352,12 +387,7 @@ impl ServiceConnection {
                 let _ = self.stream.set_read_timeout(Some(remaining));
             }
             match self.stream.read(&mut buf[filled..]) {
-                Ok(0) => {
-                    return Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "property service closed before sending a full response",
-                    )))
-                }
+                Ok(0) => return Err(early_eof()),
                 Ok(n) => filled += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(map_timeout_err(e, "waiting for property service response")),
@@ -404,13 +434,7 @@ impl ServiceConnection {
         while written < total {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "timed out sending property service request \
-                         ({SERVICE_IO_TIMEOUT:?} total, {written}/{total} bytes sent)"
-                    ),
-                )));
+                return Err(send_timed_out(written, total));
             }
             // Best-effort re-arm, mirroring `recv_i32`: on macOS this
             // `setsockopt` fails with EINVAL once the peer's FIN has been
@@ -432,12 +456,7 @@ impl ServiceConnection {
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
             let r = self.stream.write(&frame[written..]);
             match r {
-                Ok(0) => {
-                    return Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "property service socket closed mid-write",
-                    )))
-                }
+                Ok(0) => return Err(write_zero()),
                 Ok(n) => written += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(map_timeout_err(e, "sending property service request")),

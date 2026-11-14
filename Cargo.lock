@@ -816,6 +816,7 @@ dependencies = [
  "pretty-hex",
  "rustix",
  "thiserror",
+ "tokio",
  "zerocopy",
  "zerocopy-derive",
 ]
