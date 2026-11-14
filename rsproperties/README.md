@@ -527,7 +527,18 @@ clients that want to point at a custom socket directory:
   `O_NOFOLLOW` and skips (with a warning) a file writable by group or
   others. Returns `PropFileOutcome`: `Loaded`, or
   `SkippedWritable { mode }` when `path` itself was skipped (a skipped
-  `import` is only logged)
+  `import` is only logged). Values are expanded like AOSP `ExpandProps`
+  (`${name}`, `${name:-default}`, `$$` for a `$`) against the entries in
+  the map; an entry whose value cannot be expanded is logged and dropped
+- `load_properties_from_file_with(path, filter, &mut HashMap, accept)` —
+  the same load with `accept(name, value) -> bool` called on every
+  entry, with its expanded value, before it enters the map, where AOSP init's `LoadProperties`
+  calls `CheckPermissions`. An entry `accept` refuses is logged and
+  dropped; a value the map already holds for that name stays
+- `property_type_in_trie(trie, name)` — the lookup of
+  `SystemProperties::property_type` on the bytes `build_trie` returns,
+  for a trie that is not published yet (for example in an `accept`
+  closure that checks build.prop values against their types)
 - `PropertyInfoEntry::parse_from_file(path, MatchKeyword)` —
   parse a `property_contexts`-format file into
   `(Vec<PropertyInfoEntry>, Vec<Error>)` (the entries that survived

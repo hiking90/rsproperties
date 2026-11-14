@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use log::{error, warn};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -37,8 +38,19 @@ use crate::parse::is_c_space;
 /// Bound on one line's in-memory size. Real prop-file lines are a few
 /// hundred bytes; the cap exists so a crafted newline-less file cannot
 /// grow a single `read_until` buffer without bound — the same threat
-/// model as [`MAX_IMPORT_DEPTH`] / [`MAX_TOTAL_LOADS`].
+/// model as [`MAX_IMPORT_DEPTH`] / [`MAX_TOTAL_LOADS`]. [`expand_props`]
+/// bounds an expansion result by the same value.
 pub(crate) const MAX_LINE_LEN: usize = 64 * 1024;
+
+/// Bound on the total length of the expanded values in one
+/// `load_properties_from_file` call. [`MAX_LINE_LEN`] bounds one result,
+/// but every key that references the same long value stores its own
+/// copy, so a file of short `kN=${x}` lines would make the map thousands
+/// of times larger than the file. Without expansion the map grows with
+/// the bytes read; this budget keeps the expanded values to a fixed
+/// amount on top. A real build's values that use `${...}` total a few
+/// KiB; 4 MiB is 64 results of the maximum length.
+const MAX_EXPANDED_BYTES: usize = 4 * 1024 * 1024;
 
 /// `read_until(b'\n')` with `MAX_LINE_LEN` as a hard memory bound.
 /// Returns `(bytes_read_this_line, truncated)`; `(0, false)` is EOF. An
@@ -87,8 +99,8 @@ pub(crate) fn read_bounded_line(
 /// `properties`.
 ///
 /// Mirrors AOSP init's `LoadProperties`: when `filter` is `None`/empty,
-/// `import <path>` lines are loaded recursively (with `${property}`
-/// expansion against the entries collected so far), and an import that
+/// `import <path>` lines are loaded recursively (with the `${property}`
+/// expansion described below), and an import that
 /// cannot be resolved or read — including one nested deeper than
 /// `MAX_IMPORT_DEPTH` — is logged and skipped rather than aborting the
 /// rest of the file. Import *cycles* are cut by a canonicalized-path
@@ -100,6 +112,27 @@ pub(crate) fn read_bounded_line(
 /// comment bytes. Lines, keys, values, and `import` paths and filters are
 /// trimmed of C `isspace` characters only (space, `\t`, `\n`, `\v`, `\f`,
 /// `\r`); other Unicode whitespace is kept, like AOSP.
+///
+/// A value goes through the same expansion as an import path (AOSP
+/// `ExpandProps`) before it is stored: `${name}` becomes the value
+/// `properties` holds for `name`, `${name:-default}` becomes `default`
+/// when that value is missing or empty, `$$` becomes `$`, and a `$` at the
+/// end of the value is removed. An entry whose value cannot be expanded
+/// (a `$` followed by anything else, no closing `}`, an empty name, a
+/// missing or empty property without a non-empty default, or a result
+/// longer than the 64 KiB line bound; AOSP sets no bound) is logged at
+/// `error` and dropped, and a value `properties` already holds for its
+/// name stays. Write `$$` for a `$` that is part of a value.
+///
+/// The references are looked up in `properties`: the entries this call
+/// and its imports have stored so far, and whatever the map held before
+/// the call. AOSP init looks them up in the property area instead, where
+/// the entries of the build.prop files it is loading are not stored yet
+/// (init drops `b=${a}` when `a` comes from one of those files; this
+/// loader stores `b` with `a`'s value), and where properties from other
+/// sources, such as the kernel-derived `ro.boot.*`, are present. To make
+/// such a property available here, put it in `properties` before the
+/// call.
 ///
 /// Every file, the root one included, is opened like AOSP init's
 /// `ReadFile`: with `O_NOFOLLOW`, so a symlink as the last path component
@@ -128,8 +161,9 @@ pub(crate) fn read_bounded_line(
 /// # }
 /// ```
 ///
-/// On error (I/O failure reading the root file, or more than
-/// `MAX_TOTAL_LOADS` file loads across the whole pass), entries parsed
+/// On error (I/O failure reading the root file, more than
+/// `MAX_TOTAL_LOADS` file loads across the whole pass, or expanded values
+/// totalling more than 4 MiB across the whole pass), entries parsed
 /// before the failure remain in `properties` — the map is an accumulator,
 /// not a transaction.
 ///
@@ -143,12 +177,74 @@ pub fn load_properties_from_file(
     filter: Option<&str>,
     properties: &mut HashMap<String, String>,
 ) -> Result<PropFileOutcome> {
-    let mut visited = HashSet::new();
-    let mut loads = 0u32;
-    load_properties_impl(filename, filter, properties, 0, &mut visited, &mut loads)
+    load_properties_from_file_with(filename, filter, properties, |_, _| true)
 }
 
-/// What [`load_properties_from_file`] did with the file it was given.
+/// [`load_properties_from_file`] with a check of the caller's on every
+/// entry: `accept(name, value)` returns whether the entry is kept.
+///
+/// `accept` stands where AOSP init's `LoadProperties` calls
+/// `CheckPermissions`, after that function's property-name check, which
+/// the loader does itself. It is called for an entry that passed the
+/// filter, the `ctl.*` / `sys.powerctl` / `selinux.restorecon_recursive`
+/// exclusion, the value expansion and the name check, with the trimmed
+/// name and the expanded value, before the entry is put in `properties`. An entry it refuses is logged at
+/// `warn` (file, line and name) and dropped; a value `properties` already
+/// holds for that name stays, as in init, where a refused entry does not
+/// replace the earlier one. Entries of imported files go through the same
+/// `accept`.
+///
+/// A service that checks values against their `property_contexts` type
+/// (init `CheckType`) passes a closure over
+/// [`crate::property_type_in_trie`]:
+///
+/// ```rust,no_run
+/// use rsproperties::{load_properties_from_file_with, property_type_in_trie};
+/// use std::{collections::HashMap, path::Path};
+///
+/// # fn main() -> rsproperties::Result<()> {
+/// # let trie: Vec<u8> = Vec::new();
+/// let mut properties = HashMap::new();
+/// let _outcome = load_properties_from_file_with(
+///     Path::new("/system/build.prop"),
+///     None,
+///     &mut properties,
+///     |name, value| match property_type_in_trie(&trie, name) {
+///         // Only `int` here; init's `CheckType` covers the other types.
+///         Ok(Some(t)) if t == "int" => value.is_empty() || value.parse::<i64>().is_ok(),
+///         Ok(_) => true,
+///         Err(_) => false,
+///     },
+/// )?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The returned value and the errors are those of
+/// [`load_properties_from_file`].
+pub fn load_properties_from_file_with(
+    filename: &Path,
+    filter: Option<&str>,
+    properties: &mut HashMap<String, String>,
+    mut accept: impl FnMut(&str, &str) -> bool,
+) -> Result<PropFileOutcome> {
+    let mut visited = HashSet::new();
+    let mut loads = 0u32;
+    let mut expanded_bytes = 0usize;
+    load_properties_impl(
+        filename,
+        filter,
+        properties,
+        0,
+        &mut visited,
+        &mut loads,
+        &mut expanded_bytes,
+        &mut accept,
+    )
+}
+
+/// What [`load_properties_from_file`] or
+/// [`load_properties_from_file_with`] did with the file it was given.
 ///
 /// About that file only: an `import` it names can be skipped (unreadable,
 /// group- or other-writable, nested too deep) and the result is still
@@ -157,7 +253,8 @@ pub fn load_properties_from_file(
 #[must_use = "a skipped file loads nothing; check for `SkippedWritable`"]
 pub enum PropFileOutcome {
     /// The file was read to its end. Lines the loader does not accept
-    /// (illegal names, `ctl.*`, non-UTF-8, over-long) were dropped.
+    /// (illegal names, `ctl.*`, non-UTF-8, over-long) and entries the
+    /// caller's check refused were dropped.
     Loaded,
     /// The file was not read because its mode has the group- or
     /// other-write bit (`mode & 0o022 != 0`) — AOSP init's `ReadFile`
@@ -168,12 +265,13 @@ pub enum PropFileOutcome {
     },
 }
 
-/// Expands property references in an import path against the entries
-/// loaded so far, including entries read earlier in the same load pass
-/// and whatever the caller put in the map beforehand. This differs from
-/// AOSP, which expands against the live property store: there, entries
-/// of the current bulk load are not yet visible, and store values such as
-/// kernel-derived `ro.boot.*` are visible without being in any prop file.
+/// Expands property references in an import path or an entry's value
+/// against the entries loaded so far, including entries read earlier in
+/// the same load pass and whatever the caller put in the map beforehand.
+/// This differs from AOSP, which expands against the live property store:
+/// there, entries of the current bulk load are not yet visible, and store
+/// values such as kernel-derived `ro.boot.*` are visible without being in
+/// any prop file.
 ///
 /// AOSP `init/util.cpp::ExpandProps` parity:
 /// - `$$` is an escape for a literal `$`;
@@ -185,15 +283,31 @@ pub enum PropFileOutcome {
 /// - a `$` not followed by `{` or `$`, an unterminated `${`, a
 ///   zero-length name (`${}`, `${:-d}`), or a missing/empty property
 ///   without a non-empty default is an error → `None` (AOSP returns
-///   `Error()` for each; the caller logs and skips the import).
-fn expand_import_path(raw: &str, properties: &HashMap<String, String>) -> Option<String> {
+///   `Error()` for each; the caller logs and skips the import or the
+///   entry).
+///
+/// A result longer than [`MAX_LINE_LEN`] is also an error → `None`; AOSP
+/// sets no bound. Expanded values go into the map that later lines expand
+/// against, so without the bound a few lines that each repeat `${x}`
+/// multiply the size of `x` per line until the allocation aborts the
+/// process. With it, no stored value is longer than a line can be. The
+/// total over many keys is [`MAX_EXPANDED_BYTES`]', checked where the
+/// values are stored.
+fn expand_props(raw: &str, properties: &HashMap<String, String>) -> Option<String> {
+    fn push(out: &mut String, s: &str) -> Option<()> {
+        if out.len() + s.len() > MAX_LINE_LEN {
+            return None;
+        }
+        out.push_str(s);
+        Some(())
+    }
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
     while let Some(dollar) = rest.find('$') {
-        out.push_str(&rest[..dollar]);
+        push(&mut out, &rest[..dollar])?;
         let after = &rest[dollar + 1..];
         if let Some(tail) = after.strip_prefix('$') {
-            out.push('$');
+            push(&mut out, "$")?;
             rest = tail;
             continue;
         }
@@ -214,20 +328,23 @@ fn expand_import_path(raw: &str, properties: &HashMap<String, String>) -> Option
             return None;
         }
         match properties.get(name).map(String::as_str) {
-            Some(value) if !value.is_empty() => out.push_str(value),
+            Some(value) if !value.is_empty() => push(&mut out, value)?,
             // Missing and empty collapse to the default, like AOSP; an
             // empty default (`${x:-}`) counts as no default there.
-            _ => out.push_str(default.filter(|d| !d.is_empty())?),
+            _ => push(&mut out, default.filter(|d| !d.is_empty())?)?,
         }
         rest = &body[end + 1..];
     }
-    out.push_str(rest);
+    push(&mut out, rest)?;
     Some(out)
 }
 
-// Recursion state (depth/visited/loads) travels with every call; a params
-// struct would be re-destructured at each of the three call sites for no
-// clarity gain.
+// Recursion state (depth/visited/loads/expanded_bytes) and the caller's
+// entry check travel with every call; a params struct would be
+// re-destructured at each of the three call sites for no clarity gain.
+// `accept` is `dyn` so the recursion is compiled once, not once per
+// closure type.
+#[allow(clippy::too_many_arguments)]
 fn load_properties_impl(
     filename: &Path,
     filter: Option<&str>,
@@ -235,6 +352,8 @@ fn load_properties_impl(
     depth: u8,
     visited: &mut HashSet<PathBuf>,
     loads: &mut u32,
+    expanded_bytes: &mut usize,
+    accept: &mut dyn FnMut(&str, &str) -> bool,
 ) -> Result<PropFileOutcome> {
     if depth > MAX_IMPORT_DEPTH {
         // `Parse`, not `LimitExceeded`: the import call site swallows this
@@ -281,7 +400,16 @@ fn load_properties_impl(
     }
     // From here on every exit must pop the stack entry; wrap the body so
     // one removal covers all paths.
-    let result = load_properties_body(filename, filter, properties, depth, visited, loads);
+    let result = load_properties_body(
+        filename,
+        filter,
+        properties,
+        depth,
+        visited,
+        loads,
+        expanded_bytes,
+        accept,
+    );
     if !filtered {
         visited.remove(&canonical);
     }
@@ -326,6 +454,7 @@ fn open_prop_file(filename: &Path) -> Result<std::result::Result<File, u32>> {
     Ok(Ok(file))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_properties_body(
     filename: &Path,
     filter: Option<&str>,
@@ -333,6 +462,8 @@ fn load_properties_body(
     depth: u8,
     visited: &mut HashSet<PathBuf>,
     loads: &mut u32,
+    expanded_bytes: &mut usize,
+    accept: &mut dyn FnMut(&str, &str) -> bool,
 ) -> Result<PropFileOutcome> {
     let file = match open_prop_file(filename)? {
         Ok(file) => file,
@@ -389,7 +520,7 @@ fn load_properties_body(
                 };
                 // AOSP parity: resolve and load the import, but never let a
                 // broken import discard the rest of this file.
-                match expand_import_path(import_path, properties) {
+                match expand_props(import_path, properties) {
                     Some(expanded) => {
                         if let Err(e) = load_properties_impl(
                             Path::new(&expanded),
@@ -398,6 +529,8 @@ fn load_properties_body(
                             depth + 1,
                             visited,
                             loads,
+                            expanded_bytes,
+                            accept,
                         ) {
                             // A *global* budget exhaustion is not a broken
                             // import — swallowing it would keep walking the
@@ -456,6 +589,36 @@ fn load_properties_body(
             continue;
         }
 
+        // AOSP `LoadProperties` passes the value through `ExpandProps`
+        // before `CheckPermissions` and drops the entry when that fails,
+        // so the checks and the map see the expanded value. A value
+        // without `$` expands to itself. The value stays out of the log
+        // (AOSP logs it).
+        let value: Cow<'_, str> = if value.contains('$') {
+            match expand_props(value, properties) {
+                Some(expanded) => {
+                    // A pass budget like `loads`: aborting reports the
+                    // truncated load instead of dropping every later
+                    // expanded entry with a log line each.
+                    *expanded_bytes += expanded.len();
+                    if *expanded_bytes > MAX_EXPANDED_BYTES {
+                        return Err(Error::LimitExceeded(format!(
+                            "expanded values longer than {MAX_EXPANDED_BYTES} bytes in total in one pass at line {line_count} of {filename:?}"
+                        )));
+                    }
+                    Cow::Owned(expanded)
+                }
+                None => {
+                    error!(
+                        "Line {line_count} of {filename:?}: dropping property {key:?}: couldn't expand its value"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            Cow::Borrowed(value)
+        };
+
         // AOSP `LoadProperties` drops a line whose key fails
         // `IsLegalPropertyName` (first step of `CheckPermissions`); such a
         // key could be stored but never `set` again.
@@ -464,18 +627,29 @@ fn load_properties_body(
             continue;
         }
 
+        // The rest of AOSP `CheckPermissions` (the SELinux and type
+        // checks), as far as the caller supplies it. Before the map is
+        // touched: a refused entry leaves an earlier value of the name in
+        // place, like AOSP.
+        if !accept(key, &value) {
+            warn!(
+                "Line {line_count} of {filename:?}: dropping property {key:?}: refused by the caller's check"
+            );
+            continue;
+        }
+
         // Values stay out of the log, like every other log site that sees
         // one (they may carry tokens or device identifiers). Warn only when
         // the value actually changes, like AOSP `LoadProperties`: a
         // re-applied duplicate `import` is not an override.
         match properties.get_mut(key) {
-            Some(old) if old != value => {
-                *old = value.to_string();
+            Some(old) if *old != *value => {
+                *old = value.into_owned();
                 warn!("Line {line_count} of {filename:?}: Overriding previous property {key:?}");
             }
             Some(_) => {}
             None => {
-                properties.insert(key.to_string(), value.to_string());
+                properties.insert(key.to_string(), value.into_owned());
             }
         }
     }
@@ -734,6 +908,80 @@ mod tests {
         assert_eq!(properties.get("key"), Some(&"from_overlay".to_string()));
     }
 
+    /// `accept` is where AOSP `LoadProperties` calls `CheckPermissions`:
+    /// it sees the trimmed name and value of every entry the loader's own
+    /// checks let through (imported files included), and an entry it
+    /// refuses neither enters the map nor replaces an earlier value.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_accept_is_called_per_entry_before_the_map_changes() {
+        use std::io::Write;
+        let tmp = TempDir::new("rsprops_accept_test");
+        let dir = &tmp.0;
+
+        let imported = dir.join("imported.prop");
+        writeln!(
+            create_prop(&imported).unwrap(),
+            "kept.then.refused=bad\nrefused.then.kept=2\nimported.refused=bad"
+        )
+        .unwrap();
+
+        let root = dir.join("root.prop");
+        {
+            let mut f = create_prop(&root).unwrap();
+            writeln!(f, "kept.then.refused=1").unwrap();
+            writeln!(f, "refused.then.kept=bad").unwrap();
+            writeln!(f, "  spaced.key \t=  spaced value \t").unwrap();
+            // Dropped by the loader before `accept`.
+            writeln!(f, "ctl.start=svc").unwrap();
+            writeln!(f, ".illegal=1").unwrap();
+            writeln!(f, "import {}", imported.display()).unwrap();
+        }
+
+        let mut seen = Vec::new();
+        let mut properties = HashMap::new();
+        let outcome = load_properties_from_file_with(&root, None, &mut properties, |key, value| {
+            seen.push((key.to_string(), value.to_string()));
+            value != "bad"
+        })
+        .unwrap();
+        assert_eq!(outcome, PropFileOutcome::Loaded);
+
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            seen,
+            [
+                pair("kept.then.refused", "1"),
+                pair("refused.then.kept", "bad"),
+                pair("spaced.key", "spaced value"),
+                pair("kept.then.refused", "bad"),
+                pair("refused.then.kept", "2"),
+                pair("imported.refused", "bad"),
+            ]
+        );
+        let mut loaded: Vec<_> = properties.into_iter().collect();
+        loaded.sort();
+        assert_eq!(
+            loaded,
+            [
+                pair("kept.then.refused", "1"),
+                pair("refused.then.kept", "2"),
+                pair("spaced.key", "spaced value"),
+            ]
+        );
+
+        // A filter is applied before `accept`.
+        let mut seen = Vec::new();
+        let mut properties = HashMap::new();
+        let _ =
+            load_properties_from_file_with(&root, Some("spaced.*"), &mut properties, |key, _| {
+                seen.push(key.to_string());
+                true
+            })
+            .unwrap();
+        assert_eq!(seen, ["spaced.key"]);
+    }
+
     #[cfg(not(target_os = "android"))]
     #[test]
     fn test_expand_props_aosp_parity() {
@@ -741,35 +989,188 @@ mod tests {
         props.insert("a".to_string(), "va".to_string());
         props.insert("empty".to_string(), String::new());
         // `$$` escapes a literal dollar.
-        assert_eq!(expand_import_path("x$$y", &props).as_deref(), Some("x$y"));
-        assert_eq!(
-            expand_import_path("/${a}/f", &props).as_deref(),
-            Some("/va/f")
-        );
+        assert_eq!(expand_props("x$$y", &props).as_deref(), Some("x$y"));
+        assert_eq!(expand_props("/${a}/f", &props).as_deref(), Some("/va/f"));
         // `${name:-default}` falls back on missing AND empty values.
-        assert_eq!(
-            expand_import_path("${miss:-d}", &props).as_deref(),
-            Some("d")
-        );
-        assert_eq!(
-            expand_import_path("${empty:-d}", &props).as_deref(),
-            Some("d")
-        );
+        assert_eq!(expand_props("${miss:-d}", &props).as_deref(), Some("d"));
+        assert_eq!(expand_props("${empty:-d}", &props).as_deref(), Some("d"));
         // Missing/empty without a default is an error.
-        assert_eq!(expand_import_path("${miss}", &props), None);
-        assert_eq!(expand_import_path("${empty}", &props), None);
+        assert_eq!(expand_props("${miss}", &props), None);
+        assert_eq!(expand_props("${empty}", &props), None);
         // AOSP requires `{` after `$`.
-        assert_eq!(expand_import_path("a$b", &props), None);
+        assert_eq!(expand_props("a$b", &props), None);
         // Unterminated reference.
-        assert_eq!(expand_import_path("${a", &props), None);
+        assert_eq!(expand_props("${a", &props), None);
         // A trailing lone `$` is dropped, expansion succeeds.
-        assert_eq!(expand_import_path("/a/b$", &props).as_deref(), Some("/a/b"));
+        assert_eq!(expand_props("/a/b$", &props).as_deref(), Some("/a/b"));
         // Zero-length name is an error even with a default.
-        assert_eq!(expand_import_path("${:-d}", &props), None);
-        assert_eq!(expand_import_path("${}", &props), None);
+        assert_eq!(expand_props("${:-d}", &props), None);
+        assert_eq!(expand_props("${}", &props), None);
         // An empty default counts as no default.
-        assert_eq!(expand_import_path("/v/${miss:-}/b", &props), None);
-        assert_eq!(expand_import_path("/v/${empty:-}/b", &props), None);
+        assert_eq!(expand_props("/v/${miss:-}/b", &props), None);
+        assert_eq!(expand_props("/v/${empty:-}/b", &props), None);
+    }
+
+    /// AOSP `LoadProperties` expands a value (`ExpandProps`) before
+    /// `CheckPermissions` and drops the entry when that fails. The cases
+    /// are the `/data/local.prop` lines loaded on an API 37 emulator
+    /// (android-17, userdebug), with `preset.type` in the map standing in
+    /// for a property init finds in the property area. The one difference
+    /// is `same_file`: init dropped it ("property 'debug.rsp.plain' doesn't
+    /// exist"), because it looks the name up in the property area, where
+    /// the file's entries are not stored yet.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_values_are_expanded_before_the_checks() {
+        use std::io::Write;
+        let tmp = TempDir::new("rsprops_value_expansion_test");
+        let root = tmp.0.join("root.prop");
+        writeln!(
+            create_prop(&root).unwrap(),
+            "debug.rsp.plain=abc\n\
+             debug.rsp.expand=${{preset.type}}-x\n\
+             debug.rsp.same_file=${{debug.rsp.plain}}\n\
+             debug.rsp.default=${{debug.rsp.nonexistent:-dflt}}\n\
+             debug.rsp.empty_default=${{debug.rsp.nonexistent:-}}\n\
+             debug.rsp.missing=${{debug.rsp.nonexistent}}\n\
+             debug.rsp.dollar=a$$b\n\
+             debug.rsp.bare=a$b\n\
+             debug.rsp.trailing=abc$\n\
+             debug.rsp.unterminated=${{preset.type\n\
+             debug.rsp.zero_name=${{:-d}}\n\
+             debug.rsp.kept=first\n\
+             debug.rsp.kept=${{debug.rsp.nonexistent}}\n\
+             debug.rsp.refused=${{preset.type}}\n\
+             debug.rsp.last=end"
+        )
+        .unwrap();
+
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let mut seen = Vec::new();
+        let mut properties = HashMap::from([pair("preset.type", "userdebug")]);
+        let outcome = load_properties_from_file_with(&root, None, &mut properties, |key, value| {
+            seen.push((key.to_string(), value.to_string()));
+            key != "debug.rsp.refused"
+        })
+        .unwrap();
+        assert_eq!(outcome, PropFileOutcome::Loaded);
+
+        // `accept` sees the expanded value, and no entry whose value could
+        // not be expanded.
+        let expanded = [
+            pair("debug.rsp.plain", "abc"),
+            pair("debug.rsp.expand", "userdebug-x"),
+            pair("debug.rsp.same_file", "abc"),
+            pair("debug.rsp.default", "dflt"),
+            pair("debug.rsp.dollar", "a$b"),
+            pair("debug.rsp.trailing", "abc"),
+            pair("debug.rsp.kept", "first"),
+            pair("debug.rsp.refused", "userdebug"),
+            pair("debug.rsp.last", "end"),
+        ];
+        assert_eq!(seen, expanded);
+
+        let mut loaded: Vec<_> = properties.into_iter().collect();
+        loaded.sort();
+        let mut expected: Vec<_> = expanded
+            .into_iter()
+            .filter(|(key, _)| key != "debug.rsp.refused")
+            .chain([pair("preset.type", "userdebug")])
+            .collect();
+        expected.sort();
+        assert_eq!(loaded, expected);
+    }
+
+    /// An expansion result longer than `MAX_LINE_LEN` fails, whichever
+    /// part of the input pushes it over.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_expand_props_result_is_bounded() {
+        let near = "a".repeat(MAX_LINE_LEN - 1);
+        let props = HashMap::from([("a".to_string(), near.clone())]);
+        assert_eq!(
+            expand_props("${a}b", &props).map(|s| s.len()),
+            Some(MAX_LINE_LEN)
+        );
+        assert_eq!(expand_props("${a}bc", &props), None);
+        assert_eq!(
+            expand_props("${a}$$", &props).map(|s| s.len()),
+            Some(MAX_LINE_LEN)
+        );
+        assert_eq!(expand_props("${a}$$$$", &props), None);
+        assert_eq!(expand_props("${a}${miss:-xy}", &props), None);
+        assert_eq!(expand_props("${a}${a}", &props), None);
+        assert_eq!(expand_props(&format!("{near}bc"), &props), None);
+    }
+
+    /// Expanded values are stored and later lines expand against them, so
+    /// lines that each double a value must stop at the bound instead of
+    /// growing it per line until the allocation aborts.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_chained_expansion_stops_at_the_line_bound() {
+        use std::io::Write;
+        let tmp = TempDir::new("rsprops_expansion_bound_test");
+        let root = tmp.0.join("root.prop");
+        let seed = "a".repeat(MAX_LINE_LEN / 2 + 1);
+        {
+            let mut f = create_prop(&root).unwrap();
+            writeln!(f, "debug.rsp.x={seed}").unwrap();
+            writeln!(f, "debug.rsp.x=${{debug.rsp.x}}${{debug.rsp.x}}").unwrap();
+            writeln!(f, "debug.rsp.y=${{debug.rsp.x}}").unwrap();
+        }
+        let mut properties = HashMap::new();
+        load(&root, &mut properties);
+        // The doubling line is dropped; the earlier value stays and is
+        // still usable for a later reference.
+        assert_eq!(properties.get("debug.rsp.x"), Some(&seed));
+        assert_eq!(properties.get("debug.rsp.y"), Some(&seed));
+    }
+
+    /// Many keys that each copy the same long value stay within one line
+    /// bound apiece, so the total is bounded per pass instead: the pass
+    /// aborts with `LimitExceeded` once the expanded values exceed
+    /// `MAX_EXPANDED_BYTES`, counting the entries of imported files.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_expanded_values_are_bounded_per_pass() {
+        use std::io::Write;
+        let tmp = TempDir::new("rsprops_expansion_budget_test");
+        let root = tmp.0.join("root.prop");
+        let child = tmp.0.join("child.prop");
+        let seed = "a".repeat(MAX_LINE_LEN - 100);
+        let fit = MAX_EXPANDED_BYTES / seed.len();
+        // The root's expansions use part of the budget, so the child
+        // reaches it earlier than it would on its own.
+        let half = fit / 2;
+        {
+            let mut f = create_prop(&root).unwrap();
+            writeln!(f, "debug.rsp.x={seed}").unwrap();
+            for n in 0..half {
+                writeln!(f, "debug.rsp.r{n}=${{debug.rsp.x}}").unwrap();
+            }
+            writeln!(f, "import {}", child.display()).unwrap();
+            writeln!(f, "debug.rsp.after=1").unwrap();
+            let mut f = create_prop(&child).unwrap();
+            for n in 0..fit + 10 {
+                writeln!(f, "debug.rsp.k{n}=${{debug.rsp.x}}").unwrap();
+            }
+        }
+        let mut properties = HashMap::new();
+        let err = load_properties_from_file(&root, None, &mut properties).unwrap_err();
+        assert!(matches!(err, Error::LimitExceeded(_)), "{err:?}");
+        // Entries before the failure stay; the one over the budget and
+        // everything after it in the pass are not loaded.
+        assert_eq!(
+            properties.get(&format!("debug.rsp.r{}", half - 1)),
+            Some(&seed)
+        );
+        assert_eq!(
+            properties.get(&format!("debug.rsp.k{}", fit - half - 1)),
+            Some(&seed)
+        );
+        assert_eq!(properties.get(&format!("debug.rsp.k{}", fit - half)), None);
+        assert_eq!(properties.get("debug.rsp.after"), None);
     }
 
     /// AOSP `LoadProperties`: `import <path> <filter>` loads only the keys

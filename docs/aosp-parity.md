@@ -34,14 +34,15 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
 | C6 | client | global reader 초기화 실패를 process 수명 동안 유지 | (c), 재시도 방식은 (a) | 이 branch에서 수정 |
 | C7 | client | 한 property의 값 cache와 변경 대기(`CachedProperty`) | (d) | 이 branch에서 추가 |
 | S1 | service | `persist.*` / `next_boot.*` 영속화 | (d) | 이 branch에서 추가 |
-| S2 | service | property type 검사(`CheckType`) | (c) | 이 branch에서 수정 |
-| S3 | service | `ctl.*`를 일반 property로 저장 | (c) | 저장은 이 branch에서 수정. 종료 뒤 `ctl.stop` 응답은 (c)로 남아 있고 owner 결정 대기 |
+| S2 | service | property type 검사(`CheckType`) | (c) | 이 branch에서 수정. build.prop 값의 `${...}` 확장도 수정했고, 참조를 load 중인 map에서 찾는 점, 확장 결과의 64 KiB 상한, 호출 하나의 확장 값 합계 4 MiB 상한은 (b) |
+| S3 | service | `ctl.*`를 일반 property로 저장 | (c) | 저장은 이 branch에서 수정. handler 호출 순서와 미응답 요청 한도(102)는 init main loop와 같게 구현. 응답은 host가 `ControlReply`로 보내며, init이 fd를 control message와 함께 넘기는 구조와 같다. shutdown 중 `ctl.stop` 응답은 `PowerctlOutcome::ShuttingDown` 또는 `ServiceHandle::stop_handler_calls`로 init과 같아진다. 둘 다 없이 종료하면 거부((b)) |
 | S4 | service | 실패 응답 코드가 항상 `PROP_ERROR` | (c) | 이 branch에서 수정 |
 | S5 | service | `ro.property_service.version` 미설정 | (c) | 이 branch에서 수정 |
 | S6 | service | 변경 알림 hook 없음 | (a) | 검토 대상 아님 |
 | S7 | service | properties dir writer lock(`AreaWriterLock`) | (a), 해제 방식은 (b) | lock은 0.6.0부터 있음, 해제 방식은 이 branch에서 수정 |
 | S8 | service, builder | prop 파일을 읽지 못했을 때의 반환값 | open 실패로 시작 실패는 (b) | 시작 실패는 0.6.0부터 있음, skip 반환값은 이 branch에서 추가 |
 | S9 | service | V1(`PROP_MSG_SETPROP`) 미지원 | (b), owner 지시 | 이 branch에서 변경(0.5.0–0.6.0은 V1을 처리했다) |
+| S10 | service | `sys.powerctl`을 일반 property로 저장 | (c), 종료 뒤 거부는 (b) | 이 branch에서 수정. 저장하지 않고 `ServiceOptions::powerctl_handler`로 전달. 대기 command는 init과 같이 하나만 유지 |
 
 ## Client
 
@@ -691,17 +692,147 @@ subnormal 결과(`1e-310`)는 거부한다. bionic `strtod`(gdtoa `strtod.c`)는
 0이면 `errno = ERANGE`로 둔다(`:1074-1087`). subnormal 결과는 항상 이 경로를
 거친다. device 실측은 하지 않았다.
 
-type 검사는 client set과 persistent record(`init_set` → `apply_set`)에만
-적용한다. build.prop entry는 검사하지 않는다(c). init `LoadProperties`는
-entry마다 `CheckPermissions`를 호출하고(`property_service.cpp:803`), 그 안의
-`CheckType`(`:530-533`)이 실패하면 그 entry를 버린다. `PropertyInit`은
-`property_info`를 load한 뒤(`:1415`) `PropertyLoadBootDefaults`(`:1429`)를
-실행하므로, 이 시점에 type 정보가 있다. 이 service의
-`init_system_properties_sync`는 build.prop entry를 `add`로 바로 넣는다. 그래서
-`property_contexts`가 `int`로 정한 이름에 build.prop가 `abc`를 주면, init은 그
-property를 만들지 않고 이 service는 `abc`를 저장한다.
+type 검사는 client set, persistent record(`init_set` → `apply_set`),
+build.prop entry에 적용한다.
 
-### S3. `ctl.*` 저장 — 저장 동작은 (c), dispatch 없음은 (a), 종료 뒤 `ctl.stop` 응답은 (c) 미결정
+**build.prop entry.** init `LoadProperties`는 entry마다 `CheckPermissions`를
+호출하고(`property_service.cpp:803`), 그 안의 `CheckType`(`:530-533`)이
+실패하면 그 entry를 버린다. `PropertyInit`은 `property_info`를 load한
+뒤(`:1415`) `PropertyLoadBootDefaults`(`:1429`)를 실행하므로, 이 시점에 type
+정보가 있다. 0.6.0의 이 service는 검사 없이 `add`했으므로, `property_contexts`가
+`int`로 정한 이름에 build.prop가 `abc`를 주면 `abc`를 저장했다.
+
+이 service도 init과 같은 시점, 즉 entry를 읽을 때 같은 이름의 이전 entry를
+대체하기 전에(`:803-811`) 검사한다. 이를 위해 `rsproperties`에 `builder`
+feature의 공개 함수 두 개를 추가했다.
+- `load_properties_from_file_with(path, filter, properties, accept)`. loader가
+  filter, `ctl.*` 제외, 이름 검사를 통과한 entry마다 `accept(name, value)`를
+  호출한다. 호출 위치는 init의 `CheckPermissions` 자리이며 map을 바꾸기
+  전이다. `accept`가 `false`를 반환한 entry는 `warn` log(파일, 줄 번호,
+  이름)를 남기고 버리며, map에 있던 같은 이름의 값은 그대로 둔다. `import`한
+  파일의 entry에도 같은 `accept`를 호출한다. `load_properties_from_file`은
+  항상 `true`를 반환하는 closure로 이 함수를 호출한다.
+- `property_type_in_trie(trie, name)`. `build_trie`가 반환한 byte에서 type을
+  읽는다. `SystemProperties::property_type`은 `property_info`를 게시하고 area를
+  만든 뒤에만 쓸 수 있는데, 이 service는 입력 파일을 모두 읽은 뒤에
+  properties dir에 쓴다(`build_prop_error_leaves_property_info_untouched`).
+  그래서 build.prop를 읽는 시점에는 trie byte만 있다. 함수는 header 크기,
+  version, header에 기록된 크기를 `PropertyInfoAreaFile::load_path`와 같은
+  규칙으로 검사한다. trie record는 4-byte 정렬을 전제로 읽으므로, slice의
+  시작 주소가 4-byte 정렬이 아니면 `Vec<u32>`로 복사한 뒤 조회한다. 반환
+  타입이 `Option<String>`인 이유가 이 복사 경로다.
+
+`init_system_properties_sync`는 `check_type`을 호출하는 closure를 `accept`로
+넘긴다. type이 맞지 않으면 이름과 type을 `error` log로 남긴다. area에 넣는
+loop는 type을 다시 검사하지 않는다. init의 `PropertySetNoSocket` loop
+(`:1234-1239`)도 `CheckPermissions`를 거치지 않는다.
+
+이 변경으로 `ro.property_service.version`의 결과도 달라진다. AOSP
+`plat_property_contexts`는 이 이름을 `exact int`로 정한다. build.prop 값이
+`v2`처럼 `int`가 아니면 type 검사에서 entry를 버리므로, build.prop 값
+판정(S9)에 도달하지 않고 service가 `2`를 설정한다. init의 결과와 같다. 값이
+`1`처럼 `int`이면서 V1을 고르는 경우에는 종전대로 `run`이 실패한다.
+`property_contexts`에 이 이름의 type이 없으면 `v2`도 종전대로 `run`이
+실패한다.
+
+**값 확장(`ExpandProps`).** init은 값에 `ExpandProps`를 적용하고(`:795`)
+확장한 값으로 `CheckPermissions`를 호출하며, 확장에 실패한 entry는
+버린다(`:796-800`). 이 crate의 loader는 `import` 경로만 확장하고 값은 파일에
+적힌 그대로 저장했다(c). 그래서 값에 `${name}`이 있는 entry는 저장하는 값도,
+type을 검사하는 값도 init과 달랐다.
+
+loader가 `ctl.*` 제외 뒤, 이름 검사 앞에서 값을 확장하도록 수정했다. 확장
+함수는 `import` 경로에 쓰던 것과 같다(`expand_props`, 종전 이름
+`expand_import_path`). 값에 `$`가 없으면 복사 없이 통과한다. 확장에 실패하면
+`error` log(파일, 줄 번호, 이름)를 남기고 entry를 버리며, map에 있던 같은
+이름의 값은 그대로 둔다. `accept`에는 확장한 값을 넘기므로 service의 type
+검사도 확장한 값을 대상으로 한다. init은 실패한 값을 log에 남기지만 이
+loader는 남기지 않는다(값을 log에 쓰지 않는 기존 정책).
+
+확장 결과의 길이 상한(b). init `ExpandProps`는 결과 길이를 제한하지 않는다.
+init에서는 확장한 값이 같은 load의 다음 줄 조회 대상이 되지 않으므로(아래
+표의 마지막 행), 한 줄의 결과는 그 줄의 참조 개수와 area에 이미 있는 값의
+길이로 정해진다. 이 loader는 확장한 값을 map에 저장하고 다음 줄이 그 값을
+참조하므로, 각 줄이 `${x}`를 여러 번 반복하면 `x`의 길이가 줄마다 그 배수로
+커진다. 64 KiB 이하의 줄 세 개(`x=` + 약 65,500 byte, `x=` + `${x}` 16,383회
+두 줄)로 두 번째 줄에서 약 1 GB, 세 번째 줄에서 약 16 TB 할당을 요구하고,
+할당 실패는 `handle_alloc_error`로 process를 abort한다. 그래서 `expand_props`는
+결과가 `MAX_LINE_LEN`(64 KiB, 줄 길이 상한)을 넘으면 그 시점에 확장 실패로
+처리한다. 확장에 실패한 다른 경우와 같이 entry를 버리고, `import` 경로라면
+그 import를 건너뛴다. 상한을 줄 길이로 정한 이유는 map에 저장되는 값의 상한을
+확장 전후로 같게 두기 위해서다. `PROP_VALUE_MAX`(92)는 쓰지 않았다. `ro.`
+값은 92 byte 이상도 저장되므로(long property), 그 상한은 init이 저장하는
+`ro.` 값을 버린다. 포기한 것은 64 KiB를 넘는 확장 결과다. init은 저장을
+시도한다.
+
+확장한 값의 합계 상한(b). 줄 하나의 상한은 map 전체 크기를 제한하지 않는다.
+여러 key가 같은 긴 값을 참조하면 key마다 그 값의 사본을 저장하기 때문이다.
+root 파일에 `x=` + 약 65,500 byte 한 줄과 약 10 byte짜리 `kN=${x}` 줄 100만
+개(파일 약 10 MB)를 두면, 줄마다 결과는 64 KiB 이하지만 map은 약 64 GB를
+요구하고 할당 실패로 process가 abort된다. 확장이 없으면 map 크기는 읽은 파일의
+byte 수에 비례하는데, 이 경로에서는 입력 1 byte당 약 6,000 byte를 저장한다.
+init에서는 참조 대상인 area에 같은 load의 entry가 없으므로 이 증폭이 생기지
+않는다. 증폭의 원인은 map 조회(아래 표의 마지막 행)다. 그래서 loader는
+`load_properties_from_file` 호출 하나(그 `import` 포함)에서 확장한 값의 길이를
+더하고, 합계가 `MAX_EXPANDED_BYTES`(4 MiB)를 넘으면 `MAX_TOTAL_LOADS`와 같이
+`Error::LimitExceeded`로 그 호출을 중단한다. 그 전에 저장한 entry는 map에
+남는다. service에서는 `run`이 `StartupStage::PropertiesService`로 실패한다.
+초과한 entry만 버리고 계속하는 방식은 택하지 않았다. 그 방식에서는 이후의
+확장 entry가 줄마다 error log를 남기고 모두 빠지는데도 load가 `Ok`로 끝난다.
+4 MiB는 최대 길이 결과 64개에 해당한다. 실제 build에서 `${...}`를 쓰는 값의
+합계는 이보다 훨씬 작다고 보았다(기기별 실측은 확인 필요). 상한은 호출 하나에
+적용되므로, build.prop 파일마다 호출하는 service에서 map에 든 확장 값의 합계는
+파일 수 × 4 MiB까지 커질 수 있다. 포기한 것은 확장한 값의 합계가 4 MiB를 넘는
+파일 tree의 load다. init은 이런 tree도 읽는다.
+
+API 37 emulator(`android-17`, userdebug)에서 `/data/local.prop`으로 init의
+동작을 실측했다. `local.prop`도 `LoadProperties`를 거친다(`:870-878`).
+
+| 값 | init 결과 | 이 loader |
+|---|---|---|
+| `${ro.build.type}-x` | `userdebug-x` 저장 | 같음(이름이 map에 있을 때) |
+| `${없는 이름:-dflt}` | `dflt` 저장 | 같음 |
+| `${없는 이름:-}`, `${없는 이름}` | 버림(`property ... doesn't exist`) | 같음 |
+| `a$$b` | `a$b` 저장 | 같음 |
+| `a$b` | 버림(`using deprecated syntax`) | 같음 |
+| `abc$` | `abc` 저장 | 같음 |
+| `${ro.build.type`(닫는 `}` 없음) | 버림 | 같음 |
+| `${:-d}` | 버림(`invalid zero-length property name`) | 같음 |
+| `first` 뒤에 같은 이름으로 `${없는 이름}` | `first` 유지 | 같음 |
+| `uint` 이름에 `${ro.build.type}` | 버림. type 검사 log에 확장한 값 `userdebug`가 찍힌다 | 같음 |
+| `uint` 이름에 `${ro.build.version.sdk}` | `37` 저장 | 같음 |
+| 같은 파일의 앞선 entry를 가리키는 `${debug.rsp.plain}` | 버림(`property 'debug.rsp.plain' doesn't exist`) | 앞선 entry의 값으로 저장 |
+
+마지막 행이 남은 차이이며 의도한 것이다(b). init은 이름을 property area에서
+찾는다. `PropertyLoadBootDefaults`는 모든 파일을 map에 모은 뒤에 area에
+적용하므로(`:1234-1239`), 확장 시점의 area에는 같은 load의 entry가 없고
+kernel에서 파생한 `ro.boot.*` 등만 있다. 이 loader는 호출자가 넘긴 map에서
+찾는다. map에는 같은 호출과 그 `import`가 먼저 저장한 entry, 그리고 호출
+전에 들어 있던 값이 있다. 이 service는 빈 map으로 시작하고 build.prop를 읽는
+시점의 area도 비어 있다. init과 같은 조회 대상을 쓰면 default 없는 참조는
+모두 버리게 되므로, `import` 경로 확장이 이미 쓰던 map 조회를 값에도 그대로
+적용했다. 포기한 것은 init과의 일치다. 같은 load의 앞선 entry를 참조하는
+파일은 init에서는 그 entry가 빠지고 이 service에서는 저장된다. area에만 있는
+property를 참조하려면 호출자가 load 전에 map에 넣어야 한다.
+
+`load_properties_from_file`의 동작이 바뀌므로 0.6.0 대비 breaking change다.
+값에 든 `$`는 `$$`로 써야 하고, 그렇지 않은 entry는 확장한 값으로 저장하거나
+버린다.
+
+검증: `properties_service.rs`
+`build_prop_entry_with_mismatched_type_is_skipped`(같은 이름의 두 순서,
+`import`한 파일, 확장한 값의 type 검사 포함),
+`build_prop_version_that_selects_v1_is_refused`,
+`build_property_parser.rs`
+`test_accept_is_called_per_entry_before_the_map_changes`,
+`test_values_are_expanded_before_the_checks`(위 표의 `local.prop` 줄),
+`test_expand_props_aosp_parity`,
+`test_expand_props_result_is_bounded`,
+`test_chained_expansion_stops_at_the_line_bound`,
+`test_expanded_values_are_bounded_per_pass`,
+`property_info_parser.rs` `property_type_in_trie_reads_unpublished_bytes`.
+
+### S3. `ctl.*` 저장 — 저장 동작은 (c), dispatch 없음은 (a), 종료 뒤 `ctl.stop` 응답은 `stop_handler_calls`로 수정
 
 init은 `ctl.*`를 area에 저장하지 않는다. 권한을 검사한 뒤 control
 message로 처리한다(`:505-512`, `:548-549`).
@@ -715,56 +846,253 @@ init은 control message를 queue에 넣고 main thread의 `HandleControlMessage`
 실패하면 `PROP_ERROR_HANDLE_CONTROL_MESSAGE`다(`init.cpp:556-649`).
 
 **변경.** owner 결정에 따라 handler callback을 추가했다.
-`ServiceOptions::control_handler(|msg: &ControlMessage| -> bool)`이며,
-`ControlMessage`는 `action`(`ctl.` 뒤), `target`(값), `pid`(SO_PEERCRED)를
-담는다.
-- socket service가 이름을 검사한 뒤(`INVALID_NAME`) handler를 tokio blocking
-  pool에서 호출한다. `true`면 `PROP_SUCCESS`, `false`이거나 panic이면
-  `PROP_ERROR_HANDLE_CONTROL_MESSAGE`다. properties service로는 넘기지 않으므로
-  area에 저장되지 않는다.
+`ServiceOptions::control_handler(|msg: ControlMessage, reply: ControlReply|)`이며,
+`ControlMessage`는 `action`(`ctl.` 뒤), `target`(값)과 요청을 보낸 process의
+`pid`, `uid`, `gid`(SO_PEERCRED)를 담는다. `ControlReply`는 그 요청을 보낸
+client의 connection fd를 소유하고, `send(self, handled: bool)`이 응답 code를 그
+fd에 쓴 뒤 fd를 닫는다.
+- 응답 주체와 시점. init의 `SendControlMessage`는 client socket의 fd를
+  `socket->Release()`로 꺼내 control message와 함께 queue에 넣고
+  (`property_service.cpp:451-457`), main thread의 `HandleControlMessages`가
+  message를 처리한 뒤 그 fd에 결과를 `send`하고 `close`한다
+  (`init/init.cpp:625-649`). 이 service도 fd를 요청과 함께 넘긴다. connection
+  task(`handle_control`)는 이름을 검사한 뒤(`INVALID_NAME`) tokio `UnixStream`에서
+  fd를 꺼내 `ControlReply`에 넣고, 요청을 queue에 넣은 다음 끝난다.
+  `reply.send(true)`는 `PROP_SUCCESS`를, `reply.send(false)`는
+  `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 보낸다. `send`는
+  `MSG_NOSIGNAL | MSG_DONTWAIT`로 4 byte를 쓰는 동기 함수이고 tokio runtime을
+  쓰지 않는다. 따라서 host는 handler 호출 안에서도, 호출이 반환한 뒤 host의
+  다른 thread나 task에서도 `send`를 호출할 수 있다. client가 socket을 닫아서
+  쓰기가 실패하면 debug log만 남긴다. init도 `send` 결과를 확인하지 않는다.
+  요청은 properties service로 넘어가지 않으므로 area에 저장되지 않는다.
+- 응답 없이 drop된 `ControlReply`. `Drop`이
+  `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 보낸다. stop flag(아래
+  `stop_handler_calls`)가 설정된 뒤이고 action이 `stop`이면 `PROP_SUCCESS`를
+  보낸다. handler가 panic하면 인자로 받은 `ControlReply`가 unwind 중에
+  drop되므로 client는 실패 응답을 받는다. host의 처리 task가 요청을 남긴 채
+  끝나는 경우에도 channel에 남은 `ControlReply`가 drop되면서 같은 응답이
+  전송된다. 응답을 받지 못한 채 기다리는 client가 생기는 경우는 host가
+  `ControlReply`를 보유한 채 `send`도 drop도 하지 않을 때뿐이다.
 - handler가 없으면 `PROP_ERROR_HANDLE_CONTROL_MESSAGE`로 거부한다.
-- 실행 중이거나 blocking thread를 기다리는 handler 호출은 16개로 제한한다.
-  permit은 `spawn_blocking` 전에 잡으므로, 17번째 요청은 blocking thread를 쓰지
-  않고 `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 받는다. host runtime의
-  `max_blocking_threads`가 16 이하이면 느린 호출이 pool을 채울 수 있다. 연결의 10 s
-  timeout이 지나도 handler 호출은 끝까지 실행되므로, 상한이 없으면 오래
-  걸리는 handler에 반복해서 보낸 `ctl.*`가 tokio blocking pool을 채운다.
-  그러면 같은 pool에서 실행되는 persist 파일 쓰기가 대기하고, actor가 그
-  쓰기를 await하므로 모든 set이 멈춘다. init에도 상한이 있다.
-  `QueueControlMessage`(`init/init.cpp:613-623`)는 처리되지 않은 control
-  message를 101개까지 queue에 두고, 그 이상은 버린다. 이때
-  `SendControlMessage`(`property_service.cpp:458-463`)가 넘겨받은 fd로
-  `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 보낸다. init은 queue에서 기다리는
-  message 수를 세고, 이 service는 실행 중인 handler 호출 수를 센다.
-- init이 하는 권한 검사(`CheckControlPropertyPerms`)는 하지 않는다. 다른
-  property와 같은 access model이다.
+- 호출 순서. task 하나(`handler_worker`)가 queue에서 요청을 하나씩 꺼내
+  handler를 tokio blocking pool에서 호출한다. handler 호출을 한 번에 하나만
+  실행하고, 그 호출이 반환한 뒤에 다음 요청을 꺼낸다. `ctl.*` 요청은 읽은
+  순서대로 전달하고, 기록된 `sys.powerctl` command가 있으면 다음 `ctl.*`
+  요청보다 먼저 전달한다(S10). init의 main loop는 iteration의 첫 단계에서
+  `CheckShutdown`이 반환한 command로 `HandlePowerctlMessage`를 실행하고, 마지막
+  단계에서 `HandleControlMessages`가 control message 하나를 처리한 뒤 fd로
+  응답한다(`init/init.cpp:625-649`, `:1336-1338`). 반환이 늦은 handler 호출은
+  그 뒤에 queue에 들어간 모든 `ctl.*` 요청의 전달을 그 시간만큼 늦춘다. init도
+  control function을 main thread에서 실행하므로 같은 지연이 생긴다.
+- 처리 순서. service가 고정하는 것은 handler 호출의 순서뿐이다. handler 호출
+  안에서 `send`하는 host는 init처럼 요청을 읽은 순서대로 하나씩 처리하고
+  응답한다. `(msg, reply)`를 channel로 넘기고 바로 반환하는 host는 처리 순서와
+  응답 순서를 직접 정한다. 그 channel을 task 하나가 읽으면 호출 순서가
+  처리 순서로 유지된다.
+- 미응답 요청 한도. 요청은 읽힌 뒤 `ControlReply`가 `send`되거나 drop될
+  때까지 미응답으로 계산된다. queue에서 대기 중인 요청, handler 호출 중인
+  요청, host가 `ControlReply`를 보유한 요청이 모두 포함된다. 새 요청을 읽은
+  시점에 미응답 요청이 102개(`MAX_UNANSWERED_CONTROL_MESSAGES`)이면 그 요청은
+  handler 호출 없이 `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 받는다. init의
+  `QueueControlMessage`(`init/init.cpp:613-623`)는
+  `pending_control_messages.size() > 100`이면 message를 버리고,
+  `SendControlMessage`(`property_service.cpp:458-463`)가 넘겨받은 fd로 같은
+  code를 보낸다. 거부 조건은 queue 길이뿐이며, main thread가 control
+  message를 처리 중인지와는 무관하다. 따라서 init의 queue에는 101개까지
+  들어가고, main thread가 처리 중인 message 하나는 queue에서 빠진 상태이므로
+  응답을 받지 않은 message는 최대 102개다. handler 호출 안에서 응답하는
+  host에서는 control handler 호출이 진행 중일 때 거부 조건이 init과 같다.
+  worker가 powerctl handler를 호출하는 중이어서 control handler 호출이 없을
+  때는 다르다. init은 queue에 101개가 있으면 다음 message를
+  거부하지만, 이 service는 미응답이 101개이므로 하나를 더 받는다. `ControlReply`를 보유하는 host에서는 보유분도 한도에 포함되므로,
+  service process가 미응답 `ctl.*` 요청 때문에 열어 두는 fd는 102개를 넘지
+  않는다.
+- 응답 대기 시간. service는 응답까지의 시간을 제한하지 않는다. 요청이 queue에
+  들어간 뒤에는 connection task가 끝난 상태이므로 `CLIENT_TIMEOUT`(10 s)이
+  적용되지 않고, 그 요청은 connection permit(`MAX_CONCURRENT_CLIENTS` = 64)도
+  차지하지 않는다. bionic client와 Android의 `rsproperties` client는 응답이 올
+  때까지 기다린다. 그 밖의 target에서 `rsproperties` client는 2 s 뒤
+  `TimedOut`을 반환한다(`system_property_set.rs` `RESPONSE_TIMEOUT`). client가
+  socket을 닫은 요청도 handler에 전달되고, 그 요청의 응답만 버려진다. init도
+  client가 socket을 닫은 control message를 처리한다.
+- blocking thread 사용량. handler 호출이 차지하는 blocking thread는 queue
+  길이와 무관하게 최대 하나다. persist 파일 쓰기도 같은 pool에서 실행되지만,
+  반환하지 않는 handler가 그 쓰기를 막는 경우는 host runtime의
+  `max_blocking_threads`가 1일 때뿐이다.
+- init이 하는 권한 검사(`CheckControlPropertyPerms`,
+  `property_service.cpp:468-495`)는 하지 않는다((a)). init은 요청을 보낸
+  process의 SELinux context가 대상의 `ctl.*` 이름을 set할 수 있는지 검사하고,
+  실패하면 queue에 넣기 전에 `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 보낸다
+  (`:505-512`). 이 service는 socket에 연결할 수 있는 모든 process의 요청을
+  handler에 전달한다. handler가 `uid`, `gid`, `pid`로 판단해
+  `reply.send(false)`를 호출하면 client는 init의 권한 거부와 같은 code를
+  받는다. init에서는 거부된 요청이 queue에 들어가지 않지만, 이 service에서는
+  그 요청도 응답 전까지 미응답 한도에 포함된다. SELinux context를 기준으로 한
+  판정은 구현할 수 없다.
+
+handler가 요청별로 무엇을 실행하고 무엇을 반환해야 init과 같은 결과가 되는지는
+`rsproperties-service/README.md`의 "Answering as init does" 절에 표로 정리했다
+(`ctl.stop`의 `init.svc.<name>` 전이, `sys.powerctl` command 판정).
 
 **service 종료 뒤의 `ctl.*`.** init에는 control message 수신을 끊는 경로가
 있다. `HandlePowerctlMessage`가 `StopSendingMessages()`를 호출하면
 (`init/reboot.cpp:1173-1175`) `accept_messages`가 `false`가 되고
 (`property_service.cpp:141-144`), 그 뒤 `SendControlMessage`는 message를
 queue에 넣지 않는다(`property_service.cpp:439-449`).
-- (a) 종료 뒤 수신 차단. `SocketService`의 `Drop`이 handler 호출 상한용
-  semaphore를 닫는다. 그 뒤에 읽은 `ctl.*` 요청은 handler를 호출하지 않고
-  `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 받는다.
+- (a) 종료 뒤 수신 차단. `SocketService`의 `Drop`이 handler queue를 닫는다. 그
+  뒤에 읽은 `ctl.*` 요청은 handler를 호출하지 않고
+  `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 받는다. 닫는 시점에 queue에 남아 있던
+  `ctl.*` 요청도 handler 호출 없이 같은 응답을 받는다. 이 응답은 queue에 있던
+  `ControlReply`가 drop되면서 전송된다.
 - (a) handler 호출 대기. `ServiceHandle::shutdown`과 `join`은 두 actor의 task가
-  끝난 뒤, semaphore가 닫히기 전에 permit을 받은 handler 호출(실행 중인 호출과
-  blocking thread를 기다리는 호출)이 모두 끝날 때까지 기다린다. 반환 시점에는
-  실행 중인 handler 호출이 없고 그 뒤에 시작하는 호출도 없다. timeout은 없다.
-  반환하지 않는 handler 호출이 있으면 `shutdown`과 `join`도 반환하지 않는다.
-  이때 socket 파일 unlink와 lock 해제는 이미 끝난 상태다. init도 control
-  function을 main thread에서 실행하고(`init/init.cpp:625-649`, main loop
+  끝난 뒤 `handler_worker`가 끝날 때까지 기다린다. `handler_worker`는 queue가
+  닫히면 실행 중인 호출을 마치고, 닫히기 전에 기록된 `sys.powerctl` command가
+  있으면 그 호출도 마친 뒤(client가 이미 `PROP_SUCCESS`를 받았기 때문이다) 두
+  handler를 drop하고 끝난다. 반환 시점에는 실행 중인 handler 호출이 없고 그
+  뒤에 시작하는 호출도 없으며, service가 가진 handler clone도 없다. timeout은
+  없다. 반환하지 않는 handler 호출이 있으면 `shutdown`과 `join`도 반환하지
+  않는다. 이때 socket 파일 unlink와 lock 해제는 이미 끝난 상태다. init도
+  control function을 main thread에서 실행하고(`init/init.cpp:625-649`, main loop
   `:1337`) timeout을 두지 않는다. 시작에 실패한 `run`도 같은 대기를 거친 뒤
   `Err`을 반환한다. handle을 drop하는 경로는 기다리지 않는다.
-- (c) 종료 뒤 `ctl.stop`의 응답. init은 `accept_messages`가 `false`일 때
-  `ctl.stop`에 `PROP_SUCCESS`를 반환하고(`property_service.cpp:445`,
-  issuetracker 336223505), 나머지 `ctl.*`에 `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를
-  반환한다. 이 service는 action을 구분하지 않고 모든 `ctl.*`에
-  `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 반환한다. 응답은 바꾸지 않았다. init의
-  예외는 기기 shutdown 중에 service를 멈추려는 client를 위한 것이고, 이
-  service의 종료는 기기 shutdown이 아니라 service process의 종료일 수 있으므로
-  `ctl.stop`의 대상이 실제로 멈춘다고 볼 근거가 없다. init과 같은 응답으로
-  맞출지는 owner 결정이 필요하다(확인 필요).
+- (a) host가 보유한 `ControlReply`. `shutdown`, `join`, 실패한 `run`은 host가
+  보유한 `ControlReply`를 기다리지 않는다. `handler_worker`는 handler 호출이
+  반환한 시점에 그 호출의 `ControlReply`를 갖고 있지 않으므로, 대기 대상은
+  handler 호출까지다. `ControlReply`는 client의 fd를 직접 소유하고 `send`가
+  runtime을 쓰지 않으므로, `shutdown`이 반환한 뒤나 runtime이 종료된 뒤에
+  호출한 `send`도 client에 도달한다. init에는 property service만 종료하는
+  경로가 없으므로 비교할 동작이 없다.
+
+**`ServiceHandle::stop_handler_calls`.** init은 `accept_messages`가 `false`일 때
+`ctl.stop`에 `PROP_SUCCESS`를 반환하고(`property_service.cpp:445`), 나머지
+`ctl.*`에 `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 반환한다. `ctl.stop` 예외는
+commit `c9d44b84f`(2024-04-30, "Don't reject "ctl.stop.*" during shutdown.",
+issuetracker 336223505)에서 들어갔다. 비교는 `msg == "stop"`이므로
+`ctl.interface_stop`, `ctl.sigstop_off` 같은 action은 예외에 들지 않는다.
+
+변경 전의 이 service에는 `accept_messages`에 해당하는 상태가 없었다. handler
+호출이 끊기는 시점은 `SocketService`의 `Drop`뿐이고, 그 시점에는 socket 파일이
+unlink되므로 새 연결은 connect에서 실패한다. 따라서 init의 응답을 종료 뒤에만
+적용하면, 종료 전에 accept된 연결만 그 응답을 받는다. owner 결정에 따라
+service가 실행 중인 상태에서 handler 호출만 끊는 method를 추가했다.
+
+`stop_handler_calls(&self)`는 `Handlers`가 가진 `HandlerCallsStop`(`AtomicBool`)을
+설정한다. powerctl handler가 `PowerctlOutcome::ShuttingDown`을 반환하면
+`handler_worker`가 같은 flag를 설정한다(S10). 따라서 `sys.powerctl`로 시작하는
+shutdown에서는 host가 `stop_handler_calls`를 호출할 필요가 없고, 이 method는
+`sys.powerctl` set 없이 host가 종료 절차를 시작하는 경로에서 쓴다. flag가
+설정된 뒤에 읽은 요청은 다음 응답을 받는다.
+- `ctl.stop`: handler를 호출하지 않고 `PROP_SUCCESS`. control handler가 없어도
+  같다.
+- 그 밖의 `ctl.*`: `PROP_ERROR_HANDLE_CONTROL_MESSAGE`.
+- 이름 검사(`PROP_ERROR_INVALID_NAME`)는 flag 검사보다 먼저 한다. init도
+  `CheckPermissions`의 `IsLegalPropertyName`이 `SendControlMessage`보다 먼저다.
+- `sys.powerctl`: properties service의 검사는 그대로 하고, 통과하면 handler를
+  호출하지 않고 `PROP_SUCCESS`(S10).
+- 그 밖의 이름: 변경 전과 같이 처리한다. init도 `accept_messages`가 `false`인
+  동안 area에 기록한다.
+
+flag 검사는 queue가 닫혔는지 확인하는 검사보다 먼저 한다. flag를 설정한 뒤
+`shutdown`하면, 종료 전에 accept된 연결이 종료 뒤에 보낸 `ctl.*` 요청도 위
+응답을 받는다. `sys.powerctl`은 properties service의 응답을 받은 뒤에 flag를
+확인하므로, properties service가 끝난 뒤에 읽은 요청은 검사를 받지 못하고
+`PROP_ERROR_SET_FAILED`를 받는다. 그 밖의 이름도 같다. flag를 설정하지 않고 `shutdown`하면 위 "(a) 종료 뒤 수신 차단"의 거부
+응답이 유지된다.
+
+init과 남는 차이는 다음과 같다.
+- (a) 판정 주체. init은 `HandlePowerctlMessage`가 command를 유효하다고 판정한
+  뒤 `StopSendingMessages()`를 직접 호출한다. 이 service는 `sys.powerctl`
+  command를 해석하지 않으므로(S10), 그 판정을 powerctl handler의 반환값
+  (`ShuttingDown`)으로 받는다. `ctl.stop`의 `PROP_SUCCESS`는 대상을 멈추지 않고
+  보내는 응답이다. init에서는 shutdown이 모든 service를 종료하므로 이 응답이
+  결과와 어긋나지 않는다. 이 service에서는 host가 대상 process를 종료하는
+  절차에 들어간 경우에만 같은 조건이 성립하므로, handler는 그 절차를 시작한
+  경우에만 `ShuttingDown`을 반환해야 한다.
+- (b) flag 없이 종료할 때의 거부. flag를 설정하지 않은 채 `shutdown`하거나
+  handle을 drop하면 모든 `ctl.*`가 `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 받는다.
+  service process의 종료는 기기 shutdown이 아닐 수 있고, 그때는 `ctl.stop`의
+  대상이 멈춘다고 볼 근거가 없다.
+- (b) flag 설정 시점에 queue에 남은 요청. init의 main loop는
+  `if (!IsShuttingDown()) HandleControlMessages();`이므로(`init/init.cpp:1336-1338`),
+  `EnterShutdown`(`init/reboot.cpp:1029-1031`) 뒤에는 queue에 남은 control
+  message를 처리하지 않고 응답도 보내지 않는다. 그 client는 응답을 받지
+  못한다. 이 service의 `handler_worker`는 호출 직전에 flag를 읽고, 설정되어
+  있으면 handler를 호출하지 않은 채 flag 설정 뒤에 읽은 요청과 같은 응답
+  (`ctl.stop`은 `PROP_SUCCESS`, 그 밖은 `PROP_ERROR_HANDLE_CONTROL_MESSAGE`)을
+  보낸다. handler를 호출하지 않는 점은 init과 같고, 응답을 보내는 점이 다르다.
+  기록되어 있던 `sys.powerctl` command는 버린다. init의 `CheckShutdown`도
+  `IsShuttingDown()`이면 command를 반환하지 않는다(`init/init.cpp:262-269`).
+  flag 설정 시점에 host가 보유한 `ControlReply`는 host가 응답한다. host가
+  `send`를 호출하면 인자로 준 값이 그대로 전송되고, flag 설정 뒤에 drop하면 위와
+  같은 응답이 전송된다. 따라서 종료 절차에 들어간 host는 처리하지 않은 요청의
+  `ControlReply`를 drop하면 된다.
+- (a) 처리 순서의 결정 주체. init은 main thread가 control function을 실행한 뒤
+  응답하므로, 처리 순서와 응답 순서가 읽은 순서와 같다. 이 service가 고정하는
+  것은 handler 호출 순서다. handler 호출 안에서 응답하는 host는 init과 같은
+  순서를 얻는다. `ControlReply`를 넘겨서 여러 task가 처리하는 host에서는 처리
+  순서와 응답 순서가 host의 구현에 따라 정해진다.
+- (a) flag를 읽은 뒤의 호출. `handler_worker`가 flag를 읽은 뒤 `spawn_blocking`을
+  호출하기 전에 `stop_handler_calls`가 flag를 설정하면, 그 호출 하나는
+  `stop_handler_calls`가 반환한 뒤에 시작된다. `shutdown`과 `join`이 그 호출을
+  기다린다. `ShuttingDown` 반환 경로에서는 flag를 설정하는 주체가
+  `handler_worker` 자신이므로 이 간격이 없다. init은 `accept_messages_lock`을
+  잡고 검사와 queue 삽입을 함께 하고 main thread 하나가 처리하므로 이 간격이
+  없다.
+- (a) 초기 상태. init의 `accept_messages`는 `StartSendingMessages()`
+  (`property_service.cpp:137-140`) 전에도 `false`다. 이 service의 flag는 `run`
+  시점에 해제 상태이고, 되돌리는 method는 없다.
+
+**포기한 것.** flag를 되돌리는 method는 두지 않았다. init에도
+`StopSendingMessages` 뒤에 `StartSendingMessages`를 다시 호출하는 경로가 없다
+(shutdown은 reboot로 끝난다). shutdown을 취소할 수 있는 host는 service를 다시
+`run`해야 한다.
+
+handler 호출의 동시 실행도 포기했다. 대상이 서로 다른 `ctl.*` 요청도 앞 호출이
+반환할 때까지 기다린다. 호출을 동시에 실행하면 서로 다른 client가 보낸 요청과,
+client가 `TimedOut` 뒤에 다시 보낸 요청이 읽은 순서와 다른 순서로 handler에
+도착할 수 있다. 한 client가 응답을 받은 뒤에 보낸 다음 요청은 동시 실행에서도
+순서가 유지된다. 요청을 동시에 처리하려는 host는 handler에서 `(msg, reply)`를
+넘기고 바로 반환하면 된다. 종료 시점에 queue에 남은 `ctl.*` 요청은 실행하지
+않고 거부한다. 남은 요청을 모두 실행한 뒤 종료하면 `shutdown`의 대기 시간이
+queue 길이(최대 102)에 비례한다.
+
+응답 대기 timeout을 두지 않았다. host가 `ControlReply`를 보유한 채 `send`도
+drop도 하지 않으면 bionic client는 계속 기다리고, 그 요청은 미응답 한도에 계속
+포함된다. 102개가 모두 그 상태가 되면 이후의 모든 `ctl.*` 요청이 거부된다.
+init도 control function이 반환하지 않으면 main thread가 멈춘다. service가
+timeout으로 실패를 응답하면, host가 이미 실행한 action에 실패 응답이 전송되는
+경우가 생긴다.
+
+`shutdown`이 host 보유 `ControlReply`를 기다리는 방식도 채택하지 않았다.
+`ServiceHandle`을 소유한 task가 `ControlReply`도 처리하는 host(doc 예제의
+구조)에서는 `shutdown`을 기다리는 동안 그 task가 `send`를 호출할 수 없으므로,
+기다리게 하면 `shutdown`이 반환하지 않는다. 그 결과 `shutdown`이 반환한
+시점에도 응답을 기다리는 client가 남아 있을 수 있다.
+
+handler가 `bool`을 반환하는 형태(`Fn(&ControlMessage) -> bool`)는 제거했다.
+이 형태는 0.6.0에 없었고 이 branch에서만 존재했다. 반환값으로 응답하면 응답
+시점이 handler 호출의 반환 시점으로 고정되므로, host가 다른 task에서 처리한
+결과를 응답하려면 handler 호출 안에서 그 결과를 기다려야 하고 그동안 뒤의
+요청이 전달되지 않는다.
+
+**test.** `control_reply.rs` `send_answers_and_closes_and_uncounts`,
+`dropped_reply_answers_by_the_stop_flag`, `send_needs_no_runtime`,
+`probe_reports_the_answer_or_the_drop`,
+`answer_to_closed_client_is_discarded_without_sigpipe`,
+`socket_service.rs` `control_messages_go_to_the_handler`,
+`control_calls_are_serial_and_the_queue_is_bounded`,
+`reply_is_sent_when_the_host_answers`,
+`reply_dropped_by_the_host_answers_by_the_stop_flag`,
+`replies_held_by_the_host_count_toward_the_bound`,
+`queued_requests_are_answered_and_held_replies_usable_without_the_runtime`,
+`shutting_down_outcome_stops_the_handler_calls`,
+`close_ends_the_worker_after_its_calls`, `dropping_every_clone_ends_the_worker`,
+`stopped_handler_calls_get_init_shutdown_replies`,
+`lib.rs` `stop_handler_calls_answers_as_init_during_shutdown`,
+`powerctl_shutting_down_outcome_stops_handler_calls`,
+`ctl_request_read_after_shutdown_is_refused`,
+`unanswered_control_requests_hold_no_connection_slot`,
+`reply_held_by_the_host_outlives_shutdown`.
 
 ### S4. 실패 응답 코드 — (c)
 
@@ -819,17 +1147,35 @@ client는 `ro.` 거부로 보고받는다. 현재 코드에서 service의 writer
 한정한 것이다. 두 조건이 `set` 경로에 생기면 응답은 `SET_FAILED`다.
 
 init과 다른 점은 다음과 같다.
-- (c) `sys.powerctl`과 `selinux.restorecon_recursive`의 분기가 없다. init
-  `HandlePropertySet`은 `sys.powerctl`=`reboot,userspace`에
-  `PROP_ERROR_INVALID_VALUE`를 보내고(`:565-567`), `PropertySet`은
-  `sys.powerctl`의 값을 area에 쓰지 않는다(`:392-395`, 처리는 property 변경
-  trigger가 한다). pid가 1이 아닌 client가 `selinux.restorecon_recursive`에 빈
-  값이 아닌 값을 보내면 restorecon을 시작하고 저장 없이 `PROP_SUCCESS`를
-  보낸다(`:575-579`). 이 service는 두 이름 모두 일반 property처럼 저장하고
-  `PROP_SUCCESS`를 보낸다. reboot과 restorecon은 Linux emulation에서 수행할
-  대상이 없다(a). 다만 `get("sys.powerctl")` 결과와 `reboot,userspace` 응답
-  code는 init과 다르다. build.prop loader는 두 이름을 이미 버린다
-  (`build_property_parser.rs:424`).
+- `sys.powerctl`=`reboot,userspace`의 응답은 수정했다(c). init
+  `HandlePropertySet`은 이 값에 `PROP_ERROR_INVALID_VALUE`를 보낸다
+  (`:565-567`, "Userspace reboot is deprecated."). 위치는 `CheckPermissions`
+  뒤, `PropertySet` 앞이다. 이 service는 값을 저장하고 `PROP_SUCCESS`를
+  보냈다. `apply_set`이 type 검사 뒤에 같은 값을 `INVALID_VALUE`로 거부하도록
+  고쳤다. 기준은 `android-17.0.0_r1`이다. 이전 release의 init은
+  `is_userspace_reboot_supported()` 결과에 따라 이 값을 처리했다(release별
+  조건은 확인 필요).
+- `sys.powerctl`의 나머지 값은 area에 저장하지 않고 powerctl handler로
+  넘긴다. 내용은 S10에 있다.
+- (a) `selinux.restorecon_recursive`는 일반 property처럼 저장한다. pid가 1이
+  아닌 client가 빈 값이 아닌 값을 보내면 init은 restorecon thread에 경로를
+  넘기고 저장 없이 `PROP_SUCCESS`를 보낸다(`:575-579`). 그 thread는
+  `selinux_android_restorecon`이 끝나면, 실패했을 때도,
+  `SetProperty(kRestoreconProperty, path)`로 경로를 저장한다(`:207-211`).
+  따라서 restorecon이 끝난 뒤의 값은 이 service가 저장하는 값과 같고, 차이는
+  저장 시점뿐이다. 이 service에는 restorecon을 수행할 대상이 없다. 이 문서의
+  이전 판은 init이 이 값을 저장하지 않는다고 적었는데, thread의 `SetProperty`를
+  빠뜨린 서술이었다.
+- 위 세 항목의 init 동작은 API 37 emulator(userdebug, `adb root`)에서
+  실측했다. `setprop sys.powerctl reboot,userspace`는 실패했고 libc log에
+  `PROP_ERROR_INVALID_VALUE (0x14)`가 남았다. `setprop sys.powerctl rsp_bogus`는
+  성공했고 `getprop sys.powerctl`은 빈 값이었으며, init log에 `powerctl:
+  unrecognized command 'rsp_bogus'`가 남았다. `setprop
+  selinux.restorecon_recursive /data/local/tmp/rsp_rc` 2초 뒤의 `getprop`은 그
+  경로였고, 빈 값을 set한 뒤에는 빈 값이었다. build.prop loader는 두 이름을
+  버린다(`build_property_parser.rs`의 `ctl.*` 제외 분기). 검증:
+  `properties_service.rs` `apply_set_returns_init_codes`(`sys.powerctl`이 area에
+  없다는 assert 포함).
 - (c) V2 값에 NUL이 있으면 `INVALID_VALUE`로 거부한다. init
   `IsLegalPropertyValue`(`init/util.cpp:406-416`)는 `mbstowcs(nullptr,
   value.data(), 0)`로 UTF-8을 검사하는데, 이 호출은 첫 NUL에서 멈추므로 NUL을
@@ -983,7 +1329,15 @@ enum과 `handle_setprop_v1`은 삭제했다.
   service는 그 frame을 거부하는데 client는 성공을 반환하기 때문이다. init에는
   이 검사가 없다. 판정식은 이 crate의 client와 같은
   `trim().parse::<u32>()`이다. `"2x"`는 bionic의 `atoll`로는 2이지만 이
-  crate의 client는 V1로 판정하므로 이 검사에서 거부한다.
+  crate의 client는 V1로 판정한다. 이 검사는 load 중 type 검사(S2)를 통과해
+  map에 남은 값에만 적용된다. 그래서 `run`이 실패하는 값은 type 검사를
+  통과하고(이름에 type이 없으면 모든 값이 통과한다) 2부터 4294967295까지의
+  10진수가 아닌 값이다. type이 없으면 `"1"`, `"v2"`, `"2x"`가 모두 여기에
+  해당한다. `int` type(AOSP `plat_property_contexts`)에서는 `"1"`, `"0"`,
+  빈 값, `"0x10"`, `"4294967296"`이 해당한다. `check_type`은 빈 값을 type과
+  무관하게 통과시키고, `int`를 `0x` 16진수와 `i64` 범위로 판정하기 때문이다.
+  type 검사가 거부하는 값(`int`에서 `"v2"`, `"2x"`)은 load 중 버려져 이 검사에
+  도달하지 않고, service가 `2`를 설정한다(S2).
 
 **포기한 것.** V1만 구현한 client(Android O 이전 libc와 같은 규칙)는 이
 service에 set을 적용할 수 없다. V1 frame을 끝까지 읽은 뒤 닫는 방법도 있으나
@@ -998,6 +1352,109 @@ service에 set을 적용할 수 없다. V1 frame을 끝까지 읽은 뒤 닫는 
 `PROP_ERROR_INVALID_CMD`), `lib.rs` `v1_set_is_refused_and_not_applied`,
 `properties_service.rs` `build_prop_version_that_selects_v1_is_refused`,
 `tests/v1_protocol_tests.rs` `test_v1_setprop_is_refused`.
+
+### S10. `sys.powerctl` 저장 — 저장 동작은 (c), handler 호출 방식은 (a), 종료 뒤 거부는 (b)
+
+**init.** `HandlePropertySet`은 이름이 `sys.powerctl`이면 값과 pid를 log에
+남기고, 값이 `reboot,userspace`이면 `PROP_ERROR_INVALID_VALUE`를 보낸다
+(`property_service.cpp:540-585`). `PropertySet`은 이름과 값을 검사한 뒤
+`sys.powerctl`을 area에 쓰지 않는다(`:392-395`). `accept_messages`가 `true`이면
+`NotifyPropertyChange`(`:178-185`)가 부르는 `PropertyChanged`가
+`trigger_shutdown(value)`를 호출하고
+(`init/init.cpp:380-381`), `ShutdownState::TriggerShutdown`이
+`shutdown_command_`에 값을 대입한 뒤 main thread를 깨운다(`:248-260`). client에
+보내는 응답은 이 대입 뒤에 나가며, main loop의 `HandlePowerctlMessage` 실행을
+기다리지 않는다. `HandlePowerctlMessage`는 `shutdown[,reason]`과
+`reboot[,target...]`만 처리하고, 그 밖의 값에는 `powerctl: unrecognized
+command` log만 남긴다(`init/reboot.cpp`). 따라서 `PROP_SUCCESS`는 set이
+수락됐다는 뜻이고, command를 인식했는지는 나타내지 않는다.
+
+**변경 전.** 0.6.0은 `sys.powerctl`을 일반 property처럼 area에 저장했다.
+`get("sys.powerctl")`이 init에서는 항상 빈 값이고 이 service에서는 마지막으로
+요청한 값이었다.
+
+**변경.** owner 결정에 따라 callback을 추가했다.
+`ServiceOptions::powerctl_handler(|msg: &PowerctlMessage| -> PowerctlOutcome)`이며,
+`PowerctlMessage`는 `command`(값)와 요청을 보낸 process의 `pid`, `uid`,
+`gid`(SO_PEERCRED)를 담는다. 반환값 `PowerctlOutcome`은 `ShuttingDown`(host가
+그 command로 shutdown 또는 reboot 절차를 시작했다)과 `Ignored`(host가 처리하지
+않는 command다) 중 하나다.
+- properties service의 `apply_set`이 다른 set과 같은 검사(이름, UTF-8, type,
+  길이)를 하고, `reboot,userspace`는 `INVALID_VALUE`로 거부한다. 검사를
+  통과하면 저장하지 않고 `PROP_SUCCESS`를 반환한다. type 검사에
+  `property_info`가 필요하므로 검사 위치는 properties service다.
+- socket service의 `dispatch`가 `PROP_SUCCESS`를 확인한 뒤 `notify_powerctl`을
+  호출한다. peer credential을 아는 쪽이 socket service이기 때문이다.
+  `notify_powerctl`은 command를 slot 하나에 기록하고 `handler_worker`를 깨운
+  뒤, handler 호출을 기다리지 않고 `PROP_SUCCESS`를 반환한다. init의
+  `TriggerShutdown`이 `shutdown_command_`에 값을 대입하고 main thread를 깨운 뒤
+  응답하는 순서와 같다.
+- slot은 하나다. `handler_worker`가 앞의 command를 꺼내기 전에 수락된 set은
+  앞의 command를 덮어쓰고, handler는 나중 command로 한 번만 호출된다. init의
+  `shutdown_command_`도 대입으로 덮어쓴다(`init/init.cpp:248-260`).
+- `handler_worker`는 기록된 command를 다음 `ctl.*` 요청보다 먼저 꺼내 handler를
+  호출한다(S3의 호출 순서).
+- handler가 `ShuttingDown`을 반환하면 `handler_worker`가 `HandlerCallsStop`을
+  설정한다(S3). init의 `HandlePowerctlMessage`가 command를 `shutdown` 또는
+  `reboot`으로 판정한 뒤 `StopSendingMessages()`(`init/reboot.cpp:1175`)와
+  `EnterShutdown()`(`:1188`)을 호출하는 지점에 해당한다. `Ignored`는 init이
+  `unrecognized command` log를 남기고 반환하는 경로(`:1168-1171`)에 해당하며
+  상태를 바꾸지 않는다.
+- handler가 없으면 `PROP_SUCCESS`를 반환하고 `warn` log를 남긴다. init의 응답이
+  command 처리 결과를 나타내지 않으므로, handler 유무로 응답을 바꾸지 않았다.
+  `ctl.*`는 init의 응답이 처리 결과이므로 handler가 없으면 거부한다(S3).
+- handler의 panic은 `error` log로 남기고 service는 계속 실행한다. flag는
+  설정하지 않는다.
+
+**init과 남는 차이.**
+- (a) command 판정 주체. init은 `HandlePowerctlMessage`가 command를 직접
+  parse한다. 이 service는 command를 해석하지 않고 handler의 반환값을 받는다.
+  host의 handler가 init과 같은 판정(`shutdown[,reason]`과
+  `reboot[,target...]`에만 `ShuttingDown`)을 구현해야 flag 설정 조건이 init과
+  같아진다.
+- (a) flag 설정 시점. init은 `HandlePowerctlMessage` 안에서, shutdown 절차를
+  시작하기 전에 `StopSendingMessages()`를 호출한다. 이 service는 handler가
+  반환한 뒤에 flag를 설정한다. handler 호출 중에 읽은 `ctl.*` 요청은 양쪽
+  모두 queue에 들어가고 handler(control function)에 전달되지 않는다. 그
+  요청의 응답은 S3의 "flag 설정 시점에 queue에 남은 요청" 항목을 따른다.
+- (b) 종료 뒤 거부. `SocketService`의 `Drop` 뒤에 읽은 `sys.powerctl` 요청은
+  handler를 호출하지 않고 `PROP_ERROR_SET_FAILED`를 받는다. init은
+  `accept_messages`가 `false`이면 `NotifyPropertyChange`가 `PropertyChanged`를
+  건너뛰고(`:178-185`) `PropertySet`은 `PROP_SUCCESS`를 반환한다(`:426-427`).
+  init에서 이 상태는 유효한 command의 처리를 이미 시작한
+  뒤이므로 성공 응답이 실제 상태와 어긋나지 않는다. 이 service가 종료된 뒤에는
+  command를 전달받을 대상이 없으므로 실패로 응답한다.
+  flag가 설정된 뒤에는(`ShuttingDown` 반환 또는
+  `ServiceHandle::stop_handler_calls`) init과 같다. 검사를 통과한
+  `sys.powerctl`은 handler 호출 없이 `PROP_SUCCESS`를 받는다. properties
+  service가 끝난 뒤에 읽은 요청은 검사를 받지 못하므로 `PROP_ERROR_SET_FAILED`를
+  받는다(S3).
+- (a) 종료 대기. `ServiceHandle::shutdown`과 `join`은 `ctl.*` handler 호출과
+  같은 방식으로 powerctl handler 호출이 끝날 때까지 기다린다(S3). 종료 전에
+  기록된 command는 종료 뒤에도 handler에 전달된다. 따라서
+  handler 안에서 `shutdown`이나 `join`을 기다리면 양쪽이 서로를 기다려 반환하지
+  않는다. handler는 command를 channel로 넘기고 반환해야 한다. init의
+  `TriggerShutdown`이 flag만 설정하고 main loop가 처리하는 구조와 같다.
+- (b) 값 log. init은 `Received sys.powerctl='<value>' from pid`를 남긴다. 이
+  service는 값을 log에 쓰지 않는 기존 정책에 따라 길이와 pid만 남긴다.
+- (a) 권한 검사 없음. 다른 property와 같은 access model이다. socket에 연결할 수
+  있는 process는 모두 handler를 호출할 수 있으므로, host를 reboot하는 handler는
+  `uid`, `gid`, `pid`나 command를 직접 검사해야 한다.
+
+**포기한 것.** 0.6.0에서 area의 `sys.powerctl` 값을 `wait`/`watch`로 읽던
+코드는 값을 받지 못한다. handler로 옮겨야 한다. handler가 없을 때 set을
+거부하는 방법도 있으나, init에서 성공하는 `setprop sys.powerctl <임의 값>`이
+이 service에서 실패하게 되므로 선택하지 않았다.
+
+**test.** `socket_service.rs` `powerctl_goes_to_the_handler_after_the_checks`,
+`powerctl_keeps_one_command_and_goes_before_control`,
+`shutting_down_outcome_stops_the_handler_calls`,
+`close_ends_the_worker_after_its_calls`,
+`stopped_handler_calls_get_init_shutdown_replies`, `lib.rs`
+`powerctl_set_reaches_the_handler_and_is_not_stored`,
+`powerctl_shutting_down_outcome_stops_handler_calls`,
+`stop_handler_calls_answers_as_init_during_shutdown`, `properties_service.rs`
+`apply_set_returns_init_codes`.
 
 ## 누락으로 보지 않는 것
 

@@ -35,6 +35,7 @@ use std::sync::Arc;
 
 use rsactor::{Actor, ActorRef, ActorResult};
 
+mod control_reply;
 mod persistent_properties;
 mod properties_service;
 mod property_type;
@@ -57,14 +58,21 @@ struct WorkspaceReadmeDoctests;
 // a set, and spawning the socket service without the writer lock lets a
 // second instance replace a running instance's sockets. [`run`] is the
 // only way to start them, and [`ServiceHandle`] the only way to stop them.
+pub use control_reply::{ControlReply, ControlReplyProbe};
 use properties_service::{PropertiesService, PropertiesServiceArgs};
-use socket_service::{ControlCalls, ControlCallsDrain, SocketService, SocketServiceArgs};
+use socket_service::{
+    HandlerCallsDrain, HandlerCallsStop, Handlers, SocketService, SocketServiceArgs,
+};
+
+/// The property whose sets are power requests ([`PowerctlMessage`]).
+pub(crate) const POWERCTL_PROPERTY: &str = "sys.powerctl";
 
 /// A `ctl.*` set, which AOSP init handles as a control message instead of
 /// storing it: `ctl.<action>` = `<target>`, e.g. `ctl.start` =
 /// `my_service` (init `HandleControlMessage`). The service passes it to the
-/// handler given in [`ServiceOptions::control_handler`] and never writes it
-/// to a property area.
+/// handler given in [`ServiceOptions::control_handler`], together with the
+/// [`ControlReply`] that answers it, and never writes it to a property
+/// area.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ControlMessage {
@@ -75,29 +83,138 @@ pub struct ControlMessage {
     pub target: String,
     /// The sender's pid from `SO_PEERCRED`, when available.
     pub pid: Option<i32>,
+    /// The sender's uid from `SO_PEERCRED`, when available. The service
+    /// checks no sender (any process that can connect may send any
+    /// `ctl.*` set), so a handler that must restrict who may control what,
+    /// as init does with SELinux in `CheckControlPropertyPerms`, decides
+    /// by this and [`gid`](Self::gid).
+    pub uid: Option<u32>,
+    /// The sender's gid from `SO_PEERCRED`, when available.
+    pub gid: Option<u32>,
 }
 
 impl ControlMessage {
-    /// A message as the service builds it, e.g. to test a handler.
+    /// A message without the sender's uid and gid, e.g. to test a handler;
+    /// [`with_uid_gid`](Self::with_uid_gid) adds them.
     ///
     /// ```
-    /// use rsproperties_service::ControlMessage;
+    /// use rsproperties_service::{ControlMessage, ControlReply};
     ///
-    /// let handler = |msg: &ControlMessage| msg.action == "start";
-    /// assert!(handler(&ControlMessage::new("start", "my_service", None)));
+    /// let handler = |msg: ControlMessage, reply: ControlReply| reply.send(msg.action == "start");
+    ///
+    /// let (reply, probe) = ControlReply::for_test();
+    /// handler(ControlMessage::new("start", "my_service", None), reply);
+    /// assert_eq!(probe.blocking_answer(), Some(true));
     /// ```
     pub fn new(action: impl Into<String>, target: impl Into<String>, pid: Option<i32>) -> Self {
         Self {
             action: action.into(),
             target: target.into(),
             pid,
+            uid: None,
+            gid: None,
         }
+    }
+
+    /// Sets the sender's uid and gid, which the service reads together
+    /// from `SO_PEERCRED`.
+    ///
+    /// ```
+    /// use rsproperties_service::ControlMessage;
+    ///
+    /// let root_only = |msg: &ControlMessage| msg.uid == Some(0);
+    /// let message = ControlMessage::new("stop", "my_service", None);
+    /// assert!(!root_only(&message));
+    /// assert!(root_only(&message.with_uid_gid(0, 0)));
+    /// ```
+    #[must_use]
+    pub fn with_uid_gid(mut self, uid: u32, gid: u32) -> Self {
+        self.uid = Some(uid);
+        self.gid = Some(gid);
+        self
     }
 }
 
 /// The stored form of a `control_handler` (see
 /// [`ServiceOptions::control_handler`]).
-pub(crate) type ControlHandler = Arc<dyn Fn(&ControlMessage) -> bool + Send + Sync + 'static>;
+pub(crate) type ControlHandler = Arc<dyn Fn(ControlMessage, ControlReply) + Send + Sync + 'static>;
+
+/// A `sys.powerctl` set, which AOSP init takes as a shutdown or reboot
+/// request instead of storing it: `sys.powerctl` = `<command>`, e.g.
+/// `reboot,recovery` or `shutdown,userrequested` (init `PropertySet` →
+/// `trigger_shutdown`). The service passes it to the handler given in
+/// [`ServiceOptions::powerctl_handler`] and never writes it to a property
+/// area.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PowerctlMessage {
+    /// The value as it was set. init acts on `shutdown[,<reason>]` and
+    /// `reboot[,<target>[,...]]` and logs any other command as
+    /// unrecognized; the service passes every value on except
+    /// `reboot,userspace`, which it refuses as init does.
+    pub command: String,
+    /// The sender's pid from `SO_PEERCRED`, when available.
+    pub pid: Option<i32>,
+    /// The sender's uid from `SO_PEERCRED`, when available. The service
+    /// checks no sender, so a handler that must restrict who may shut the
+    /// host down decides by this and [`gid`](Self::gid).
+    pub uid: Option<u32>,
+    /// The sender's gid from `SO_PEERCRED`, when available.
+    pub gid: Option<u32>,
+}
+
+impl PowerctlMessage {
+    /// A message without the sender's uid and gid, e.g. to test a handler;
+    /// [`with_uid_gid`](Self::with_uid_gid) adds them.
+    ///
+    /// ```
+    /// use rsproperties_service::PowerctlMessage;
+    ///
+    /// let is_reboot = |msg: &PowerctlMessage| msg.command.split(',').next() == Some("reboot");
+    /// assert!(is_reboot(&PowerctlMessage::new("reboot,recovery", None)));
+    /// ```
+    pub fn new(command: impl Into<String>, pid: Option<i32>) -> Self {
+        Self {
+            command: command.into(),
+            pid,
+            uid: None,
+            gid: None,
+        }
+    }
+
+    /// Sets the sender's uid and gid, which the service reads together
+    /// from `SO_PEERCRED`.
+    #[must_use]
+    pub fn with_uid_gid(mut self, uid: u32, gid: u32) -> Self {
+        self.uid = Some(uid);
+        self.gid = Some(gid);
+        self
+    }
+}
+
+/// What a [powerctl handler](ServiceOptions::powerctl_handler) did with a
+/// `sys.powerctl` command: the two ways init's `HandlePowerctlMessage`
+/// ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PowerctlOutcome {
+    /// The host is going down on this command. The service stops the
+    /// control and powerctl handler calls before it takes the next
+    /// request for a handler, exactly as
+    /// [`ServiceHandle::stop_handler_calls`] does; init calls
+    /// `StopSendingMessages` at this point, for a `shutdown` or `reboot`
+    /// command it acts on.
+    ShuttingDown,
+    /// Nothing is going down: the command is not one the host acts on
+    /// (init logs `unrecognized command` and goes on). Later `ctl.*` and
+    /// `sys.powerctl` requests reach the handlers as before.
+    Ignored,
+}
+
+/// The stored form of a `powerctl_handler` (see
+/// [`ServiceOptions::powerctl_handler`]).
+pub(crate) type PowerctlHandler =
+    Arc<dyn Fn(&PowerctlMessage) -> PowerctlOutcome + Send + Sync + 'static>;
 
 /// What [`run`] serves besides the directories in its
 /// `rsproperties::PropertyConfig`.
@@ -109,9 +226,9 @@ pub(crate) type ControlHandler = Arc<dyn Fn(&ControlMessage) -> bool + Send + Sy
 ///     .property_contexts_files(["/etc/props/property_contexts"])
 ///     .build_prop_files(["/etc/props/build.prop"])
 ///     .persistent_properties_file("/var/lib/props/persistent_properties")
-///     .control_handler(|msg| {
+///     .control_handler(|msg, reply| {
 ///         println!("ctl.{} {}", msg.action, msg.target);
-///         true
+///         reply.send(true);
 ///     });
 /// ```
 #[derive(Clone, Default)]
@@ -120,6 +237,7 @@ pub struct ServiceOptions {
     build_prop_files: Vec<PathBuf>,
     persistent_properties_file: Option<PathBuf>,
     control_handler: Option<ControlHandler>,
+    powerctl_handler: Option<PowerctlHandler>,
 }
 
 impl std::fmt::Debug for ServiceOptions {
@@ -132,12 +250,14 @@ impl std::fmt::Debug for ServiceOptions {
                 &self.persistent_properties_file,
             )
             .field("control_handler", &self.control_handler.is_some())
+            .field("powerctl_handler", &self.powerctl_handler.is_some())
             .finish()
     }
 }
 
 impl ServiceOptions {
-    /// No input files, no persistence, no control handler.
+    /// No input files, no persistence, no control handler, no powerctl
+    /// handler.
     pub fn new() -> Self {
         Self::default()
     }
@@ -204,50 +324,210 @@ impl ServiceOptions {
         self
     }
 
-    /// Handles `ctl.*` sets. `handler` returning `true` reports success to
-    /// the client (`PROP_SUCCESS`); `false` reports
-    /// `PROP_ERROR_HANDLE_CONTROL_MESSAGE`, as init does when the service is
-    /// unknown or the action fails. Without a handler every `ctl.*` set is
-    /// refused with `PROP_ERROR_HANDLE_CONTROL_MESSAGE`. Either way, `ctl.*`
-    /// names are never stored.
+    /// Handles `ctl.*` sets. `handler` gets each message with the
+    /// [`ControlReply`] that answers it: `reply.send(true)` reports
+    /// success to the client (`PROP_SUCCESS`), `reply.send(false)` reports
+    /// `PROP_ERROR_HANDLE_CONTROL_MESSAGE`, as init does when the service
+    /// is unknown or the action fails. Without a handler every `ctl.*` set
+    /// is refused with `PROP_ERROR_HANDLE_CONTROL_MESSAGE`. Either way,
+    /// `ctl.*` names are never stored.
     ///
-    /// The handler runs on tokio's blocking pool (`spawn_blocking`), one
-    /// call per request, so it may block, and calls can run concurrently. A
-    /// panic is reported to the client as a failure. At most 16 calls are
-    /// running or waiting for a blocking thread at once: a call that
-    /// outlasts the client's 10 s connection timeout still holds its slot
-    /// until it returns, and a request that finds all 16 slots taken gets
-    /// `PROP_ERROR_HANDLE_CONTROL_MESSAGE` without the handler being called
-    /// and without using a blocking thread.
+    /// The reply may be sent in the call or after it has returned, from
+    /// any thread. init answers a control message once its main thread
+    /// has handled it; a host that handles the messages in a thread or
+    /// task of its own passes the message and the reply on to it and
+    /// answers there, when the work is done:
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// use rsproperties_service::ServiceOptions;
+    ///
+    /// let (requests, mut control_requests) = tokio::sync::mpsc::unbounded_channel();
+    /// let options = ServiceOptions::new().control_handler(move |msg, reply| {
+    ///     // A send that fails drops the reply, which answers the client
+    ///     // with a failure.
+    ///     let _ = requests.send((msg, reply));
+    /// });
+    /// let mut service =
+    ///     rsproperties_service::run(rsproperties::PropertyConfig::new(), options).await?;
+    ///
+    /// loop {
+    ///     tokio::select! {
+    ///         Some((msg, reply)) = control_requests.recv() => {
+    ///             // ... start or stop the process named by `msg.target` ...
+    ///             reply.send(msg.action == "start" || msg.action == "stop");
+    ///         }
+    ///         _ = service.join() => break,
+    ///     }
+    /// }
+    /// service.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// A reply that is dropped without an answer reports a failure, or
+    /// success for `ctl.stop` once the handler calls are stopped; see
+    /// [`ControlReply`]. A handler that panics drops the reply it was
+    /// given, so a panic is reported to the client as a failure.
+    ///
+    /// # Order
+    ///
+    /// The calls of this handler and of the
+    /// [powerctl handler](Self::powerctl_handler) are made one at a time,
+    /// in the order in which init's main thread takes the same requests:
+    /// `ctl.*` requests in the order they were read, and a `sys.powerctl`
+    /// command before the next `ctl.*` request. Each call runs on tokio's
+    /// blocking pool (`spawn_blocking`), so `handler` may block; while it
+    /// does, the requests behind it wait for their call.
+    ///
+    /// The service fixes the order of the calls only. A host that answers
+    /// in the call handles the messages one at a time, as init does. A
+    /// host that passes the messages on decides the order in which they
+    /// are handled and answered itself: a channel read by one task keeps
+    /// the order of the calls.
+    ///
+    /// # Unanswered requests
+    ///
+    /// A request is unanswered from the time it was read until its reply
+    /// has been sent or dropped. A request that finds 102 others
+    /// unanswered gets `PROP_ERROR_HANDLE_CONTROL_MESSAGE` without the
+    /// handler being called; init refuses a control message when 101 are
+    /// queued, whether or not one is being handled, so the two limits
+    /// agree while a control message is in its call. Each unanswered
+    /// request holds its
+    /// client's connection (one fd) and none of the service's connection
+    /// slots, so other sets are served meanwhile.
+    ///
+    /// The service does not limit the time to the reply. A client of
+    /// bionic or of `rsproperties` on Android waits until the reply is
+    /// sent or dropped; an `rsproperties` client on other targets gives up
+    /// after 2 s (`TimedOut`). `handler` is called for a request whose
+    /// client has gone, as in init, and an answer to such a client is
+    /// discarded.
+    ///
+    /// # Handling a message as init does
+    ///
+    /// init's control functions start an action and return; none waits for
+    /// a process. For `ctl.stop`, `Service::Stop` records that the service
+    /// must not be restarted, sends `SIGKILL` to its process group, sets
+    /// `init.svc.<name>` to `stopping` and answers success; the property
+    /// becomes `stopped` when the process has been reaped. A service that
+    /// is not running is set to `stopped` at once, also with success. An
+    /// unknown service and an unknown action are failures. A host that
+    /// answers only when the process has exited keeps the client waiting
+    /// for that time, which init does not. The crate's README lists the
+    /// whole contract ("Answering as init does").
+    ///
+    /// # Shutdown
     ///
     /// [`ServiceHandle::shutdown`] and [`ServiceHandle::join`] return only
-    /// after every call has returned, and so does a [`run`] that fails to
-    /// start, for the calls made while it was starting. A call that never
-    /// returns keeps them pending, and a handler must not wait for any of
-    /// the three to return.
+    /// after the call that was running has returned, and so does a [`run`]
+    /// that fails to start, for a call made while it was starting.
+    /// Requests that were still waiting for their call are refused without
+    /// one. A call that never returns keeps the three pending, and a
+    /// handler must not wait for any of them to return.
     ///
-    /// `handler` and what it captured can be dropped later than that. The
-    /// task of each accepted connection holds a clone until the task ends,
-    /// which two 10 s timeouts bound from the time the connection was
-    /// accepted (the wait for a connection slot, then the exchange with
-    /// the client), and the blocking thread of a call drops its clone just
-    /// after the call has been counted as returned. Code that waits for a
-    /// captured value to be dropped (for example a channel sender, or the
-    /// last clone of an `Arc`) must allow for that delay after `shutdown`
-    /// or `join` has returned.
+    /// None of the three waits for a reply that the host holds: such a
+    /// reply stays connected to its client and can be answered after the
+    /// service has stopped.
     ///
-    /// The timeouts run inside the connection's task, so the bound holds
-    /// only while the runtime keeps polling that task. On a current-thread
-    /// runtime whose thread is blocked, or has left `block_on`, the task
-    /// keeps its clone until the runtime polls it again or is dropped;
-    /// dropping the runtime drops the task. Code that waits for a captured
-    /// value to be dropped must therefore not block that thread while it
-    /// waits.
+    /// Once one of the three has returned, the service holds no clone of
+    /// `handler`: unless the caller kept a clone of the
+    /// [`ServiceOptions`], `handler` and what it captured (for example a
+    /// channel sender, or a clone of an `Arc`) have been dropped by then.
     pub fn control_handler<F>(mut self, handler: F) -> Self
     where
-        F: Fn(&ControlMessage) -> bool + Send + Sync + 'static,
+        F: Fn(ControlMessage, ControlReply) + Send + Sync + 'static,
     {
         self.control_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Handles `sys.powerctl` sets, which init takes as shutdown and
+    /// reboot requests. A set that passes the checks of every set (name,
+    /// `property_contexts` type, value length) is answered with
+    /// `PROP_SUCCESS` and passed to `handler`; the value
+    /// `reboot,userspace` is refused before that with
+    /// `PROP_ERROR_INVALID_VALUE`, as in init (android-17). The value is
+    /// never stored, with or without a handler, so a `get` of
+    /// `sys.powerctl` finds nothing; init does not write it to its
+    /// property area either.
+    ///
+    /// The reply does not wait for `handler` and does not depend on what
+    /// it returns. init answers once it has recorded the command for its
+    /// main loop, and answers `PROP_SUCCESS` also for a command it then
+    /// logs as unrecognized, so the reply says that the request was
+    /// accepted, not that anything was shut down. Without a handler the
+    /// set is still answered with `PROP_SUCCESS` and has no effect (a
+    /// warning is logged). This differs from `ctl.*`, whose reply is the
+    /// result of handling the message.
+    ///
+    /// `handler` returns what it did with the command
+    /// ([`PowerctlOutcome`]), which is init's `HandlePowerctlMessage`:
+    /// init acts on `shutdown[,<reason>]` and `reboot[,<target>[,...]]`
+    /// and logs any other command as unrecognized. Return
+    /// [`PowerctlOutcome::ShuttingDown`] when the host goes down on the
+    /// command: the service then stops the handler calls as
+    /// [`ServiceHandle::stop_handler_calls`] does, before it takes the
+    /// next request for a handler, where init calls
+    /// `StopSendingMessages`. Return [`PowerctlOutcome::Ignored`]
+    /// otherwise. A panic is logged and counts as `Ignored`.
+    ///
+    /// The calls of this handler and of the
+    /// [control handler](Self::control_handler) are made one at a time, on
+    /// tokio's blocking pool (`spawn_blocking`), so `handler` may block; a
+    /// command is passed before the next `ctl.*` request. As init does,
+    /// the service keeps one command for the handler: a set made before
+    /// `handler` was called for the previous one replaces it, and
+    /// `handler` is called for the later command only.
+    ///
+    /// [`ServiceHandle::shutdown`] and [`ServiceHandle::join`] return only
+    /// after the call that was running has returned, and after the call
+    /// for a command accepted before the service ended, so a handler must
+    /// not wait for either of them. To stop the service on a power
+    /// request, pass the command to the task that owns the
+    /// [`ServiceHandle`] and return, as init's `HandlePowerctlMessage`
+    /// only queues the shutdown for its main loop:
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// use rsproperties_service::{PowerctlOutcome, ServiceOptions};
+    ///
+    /// let (requests, mut power_requests) = tokio::sync::mpsc::unbounded_channel();
+    /// let options = ServiceOptions::new().powerctl_handler(move |msg| {
+    ///     match msg.command.split(',').next() {
+    ///         Some("shutdown" | "reboot") => {
+    ///             let _ = requests.send(msg.command.clone());
+    ///             // From here on `ctl.stop` is answered with success and
+    ///             // no handler is called; other sets are still applied.
+    ///             PowerctlOutcome::ShuttingDown
+    ///         }
+    ///         _ => PowerctlOutcome::Ignored,
+    ///     }
+    /// });
+    /// let mut service =
+    ///     rsproperties_service::run(rsproperties::PropertyConfig::new(), options).await?;
+    ///
+    /// tokio::select! {
+    ///     command = power_requests.recv() => {
+    ///         println!("power request: {command:?}");
+    ///         // ... stop the processes of the host ...
+    ///     }
+    ///     _ = service.join() => {}
+    /// }
+    /// service.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// What [`control_handler`](Self::control_handler) says about the time
+    /// at which `handler` and what it captured are dropped applies to this
+    /// handler too.
+    pub fn powerctl_handler<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&PowerctlMessage) -> PowerctlOutcome + Send + Sync + 'static,
+    {
+        self.powerctl_handler = Some(Arc::new(handler));
         self
     }
 }
@@ -335,11 +615,12 @@ where
 ///   ends by itself, which [`join`](Self::join) reports;
 /// - the handle is dropped. This also stops the service, but nothing
 ///   waits for it: the socket files are unlinked and the properties dir's
-///   writer lock is released later, by tasks on the runtime. Control
-///   handler calls are not waited for either: a `ctl.*` request is
-///   refused once the socket service has ended, which is after the drop
-///   returned, and a call whose request was read before that runs to
-///   completion. Call [`shutdown`](Self::shutdown) when the next step
+///   writer lock is released later, by tasks on the runtime. Control and
+///   powerctl handler calls are not waited for either: a `ctl.*` or
+///   `sys.powerctl` request is refused once the socket service has
+///   ended, which is after the drop returned, and the call that is
+///   running then runs to completion. Call
+///   [`shutdown`](Self::shutdown) when the next step
 ///   depends on the files and locks being released (starting the service
 ///   again on the same directories, for example) or on no handler call
 ///   running.
@@ -367,16 +648,72 @@ where
 pub struct ServiceHandle {
     socket: ActorSlot<SocketService>,
     properties: ActorSlot<PropertiesService>,
-    /// `None` without a control handler.
-    control_calls: Option<ControlCallsDrain>,
+    /// Waits for the task that makes the control and powerctl handler
+    /// calls; returns at once when the service has neither handler.
+    handler_calls: HandlerCallsDrain,
+    /// Set by [`Self::stop_handler_calls`].
+    handler_stop: HandlerCallsStop,
 }
 
 impl ServiceHandle {
+    /// Ends the control and powerctl handler calls while the service keeps
+    /// running. This is init's `StopSendingMessages`, which init calls
+    /// once it has begun a shutdown or reboot. A
+    /// [powerctl handler](ServiceOptions::powerctl_handler) that returns
+    /// [`PowerctlOutcome::ShuttingDown`] has the same effect; call this
+    /// when the host goes down by another way than a `sys.powerctl` set (a
+    /// signal, for example) and the processes that `ctl.*` requests act on
+    /// are being stopped.
+    ///
+    /// A request the service reads after this has returned is answered as
+    /// init answers it during its shutdown, and reaches no handler:
+    ///
+    /// - `ctl.stop`: `PROP_SUCCESS` ("If we're already shutting down and
+    ///   you're asking us to stop something, just say we did"). Also
+    ///   without a control handler;
+    /// - every other `ctl.*` action, `ctl.interface_stop` included:
+    ///   `PROP_ERROR_HANDLE_CONTROL_MESSAGE`;
+    /// - `sys.powerctl`: checked as before (`reboot,userspace` is
+    ///   `PROP_ERROR_INVALID_VALUE`), then `PROP_SUCCESS`;
+    /// - any other name: applied as before.
+    ///
+    /// The `PROP_SUCCESS` for `ctl.stop` is sent without anything having
+    /// been stopped. In init it holds because init kills every service
+    /// during shutdown; here the caller must be stopping those processes.
+    ///
+    /// This cannot be undone, and a second call changes nothing. The
+    /// handler call that is running is not affected, and at most one more
+    /// begins: the one the service was about to make when this was
+    /// called. [`shutdown`](Self::shutdown) waits for both. A `ctl.*`
+    /// request that was waiting for its call gets the reply listed above
+    /// without one, and a `sys.powerctl` command that was waiting is
+    /// dropped. init leaves the control messages still in its queue
+    /// unanswered once it has entered shutdown, so their clients wait
+    /// until the device goes down; here they are answered at once.
+    ///
+    /// A [`ControlReply`] that the host got from an earlier call is the
+    /// host's to answer. One that the host drops from now on answers as
+    /// listed above (`PROP_SUCCESS` for `ctl.stop`, a failure for every
+    /// other action), so a host that is going down can drop the requests
+    /// it has not handled; [`ControlReply::send`] still answers what it is
+    /// given.
+    ///
+    /// The `ctl.*` replies stay as listed after
+    /// [`shutdown`](Self::shutdown) or a drop of the handle, for the
+    /// connections accepted before it; without this call those get the
+    /// refusals `shutdown` documents. A set that is read once the
+    /// properties service has ended, `sys.powerctl` included, is not
+    /// checked and gets `PROP_ERROR_SET_FAILED` either way.
+    pub fn stop_handler_calls(&self) {
+        self.handler_stop.stop();
+    }
+
     /// Waits until the service has ended.
     ///
     /// Returns when one of the two parts has ended by itself — after the
     /// other one has been stopped and has ended too, and after the control
-    /// handler calls have returned (as for [`shutdown`](Self::shutdown)),
+    /// and powerctl handler calls have returned (as for
+    /// [`shutdown`](Self::shutdown)),
     /// so the socket files are unlinked, the writer lock is released and
     /// no handler call is running by then. Nothing ends a part in normal
     /// operation; this returns only after a failure, or never.
@@ -406,21 +743,33 @@ impl ServiceHandle {
     /// applied before it ends; a connection whose request had not been
     /// queued by then gets an error reply or is closed. A `ctl.*` request
     /// read after the socket service has ended is refused with
-    /// `PROP_ERROR_HANDLE_CONTROL_MESSAGE`.
+    /// `PROP_ERROR_HANDLE_CONTROL_MESSAGE`, and a `sys.powerctl` request
+    /// with `PROP_ERROR_SET_FAILED`: the service has ended, which says
+    /// nothing about the processes a handler acts on. After
+    /// [`stop_handler_calls`](Self::stop_handler_calls) the `ctl.*`
+    /// replies are the ones listed there instead, and so is the
+    /// `sys.powerctl` reply until the properties service has ended; a
+    /// `sys.powerctl` request read after that still gets
+    /// `PROP_ERROR_SET_FAILED`.
     ///
-    /// Last, this waits for the control handler calls whose requests were
-    /// read before the socket service ended: those that are running and
-    /// those still queued for a blocking thread. When it returns, no
-    /// handler call is running and none begins afterwards. There is no
-    /// timeout, so a call that does not return keeps this pending (init
-    /// runs its control functions on its main thread and does not time
-    /// them out either). Dropping the returned future before it completes
-    /// is dropping the handle at that point: a part that has not ended is
-    /// stopped without being waited for, and handler calls that have not
-    /// returned keep running. During the last wait both parts have ended,
-    /// so the socket files are unlinked and the locks are released. The
-    /// handler value itself can be dropped after this returns; see
-    /// [`ServiceOptions::control_handler`].
+    /// Last, this waits for the handler call that is running when the
+    /// socket service ends, and for the powerctl handler call of a
+    /// `sys.powerctl` set that was answered with `PROP_SUCCESS` before
+    /// that. `ctl.*` requests that were still waiting for their call are
+    /// refused with `PROP_ERROR_HANDLE_CONTROL_MESSAGE` without one. When
+    /// this returns, no handler call is running, none begins afterwards,
+    /// and the service has dropped both handlers (see
+    /// [`ServiceOptions::control_handler`]). A [`ControlReply`] that the
+    /// host got from a call and has not answered is not waited for: it
+    /// keeps its client's connection and can be answered or dropped after
+    /// this has returned. There is no timeout, so a
+    /// call that does not return keeps this pending (init runs its
+    /// control functions on its main thread and does not time them out
+    /// either). Dropping the returned future before it completes is
+    /// dropping the handle at that point: a part that has not ended is
+    /// stopped without being waited for, and a handler call that has not
+    /// returned keeps running. During the last wait both parts have ended,
+    /// so the socket files are unlinked and the locks are released.
     ///
     /// The property area files and `property_info` stay in the properties
     /// dir, so readers that mapped them keep working; they see no further
@@ -439,27 +788,29 @@ impl ServiceHandle {
     /// properties service got its stop. The connection tasks are detached
     /// and are not waited for: one that reads its request later has it
     /// refused — by the properties service's closed mailbox, or, for
-    /// `ctl.*`, by the control-call semaphore that the socket service
-    /// closes when it is dropped (joining its task drops it). The
-    /// client then gets an error reply.
+    /// `ctl.*` and for a `sys.powerctl` set the properties service still
+    /// accepted, by the handler queue that the socket service closes when
+    /// it is dropped (joining its task drops it). The client then gets an
+    /// error reply.
     ///
-    /// The control handler calls that got a permit before the semaphore
-    /// was closed are waited for last ([`ControlCallsDrain::wait`]): the
-    /// refusal is in effect before that wait starts, and the wait comes
-    /// after both tasks so that a call that does not return leaves the
-    /// socket files unlinked and the locks released.
+    /// The handler worker is waited for last
+    /// ([`HandlerCallsDrain::wait`]); it ends after the call it was
+    /// making when the queue was closed. The refusal is in effect before
+    /// that wait starts, and the wait comes after both tasks so that a
+    /// call that does not return leaves the socket files unlinked and the
+    /// locks released. The worker does not hold the `ControlReply` of a
+    /// call that has returned, so the replies the host keeps are outside
+    /// this wait.
     ///
     /// Cancel-safe: `ActorRef::stop` only enqueues a signal and can be
     /// repeated, also for an actor that has ended, and
-    /// [`ActorSlot::wait`] and [`ControlCallsDrain::wait`] are cancel-safe.
+    /// [`ActorSlot::wait`] and [`HandlerCallsDrain::wait`] are cancel-safe.
     async fn stop_and_wait(&mut self) -> Result<(), ServiceError> {
         self.socket.actor_ref.stop().await;
         self.socket.wait().await;
         self.properties.actor_ref.stop().await;
         self.properties.wait().await;
-        if let Some(control_calls) = &self.control_calls {
-            control_calls.wait().await;
-        }
+        self.handler_calls.wait().await;
         // Both set: the socket service's failure is the one reported, as
         // in `run`.
         match self
@@ -637,7 +988,10 @@ impl std::error::Error for StartupError {
 ///
 /// `ctl.*` sets are not queued: they go to the control handler as soon as
 /// they are read, before the areas exist, and are not undone if startup
-/// fails. The rest of this section is about every other set.
+/// fails. The rest of this section is about every other set, including
+/// `sys.powerctl`: it waits like any other set, and the powerctl handler
+/// is called once the properties service has checked it, so not before
+/// the areas exist and not when startup fails.
 ///
 /// The socket service can be accepting connections while the properties
 /// service is still reading its input files and creating the areas, so a
@@ -775,6 +1129,7 @@ pub async fn run(
         build_prop_files,
         persistent_properties_file,
         control_handler,
+        powerctl_handler,
     } = options;
     let (properties_ref, properties_join) = properties_service::spawn(PropertiesServiceArgs {
         property_contexts_files,
@@ -782,12 +1137,13 @@ pub async fn run(
         writer_lock: lock,
         persistent_properties_file,
     });
-    let control = control_handler.map(ControlCalls::new);
-    let control_calls = control.as_ref().map(ControlCalls::drain);
+    let handlers = Handlers::new(control_handler, powerctl_handler);
+    let handler_calls = handlers.drain();
+    let handler_stop = handlers.stop_switch();
     let (socket_ref, socket_join) = socket_service::spawn(SocketServiceArgs {
         socket_dir: rsproperties::socket_dir().to_path_buf(),
         properties_service: properties_ref.clone(),
-        control,
+        handlers,
     });
 
     // Sequential readiness checks: the socket service is checked first, so
@@ -810,7 +1166,14 @@ pub async fn run(
         // Wait for that, so nothing writes the properties dir after `run`
         // returned.
         let _ = properties_join.await;
-        wait_for_control_calls(control_calls.as_ref()).await;
+        // The socket service may have been listening before the failure,
+        // so a `ctl.*` request may have reached the control handler. Its
+        // task was joined above, which closed the handler queue (the
+        // actor's `Drop`, or the drop of its unused `args`), so the worker
+        // ends after the call it is making: no handler call is running or
+        // begins once `run` has returned its error. The same holds for
+        // the other failure branch below.
+        handler_calls.wait().await;
         return Err(err);
     }
     if let Err(e) = properties_ref.ask(ReadyMessage).await {
@@ -823,26 +1186,16 @@ pub async fn run(
         // names. Wait for that, so a retry on the same socket dir does not
         // race this instance's unlink.
         let _ = socket_join.await;
-        wait_for_control_calls(control_calls.as_ref()).await;
+        handler_calls.wait().await;
         return Err(err);
     }
 
     Ok(ServiceHandle {
         socket: ActorSlot::new("socket service", socket_ref, socket_join),
         properties: ActorSlot::new("properties service", properties_ref, properties_join),
-        control_calls,
+        handler_calls,
+        handler_stop,
     })
-}
-
-/// The last step of a failed [`run`]: the socket service may have been
-/// listening before the failure, so a `ctl.*` request may have reached
-/// the control handler. Called after the socket service's task was joined
-/// (see [`ControlCallsDrain::wait`]), so no handler call is running or
-/// begins once `run` has returned its error.
-async fn wait_for_control_calls(control_calls: Option<&ControlCallsDrain>) {
-    if let Some(control_calls) = control_calls {
-        control_calls.wait().await;
-    }
 }
 
 /// Builds the [`StartupError`] for a failed actor: the cause is the
@@ -876,7 +1229,10 @@ mod tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    use rsproperties::wire::{PROP_ERROR_HANDLE_CONTROL_MESSAGE, PROP_MSG_SETPROP2, PROP_SUCCESS};
+    use rsproperties::wire::{
+        PROP_ERROR_HANDLE_CONTROL_MESSAGE, PROP_ERROR_INVALID_VALUE, PROP_ERROR_SET_FAILED,
+        PROP_MSG_SETPROP2, PROP_SUCCESS,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 
@@ -1504,9 +1860,9 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new().control_handler(move |_| {
+                ServiceOptions::new().control_handler(move |_, reply| {
                     counter.fetch_add(1, Ordering::SeqCst);
-                    true
+                    reply.send(true);
                 }),
             )
             .await
@@ -1561,9 +1917,10 @@ mod tests {
         returned: Arc<std::sync::atomic::AtomicUsize>,
     }
 
-    /// A control handler whose calls block until the test releases them.
+    /// A control handler whose calls block until the test releases them,
+    /// and then answer `true` before they return.
     fn blocking_handler() -> (
-        impl Fn(&ControlMessage) -> bool + Send + Sync + 'static,
+        impl Fn(ControlMessage, ControlReply) + Send + Sync + 'static,
         BlockedCalls,
     ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1574,12 +1931,12 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let returned = Arc::new(AtomicUsize::new(0));
         let (calls_in, returned_in) = (calls.clone(), returned.clone());
-        let handler = move |_: &ControlMessage| {
+        let handler = move |_: ControlMessage, reply: ControlReply| {
             calls_in.fetch_add(1, Ordering::SeqCst);
             let _ = entered_tx.send(());
             let _ = release_rx.lock().unwrap().recv();
             returned_in.fetch_add(1, Ordering::SeqCst);
-            true
+            reply.send(true);
         };
         (
             handler,
@@ -1592,15 +1949,321 @@ mod tests {
         )
     }
 
-    /// A SETPROP2 frame for `ctl.start` = `some_service`.
-    fn ctl_start_frame() -> Vec<u8> {
-        let (name, value) = ("ctl.start", "some_service");
+    /// A SETPROP2 frame for `name` = `value`.
+    fn set_frame(name: &str, value: &str) -> Vec<u8> {
         let mut frame = PROP_MSG_SETPROP2.to_ne_bytes().to_vec();
         frame.extend_from_slice(&(name.len() as u32).to_ne_bytes());
         frame.extend_from_slice(name.as_bytes());
         frame.extend_from_slice(&(value.len() as u32).to_ne_bytes());
         frame.extend_from_slice(value.as_bytes());
         frame
+    }
+
+    /// A SETPROP2 frame for `ctl.start` = `some_service`.
+    fn ctl_start_frame() -> Vec<u8> {
+        set_frame("ctl.start", "some_service")
+    }
+
+    /// A `sys.powerctl` set sent over the socket reaches the powerctl
+    /// handler with its value and the sender's pid, uid and gid, and is
+    /// not stored.
+    /// `reboot,userspace` is refused without a handler call, and so is a
+    /// request that a connection accepted before `shutdown` sends after
+    /// `shutdown` has returned.
+    #[test]
+    fn powerctl_set_reaches_the_handler_and_is_not_stored() {
+        const TEST: &str = "tests::powerctl_set_reaches_the_handler_and_is_not_stored";
+        if !is_child(TEST) {
+            run_in_child(TEST);
+            return;
+        }
+        block_on_child(async {
+            let dir = TempDir(socket_test_dir(
+                "rsprops_svc_powerctl",
+                socket_suffix_len("sockets"),
+            ));
+            let _ = std::fs::remove_dir_all(&dir.0);
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let socket_dir = dir.0.join("sockets");
+            let (requests, mut power_requests) = tokio::sync::mpsc::unbounded_channel();
+            let service = run(
+                rsproperties::PropertyConfig::new()
+                    .properties_dir(dir.0.clone())
+                    .socket_dir(socket_dir.clone()),
+                ServiceOptions::new().powerctl_handler(move |msg| {
+                    let _ = requests.send(msg.clone());
+                    PowerctlOutcome::Ignored
+                }),
+            )
+            .await
+            .expect("run");
+            let socket = socket_dir.join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
+            let set = |value: &'static str| {
+                let socket = socket.clone();
+                async move {
+                    let mut stream = UnixStream::connect(&socket).await.unwrap();
+                    let frame = set_frame(POWERCTL_PROPERTY, value);
+                    stream.write_all(&frame).await.unwrap();
+                    read_reply(&mut stream).await
+                }
+            };
+
+            // Connects first and sends nothing yet; accepted before the
+            // connections of the sets below.
+            let mut late = UnixStream::connect(&socket).await.unwrap();
+
+            assert_eq!(set("reboot,recovery").await, Some(PROP_SUCCESS));
+            let message = tokio::time::timeout(Duration::from_secs(10), power_requests.recv())
+                .await
+                .expect("the handler call must begin")
+                .unwrap();
+            // The sender is this process.
+            assert_eq!(
+                message,
+                PowerctlMessage::new("reboot,recovery", Some(std::process::id() as i32))
+                    .with_uid_gid(
+                        rustix::process::getuid().as_raw(),
+                        rustix::process::getgid().as_raw()
+                    )
+            );
+            assert_eq!(
+                set("reboot,userspace").await,
+                Some(PROP_ERROR_INVALID_VALUE)
+            );
+            assert!(
+                rsproperties::get::<String>(POWERCTL_PROPERTY).is_err(),
+                "sys.powerctl must not be stored"
+            );
+
+            service.shutdown().await.unwrap();
+
+            // A write to a connection the service already closed fails
+            // (`EPIPE`), which counts as no reply.
+            let reply = match late
+                .write_all(&set_frame(POWERCTL_PROPERTY, "reboot"))
+                .await
+            {
+                Ok(()) => read_reply(&mut late).await,
+                Err(_) => None,
+            };
+            assert!(
+                matches!(reply, None | Some(PROP_ERROR_SET_FAILED)),
+                "a sys.powerctl request read after shutdown must be refused or dropped, got \
+                 {reply:?}"
+            );
+            assert!(
+                power_requests.try_recv().is_err(),
+                "only the accepted set made before shutdown may reach the handler"
+            );
+        });
+    }
+
+    /// After `stop_handler_calls` the service answers as init does during
+    /// its shutdown: `ctl.stop` succeeds, other `ctl.*` actions are
+    /// refused, `sys.powerctl` is accepted, and no handler is called;
+    /// other sets are still applied. The replies stay the same for a
+    /// request that a connection accepted before `shutdown` sends after
+    /// `shutdown` has returned.
+    #[test]
+    fn stop_handler_calls_answers_as_init_during_shutdown() {
+        const TEST: &str = "tests::stop_handler_calls_answers_as_init_during_shutdown";
+        if !is_child(TEST) {
+            run_in_child(TEST);
+            return;
+        }
+        block_on_child(async {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let dir = TempDir(socket_test_dir(
+                "rsprops_svc_stop_calls",
+                socket_suffix_len("sockets"),
+            ));
+            let _ = std::fs::remove_dir_all(&dir.0);
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let socket_dir = dir.0.join("sockets");
+            let control_calls = Arc::new(AtomicUsize::new(0));
+            let powerctl_calls = Arc::new(AtomicUsize::new(0));
+            let (control_counter, powerctl_counter) =
+                (control_calls.clone(), powerctl_calls.clone());
+            let service = run(
+                rsproperties::PropertyConfig::new()
+                    .properties_dir(dir.0.clone())
+                    .socket_dir(socket_dir.clone()),
+                ServiceOptions::new()
+                    .control_handler(move |_, reply| {
+                        control_counter.fetch_add(1, Ordering::SeqCst);
+                        reply.send(true);
+                    })
+                    .powerctl_handler(move |_| {
+                        powerctl_counter.fetch_add(1, Ordering::SeqCst);
+                        PowerctlOutcome::Ignored
+                    }),
+            )
+            .await
+            .expect("run");
+            let socket = socket_dir.join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
+            let set = |name: &'static str, value: &'static str| {
+                let socket = socket.clone();
+                async move {
+                    let mut stream = UnixStream::connect(&socket).await.unwrap();
+                    stream.write_all(&set_frame(name, value)).await.unwrap();
+                    read_reply(&mut stream).await
+                }
+            };
+
+            // Connects first and sends nothing yet; accepted before the
+            // connections of the sets below.
+            let mut late = UnixStream::connect(&socket).await.unwrap();
+
+            assert_eq!(set("ctl.start", "svc").await, Some(PROP_SUCCESS));
+            assert_eq!(control_calls.load(Ordering::SeqCst), 1);
+
+            service.stop_handler_calls();
+            service.stop_handler_calls();
+
+            assert_eq!(set("ctl.stop", "svc").await, Some(PROP_SUCCESS));
+            assert_eq!(
+                set("ctl.start", "svc").await,
+                Some(PROP_ERROR_HANDLE_CONTROL_MESSAGE)
+            );
+            assert_eq!(set(POWERCTL_PROPERTY, "reboot").await, Some(PROP_SUCCESS));
+            assert_eq!(
+                set(POWERCTL_PROPERTY, "reboot,userspace").await,
+                Some(PROP_ERROR_INVALID_VALUE)
+            );
+            assert_eq!(set("debug.after.stop", "1").await, Some(PROP_SUCCESS));
+            assert_eq!(
+                rsproperties::get::<String>("debug.after.stop").unwrap(),
+                "1",
+                "other sets must still be applied"
+            );
+
+            service.shutdown().await.unwrap();
+
+            // A write to a connection the service already closed fails
+            // (`EPIPE`), which counts as no reply.
+            let reply = match late.write_all(&set_frame("ctl.stop", "svc")).await {
+                Ok(()) => read_reply(&mut late).await,
+                Err(_) => None,
+            };
+            assert!(
+                matches!(reply, None | Some(PROP_SUCCESS)),
+                "after stop_handler_calls, a ctl.stop read after shutdown must be answered \
+                 with success or dropped, got {reply:?}"
+            );
+            assert_eq!(
+                control_calls.load(Ordering::SeqCst),
+                1,
+                "no control handler call may begin after stop_handler_calls"
+            );
+            assert_eq!(
+                powerctl_calls.load(Ordering::SeqCst),
+                0,
+                "no powerctl handler call may begin after stop_handler_calls"
+            );
+        });
+    }
+
+    /// A powerctl handler that returns `ShuttingDown` stops the handler
+    /// calls as `stop_handler_calls` does, and one that returns `Ignored`
+    /// does not: the control handler is still called after an ignored
+    /// command, and after the command the handler acted on `ctl.stop`
+    /// succeeds without a call, `ctl.start` is refused, and a later
+    /// `sys.powerctl` set is accepted without a call.
+    #[test]
+    fn powerctl_shutting_down_outcome_stops_handler_calls() {
+        const TEST: &str = "tests::powerctl_shutting_down_outcome_stops_handler_calls";
+        if !is_child(TEST) {
+            run_in_child(TEST);
+            return;
+        }
+        block_on_child(async {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let dir = TempDir(socket_test_dir(
+                "rsprops_svc_powerctl_stop",
+                socket_suffix_len("sockets"),
+            ));
+            let _ = std::fs::remove_dir_all(&dir.0);
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let socket_dir = dir.0.join("sockets");
+            let control_calls = Arc::new(AtomicUsize::new(0));
+            let control_counter = control_calls.clone();
+            let (requests, mut power_requests) = tokio::sync::mpsc::unbounded_channel();
+            let service = run(
+                rsproperties::PropertyConfig::new()
+                    .properties_dir(dir.0.clone())
+                    .socket_dir(socket_dir.clone()),
+                ServiceOptions::new()
+                    .control_handler(move |_, reply| {
+                        control_counter.fetch_add(1, Ordering::SeqCst);
+                        reply.send(true);
+                    })
+                    .powerctl_handler(move |msg| {
+                        let _ = requests.send(msg.command.clone());
+                        match msg.command.split(',').next() {
+                            Some("shutdown" | "reboot") => PowerctlOutcome::ShuttingDown,
+                            _ => PowerctlOutcome::Ignored,
+                        }
+                    }),
+            )
+            .await
+            .expect("run");
+            let socket = socket_dir.join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
+            let set = |name: &'static str, value: &'static str| {
+                let socket = socket.clone();
+                async move {
+                    let mut stream = UnixStream::connect(&socket).await.unwrap();
+                    stream.write_all(&set_frame(name, value)).await.unwrap();
+                    read_reply(&mut stream).await
+                }
+            };
+            async fn next_command(
+                requests: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+            ) -> String {
+                tokio::time::timeout(Duration::from_secs(10), requests.recv())
+                    .await
+                    .expect("the handler call must begin")
+                    .unwrap()
+            }
+
+            assert_eq!(set(POWERCTL_PROPERTY, "bogus").await, Some(PROP_SUCCESS));
+            assert_eq!(next_command(&mut power_requests).await, "bogus");
+            assert_eq!(set("ctl.start", "svc").await, Some(PROP_SUCCESS));
+            assert_eq!(
+                control_calls.load(Ordering::SeqCst),
+                1,
+                "an ignored command must not stop the handler calls"
+            );
+
+            assert_eq!(
+                set(POWERCTL_PROPERTY, "reboot,recovery").await,
+                Some(PROP_SUCCESS)
+            );
+            assert_eq!(next_command(&mut power_requests).await, "reboot,recovery");
+            // The `ctl.stop` request may be read before the handler call
+            // has returned. It is then queued behind the call and answered
+            // once the call has stopped the handler calls, with the same
+            // reply; so the requests after it find the calls stopped.
+            assert_eq!(set("ctl.stop", "svc").await, Some(PROP_SUCCESS));
+            assert_eq!(
+                set("ctl.start", "svc").await,
+                Some(PROP_ERROR_HANDLE_CONTROL_MESSAGE)
+            );
+            assert_eq!(set(POWERCTL_PROPERTY, "shutdown").await, Some(PROP_SUCCESS));
+            assert_eq!(set("debug.after.reboot", "1").await, Some(PROP_SUCCESS));
+
+            service.shutdown().await.unwrap();
+            assert_eq!(
+                control_calls.load(Ordering::SeqCst),
+                1,
+                "no control handler call may begin after ShuttingDown"
+            );
+            assert!(
+                power_requests.try_recv().is_err(),
+                "no powerctl handler call may begin after ShuttingDown"
+            );
+        });
     }
 
     /// `shutdown` returns only after a control handler call that was
@@ -1788,6 +2451,154 @@ mod tests {
             );
             assert_eq!(err.stage(), StartupStage::PropertiesService, "{err}");
             releaser.await.unwrap();
+        });
+    }
+
+    /// A control handler that passes each message and its reply on to the
+    /// test, as a host does that handles the messages in a task of its
+    /// own.
+    fn deferring_handler() -> (
+        impl Fn(ControlMessage, ControlReply) + Send + Sync + 'static,
+        tokio::sync::mpsc::UnboundedReceiver<(ControlMessage, ControlReply)>,
+    ) {
+        let (pass, passed) = tokio::sync::mpsc::unbounded_channel();
+        let handler = move |msg: ControlMessage, reply: ControlReply| {
+            let _ = pass.send((msg, reply));
+        };
+        (handler, passed)
+    }
+
+    /// Sends `ctl.start` = `target` on a new connection and returns the
+    /// connection with the reply the [`deferring_handler`] passed on for
+    /// it.
+    async fn send_held_ctl_start(
+        socket: &Path,
+        passed: &mut tokio::sync::mpsc::UnboundedReceiver<(ControlMessage, ControlReply)>,
+        target: &str,
+    ) -> (UnixStream, ControlReply) {
+        let mut stream = UnixStream::connect(socket).await.unwrap();
+        stream
+            .write_all(&set_frame("ctl.start", target))
+            .await
+            .unwrap();
+        let (message, reply) = tokio::time::timeout(Duration::from_secs(10), passed.recv())
+            .await
+            .expect("the handler call must begin")
+            .unwrap();
+        assert_eq!(message.target, target);
+        (stream, reply)
+    }
+
+    /// A `ctl.*` request the host has not answered holds no connection
+    /// slot: with more of them unanswered than the service handles
+    /// connections at once, another set is still applied and answered, and
+    /// each request then gets the reply the host sends for it.
+    #[test]
+    fn unanswered_control_requests_hold_no_connection_slot() {
+        const TEST: &str = "tests::unanswered_control_requests_hold_no_connection_slot";
+        if !is_child(TEST) {
+            run_in_child(TEST);
+            return;
+        }
+        block_on_child(async {
+            const HELD: usize = crate::socket_service::MAX_CONCURRENT_CLIENTS + 1;
+
+            let dir = TempDir(socket_test_dir(
+                "rsprops_svc_ctl_held",
+                socket_suffix_len("sockets"),
+            ));
+            let _ = std::fs::remove_dir_all(&dir.0);
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let socket_dir = dir.0.join("sockets");
+            let (handler, mut passed) = deferring_handler();
+            let service = run(
+                rsproperties::PropertyConfig::new()
+                    .properties_dir(dir.0.clone())
+                    .socket_dir(socket_dir.clone()),
+                ServiceOptions::new().control_handler(handler),
+            )
+            .await
+            .expect("run");
+            let socket = socket_dir.join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
+
+            let mut held = Vec::new();
+            for i in 0..HELD {
+                held.push(send_held_ctl_start(&socket, &mut passed, &format!("svc{i}")).await);
+            }
+
+            let mut stream = UnixStream::connect(&socket).await.unwrap();
+            stream
+                .write_all(&set_frame("debug.while.held", "1"))
+                .await
+                .unwrap();
+            assert_eq!(read_reply(&mut stream).await, Some(PROP_SUCCESS));
+            assert_eq!(
+                rsproperties::get::<String>("debug.while.held").unwrap(),
+                "1"
+            );
+
+            for (i, (mut stream, reply)) in held.into_iter().enumerate() {
+                let handled = i % 2 == 0;
+                reply.send(handled);
+                let expected = if handled {
+                    PROP_SUCCESS
+                } else {
+                    PROP_ERROR_HANDLE_CONTROL_MESSAGE
+                };
+                assert_eq!(read_reply(&mut stream).await, Some(expected), "svc{i}");
+            }
+
+            service.shutdown().await.unwrap();
+        });
+    }
+
+    /// `shutdown` does not wait for a reply the host holds, and the reply
+    /// outlives the service: sent after `shutdown` has returned it still
+    /// reaches its client, and dropped it answers with a failure.
+    #[test]
+    fn reply_held_by_the_host_outlives_shutdown() {
+        const TEST: &str = "tests::reply_held_by_the_host_outlives_shutdown";
+        if !is_child(TEST) {
+            run_in_child(TEST);
+            return;
+        }
+        block_on_child(async {
+            let dir = TempDir(socket_test_dir(
+                "rsprops_svc_ctl_late",
+                socket_suffix_len("sockets"),
+            ));
+            let _ = std::fs::remove_dir_all(&dir.0);
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let socket_dir = dir.0.join("sockets");
+            let (handler, mut passed) = deferring_handler();
+            let service = run(
+                rsproperties::PropertyConfig::new()
+                    .properties_dir(dir.0.clone())
+                    .socket_dir(socket_dir.clone()),
+                ServiceOptions::new().control_handler(handler),
+            )
+            .await
+            .expect("run");
+            let socket = socket_dir.join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME);
+
+            let (mut answered, answered_reply) =
+                send_held_ctl_start(&socket, &mut passed, "answered").await;
+            let (mut dropped, dropped_reply) =
+                send_held_ctl_start(&socket, &mut passed, "dropped").await;
+
+            tokio::time::timeout(Duration::from_secs(10), service.shutdown())
+                .await
+                .expect("shutdown must not wait for the replies the host holds")
+                .unwrap();
+            assert!(service_is_gone(&dir.0, &socket_dir));
+
+            answered_reply.send(true);
+            assert_eq!(read_reply(&mut answered).await, Some(PROP_SUCCESS));
+            drop(dropped_reply);
+            assert_eq!(
+                read_reply(&mut dropped).await,
+                Some(PROP_ERROR_HANDLE_CONTROL_MESSAGE)
+            );
         });
     }
 
