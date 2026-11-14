@@ -25,10 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SystemProperties::read_index_with(index, |name, value, serial| ...)`:
   reads by index without a name lookup and passes the serial the value
   was read under (bionic `__system_property_read_callback`).
-- `SystemProperties::wait_for_creation(name, timeout)` and
-  `wait_for_value(name, expected, timeout)` (libbase
-  `WaitForPropertyCreation` / `WaitForProperty`), with
-  `Option<Duration>` timeouts.
+- `SystemProperties::wait_for_creation(name)` and
+  `wait_for_value(name, expected)` (libbase `WaitForPropertyCreation` /
+  `WaitForProperty`), and `wait_for_creation_timeout(name, timeout)` /
+  `wait_for_value_timeout(name, expected, timeout)` with a `Duration`
+  that bounds the whole call (`Ok(None)` / `Ok(false)` when it expires).
 - `SystemProperties::open(dir)`: a read-only instance on a directory the
   caller names. 0.6.0 had no public read-only constructor, so a process
   could read only the one directory `init` latched, and a library could
@@ -36,8 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SystemProperties::watch(name)` and `PropertyWatcher` (libbase
   `CachedProperty`): `value()` returns the current value, reading the
   store again only when the property's serial has moved, and
-  `wait_for_change(timeout)` blocks until the property is created or
-  updated. Following one property took `find`, `read_index_with` and
+  `wait_for_change()` blocks until the property is created or updated
+  (`wait_for_change_timeout(timeout)`: `Ok(false)` when the timeout
+  expires first). Following one property took `find`, `read_index_with` and
   `wait` in a loop that carried the index and the serial, and a `wait`
   from a serial with the dirty bit set reported one update twice. The
   watcher reports an update once and does not queue changes.
@@ -282,14 +284,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `PropertyConfigBuilder`, `PropertyConfig::builder`, `with_*_dir`,
     `with_both_dirs` and the `From<PathBuf | String | &str>` impls are
     removed.
-  - `SystemProperties::wait` takes `Option<Duration>` and returns
-    `Result<Option<u32>>`: `Ok(Some(serial))` on a change, `Ok(None)` on
-    timeout, `Err` on a lookup or futex failure (0.6.0: `None` for all
-    three). `old_serial` is a `u32`, as in bionic's
-    `__system_property_wait`, not an `Option<u32>`: 0.6.0's `None` read
-    the serial inside `wait`, so a change made before the call was
-    missed. `wait_any()` is removed: `wait(None, old_serial, None)` is
-    bionic's deprecated `__system_property_wait_any(old_serial)`. The
+  - `SystemProperties::wait(index, old_serial)` has no timeout argument
+    and returns `Result<u32>`, the new serial;
+    `wait_timeout(index, old_serial, timeout)` takes a `Duration` and
+    returns `Result<Option<u32>>`: `Ok(Some(serial))` on a change,
+    `Ok(None)` on timeout. Both return `Err` on a lookup or futex failure
+    (0.6.0: `None` for all three). `wait(i, old, None)` becomes
+    `wait(i, old)`, and `wait(i, old, Some(&ts))` becomes
+    `wait_timeout(i, old, d)` with `d` a `Duration`. `old_serial` is a
+    `u32`, as in bionic's `__system_property_wait`, not an
+    `Option<u32>`: 0.6.0's `None` read the serial inside `wait`, so a
+    change made before the call was missed. `wait_any()` is removed:
+    `wait(None, old_serial)` is bionic's deprecated
+    `__system_property_wait_any(old_serial)`. The
     `rsproperties::Timespec` re-export is removed too.
   - `SystemProperties::serial` returns `Result<u32>` (0.6.0: `None` for a
     foreign index or a failed lookup).

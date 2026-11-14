@@ -137,7 +137,7 @@ use std::time::Duration;
 fn main() -> rsproperties::Result<()> {
     let props = rsproperties::system_properties()?;
     // Returns when the property exists and equals "1"; `false` is a timeout.
-    if !props.wait_for_value("sys.boot_completed", "1", Some(Duration::from_secs(30)))? {
+    if !props.wait_for_value_timeout("sys.boot_completed", "1", Duration::from_secs(30))? {
         eprintln!("not booted after 30 s");
     }
     Ok(())
@@ -159,7 +159,7 @@ fn main() -> rsproperties::Result<()> {
         println!("log level: {:?}", level.value()?);
         // Blocks until the property is created or updated. A change made
         // since the `value()` above returns at once, so none is missed.
-        level.wait_for_change(None)?;
+        level.wait_for_change()?;
     }
 }
 ```
@@ -179,7 +179,7 @@ fn main() -> rsproperties::Result<()> {
     // between `area_serial()` and `wait` returns at once.
     let mut serial = props.area_serial();
     loop {
-        match props.wait(None, serial, Some(Duration::from_secs(60)))? {
+        match props.wait_timeout(None, serial, Duration::from_secs(60))? {
             Some(new_serial) => {
                 println!("a property changed, serial {new_serial}");
                 serial = new_serial;
@@ -191,8 +191,8 @@ fn main() -> rsproperties::Result<()> {
 ```
 
 The watcher is built on `find`, `read_index_with` and
-`wait(Some(index), old_serial, timeout)`; they stay public for a caller
-that keeps its own index and serial.
+`wait(Some(index), old_serial)`; they stay public for a caller that keeps
+its own index and serial.
 
 ### Setting Properties
 
@@ -435,19 +435,24 @@ fn main() -> rsproperties::Result<()> {
   UTF-8 arrive as U+FFFD
 - `serial(index)` / `area_serial()` — a property's serial / the global
   serial that any change advances (bionic `__system_property_area_serial`)
-- `wait(index, old_serial, timeout)` — futex-wait until the serial
-  differs from `old_serial` (bionic `__system_property_wait`).
-  `index: Some(i)` waits on that property, with `old_serial` from
-  `serial(i)`; `index: None` waits on any property, with `old_serial`
-  from `area_serial()`. `timeout: Option<Duration>`; `Ok(Some(serial))`
-  on a change, `Ok(None)` on timeout, `Err` on failure
-- `wait_for_creation(name, timeout)` / `wait_for_value(name, expected,
-  timeout)` — libbase `WaitForPropertyCreation` / `WaitForProperty`;
-  a timeout is `Ok(None)` / `Ok(false)`, a failure is `Err`
+- `wait(index, old_serial)` — futex-wait until the serial differs from
+  `old_serial` and return the new serial (bionic
+  `__system_property_wait`). `index: Some(i)` waits on that property,
+  with `old_serial` from `serial(i)`; `index: None` waits on any
+  property, with `old_serial` from `area_serial()`. `Err` on failure
+- `wait_for_creation(name)` / `wait_for_value(name, expected)` — libbase
+  `WaitForPropertyCreation` / `WaitForProperty`; `Ok(index)` / `Ok(())`,
+  a failure is `Err`
+- Each wait above has a `_timeout` form that takes a `Duration` as its
+  last argument: `wait_timeout` returns `Ok(Some(serial))` on a change and
+  `Ok(None)` on timeout, `wait_for_creation_timeout` `Ok(None)`,
+  `wait_for_value_timeout` `Ok(false)`. `Duration::ZERO` checks without
+  blocking
 - `watch(name)` — a `PropertyWatcher` (libbase `CachedProperty`):
   `value()` is `Ok(None)` until the property exists and reads the store
-  again only after a change; `wait_for_change(timeout)` blocks until the
-  creation or the next update, `Ok(false)` on timeout. One update is one
+  again only after a change; `wait_for_change()` blocks until the
+  creation or the next update, and `wait_for_change_timeout(timeout)`
+  returns `Ok(false)` on timeout. One update is one
   change (the dirty and the clean serial store are not reported
   separately), and changes are not queued. `name()` returns the watched
   name

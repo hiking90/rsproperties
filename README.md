@@ -138,7 +138,7 @@ use std::time::Duration;
 fn main() -> rsproperties::Result<()> {
     let props = rsproperties::system_properties()?;
     // Returns when the property exists and equals "1"; `false` is a timeout.
-    if !props.wait_for_value("sys.boot_completed", "1", Some(Duration::from_secs(30)))? {
+    if !props.wait_for_value_timeout("sys.boot_completed", "1", Duration::from_secs(30))? {
         eprintln!("not booted after 30 s");
     }
     Ok(())
@@ -160,7 +160,7 @@ fn main() -> rsproperties::Result<()> {
         println!("log level: {:?}", level.value()?);
         // Blocks until the property is created or updated. A change made
         // since the `value()` above returns at once, so none is missed.
-        level.wait_for_change(None)?;
+        level.wait_for_change()?;
     }
 }
 ```
@@ -180,7 +180,7 @@ fn main() -> rsproperties::Result<()> {
     // between `area_serial()` and `wait` returns at once.
     let mut serial = props.area_serial();
     loop {
-        match props.wait(None, serial, Some(Duration::from_secs(60)))? {
+        match props.wait_timeout(None, serial, Duration::from_secs(60))? {
             Some(new_serial) => {
                 println!("a property changed, serial {new_serial}");
                 serial = new_serial;
@@ -192,8 +192,8 @@ fn main() -> rsproperties::Result<()> {
 ```
 
 The watcher is built on `find`, `read_index_with` and
-`wait(Some(index), old_serial, timeout)`; they stay public for a caller
-that keeps its own index and serial.
+`wait(Some(index), old_serial)`; they stay public for a caller that keeps
+its own index and serial.
 
 ### Custom Configuration
 

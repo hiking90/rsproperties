@@ -919,8 +919,8 @@ mod tests {
         let reader = system_properties().unwrap();
         let wait_any_from = |old: u32| {
             std::thread::spawn(move || {
-                let changed = reader.wait(None, old, None).unwrap();
-                assert!(changed.is_some(), "no timeout was given");
+                let changed = reader.wait(None, old).unwrap();
+                assert_ne!(changed, old);
             })
         };
 
@@ -933,8 +933,8 @@ mod tests {
         let index = reader.find(test_prop).unwrap().expect("just added");
         let old_prop_serial = reader.serial(index).expect("index valid");
         let handle = std::thread::spawn(move || {
-            let changed = reader.wait(Some(index), old_prop_serial, None).unwrap();
-            assert!(changed.is_some(), "no timeout was given");
+            let changed = reader.wait(Some(index), old_prop_serial).unwrap();
+            assert_ne!(changed, old_prop_serial);
         });
 
         let handle_any = wait_any_from(reader.area_serial());

@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use crate::errors::*;
-use crate::system_properties::{Deadline, PropertyIndex, SystemProperties};
+use crate::system_properties::{wait_forever, Deadline, PropertyIndex, SystemProperties};
 
 /// Bit 0 of a property serial: set by a writer's first store of an update
 /// and cleared by its last.
@@ -40,7 +40,7 @@ struct Seen {
 /// let props = rsproperties::system_properties()?;
 /// let mut boot = props.watch("sys.boot_completed");
 /// while boot.value()? != Some("1") {
-///     if !boot.wait_for_change(Some(Duration::from_secs(30)))? {
+///     if !boot.wait_for_change_timeout(Duration::from_secs(30))? {
 ///         println!("no change for 30 s; still {:?}", boot.value()?);
 ///     }
 /// }
@@ -140,26 +140,36 @@ impl<'a> PropertyWatcher<'a> {
 
     /// Blocks until the property changes (see the type's "What a change
     /// is"), then reads the new value, which the next [`Self::value`]
-    /// returns without reading the store again. `Ok(true)` on a change,
-    /// `Ok(false)` when `timeout` expires first; `None` waits forever.
+    /// returns without reading the store again.
+    /// [`Self::wait_for_change_timeout`] bounds the wait.
     ///
     /// The wait starts from the value this watcher last read, by
     /// [`Self::value`] or by an earlier call: a change made since then
     /// returns at once. A watcher that has not read the property yet waits
-    /// for it to exist, so the first call returns `Ok(true)` at once for a
-    /// property that already does. `timeout` bounds the whole call. With
-    /// `Some(Duration::ZERO)` the call does not block and reports whether
-    /// the property changed since the last read.
+    /// for it to exist, so the first call returns at once for a property
+    /// that already does.
     ///
     /// Failures are those of [`SystemProperties::wait`] and
     /// [`Self::value`]. After an `Err` the watcher still holds the value
     /// it had, so the next call reports the same change again; a value
     /// that is not UTF-8 therefore fails every call until the property is
     /// updated. On macOS a call that would have to block fails (no futex).
-    pub fn wait_for_change(&mut self, timeout: Option<Duration>) -> Result<bool> {
-        let deadline = Deadline::after(timeout);
+    pub fn wait_for_change(&mut self) -> Result<()> {
+        wait_forever(|deadline| Ok(self.wait_for_change_until(deadline)?.then_some(())))
+    }
+
+    /// [`Self::wait_for_change`] bounded by `timeout`, which covers the
+    /// whole call: `Ok(true)` on a change, `Ok(false)` when `timeout`
+    /// expires first. With `Duration::ZERO` the call does not block and
+    /// reports whether the property changed since the last read (or, for
+    /// a watcher that has not read it yet, whether it exists).
+    pub fn wait_for_change_timeout(&mut self, timeout: Duration) -> Result<bool> {
+        self.wait_for_change_until(&Deadline::after(Some(timeout)))
+    }
+
+    fn wait_for_change_until(&mut self, deadline: &Deadline) -> Result<bool> {
         let Some(Seen { index, serial }) = self.seen else {
-            let Some(index) = self.props.wait_for_creation_until(&self.name, &deadline)? else {
+            let Some(index) = self.props.wait_for_creation_until(&self.name, deadline)? else {
                 return Ok(false);
             };
             self.read(index)?;
@@ -169,7 +179,7 @@ impl<'a> PropertyWatcher<'a> {
         loop {
             let changed = self
                 .props
-                .wait_until(Some(index), old_serial, &deadline)
+                .wait_until(Some(index), old_serial, deadline)
                 .with_context_location(|| format!("waiting for property {:?}", self.name))?;
             if changed.is_none() {
                 return Ok(false);
@@ -210,7 +220,7 @@ mod tests {
     use super::*;
     use crate::system_properties::test_fixture::Fixture;
 
-    const NO_WAIT: Option<Duration> = Some(Duration::ZERO);
+    const NO_WAIT: Duration = Duration::ZERO;
 
     /// `value` is `None` until the property exists, then follows every
     /// update without a wait in between.
@@ -247,31 +257,33 @@ mod tests {
         let mut watcher = reader.watch("debug.rsp.state");
         assert_eq!(watcher.value().unwrap(), None);
 
-        let timeout = Some(Duration::from_secs(5));
         std::thread::scope(|s| {
             let sp = &mut fx.sp;
             let writer = s.spawn(move || {
                 std::thread::sleep(Duration::from_millis(50));
                 sp.add("debug.rsp.state", "starting").unwrap();
             });
-            assert!(watcher.wait_for_change(timeout).unwrap());
+            assert!(watcher
+                .wait_for_change_timeout(Duration::from_secs(5))
+                .unwrap());
             assert_eq!(watcher.value().unwrap(), Some("starting"));
             writer.join().unwrap();
         });
+        // No timeout: the call returns on the update.
         std::thread::scope(|s| {
             let sp = &mut fx.sp;
             let writer = s.spawn(move || {
                 std::thread::sleep(Duration::from_millis(50));
                 sp.set("debug.rsp.state", "running").unwrap();
             });
-            assert!(watcher.wait_for_change(timeout).unwrap());
+            watcher.wait_for_change().unwrap();
             assert_eq!(watcher.value().unwrap(), Some("running"));
             writer.join().unwrap();
         });
 
         let start = Instant::now();
         assert!(!watcher
-            .wait_for_change(Some(Duration::from_millis(50)))
+            .wait_for_change_timeout(Duration::from_millis(50))
             .unwrap());
         assert!(start.elapsed() >= Duration::from_millis(50));
         assert_eq!(watcher.value().unwrap(), Some("running"));
@@ -287,12 +299,12 @@ mod tests {
         let reader = SystemProperties::open(fx.dir()).unwrap();
 
         let mut exists = reader.watch("debug.rsp.exists");
-        assert!(exists.wait_for_change(NO_WAIT).unwrap());
+        assert!(exists.wait_for_change_timeout(NO_WAIT).unwrap());
         assert_eq!(exists.value().unwrap(), Some("1"));
-        assert!(!exists.wait_for_change(NO_WAIT).unwrap());
+        assert!(!exists.wait_for_change_timeout(NO_WAIT).unwrap());
 
         let mut missing = reader.watch("debug.rsp.missing");
-        assert!(!missing.wait_for_change(NO_WAIT).unwrap());
+        assert!(!missing.wait_for_change_timeout(NO_WAIT).unwrap());
         assert_eq!(missing.value().unwrap(), None);
     }
 
@@ -306,22 +318,22 @@ mod tests {
         let reader = SystemProperties::open(fx.dir()).unwrap();
         let mut watcher = reader.watch("debug.rsp.merge");
         assert_eq!(watcher.value().unwrap(), Some("0"));
-        assert!(!watcher.wait_for_change(NO_WAIT).unwrap());
+        assert!(!watcher.wait_for_change_timeout(NO_WAIT).unwrap());
 
         for value in ["1", "2", "3"] {
             fx.sp.set("debug.rsp.merge", value).unwrap();
         }
-        assert!(watcher.wait_for_change(NO_WAIT).unwrap());
+        assert!(watcher.wait_for_change_timeout(NO_WAIT).unwrap());
         assert_eq!(watcher.value().unwrap(), Some("3"));
-        assert!(!watcher.wait_for_change(NO_WAIT).unwrap());
+        assert!(!watcher.wait_for_change_timeout(NO_WAIT).unwrap());
 
         // A change `value` has already read is not reported by the wait.
         fx.sp.set("debug.rsp.merge", "4").unwrap();
         assert_eq!(watcher.value().unwrap(), Some("4"));
-        assert!(!watcher.wait_for_change(NO_WAIT).unwrap());
+        assert!(!watcher.wait_for_change_timeout(NO_WAIT).unwrap());
 
         fx.sp.set("debug.rsp.merge", "4").unwrap();
-        assert!(watcher.wait_for_change(NO_WAIT).unwrap());
+        assert!(watcher.wait_for_change_timeout(NO_WAIT).unwrap());
         assert_eq!(watcher.value().unwrap(), Some("4"));
     }
 
@@ -342,19 +354,21 @@ mod tests {
         assert_eq!(fx.serial_word(index) & DIRTY, DIRTY);
         // `SystemProperties::wait` reports the dirty store.
         let seen = watcher.seen.as_ref().unwrap();
-        let raw = reader.wait(Some(seen.index), seen.serial, NO_WAIT).unwrap();
+        let raw = reader
+            .wait_timeout(Some(seen.index), seen.serial, NO_WAIT)
+            .unwrap();
         assert_eq!(raw, Some(seen.serial | DIRTY));
         // The watcher does not.
         assert!(!watcher
-            .wait_for_change(Some(Duration::from_millis(50)))
+            .wait_for_change_timeout(Duration::from_millis(50))
             .unwrap());
         assert_eq!(watcher.value().unwrap(), Some("v1"));
 
         // The writer completes an update: one change.
         fx.sp.set("debug.rsp.dirty", "v2").unwrap();
-        assert!(watcher.wait_for_change(NO_WAIT).unwrap());
+        assert!(watcher.wait_for_change_timeout(NO_WAIT).unwrap());
         assert_eq!(watcher.value().unwrap(), Some("v2"));
-        assert!(!watcher.wait_for_change(NO_WAIT).unwrap());
+        assert!(!watcher.wait_for_change_timeout(NO_WAIT).unwrap());
     }
 
     /// A watcher on a `'static` reader can be moved to another thread.
