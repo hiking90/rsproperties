@@ -64,7 +64,9 @@ fn with_override_name<R>(name: &str, f: impl FnOnce(&str) -> R) -> R {
     f(joined)
 }
 
-/// Absolute end of a caller-supplied `Option<Duration>` timeout.
+/// Absolute end of a caller-supplied `Option<Duration>` timeout. On macOS
+/// nothing blocks (no futex), so nothing reads a deadline.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) enum Deadline {
     /// No timeout — also for a timeout too large for `Instant`.
     Never,
@@ -75,6 +77,7 @@ pub(crate) enum Deadline {
     At(Instant),
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 impl Deadline {
     pub(crate) fn after(timeout: Option<Duration>) -> Self {
         match timeout {
