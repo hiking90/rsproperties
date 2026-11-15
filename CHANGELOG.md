@@ -61,9 +61,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs until the process exits; another instance's thread ends within
   about a second of the instance's drop. Return conditions are the sync
   methods', except that a per-property wait returns after the writer's
-  global `FUTEX_WAKE`, a writer that moves a serial without a wake is
-  seen within about a second, and async `serial` waits for the clean
-  serial without the sync method's 200 ms bound. A child forked without
+  global `FUTEX_WAKE` and async `serial` waits for the clean serial
+  without the sync method's 200 ms bound. A writer that moves the global
+  serial without a wake (bionic in an appcompat override process on API
+  35–36) is seen at the next change that wakes, as with bionic's own
+  waits. The process-wide reader's thread has no timed wakeups while
+  nothing changes. A child forked without
   exec has no thread: its waits that have to block are never woken (not
   supported).
 - `asynchronous::set(name, value)` (`tokio` feature): `set` on tokio's

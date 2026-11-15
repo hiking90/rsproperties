@@ -474,8 +474,12 @@ pub fn system_properties() -> Result<&'static system_properties::SystemPropertie
     log::debug!("Initializing global SystemProperties instance from: {dir:?}");
     match system_properties::SystemProperties::open(dir) {
         // Only a holder of `SYSTEM_PROPERTIES_INIT` sets the cell, and it
-        // was empty above, so `props` is the value stored.
-        Ok(props) => Ok(SYSTEM_PROPERTIES.get_or_init(|| props)),
+        // was empty above, so `props` is the value stored — and a `static`
+        // is never dropped.
+        Ok(mut props) => {
+            props.never_dropped();
+            Ok(SYSTEM_PROPERTIES.get_or_init(|| props))
+        }
         Err(e) => {
             if INIT_FAILURE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 log::debug!("SystemProperties from {dir:?} still unavailable: {e}");

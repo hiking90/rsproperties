@@ -279,6 +279,40 @@ override가 켜진 프로세스에서는 같은 property에 대해 libc
     `ro.build.version.sdk`는 37이다. workflow의 matrix는 `api-level: 37`에
     `platform: android-37.0`을 따로 지정한다.
 
+**wait와 override area (분류 (a), 보완하지 않음).** bionic writer는 override
+area의 serial을 바꾸지만 그 word에 `FUTEX_WAKE`를 보내지 않는다.
+- `Update`는 override entry의 serial과 override area의 global serial에
+  store한다(`android-vts-17.0_r1` `system_properties.cpp:339`, `:347`,
+  `:356-358`). `__futex_wake`는 primary의 `&pi->serial`(`:351`)과
+  `serial_pa->serial()`(`:360`)에만 호출한다. `Add`도 override area의 serial을
+  올린 뒤(`:419-422`) primary serial에만 wake를 보낸다(`:439`).
+  `android-16.0.0_r4`도 같다(`:328-337`, `:397-416`). 이 구조는 처음 들어온
+  commit `b8c87b14b`(2023-08-28)부터 같고, commit message와 test에는 wait에
+  대한 언급이 없다. 의도적으로 생략했는지는 확인 필요다.
+- shared futex의 key는 mapping한 file의 inode와 offset이다. bind mount된
+  namespace의 reader는 override file(실측 inode 765)에서 기다리고, writer는
+  primary file(inode 411)을 깨운다. 따라서 그 reader는 wake를 받지 않는다.
+- 영향 범위: API 35–36에서 zygote가 bind mount한 process, 즉 DeviceConfig
+  `app_compat` / `appcompat_sysprop_override_pkgs` 목록에 오른 app이다.
+  API 37 zygote는 bind mount를 하지 않으므로 reader가 primary file에서
+  기다린다.
+- 실측(API 36, `unshare -m`과 `mount -o rprivate none /` 뒤 bind mount, 1 s
+  뒤 `setprop`): bionic `__system_property_wait(NULL, .., 5 s)`는 5.000 s 뒤
+  `false`를 반환했다(namespace 밖에서는 1.003 s에 `true`). 이 crate의 sync
+  `wait_timeout(None, .., 5 s)`도 5 s 뒤 `Ok(None)`을 반환했다.
+
+이 crate는 이 동작을 보완하지 않는다. bionic의 wait와 같은 조건이고, 보완하려면
+모든 process의 global serial 대기에 timed slice를 넣거나 mountinfo로 override
+namespace를 판정해야 한다. 그 비용을 위 범위의 process를 위해 모든 process에
+지우지 않는다. 결과는 다음과 같다.
+- global serial 대기(sync `wait(None, ..)`, `wait_for_creation`, async wait의
+  process-wide reader)는 wake가 오는 다음 변경에서 반환한다. timeout이 있으면
+  timeout에 `Ok(None)`을 반환한다.
+- per-property sync 대기는 `LOCK_SLICE`(100 ms)마다 다시 비교하므로 실측에서
+  96.8 ms에 감지했다. process-wide reader가 아닌 instance의 async wait는
+  waiter slice(1 s)마다 다시 비교한다. 두 slice는 lock 해제와 thread 종료를
+  위한 것이고, 이 감지는 부수 효과이므로 보장하지 않는다.
+
 ### C4. `WaitForProperty` / `WaitForPropertyCreation`
 
 **AOSP** (`libbase/properties.cpp:246-292`).

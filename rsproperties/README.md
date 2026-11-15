@@ -556,9 +556,11 @@ The futures are `Send`. The first wait of an instance that has to block
 starts that instance's waiter thread: the global reader's thread runs
 until the process exits, another instance's ends within about a second of
 the instance's drop. A per-property wait wakes on the global serial's
-`FUTEX_WAKE`, and a change whose writer did not wake the futex is seen
-within about a second. A child forked without exec has no waiter thread,
-so its waits that have to block are never woken (not supported).
+`FUTEX_WAKE`. A writer that moves the global serial without a wake
+(bionic in an appcompat override process on API 35–36) is seen at the
+next change that wakes, as with bionic's own waits. A child forked
+without exec has no waiter thread, so its waits that have to block are
+never woken (not supported).
 
 ### Wire-protocol constants & validators (`rsproperties::wire`)
 

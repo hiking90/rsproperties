@@ -29,11 +29,12 @@
 //!   second of the instance's drop.
 //! - **Return conditions** are those of the sync methods, except:
 //!   a per-property wait wakes on the global serial, so it returns after
-//!   the writer's global `FUTEX_WAKE` rather than the property's; a change
-//!   whose writer moved the serial without `FUTEX_WAKE` is seen within
-//!   about a second (the thread's futex wait is timed); and
+//!   the writer's global `FUTEX_WAKE` rather than the property's; and
 //!   [`SystemProperties::serial`] waits for the clean serial without the
-//!   sync method's 200 ms bound.
+//!   sync method's 200 ms bound. A writer that moves the global serial
+//!   without `FUTEX_WAKE` — bionic in an appcompat override process on
+//!   API 35–36 — is seen at the next change that wakes, as bionic's own
+//!   waits see it (`docs/aosp-parity.md` C3).
 //! - **fork.** A child forked without exec has no waiter thread, and its
 //!   async waits that have to block are never woken. Not supported.
 //! - **macOS** has no futex: a wait that has to block fails, as the sync

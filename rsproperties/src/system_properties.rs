@@ -340,6 +340,12 @@ impl SystemProperties {
         &self.waiter
     }
 
+    /// Marks this instance as never dropped, for the process-wide reader
+    /// before it is stored: see [`Waiter::never_dropped`].
+    pub(crate) fn never_dropped(&mut self) {
+        self.waiter.never_dropped();
+    }
+
     /// Opens the property store of the properties directory `dir` for
     /// reading.
     ///

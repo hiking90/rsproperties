@@ -24,6 +24,11 @@
 //! - Dropping the [`Waiter`] sets a stop flag that the thread checks each
 //!   time its timed futex wait returns. `Drop` does not join, so the thread
 //!   and the mapping outlive the instance by at most one slice.
+//! - The process-wide reader is never dropped, so its thread has no stop
+//!   flag to check and waits without a slice ([`Waiter::never_dropped`]):
+//!   it wakes only on a writer's `FUTEX_WAKE`, as bionic's waits do. A
+//!   writer that moves the serial without one (bionic's appcompat override
+//!   area, API 35–36) is seen at the next change that wakes.
 //! - Not supported: a child forked without exec has no thread but a
 //!   registry that says one is running, so its async waits are not woken.
 
@@ -43,16 +48,17 @@ use crate::property_area::PropertyAreaMap;
 use crate::system_properties::no_futex;
 use crate::system_properties::{futex_wait, Deadline};
 
-/// How long one futex wait of the thread lasts. It bounds two delays: the
-/// thread's exit after its `Waiter` is dropped, and the detection of a
-/// change whose writer moved the global serial without `FUTEX_WAKE`. A
-/// writer that wakes is seen at once. Not measured yet (docs 7절).
+/// How long one futex wait of the thread lasts, for a waiter that can be
+/// dropped: it bounds the thread's exit after the drop. A writer that
+/// wakes is seen at once; one that moves the global serial without
+/// `FUTEX_WAKE` is seen when the slice ends, a side effect only.
 const SLICE: Duration = Duration::from_secs(1);
 
 pub(crate) struct Waiter {
     shared: Arc<Shared>,
     serial: Arc<PropertyAreaMap>,
-    slice: Duration,
+    /// `None` once [`Self::never_dropped`]: one untimed futex wait.
+    slice: Option<Duration>,
 }
 
 struct Shared {
@@ -135,8 +141,17 @@ impl Waiter {
                 before_first_wait: Mutex::new(None),
             }),
             serial,
-            slice,
+            slice: Some(slice),
         }
+    }
+
+    /// Marks the owner as never dropped (the process-wide reader, kept in
+    /// a `static`). Its thread has no stop flag to check, so it waits on
+    /// the futex without a slice and wakes only on a writer's
+    /// `FUTEX_WAKE`: no wakeup while nothing changes. Called before the
+    /// first registration, while the owner is not shared yet.
+    pub(crate) fn never_dropped(&mut self) {
+        self.slice = None;
     }
 
     /// A registration with nothing registered yet.
@@ -181,9 +196,9 @@ impl Drop for Waiter {
     }
 }
 
-/// The thread: waits on the global serial from `last` in timed slices and
-/// wakes everyone on each change.
-fn run(serial: &PropertyAreaMap, shared: &Shared, mut last: u32, slice: Duration) {
+/// The thread: waits on the global serial from `last` — in timed slices,
+/// or untimed when `slice` is `None` — and wakes everyone on each change.
+fn run(serial: &PropertyAreaMap, shared: &Shared, mut last: u32, slice: Option<Duration>) {
     #[cfg(test)]
     if let Some(hook) = shared.before_first_wait.lock().unwrap().take() {
         hook();
@@ -191,7 +206,7 @@ fn run(serial: &PropertyAreaMap, shared: &Shared, mut last: u32, slice: Duration
     let word = serial.property_area().serial();
     let mut spare = Vec::new();
     loop {
-        match futex_wait(word, last, &Deadline::after(Some(slice))) {
+        match futex_wait(word, last, &Deadline::after(slice)) {
             // `last` is updated only together with a wake: a future that
             // registered before this change is in the list being woken.
             Ok(Some(new)) => {
@@ -398,6 +413,56 @@ mod tests {
         assert!(flag.woken_within(LONG));
         // Bounded by a slice, with room for a loaded machine.
         assert!(start.elapsed() < slice * 20, "{:?}", start.elapsed());
+    }
+
+    /// A never-dropped waiter waits without a slice: a change without
+    /// `FUTEX_WAKE` is not seen, the next change that wakes is.
+    #[test]
+    fn never_dropped_waits_for_a_futex_wake() {
+        let mut fx = Fixture::new("waiter_static");
+        let reader = reader(&fx);
+        let serial = Fixture::serial_area_of(&reader);
+        let before = Arc::strong_count(&serial);
+        let mut waiter = Waiter::with_slice(Arc::clone(&serial), Duration::from_millis(20));
+        waiter.never_dropped();
+        let (tid_tx, tid) = mpsc::channel();
+        waiter.before_first_wait(move || {
+            let _ = tid_tx.send(rustix::thread::gettid().as_raw_nonzero().get());
+        });
+        let (flag, waker) = Flag::waker();
+        let mut registration = waiter.registration();
+        registration.register(&waker).unwrap();
+
+        // A change before the thread is in `FUTEX_WAIT` is seen by the
+        // kernel's comparison on entry (R1), so wait until it sleeps.
+        // Between the hook and the futex wait nothing else blocks it.
+        let stat = format!("/proc/self/task/{}/stat", tid.recv_timeout(LONG).unwrap());
+        let start = Instant::now();
+        loop {
+            let stat = std::fs::read_to_string(&stat).unwrap();
+            let state = stat.rsplit_once(") ").map(|(_, rest)| rest.as_bytes()[0]);
+            if state == Some(b'S') {
+                break;
+            }
+            assert!(start.elapsed() < LONG, "the thread never slept: {stat}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        fx.bump_global_serial();
+        // 25 of the 20 ms slices it was built with: a timed wait sees it.
+        assert!(!flag.woken_within(Duration::from_millis(500)));
+        fx.sp.add("debug.rsp.static", "1").unwrap();
+        assert!(flag.woken_within(LONG));
+
+        // Not a real owner's path: dropped here so the test leaves no
+        // thread. The stop flag is checked after a wake, so wake it.
+        drop(registration);
+        drop(waiter);
+        fx.sp.add("debug.rsp.static.end", "1").unwrap();
+        let start = Instant::now();
+        while Arc::strong_count(&serial) != before {
+            assert!(start.elapsed() < LONG, "the thread did not end");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Dropping a registration removes its entry; registering again
