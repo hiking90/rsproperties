@@ -188,11 +188,10 @@ impl SystemProperties {
         drive(self.0.waiter(), CleanSerialWait::new(&self.0, index)).await
     }
 
-    /// [`crate::SystemProperties::wait`]: the property's serial (or, with
-    /// `index == None`, the global serial) once it differs from
-    /// `old_serial`. A serial that already differs is returned on the
-    /// first poll.
-    pub async fn wait(&self, index: Option<PropertyIndex>, old_serial: u32) -> Result<u32> {
+    /// [`crate::SystemProperties::wait`]: the property's serial once it
+    /// differs from `old_serial`. A serial that already differs is returned
+    /// on the first poll. A wait for any property is [`Self::watch_area`].
+    pub async fn wait(&self, index: PropertyIndex, old_serial: u32) -> Result<u32> {
         drive(self.0.waiter(), SerialWait::new(&self.0, index, old_serial)).await
     }
 
@@ -302,7 +301,7 @@ fn futures_are_send(
 ) {
     fn send<T: Send>(_: T) {}
     send(props.serial(index));
-    send(props.wait(None, 0));
+    send(props.wait(index, 0));
     send(props.wait_for_creation(""));
     send(props.wait_for_value("", ""));
     send(watcher.wait_for_change());
@@ -385,18 +384,18 @@ mod tests {
         let poller = Poller::new();
         let index = sync.find("debug.rsp.async").unwrap().unwrap();
         let serial = sync.serial(index).unwrap();
-        let global = sync.area_serial();
 
-        // `wait(None, old)`, global serial already moved.
-        let got = poller.poll(pin!(props.wait(None, global - 1)));
-        assert!(matches!(got, Poll::Ready(Ok(g)) if g == global));
-        // `wait(Some(i), old)`, dirty serial included: the word as read.
+        // An area watcher, global serial moved since its creation.
+        let mut area = props.watch_area();
+        fx.sp.add("debug.rsp.async.any", "x").unwrap();
+        let got = poller.poll(pin!(area.wait_for_change()));
+        assert!(matches!(got, Poll::Ready(Ok(()))));
+        assert_eq!(area.serial(), sync.area_serial());
+        // `wait(i, old)`, dirty serial included: the word as read.
         fx.set_dirty("debug.rsp.async");
-        let sync_got = sync
-            .wait_timeout(Some(index), serial, Duration::ZERO)
-            .unwrap();
+        let sync_got = sync.wait_timeout(index, serial, Duration::ZERO).unwrap();
         assert_eq!(sync_got, Some(serial | 1));
-        let got = poller.poll(pin!(props.wait(Some(index), serial)));
+        let got = poller.poll(pin!(props.wait(index, serial)));
         assert!(matches!(got, Poll::Ready(Ok(s)) if Some(s) == sync_got));
         fx.sp.set("debug.rsp.async", "v").unwrap();
         // `wait_for_creation`, the property exists.
@@ -428,7 +427,7 @@ mod tests {
         let sync = reader(&fx);
         let foreign = fx.sp.find("debug.rsp.foreign").unwrap().unwrap();
         let poller = Poller::new();
-        let got = poller.poll(pin!(sync.as_async().wait(Some(foreign), 0)));
+        let got = poller.poll(pin!(sync.as_async().wait(foreign, 0)));
         assert!(matches!(got, Poll::Ready(Err(Error::InvalidArgument(_)))));
         let got = poller.poll(pin!(sync.as_async().serial(foreign)));
         assert!(matches!(got, Poll::Ready(Err(Error::InvalidArgument(_)))));
@@ -447,7 +446,7 @@ mod tests {
 
         let serial = sync.serial(index).unwrap();
         let poller = Poller::new();
-        let mut wait = pin!(props.wait(Some(index), serial));
+        let mut wait = pin!(props.wait(index, serial));
         assert!(poller.poll(wait.as_mut()).is_pending());
         fx.sp.set("debug.rsp.cycle", "1").unwrap();
         assert!(poller.woken());
@@ -566,11 +565,11 @@ mod tests {
         let serial = sync.serial(index).unwrap();
         let poller = Poller::new();
         // An index from the sync type on the async one, and back.
-        let mut a = pin!(first.wait(Some(index), serial));
+        let mut a = pin!(first.wait(index, serial));
         assert!(poller.poll(a.as_mut()).is_pending());
         let async_index = second.find("debug.rsp.view").unwrap().unwrap();
         assert_eq!(sync.serial(async_index).unwrap(), serial);
-        let mut b = pin!(second.wait(Some(async_index), serial));
+        let mut b = pin!(second.wait(async_index, serial));
         assert!(poller.poll(b.as_mut()).is_pending());
         assert_eq!(sync.waiter().registered(), 2);
         assert!(sync.waiter().started_from().is_some());

@@ -17,9 +17,9 @@ use crate::wait_step::{drive, Step, Wait, WaitOn, WaitStep};
 /// one at its creation. [`Self::wait_for_change`] returns once the serial
 /// differs from it, so a change that lands between two calls — after a
 /// timeout, or while the caller handled the previous change — returns the
-/// next call at once instead of being missed. A loop over
-/// [`SystemProperties::wait`] does the same only when it passes back the
-/// serial the previous wait returned, not one read again.
+/// next call at once instead of being missed. This is bionic
+/// `__system_property_wait(NULL, …)` with the serial carried for the
+/// caller; [`SystemProperties::wait`] is the per-property form.
 ///
 /// ```rust,no_run
 /// use std::time::Duration;

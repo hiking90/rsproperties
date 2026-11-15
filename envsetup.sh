@@ -249,7 +249,7 @@ function ndk_test_shell() {
 # Smoke-tests getprop/setprop, then runs every binary of the test manifest
 # once, as whichever user adbd runs as. A binary missing on the device
 # fails the run. `--test-threads=1` for all: the tests share the device's
-# properties (e.g. `wait(None, …)` returns on any change), so tests of one
+# properties (e.g. an `AreaWatcher` returns on any change), so tests of one
 # binary running in parallel could wake or overwrite each other.
 function ndk_run_tests() {
     read_remote_android || return 1

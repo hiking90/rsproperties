@@ -403,7 +403,7 @@ mod tests {
         // `SystemProperties::wait` reports the dirty store.
         let seen = watcher.seen.as_ref().unwrap();
         let raw = reader
-            .wait_timeout(Some(seen.index), seen.serial, NO_WAIT)
+            .wait_timeout(seen.index, seen.serial, NO_WAIT)
             .unwrap();
         assert_eq!(raw, Some(seen.serial | DIRTY));
         // The watcher does not.

@@ -142,7 +142,7 @@ lookup을 다시 한다. callback은 value만 받는다. `PropertyIndex`로 값�
   `pi->name`으로 판정하는 것과 같다. 기존 `read_with`는 lookup에 쓴 이름으로
   판정하지만, index로 읽을 때는 lookup 이름이 없다.
 - serial 의미는 bionic과 같다. mutable property의 serial에는 dirty bit가
-  켜져 있을 수 있다. 이 serial을 `wait(Some(idx), serial)`에 넘기면 같은
+  켜져 있을 수 있다. 이 serial을 `wait(idx, serial)`에 넘기면 같은
   update의 clean store를 변경 한 번으로 보고한다.
 - 다른 instance의 index는 `Error::InvalidArgument`로 거부한다. `update`와
   같은 규칙이다.
@@ -299,13 +299,15 @@ area의 serial을 바꾸지만 그 word에 `FUTEX_WAKE`를 보내지 않는다.
 - 실측(API 36, `unshare -m`과 `mount -o rprivate none /` 뒤 bind mount, 1 s
   뒤 `setprop`): bionic `__system_property_wait(NULL, .., 5 s)`는 5.000 s 뒤
   `false`를 반환했다(namespace 밖에서는 1.003 s에 `true`). 이 crate의 sync
-  `wait_timeout(None, .., 5 s)`도 5 s 뒤 `Ok(None)`을 반환했다.
+  global serial 대기도 5 s 뒤 timeout을 반환했다. 측정 당시의 호출은
+  `wait_timeout(None, .., 5 s)`였고, 지금은 같은 경로(`wait_word`의 global
+  분기)를 `AreaWatcher::wait_for_change_timeout`이 쓴다.
 
 이 crate는 이 동작을 보완하지 않는다. bionic의 wait와 같은 조건이고, 보완하려면
 모든 process의 global serial 대기에 timed slice를 넣거나 mountinfo로 override
 namespace를 판정해야 한다. 그 비용을 위 범위의 process를 위해 모든 process에
 지우지 않는다. 결과는 다음과 같다.
-- global serial 대기(sync `wait(None, ..)`, `wait_for_creation`, async wait의
+- global serial 대기(sync `AreaWatcher`, `wait_for_creation`, async wait의
   process-wide reader)는 wake가 오는 다음 변경에서 반환한다. timeout이 있으면
   timeout에 `Ok(None)`을 반환한다.
 - per-property sync 대기는 `LOCK_SLICE`(100 ms)마다 다시 비교하므로 실측에서
@@ -357,10 +359,21 @@ case(`None` / `false`)가 남아, 호출자가 일어날 수 없는 분기를 �
   이 형태가 없다.
 - bionic이 deprecated로 둔 `__system_property_wait_any(old_serial)`
   (`system_properties.h:125`)은 `Wait(nullptr, old_serial, &new_serial,
-  nullptr)`다. 대응하던 `wait_any()`는 삭제했고, `wait(None, old_serial)`이
-  같은 호출이다. 이때 `old_serial`은 `area_serial()`
-  (`__system_property_area_serial`, `system_properties.h:150`)에서 얻는다.
-  0.6.0의 `wait_any()`는 인자가 없어 bionic 함수와 signature가 달랐다.
+  nullptr)`다. 대응하던 `wait_any()`는 삭제했다. 0.6.0의 `wait_any()`는
+  인자가 없어 bionic 함수와 signature가 달랐다.
+- global serial 대기(`__system_property_wait(NULL, ..)`)는 `wait`의 형태로
+  두지 않고 `watch_area()`가 돌려주는 `AreaWatcher`로만 제공한다. `wait`의
+  `index`는 `Option`이 아닌 `PropertyIndex`다. AOSP에서 global serial로
+  기다리는 호출은 libbase `WaitForPropertyCreation`(`properties.cpp:255-262`)
+  하나였고, 이 함수는 serial `0`에서 시작해 직전 wait가 돌려준 serial을 다시
+  넘긴다. 즉 현재 serial부터 기다리는 loop이고, `AreaWatcher`가 그 serial을
+  대신 보관한다. 저장해 둔 `__system_property_area_serial()`을 쓰는 곳
+  (libbase `CachedProperty`, bionic `private/CachedProperty.h`, liblog
+  `properties.cpp`)은 기다리지 않고 비교만 하며, 이 용도에는 `area_serial()`이
+  남는다. 포기한 것은 임의의 serial에서 global 대기를 시작하는 호출이다.
+  local checkout(bionic, system/core, system/libbase, system/logging,
+  frameworks/native, hardware/interfaces)에서는 그런 호출을 찾지 못했다.
+  frameworks/base와 vendor code는 확인 필요다.
 - 값 비교는 byte 단위로 한다. 값이 UTF-8이 아니면 `expected`와 같지 않은
   것으로 보고 계속 기다린다.
 

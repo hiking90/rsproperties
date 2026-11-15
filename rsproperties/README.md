@@ -190,9 +190,10 @@ fn main() -> rsproperties::Result<()> {
 }
 ```
 
-The watchers are built on `find`, `read_index_with`, `area_serial` and
+`PropertyWatcher` is built on `find`, `read_index_with` and
 `wait(index, old_serial)`; they stay public for a caller that keeps its
-own index and serial.
+own index and serial. A wait for any property is `watch_area()` only;
+`area_serial()` stays for a check without a wait.
 
 ### Async Waits
 
@@ -497,11 +498,11 @@ fn main() -> rsproperties::Result<()> {
   UTF-8 arrive as U+FFFD
 - `serial(index)` / `area_serial()` — a property's serial / the global
   serial that any change advances (bionic `__system_property_area_serial`)
-- `wait(index, old_serial)` — futex-wait until the serial differs from
-  `old_serial` and return the new serial (bionic
-  `__system_property_wait`). `index: Some(i)` waits on that property,
-  with `old_serial` from `serial(i)`; `index: None` waits on any
-  property, with `old_serial` from `area_serial()`. `Err` on failure
+- `wait(index, old_serial)` — futex-wait until the property's serial
+  differs from `old_serial` (from `serial(index)` or `read_index_with`)
+  and return the new serial (bionic `__system_property_wait(pi, ..)`).
+  `Err` on failure. A wait on any property (bionic
+  `__system_property_wait(NULL, ..)`) is `watch_area()`
 - `wait_for_creation(name)` / `wait_for_value(name, expected)` — libbase
   `WaitForPropertyCreation` / `WaitForProperty`; `Ok(index)` / `Ok(())`,
   a failure is `Err`

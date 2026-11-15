@@ -1041,7 +1041,7 @@ impl SystemProperties {
         // The value is fully published at this point — from here on NOTHING
         // may early-return. A failure would misreport a completed update
         // and, worse, skip the global serial bump below, leaving
-        // global-serial waiters (`wait(None, ..)`) permanently unaware of the
+        // global-serial waiters (`AreaWatcher`) permanently unaware of the
         // change. That is why the
         // re-fetch for the futex wake is non-fatal too (it re-runs checks
         // the offset just passed inside `backup_and_apply_write`, so a
@@ -1130,10 +1130,11 @@ impl SystemProperties {
     /// area, that every property add and update increments. A plain atomic
     /// load; no lock is taken.
     ///
-    /// Pass it as `old_serial` to [`Self::wait`] with `index == None` to
-    /// wait for the next change to any property. Sample it *before* the
-    /// lookup whose result decides whether to wait, so a change between the
-    /// lookup and the wait is not missed.
+    /// Comparing it with a stored value tells whether any property changed
+    /// since, without a wait (bionic `CachedProperty` does this). To wait
+    /// for the next change, use [`Self::watch_area`]; create the watcher
+    /// *before* the lookup whose result decides whether to wait, so a
+    /// change between the lookup and the wait is not missed.
     pub fn area_serial(&self) -> u32 {
         let serial_pa = self.contexts.serial_prop_area();
         load_acquire(serial_pa.serial())
@@ -1224,17 +1225,18 @@ impl SystemProperties {
         Ok(load_acquire(&pi.serial))
     }
 
-    /// Waits until the property at `index` (or, with `index == None`, the
-    /// global serial — i.e. any property) changes, and returns the new
-    /// serial — bionic `__system_property_wait` with no timeout.
+    /// Waits until the property at `index` changes and returns its new
+    /// serial — bionic `__system_property_wait(pi, …)` with no timeout.
     /// [`Self::wait_timeout`] bounds the wait. A lookup or futex failure is
     /// `Err`, unlike bionic, whose `bool` reports it as a timeout.
-    /// `wait(None, old_serial)` is bionic's deprecated
-    /// `__system_property_wait_any(old_serial)`.
+    ///
+    /// A wait for a change to any property — bionic
+    /// `__system_property_wait(NULL, …)` and the deprecated
+    /// `__system_property_wait_any` — is [`Self::watch_area`], which keeps
+    /// the global serial between calls.
     ///
     /// `old_serial` is the serial observed when the caller last read the
-    /// value: from [`Self::serial`] or [`Self::read_index_with`] for an
-    /// index, from [`Self::area_serial`] for the global serial. If the
+    /// value, from [`Self::serial`] or [`Self::read_index_with`]. If the
     /// serial already differs from `old_serial`, this returns immediately
     /// with the current one, so a change between the read and the wait is
     /// not missed — the contract of bionic
@@ -1254,14 +1256,14 @@ impl SystemProperties {
     ///         if booted {
     ///             break;
     ///         }
-    ///         props.wait(Some(index), serial)?;
+    ///         props.wait(index, serial)?;
     ///     }
     /// }
     /// # Ok(())
     /// # }
     /// ```
     ///
-    /// With an index, the returned serial can have the dirty bit (bit 0)
+    /// The returned serial can have the dirty bit (bit 0)
     /// set: a writer on another instance stores the dirty serial, writes
     /// the value, then stores the clean one, and this call returns
     /// whichever differs from `old_serial` first, as bionic
@@ -1281,8 +1283,8 @@ impl SystemProperties {
     ///
     /// # Locking
     ///
-    /// A per-property wait holds the context node's read lock to reach the
-    /// serial word in the mapping. The lock belongs to this instance: a
+    /// A wait holds the context node's read lock to reach the serial word
+    /// in the mapping. The lock belongs to this instance: a
     /// writer on another instance (another process, or a `new_area`
     /// instance in this process) does not take it, and this instance's own
     /// `set`/`update` need `&mut self`, so they cannot run during a `wait`.
@@ -1294,9 +1296,9 @@ impl SystemProperties {
     /// of that delay a `wait` causes (a [`Self::read_with`] callback holds
     /// the read lock for as long as it runs). The comparison on each
     /// re-take also observes a change whose writer did not wake the futex.
-    /// Global-serial waits (`index == None`) take no lock and are not
-    /// sliced.
-    pub fn wait(&self, index: Option<PropertyIndex>, old_serial: u32) -> Result<u32> {
+    /// A global-serial wait ([`Self::watch_area`]) takes no lock and is
+    /// not sliced.
+    pub fn wait(&self, index: PropertyIndex, old_serial: u32) -> Result<u32> {
         wait_forever(|deadline| drive(SerialWait::new(self, index, old_serial), deadline))
     }
 
@@ -1308,8 +1310,8 @@ impl SystemProperties {
     /// so with `Duration::ZERO` this call is a non-blocking check
     /// (`Ok(None)` for an unchanged serial). bionic gets the same result
     /// from the kernel: `FUTEX_WAIT` returns `EAGAIN` for a changed word
-    /// with a zero timeout, and bionic reloads the serial after it. With an
-    /// index the comparison needs the context node's read lock, which even
+    /// with a zero timeout, and bionic reloads the serial after it. The
+    /// comparison needs the context node's read lock, which even
     /// a zero-timeout call can wait for: only when another thread of this
     /// instance started opening that area before it was open, and then
     /// until the call that holds the node's read lock releases it (see
@@ -1319,7 +1321,7 @@ impl SystemProperties {
     /// macOS — is as for [`Self::wait`].
     pub fn wait_timeout(
         &self,
-        index: Option<PropertyIndex>,
+        index: PropertyIndex,
         old_serial: u32,
         timeout: Duration,
     ) -> Result<Option<u32>> {
@@ -1805,8 +1807,8 @@ mod wait_tests {
         }
     }
 
-    /// With an index, a zero timeout still compares `old_serial` first,
-    /// like the global-serial path and bionic.
+    /// A zero timeout still compares `old_serial` first, like the
+    /// global-serial path and bionic.
     #[test]
     fn index_wait_compares_before_timeout() {
         let mut fx = Fixture::new("wait_zero");
@@ -1816,17 +1818,17 @@ mod wait_tests {
         let old = reader.serial(idx).unwrap();
         fx.sp.set("debug.rsp.zero", "1").unwrap();
 
-        let got = reader.wait_timeout(Some(idx), old, Duration::ZERO).unwrap();
+        let got = reader.wait_timeout(idx, old, Duration::ZERO).unwrap();
         assert!(got.is_some_and(|s| s != old), "{got:?}");
         let cur = reader.serial(idx).unwrap();
-        let unchanged = reader.wait_timeout(Some(idx), cur, Duration::ZERO);
+        let unchanged = reader.wait_timeout(idx, cur, Duration::ZERO);
         assert!(matches!(unchanged, Ok(None)), "{unchanged:?}");
         // Regression only (passes before the fix): the global path gives
         // the same answer for the same inputs.
-        let global = reader.area_serial();
+        let mut area = reader.watch_area();
         fx.sp.set("debug.rsp.zero", "2").unwrap();
-        let got = reader.wait_timeout(None, global, Duration::ZERO);
-        assert!(matches!(got, Ok(Some(_))), "{got:?}");
+        let got = area.wait_for_change_timeout(Duration::ZERO);
+        assert!(matches!(got, Ok(true)), "{got:?}");
     }
 
     /// `update` wakes waiters on the entry's own serial word. The waiter

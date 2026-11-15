@@ -924,22 +924,22 @@ mod tests {
 
         let test_prop = "test.property";
 
-        // Deterministic (no sleeps): sample the serial *before* spawning
-        // the waiter and pass it as `old_serial` — the documented contract
+        // Deterministic (no sleeps): sample the serial (or create the area
+        // watcher) *before* spawning the waiter — the documented contract
         // closes the lost-wakeup window, so it does not matter whether the
         // waiter enters futex_wait before or after the change lands. The
         // old sleep-based sync hung forever (not failed) when the waiter
         // lost the race.
         let reader = system_properties().unwrap();
-        let wait_any_from = |old: u32| {
+        let wait_any = |mut area: AreaWatcher<'static>| {
             std::thread::spawn(move || {
-                let changed = reader.wait(None, old).unwrap();
-                assert_ne!(changed, old);
+                let old = area.serial();
+                area.wait_for_change().unwrap();
+                assert_ne!(area.serial(), old);
             })
         };
 
-        let old = reader.area_serial();
-        let handle = wait_any_from(old);
+        let handle = wait_any(reader.watch_area());
 
         system_properties_area.add(test_prop, "true").unwrap();
         handle.join().unwrap();
@@ -947,11 +947,11 @@ mod tests {
         let index = reader.find(test_prop).unwrap().expect("just added");
         let old_prop_serial = reader.serial(index).expect("index valid");
         let handle = std::thread::spawn(move || {
-            let changed = reader.wait(Some(index), old_prop_serial).unwrap();
+            let changed = reader.wait(index, old_prop_serial).unwrap();
             assert_ne!(changed, old_prop_serial);
         });
 
-        let handle_any = wait_any_from(reader.area_serial());
+        let handle_any = wait_any(reader.watch_area());
 
         let index = system_properties_area.find(test_prop).unwrap();
         system_properties_area

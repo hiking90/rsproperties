@@ -100,12 +100,12 @@ pub(crate) fn drive<S: WaitStep>(mut wait: S, deadline: &Deadline) -> Result<Opt
 /// differs from `old`.
 pub(crate) struct SerialWait<'a> {
     props: &'a SystemProperties,
-    index: Option<PropertyIndex>,
+    index: PropertyIndex,
     old: u32,
 }
 
 impl<'a> SerialWait<'a> {
-    pub(crate) fn new(props: &'a SystemProperties, index: Option<PropertyIndex>, old: u32) -> Self {
+    pub(crate) fn new(props: &'a SystemProperties, index: PropertyIndex, old: u32) -> Self {
         Self { props, index, old }
     }
 }
@@ -114,14 +114,14 @@ impl WaitStep for SerialWait<'_> {
     type Output = u32;
 
     fn step(&mut self) -> Result<Step<u32>> {
-        let (on, current) = match self.index {
-            None => (WaitOn::Global, self.props.area_serial()),
-            Some(index) => (WaitOn::Property(index), self.props.serial_word(index)?),
-        };
+        let current = self.props.serial_word(self.index)?;
         Ok(if current != self.old {
             Step::Done(current)
         } else {
-            Step::Wait(Wait { on, old: self.old })
+            Step::Wait(Wait {
+                on: WaitOn::Property(self.index),
+                old: self.old,
+            })
         })
     }
 
@@ -280,12 +280,8 @@ mod tests {
     use super::*;
     use crate::system_properties::test_fixture::Fixture;
 
-    fn wait(on: WaitOn, old: u32) -> Step<u32> {
-        Step::Wait(Wait { on, old })
-    }
-
-    /// `wait`'s step names the word the index selects, from `old`, and
-    /// takes the woken serial as its result.
+    /// `wait`'s step names the property's word, from `old`, and takes the
+    /// woken serial as its result.
     #[test]
     fn serial_step_names_the_word() {
         let mut fx = Fixture::new("step_serial");
@@ -293,15 +289,15 @@ mod tests {
         let reader = SystemProperties::open(fx.dir()).unwrap();
         let index = reader.find("debug.rsp.step").unwrap().unwrap();
         let serial = reader.serial(index).unwrap();
-        let global = reader.area_serial();
 
-        let mut by_index = SerialWait::new(&reader, Some(index), serial);
+        let mut by_index = SerialWait::new(&reader, index, serial);
         assert_eq!(
             by_index.step().unwrap(),
-            wait(WaitOn::Property(index), serial)
+            Step::Wait(Wait {
+                on: WaitOn::Property(index),
+                old: serial
+            })
         );
-        let mut any = SerialWait::new(&reader, None, global);
-        assert_eq!(any.step().unwrap(), wait(WaitOn::Global, global));
         assert_eq!(by_index.woke(serial + 2), Some(serial + 2));
 
         fx.sp.set("debug.rsp.step", "1").unwrap();
@@ -309,7 +305,6 @@ mod tests {
             by_index.step().unwrap(),
             Step::Done(reader.serial(index).unwrap())
         );
-        assert!(matches!(any.step().unwrap(), Step::Done(g) if g != global));
     }
 
     /// The value step waits on the global serial until the property

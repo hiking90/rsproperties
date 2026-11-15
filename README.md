@@ -191,9 +191,10 @@ fn main() -> rsproperties::Result<()> {
 }
 ```
 
-The watchers are built on `find`, `read_index_with`, `area_serial` and
+`PropertyWatcher` is built on `find`, `read_index_with` and
 `wait(index, old_serial)`; they stay public for a caller that keeps its
-own index and serial.
+own index and serial. A wait for any property is `watch_area()` only;
+`area_serial()` stays for a check without a wait.
 
 ### Async Waits and Set
 

@@ -49,8 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change, so a change that lands after a timeout or between two calls
   returns the next call at once. `wait_for_change_timeout(timeout)`
   returns `Ok(false)` when the timeout expires first; `serial()` is the
-  serial last reported. A loop over `wait(None, ..)` kept that serial
-  itself and missed a change when it read `area_serial()` again instead.
+  serial last reported. It is the only wait on the global serial (bionic
+  `__system_property_wait(NULL, ..)`); `wait` takes a property index.
 - `rsproperties::asynchronous`: the waits as `async fn`s, without a
   feature or a runtime. `asynchronous::SystemProperties`,
   `asynchronous::PropertyWatcher` and `asynchronous::AreaWatcher` are
@@ -344,17 +344,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `wait_timeout(i, old, d)` with `d` a `Duration`. `old_serial` is a
     `u32`, as in bionic's `__system_property_wait`, not an
     `Option<u32>`: 0.6.0's `None` read the serial inside `wait`, so a
-    change made before the call was missed. `wait_any()` is removed:
-    `wait(None, old_serial)` is bionic's deprecated
-    `__system_property_wait_any(old_serial)`. The
+    change made before the call was missed. `index` is a
+    `PropertyIndex`, not an `Option<&PropertyIndex>`: the global-serial
+    wait (0.6.0 `wait(None, ..)` and `wait_any()`, bionic
+    `__system_property_wait(NULL, ..)` and the deprecated
+    `__system_property_wait_any`) is `watch_area()`, which keeps the
+    serial between calls. `wait_any()` is removed. The
     `rsproperties::Timespec` re-export is removed too.
   - `SystemProperties::serial` returns `Result<u32>` (0.6.0: `None` for a
     foreign index or a failed lookup).
   - `SystemProperties::context_serial` is renamed `area_serial` (bionic
-    `__system_property_area_serial`): it is the `old_serial` of a
-    `wait(None, ..)`.
+    `__system_property_area_serial`).
   - `PropertyIndex` is passed by value (it is `Copy`): `serial(index)`,
-    `update(index, value)`, `wait(Some(index), ..)`.
+    `update(index, value)`, `wait(index, ..)`.
   - `system_properties()` returns `Result<&'static SystemProperties>`
     and `try_system_properties` is removed, as `init` / `try_init` above
     (0.6.0 `system_properties()` panicked when the store could not be
@@ -1211,7 +1213,7 @@ Service (`rsproperties-service`, git dependency only):
     counting (0.6.0: the counter wrapped to 0), so serial values from then
     on differ from 0.6.0's. Code that only compares serials for equality
     needs no change;
-  - `SystemProperties::wait_timeout(Some(index), old, Duration::ZERO)`
+  - `SystemProperties::wait_timeout(index, old, Duration::ZERO)`
     returns `Ok(Some(serial))` when the serial already differs from `old`
     (0.6.0: `wait` returned `None` for a zero timeout, and for a negative
     or out-of-range one, which `Duration` cannot express). With an
@@ -1348,18 +1350,22 @@ Service (`rsproperties-service`, git dependency only):
     `Option<u32>` becomes `Result<Option<u32>>`: `Some(s)` →
     `Ok(Some(s))`, a timeout → `Ok(None)`, a failure → `Err` (0.6.0
     returned `None` for both); `rsproperties::Timespec` is gone;
-  - `wait`'s `old_serial` is a `u32`: `wait(index, Some(old), ..)`
-    becomes `wait(index, old)`. `wait(Some(&index), None, ..)` becomes
-    `wait(Some(index), props.serial(index)?)`, and
-    `wait(None, None, ..)` or `wait_any()` becomes
-    `wait(None, props.area_serial())`; a call that passed a timeout
+  - `wait`'s `index` is a `PropertyIndex` and its `old_serial` a `u32`:
+    `wait(Some(&index), Some(old), ..)` becomes `wait(index, old)`, and
+    `wait(Some(&index), None, ..)` becomes
+    `wait(index, props.serial(index)?)`; a call that passed a timeout
     takes the same arguments in `wait_timeout` with the `Duration` last.
     Read the serial before the check that decides to wait, not right
     before `wait`: a change made between the two then returns at once;
+  - `wait(None, ..)` and `wait_any()` become an `AreaWatcher`:
+    `let mut area = props.watch_area();` before the check that decides
+    to wait, then `area.wait_for_change()?` (or
+    `area.wait_for_change_timeout(d)?`, `Ok(false)` on timeout) in place
+    of each wait. `area.serial()` is the serial the wait returned;
   - `context_serial()` becomes `area_serial()`;
   - `&index` arguments become `index`: `serial(&index)` →
     `serial(index)`, `update(&index, v)` → `update(index, v)`,
-    `wait(Some(&index), ..)` → `wait(Some(index), ..)`;
+    `wait(Some(&index), ..)` → `wait(index, ..)`;
   - `serial(index)` returns `Result<u32>`: `.expect(..)` and `?` keep
     working on the success path; `== None` / `.is_some()` checks become
     `.is_err()` / `.is_ok()`;
