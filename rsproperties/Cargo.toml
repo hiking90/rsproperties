@@ -46,7 +46,7 @@ pretty-hex.workspace = true
 tokio = { version = "1", default-features = false, features = ["net", "time"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync"] }
 android_system_properties.workspace = true
 env_logger.workspace = true
 anyhow.workspace = true

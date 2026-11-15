@@ -403,6 +403,75 @@ mod tests {
         assert!(start.elapsed() >= SERVICE_IO_TIMEOUT);
     }
 
+    // Cancellation (docs/async-wait-set.md 3.6). The exchange awaits in
+    // two places only: the connect retries and the reply. A connect that
+    // completes is followed by the send in the same poll — the socket is
+    // writable at once and a frame this small goes out in one `send` — so
+    // a drop lands either before any byte is sent or after the whole
+    // frame is. The two tests below drop at each place.
+
+    /// Dropped while the connect retries a full backlog: no connection
+    /// was made, so the service gets nothing.
+    #[tokio::test]
+    async fn dropped_in_the_connect_sends_nothing() {
+        let dir = SocketDir::new("drop_connect");
+        let path = dir.path("s");
+        let (listener, _queued) = full_backlog(&path);
+        let request = v2_request("debug.rsp.drop_connect", "1");
+        let sockets = one(path);
+        let exchanging = exchange(&request, &sockets);
+        // Several 10 ms retries, well within the connect's 2 s.
+        assert!(timeout(Duration::from_millis(100), exchanging)
+            .await
+            .is_err());
+
+        // Only the queued connection is there: the dropped exchange left
+        // no connection behind for the service to read a frame from.
+        rustix::fs::fcntl_setfl(&listener, rustix::fs::OFlags::NONBLOCK).unwrap();
+        let _first = rustix::net::accept(&listener).unwrap();
+        assert_eq!(
+            rustix::net::accept(&listener).unwrap_err(),
+            rustix::io::Errno::AGAIN
+        );
+    }
+
+    /// Dropped while it waits for the reply: the service has the whole
+    /// frame, and its reply finds the connection closed.
+    #[tokio::test]
+    async fn dropped_in_the_reply_wait_sent_the_whole_frame() {
+        let dir = SocketDir::new("drop_reply");
+        let path = dir.path("s");
+        let listener = UnixListener::bind(&path).unwrap();
+        let request = v2_request("debug.rsp.drop_reply", "value");
+        let frame_len = request.frame.len();
+        let (got_frame, frame_in) = tokio::sync::oneshot::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut frame = vec![0u8; frame_len];
+            stream.read_exact(&mut frame).unwrap();
+            got_frame.send(()).unwrap();
+            // The client's drop closes the connection: EOF, then the
+            // reply fails (libtest ignores SIGPIPE).
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).unwrap();
+            let reply = stream.write_all(&PROP_SUCCESS.to_ne_bytes());
+            (frame, rest, reply.map_err(|e| e.kind()))
+        });
+
+        let sockets = one(path);
+        let mut exchanging = Box::pin(exchange(&request, &sockets));
+        tokio::select! {
+            done = &mut exchanging => panic!("returned without a reply: {done:?}"),
+            got = frame_in => got.unwrap(),
+        }
+        drop(exchanging);
+
+        let (frame, rest, reply) = server.join().unwrap();
+        assert_eq!(frame, request.frame);
+        assert!(rest.is_empty());
+        assert_eq!(reply, Err(ErrorKind::BrokenPipe));
+    }
+
     /// `sys.powerctl`'s route: a missing for_system socket falls back to
     /// the default one.
     #[tokio::test]
