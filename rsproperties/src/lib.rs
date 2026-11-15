@@ -115,6 +115,7 @@ pub mod wire;
 pub use errors::{Error, Result, SetRejection};
 pub use from_property::FromProperty;
 
+mod area_watcher;
 #[cfg(feature = "builder")]
 mod build_property_parser;
 mod context_node;
@@ -276,6 +277,7 @@ pub(crate) mod test_support {
 
 // Explicit re-export lists (not globs) so the public API surface is
 // visible here and additions to the modules don't silently become public.
+pub use area_watcher::AreaWatcher;
 #[cfg(feature = "builder")]
 pub use build_property_parser::{
     load_properties_from_file, load_properties_from_file_with, PropFileOutcome,

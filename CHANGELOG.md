@@ -43,14 +43,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `wait` in a loop that carried the index and the serial, and a `wait`
   from a serial with the dirty bit set reported one update twice. The
   watcher reports an update once and does not queue changes.
+- `SystemProperties::watch_area()` and `AreaWatcher`: a wait for the next
+  add or update of any property. The watcher keeps the global serial,
+  from its value at `watch_area` on, and moves it only when it reports a
+  change, so a change that lands after a timeout or between two calls
+  returns the next call at once. `wait_for_change_timeout(timeout)`
+  returns `Ok(false)` when the timeout expires first; `serial()` is the
+  serial last reported. A loop over `wait(None, ..)` kept that serial
+  itself and missed a change when it read `area_serial()` again instead.
 - `rsproperties::asynchronous`: the waits as `async fn`s, without a
-  feature or a runtime. `asynchronous::SystemProperties` and
-  `asynchronous::PropertyWatcher` are views of the crate root's types
+  feature or a runtime. `asynchronous::SystemProperties`,
+  `asynchronous::PropertyWatcher` and `asynchronous::AreaWatcher` are
+  views of the crate root's types
   (`SystemProperties::as_async()` / `as_sync()` convert a reference
   without a copy, `asynchronous::system_properties()` is the process-wide
   reader), so a `PropertyIndex` works with both. `wait`,
-  `wait_for_creation`, `wait_for_value`, `serial` and
-  `PropertyWatcher::wait_for_change` take the sync methods' arguments and
+  `wait_for_creation`, `wait_for_value`, `serial` and the watchers'
+  `wait_for_change` take the sync methods' arguments and
   no timeout: wrap the future in the runtime's timeout, and drop it to
   cancel the wait. The futures are `Send` and use only the waker, so they
   run on any executor. A futex has no fd to poll, so the first wait of

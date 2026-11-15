@@ -168,31 +168,31 @@ One update is reported as one change, also when it stores the value the
 property already had; updates that land between two calls are reported as
 one change with the latest value.
 
-Wait for a change to any property on the global serial:
+Wait for a change to any property with an `AreaWatcher`, which keeps the
+global serial between calls:
 
 ```rust,no_run
 use std::time::Duration;
 
 fn main() -> rsproperties::Result<()> {
     let props = rsproperties::system_properties()?;
-    // `old_serial` is the serial the caller last saw: a change made
-    // between `area_serial()` and `wait` returns at once.
-    let mut serial = props.area_serial();
+    // Starts at the global serial of this call.
+    let mut area = props.watch_area();
     loop {
-        match props.wait_timeout(None, serial, Duration::from_secs(60))? {
-            Some(new_serial) => {
-                println!("a property changed, serial {new_serial}");
-                serial = new_serial;
-            }
-            None => println!("no change for 60 s"),
+        // A change made after a timeout, or while the previous one was
+        // handled, returns the next call at once.
+        if area.wait_for_change_timeout(Duration::from_secs(60))? {
+            println!("a property changed, serial {}", area.serial());
+        } else {
+            println!("no change for 60 s");
         }
     }
 }
 ```
 
-The watcher is built on `find`, `read_index_with` and
-`wait(Some(index), old_serial)`; they stay public for a caller that keeps
-its own index and serial.
+The watchers are built on `find`, `read_index_with`, `area_serial` and
+`wait(index, old_serial)`; they stay public for a caller that keeps its
+own index and serial.
 
 ### Async Waits
 
@@ -518,6 +518,11 @@ fn main() -> rsproperties::Result<()> {
   change (the dirty and the clean serial store are not reported
   separately), and changes are not queued. `name()` returns the watched
   name
+- `watch_area()` — an `AreaWatcher` on the global serial, starting at
+  its value at this call: `wait_for_change()` blocks until any property
+  is added or updated, `wait_for_change_timeout(timeout)` returns
+  `Ok(false)` on timeout and keeps the serial, and `serial()` returns the
+  serial last reported. Changes are not queued
 - `PropertyIndex` — the handle `find` / `foreach` return; `Copy`, `Eq`
   and `Hash`. Two indexes are equal when the same instance returned them
   for the same entry, so an index can be a `HashMap` key
@@ -538,12 +543,12 @@ which a reader created in that process follows without extra code.
   — the async / blocking view of one instance; the same instance, not a
   copy, so a `PropertyIndex` works with both
 - `wait(index, old_serial)`, `wait_for_creation(name)`,
-  `wait_for_value(name, expected)` and `watch(name)` with an async
-  `PropertyWatcher::wait_for_change()` — the blocking waits as
-  `async fn`s with the same arguments and results. There is no `_timeout`
-  form: wrap the future in the runtime's timeout. Dropping the future
-  cancels the wait; a dropped `wait_for_change` leaves the watcher as it
-  was
+  `wait_for_value(name, expected)`, and `watch(name)` / `watch_area()`
+  with an async `wait_for_change()` on `PropertyWatcher` / `AreaWatcher`
+  — the blocking waits as `async fn`s with the same arguments and
+  results. There is no `_timeout` form: wrap the future in the runtime's
+  timeout. Dropping the future cancels the wait; a dropped
+  `wait_for_change` leaves the watcher as it was
 - `serial(index)` — `async fn`: the clean serial, waiting without the
   blocking `serial`'s 200 ms bound
 - `read_with`, `read_index_with`, `foreach`, `list`, `get`, `find`,

@@ -169,31 +169,31 @@ One update is reported as one change, also when it stores the value the
 property already had; updates that land between two calls are reported as
 one change with the latest value.
 
-Wait for a change to any property on the global serial:
+Wait for a change to any property with an `AreaWatcher`, which keeps the
+global serial between calls:
 
 ```rust,no_run
 use std::time::Duration;
 
 fn main() -> rsproperties::Result<()> {
     let props = rsproperties::system_properties()?;
-    // `old_serial` is the serial the caller last saw: a change made
-    // between `area_serial()` and `wait` returns at once.
-    let mut serial = props.area_serial();
+    // Starts at the global serial of this call.
+    let mut area = props.watch_area();
     loop {
-        match props.wait_timeout(None, serial, Duration::from_secs(60))? {
-            Some(new_serial) => {
-                println!("a property changed, serial {new_serial}");
-                serial = new_serial;
-            }
-            None => println!("no change for 60 s"),
+        // A change made after a timeout, or while the previous one was
+        // handled, returns the next call at once.
+        if area.wait_for_change_timeout(Duration::from_secs(60))? {
+            println!("a property changed, serial {}", area.serial());
+        } else {
+            println!("no change for 60 s");
         }
     }
 }
 ```
 
-The watcher is built on `find`, `read_index_with` and
-`wait(Some(index), old_serial)`; they stay public for a caller that keeps
-its own index and serial.
+The watchers are built on `find`, `read_index_with`, `area_serial` and
+`wait(index, old_serial)`; they stay public for a caller that keeps its
+own index and serial.
 
 ### Async Waits and Set
 

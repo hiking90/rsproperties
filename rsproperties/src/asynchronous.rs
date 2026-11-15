@@ -3,9 +3,10 @@
 
 //! The property waits as `async fn`s.
 //!
-//! [`SystemProperties`] and [`PropertyWatcher`] here are the crate root's
-//! types with the same names, with every wait an `async fn` and the same
-//! arguments: `props.wait(index, serial)` blocks the thread,
+//! [`SystemProperties`], [`PropertyWatcher`] and [`AreaWatcher`] here are
+//! the crate root's types with the same names, with every wait an
+//! `async fn` and the same arguments: `props.wait(index, serial)` blocks
+//! the thread,
 //! `props.as_async().wait(index, serial).await` does not. An async
 //! [`SystemProperties`] is a view of a sync one —
 //! [`crate::SystemProperties::as_async`] and [`SystemProperties::as_sync`]
@@ -56,6 +57,7 @@
 use std::future::poll_fn;
 use std::task::Poll;
 
+use crate::area_watcher::AreaChangeWait;
 use crate::errors::*;
 use crate::property_watcher::ChangeWait;
 use crate::wait_step::{CleanSerialWait, CreationWait, SerialWait, Step, ValueWait, WaitStep};
@@ -209,6 +211,33 @@ impl SystemProperties {
     pub fn watch(&self, name: &str) -> PropertyWatcher<'_> {
         PropertyWatcher(self.0.watch(name))
     }
+
+    /// [`crate::SystemProperties::watch_area`], with an async
+    /// [`AreaWatcher::wait_for_change`].
+    pub fn watch_area(&self) -> AreaWatcher<'_> {
+        AreaWatcher(self.0.watch_area())
+    }
+}
+
+/// [`crate::AreaWatcher`] with an async
+/// [`wait_for_change`](Self::wait_for_change). Created by
+/// [`SystemProperties::watch_area`].
+#[derive(Debug)]
+pub struct AreaWatcher<'a>(crate::AreaWatcher<'a>);
+
+impl AreaWatcher<'_> {
+    /// [`crate::AreaWatcher::serial`].
+    pub fn serial(&self) -> u32 {
+        self.0.serial()
+    }
+
+    /// [`crate::AreaWatcher::wait_for_change`]. Dropping the future before
+    /// it completes leaves the watcher's serial as it was: the next call
+    /// still reports a change made meanwhile.
+    pub async fn wait_for_change(&mut self) -> Result<()> {
+        let props = self.0.props();
+        drive(props.waiter(), AreaChangeWait::new(&mut self.0)).await
+    }
 }
 
 /// [`crate::PropertyWatcher`] with an async
@@ -269,6 +298,7 @@ fn futures_are_send(
     props: &'static SystemProperties,
     index: PropertyIndex,
     watcher: &'static mut PropertyWatcher<'static>,
+    area: &'static mut AreaWatcher<'static>,
 ) {
     fn send<T: Send>(_: T) {}
     send(props.serial(index));
@@ -276,6 +306,7 @@ fn futures_are_send(
     send(props.wait_for_creation(""));
     send(props.wait_for_value("", ""));
     send(watcher.wait_for_change());
+    send(area.wait_for_change());
 }
 
 #[cfg(all(test, feature = "builder", target_os = "linux"))]
@@ -487,6 +518,37 @@ mod tests {
         assert!(poller.poll(pin!(watcher.wait_for_change())).is_pending());
         assert_eq!(watcher.value().unwrap(), Some("v1"));
         assert_eq!(sync.waiter().registered(), 0, "dropped future unregistered");
+    }
+
+    /// An area watcher: `Pending` until something changes, `Ready` after
+    /// the wake. A future dropped while pending leaves the serial, so the
+    /// next one reports a change made after the drop on its first poll.
+    #[test]
+    fn area_watcher_pending_then_change() {
+        let mut fx = Fixture::new("async_area");
+        let sync = reader(&fx);
+        let mut area = sync.as_async().watch_area();
+        let before = area.serial();
+
+        let poller = Poller::new();
+        {
+            let mut change = pin!(area.wait_for_change());
+            assert!(poller.poll(change.as_mut()).is_pending());
+            fx.sp.add("debug.rsp.area.async", "1").unwrap();
+            assert!(poller.woken());
+            assert!(matches!(poller.poll(change.as_mut()), Poll::Ready(Ok(()))));
+        }
+        assert_eq!(area.serial(), sync.area_serial());
+
+        let reported = area.serial();
+        let poller = Poller::new();
+        assert!(poller.poll(pin!(area.wait_for_change())).is_pending());
+        assert_eq!(area.serial(), reported);
+        assert_eq!(sync.waiter().registered(), 0, "dropped future unregistered");
+        fx.sp.set("debug.rsp.area.async", "2").unwrap();
+        let got = poller.poll(pin!(area.wait_for_change()));
+        assert!(matches!(got, Poll::Ready(Ok(()))));
+        assert_ne!(area.serial(), before);
     }
 
     /// `as_async` and `as_sync` are views of one instance: same address,

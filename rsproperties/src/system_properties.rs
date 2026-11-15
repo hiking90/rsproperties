@@ -16,6 +16,7 @@ use crate::contexts_serialized::ContextsSerialized;
 // Every serial load below can run on a `PROT_READ` mapping: Acquire goes
 // through `load_acquire` (`Relaxed` load + `fence(Acquire)`),
 // property_area.rs [R-RO].
+use crate::area_watcher::AreaWatcher;
 use crate::property_area::{load_acquire, EntryOffset};
 use crate::property_watcher::PropertyWatcher;
 use crate::wait_step::{drive, CreationWait, SerialWait, ValueWait, WaitOn};
@@ -1515,6 +1516,23 @@ impl SystemProperties {
     /// ```
     pub fn watch(&self, name: &str) -> PropertyWatcher<'_> {
         PropertyWatcher::new(self, name)
+    }
+
+    /// An [`AreaWatcher`]: a wait for the next add or update of any
+    /// property, from the global serial at this call ([`Self::area_serial`])
+    /// on, with the serial kept between calls.
+    ///
+    /// ```rust,no_run
+    /// # fn main() -> rsproperties::Result<()> {
+    /// let props = rsproperties::system_properties()?;
+    /// let mut area = props.watch_area();
+    /// // Returns at the first change after `watch_area`.
+    /// area.wait_for_change()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn watch_area(&self) -> AreaWatcher<'_> {
+        AreaWatcher::new(self)
     }
 }
 
