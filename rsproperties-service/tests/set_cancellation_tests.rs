@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! What the service does with a client that goes away mid-request, the
-//! service half of a dropped `asynchronous::set` (docs/async-wait-set.md
-//! 3.6). The client half — a dropped exchange either sent no byte or the
-//! whole frame — is tested in `tokio_transport`.
+//! service half of a dropped `asynchronous::set`. The client half — a
+//! dropped exchange either sent no byte or the whole frame — is tested in
+//! `tokio_transport`.
 //!
 //! - The whole frame, then the client closes without reading the reply:
 //!   the set is applied.

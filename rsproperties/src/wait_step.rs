@@ -140,8 +140,8 @@ impl WaitStep for SerialWait<'_> {
 
 /// The async [`serial`](crate::asynchronous::SystemProperties::serial):
 /// the property's serial once it is clean. The sync `serial` waits for that
-/// at most 200 ms and then returns the dirty one; this has no bound (docs
-/// 2.8, item 4).
+/// at most 200 ms and then returns the dirty one; this has no bound, and
+/// the caller wraps it in a timeout as it does the other async waits.
 pub(crate) struct CleanSerialWait<'a> {
     props: &'a SystemProperties,
     index: PropertyIndex,

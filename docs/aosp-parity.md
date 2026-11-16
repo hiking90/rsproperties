@@ -234,7 +234,7 @@ mount를 하지 않고 reload 함수만 호출한다(`:1842-1847`). init과 writ
 override가 켜진 프로세스에서는 같은 property에 대해 libc
 `__system_property_get`과 rsproperties가 서로 다른 값을 돌려줄 수 있다.
 
-**변경.** read-only instance(`SystemProperties::new`, 전역 reader)를 만들 때
+**변경.** read-only instance(`SystemProperties::open`, 전역 reader)를 만들 때
 환경변수를 한 번 읽어 flag로 저장한다. flag가 켜져 있으면 `find`와
 `read_with`가 bionic처럼 override 이름을 먼저 조회한다.
 - Android에서는 `ro.build.version.sdk`가 37 이상일 때만 환경변수를 따른다.
@@ -309,7 +309,7 @@ namespace를 판정해야 한다. 그 비용을 위 범위의 process를 위해 
 지우지 않는다. 결과는 다음과 같다.
 - global serial 대기(sync `AreaWatcher`, `wait_for_creation`, async wait의
   process-wide reader)는 wake가 오는 다음 변경에서 반환한다. timeout이 있으면
-  timeout에 `Ok(None)`을 반환한다.
+  timeout에 `Ok(false)`(`wait_for_creation_timeout`은 `Ok(None)`)를 반환한다.
 - per-property sync 대기는 `LOCK_SLICE`(100 ms)마다 다시 비교하므로 실측에서
   96.8 ms에 감지했다. process-wide reader가 아닌 instance의 async wait는
   waiter slice(1 s)마다 다시 비교한다. 두 slice는 lock 해제와 thread 종료를
@@ -975,8 +975,9 @@ fd에 쓴 뒤 fd를 닫는다.
   들어간 뒤에는 connection task가 끝난 상태이므로 `CLIENT_TIMEOUT`(10 s)이
   적용되지 않고, 그 요청은 connection permit(`MAX_CONCURRENT_CLIENTS` = 64)도
   차지하지 않는다. bionic client와 Android의 `rsproperties` client는 응답이 올
-  때까지 기다린다. 그 밖의 target에서 `rsproperties` client는 2 s 뒤
-  `TimedOut`을 반환한다(`system_property_set.rs` `RESPONSE_TIMEOUT`). client가
+  때까지 기다린다. 그 밖의 target에서 `rsproperties::set`은 2 s 뒤
+  `TimedOut`을 반환하고(`system_property_set.rs` `RESPONSE_TIMEOUT`),
+  `asynchronous::set`(`tokio` feature)은 상한 없이 기다린다. client가
   socket을 닫은 요청도 handler에 전달되고, 그 요청의 응답만 버려진다. init도
   client가 socket을 닫은 control message를 처리한다.
 - blocking thread 사용량. handler 호출이 차지하는 blocking thread는 queue

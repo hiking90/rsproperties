@@ -16,7 +16,7 @@ and was compared with `getprop` on an API 37 emulator.
 
 - **Complete Android Properties Implementation**: Full Rust implementation of Android's property system - read, write, and monitor properties exactly like Android native code
 - **Cross-Platform Compatibility**: Works seamlessly on both Android devices and Linux systems without modification
-- **Pure Rust Solution**: No dependencies on Android's C libraries or JNI - everything implemented in Rust (`unsafe` is limited to the mmap / shared-memory layer)
+- **Pure Rust Solution**: No dependencies on Android's C libraries or JNI - everything implemented in Rust (`unsafe` is limited to the mmap / shared-memory layer and the `repr(transparent)` reference cast behind `as_async`)
 - **Real-time Property Monitoring**: Watch for property changes in real-time, enabling reactive applications
 - **High Performance**: Optimized for speed with direct memory access and zero-copy operations
 - **Drop-in Replacement**: Compatible with Android's property naming conventions and value constraints
@@ -29,7 +29,7 @@ Add `rsproperties` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rsproperties = "0.6"
+rsproperties = "0.7"
 ```
 
 Creating property areas (`SystemProperties::new_area`, `build_trie`,
@@ -37,7 +37,7 @@ Creating property areas (`SystemProperties::new_area`, `build_trie`,
 
 ```toml
 [dependencies]
-rsproperties = { version = "0.6", features = ["builder"] }
+rsproperties = { version = "0.7", features = ["builder"] }
 ```
 
 ### Basic Usage
@@ -103,8 +103,9 @@ started later) is picked up by the next call.
 
 `get<T>` and `get_or<T>` already route through a zero-allocation path,
 but if you want raw access to the validated value without parsing,
-`SystemProperties::read_with` hands you a `&str` borrowed from the
-seqlock-protected mmap buffer:
+`SystemProperties::read_with` hands you a `&str` borrowed from a
+seqlock-validated stack copy (short values) or from the mmap (long `ro.`
+values):
 
 ```rust,no_run
 fn main() -> rsproperties::Result<()> {
@@ -294,14 +295,15 @@ and time drivers and returns a `Send + 'static` future:
 
 ```toml
 [dependencies]
-rsproperties = { version = "0.6", features = ["tokio"] }
+rsproperties = { version = "0.7", features = ["tokio"] }
 ```
 
 ```rust,no_run
 async fn configure() -> rsproperties::Result<()> {
     rsproperties::asynchronous::set("debug.my_app.workers", 4).await?;
     // The future owns its request, so it can be spawned.
-    tokio::spawn(rsproperties::asynchronous::set("debug.my_app.mode", "fast"));
+    let mode = tokio::spawn(rsproperties::asynchronous::set("debug.my_app.mode", "fast"));
+    mode.await.expect("set task panicked")?;
     Ok(())
 }
 ```
@@ -315,8 +317,8 @@ async fn configure() -> rsproperties::Result<()> {
 - Dropping the future before the request is sent in full leaves the
   property unchanged. Dropped after that, the service applies the request
   and the outcome is not reported.
-- The first poll panics outside a tokio runtime that has its I/O and time
-  drivers enabled.
+- A request that passed the checks panics when polled outside a tokio
+  runtime, or in one without both the time and the I/O driver enabled.
 
 #### Property Setting Examples by Type
 
@@ -565,8 +567,8 @@ the instance's drop. A per-property wait wakes on the global serial's
 `FUTEX_WAKE`. A writer that moves the global serial without a wake
 (bionic in an appcompat override process on API 35–36) is seen at the
 next change that wakes, as with bionic's own waits. A child forked
-without exec has no waiter thread, so its waits that have to block are
-never woken (not supported).
+without exec after the instance's first blocking async wait has no waiter
+thread, so its waits that have to block are never woken (not supported).
 
 ### Wire-protocol constants & validators (`rsproperties::wire`)
 

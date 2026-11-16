@@ -27,7 +27,8 @@
 //!   again. A wait that is already satisfied returns on its first poll and
 //!   starts nothing. The thread of the process-wide instance runs until
 //!   the process exits; another instance's thread ends within about a
-//!   second of the instance's drop.
+//!   second of the instance's drop. Either ends early on a futex error
+//!   (below).
 //! - **Return conditions** are those of the sync methods, except:
 //!   a per-property wait wakes on the global serial, so it returns after
 //!   the writer's global `FUTEX_WAKE` rather than the property's; and
@@ -35,9 +36,13 @@
 //!   sync method's 200 ms bound. A writer that moves the global serial
 //!   without `FUTEX_WAKE` — bionic in an appcompat override process on
 //!   API 35–36 — is seen at the next change that wakes, as bionic's own
-//!   waits see it (`docs/aosp-parity.md` C3).
-//! - **fork.** A child forked without exec has no waiter thread, and its
-//!   async waits that have to block are never woken. Not supported.
+//!   waits see it (`docs/aosp-parity.md` C3). A wait that has to block
+//!   also fails when the waiter thread cannot be started (the next wait
+//!   tries again), and once that thread has ended on a futex error, every
+//!   later blocking wait of the instance fails with that error.
+//! - **fork.** A child forked without exec after the instance's first
+//!   blocking async wait has no waiter thread, and its async waits that
+//!   have to block are never woken. Not supported.
 //! - **macOS** has no futex: a wait that has to block fails, as the sync
 //!   one does.
 //!
@@ -87,10 +92,13 @@ use crate::PropertyIndex;
 ///
 /// # Panics
 ///
-/// On its first poll, when that is outside a tokio runtime or in one built
-/// without its I/O or time driver (`enable_io`, `enable_time`). Calling
-/// `set` itself uses no tokio, and tokio has no way to ask whether the
-/// time driver is on, so this is not checked beforehand.
+/// A request that passed the checks panics when polled outside a tokio
+/// runtime, or in one that does not have both the time driver
+/// (`enable_time`) and the I/O driver (`enable_io`) enabled, as
+/// `tokio::time::timeout` and `tokio::net::UnixStream::connect` document.
+/// A request the checks refuse returns its error without touching tokio.
+/// Calling `set` itself uses no tokio, and tokio has no way to ask
+/// whether a driver is on, so this is not checked beforehand.
 ///
 /// ```rust,no_run
 /// # async fn run() -> rsproperties::Result<()> {
@@ -265,10 +273,10 @@ impl PropertyWatcher<'_> {
     }
 }
 
-/// The async driver: check, register, check again (docs 2.5). A wait
-/// already satisfied returns before the registry is touched; the second
-/// check covers a change between the first one and the registration,
-/// whose wake went to the futures registered before.
+/// The async driver: check, register, check again. A wait already
+/// satisfied returns before the registry is touched; the second check
+/// covers a change between the first one and the registration, whose
+/// wake went to the futures registered before.
 async fn drive<S: WaitStep>(waiter: &Waiter, mut wait: S) -> Result<S::Output> {
     let mut registration = waiter.registration();
     poll_fn(|cx| {
@@ -372,7 +380,7 @@ mod tests {
         props.waiter().started_from().is_none()
     }
 
-    /// The rows of docs 2.8 that return without waiting: the first poll
+    /// The inputs that return without waiting: the first poll
     /// returns what the sync method returns for the same input, and no
     /// thread starts.
     #[test]

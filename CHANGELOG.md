@@ -49,8 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change, so a change that lands after a timeout or between two calls
   returns the next call at once. `wait_for_change_timeout(timeout)`
   returns `Ok(false)` when the timeout expires first; `serial()` is the
-  serial last reported. It is the only wait on the global serial (bionic
-  `__system_property_wait(NULL, ..)`); `wait` takes a property index.
+  serial last reported. It is the only public wait for a change to any
+  property (bionic `__system_property_wait(NULL, ..)`); `wait` takes a
+  property index.
 - `rsproperties::asynchronous`: the waits as `async fn`s, without a
   feature or a runtime. `asynchronous::SystemProperties`,
   `asynchronous::PropertyWatcher` and `asynchronous::AreaWatcher` are
@@ -65,19 +66,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run on any executor. A futex has no fd to poll, so the first wait of
   an instance that has to block starts one thread per instance; it
   futex-waits on the global serial and wakes the registered futures,
-  which check their condition again. A wait already satisfied returns on
-  its first poll and starts no thread. The process-wide reader's thread
-  runs until the process exits; another instance's thread ends within
-  about a second of the instance's drop. Return conditions are the sync
-  methods', except that a per-property wait returns after the writer's
-  global `FUTEX_WAKE` and async `serial` waits for the clean serial
-  without the sync method's 200 ms bound. A writer that moves the global
-  serial without a wake (bionic in an appcompat override process on API
-  35–36) is seen at the next change that wakes, as with bionic's own
-  waits. The process-wide reader's thread has no timed wakeups while
-  nothing changes. A child forked without
-  exec has no thread: its waits that have to block are never woken (not
-  supported).
+  which check their condition again; a waker whose `wake` panics does
+  not stop the thread (with `panic = "unwind"`). A wait already
+  satisfied returns on its first poll and starts no thread. The
+  process-wide reader's thread runs until the process exits; another
+  instance's thread ends within about a second of the instance's drop.
+  Return conditions are the sync methods', except that a per-property
+  wait returns after the writer's global `FUTEX_WAKE` and async `serial`
+  waits for the clean serial without the sync method's 200 ms bound. A
+  writer that moves the global serial without a wake (bionic in an
+  appcompat override process on API 35–36) is seen at the next change
+  that wakes, as with bionic's own waits. A wait that has to block also
+  fails when the thread cannot be started (the next wait tries again),
+  and once the thread has ended on a futex error, every later blocking
+  wait of the instance fails with that error. The process-wide reader's
+  thread has no timed wakeups while nothing changes. A child forked
+  without exec after the instance's first blocking async wait has no
+  thread: its waits that have to block are never woken (not supported).
 - `asynchronous::set(name, value)` (`tokio` feature): `set` on tokio's
   I/O and time drivers. The future is `Send + 'static`, for
   `tokio::spawn`. Name and value are checked when `set` is called; a
@@ -88,10 +93,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`rsproperties::set`: 2 s outside Android); bound it with
   `tokio::time::timeout`. Dropped before the request is sent in full,
   the future leaves the property unchanged; dropped after, the service
-  applies the request and the outcome is not reported. The first poll
-  panics outside a tokio runtime that has its I/O and time drivers
-  enabled. The feature adds `tokio` with `net` and `time` only and no
-  default features (5 crates in the dependency tree: `tokio`, `mio`,
+  applies the request and the outcome is not reported. A request that
+  passed the checks panics when polled outside a tokio runtime, or in
+  one without both the time and the I/O driver enabled. The feature
+  adds `tokio` 1.27 or later with `net` and `time` only and no default
+  features (5 crates in the dependency tree: `tokio`, `mio`,
   `socket2`, `pin-project-lite`, `libc`).
 - `parse::parse_bool` and `parse::parse_int`: libbase `ParseBool` /
   `ParseInt` / `ParseUint` rules (`yes`/`on`/`1`, leading whitespace,
@@ -734,24 +740,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SystemProperties::find` returns `Ok(None)`, like bionic
   `__system_property_find`. They returned `Error::Parse` and logged two
   `error` lines per lookup, also from `get_or`.
-- `SystemProperties::update`, `serial` and `wait` reject a `PropertyIndex`
+- `SystemProperties::update`, `serial`, `wait`, `wait_timeout` and
+  `read_index_with`, and the `asynchronous` `serial`, `wait` and
+  `read_index_with`, reject a `PropertyIndex`
   returned by a different `SystemProperties` instance with
   `Error::InvalidArgument`, including another
   instance on the same directory such as the global reader. An index from
   another directory's instance, or from the instance before a writer
   restart, addressed an unrelated layout, and `update` could overwrite
   trie bytes of the area without an error.
-- `SystemProperties::wait` with an index compares the property's serial
+- `SystemProperties::wait_timeout` compares the property's serial
   with `old_serial` before it applies the timeout, like the global-serial
   path and bionic `__system_property_wait` (the kernel's `FUTEX_WAIT`
   returns `EAGAIN` for a changed word with a zero timeout and `EINVAL`
   for an out-of-range one, and bionic reloads the serial after both).
-  With a zero timeout, or a negative or out-of-range one (`tv_nsec` ≥
-  10^9), it returned `None` without comparing, also in 0.6.0, so a
-  zero-timeout poll never reported a change. With an unchanged serial, a
-  negative or out-of-range timeout still returns `None` after that one
-  comparison, without waiting; bionic retries the `EINVAL` in a loop of
-  `futex` syscalls until the serial changes.
+  0.6.0's `wait` with an index and a zero timeout, or a negative or
+  out-of-range one (`tv_nsec` ≥ 10^9), returned `None` without
+  comparing, so a zero-timeout poll never reported a change. With an
+  unchanged serial, a zero timeout returns `Ok(None)` after that one
+  comparison, without waiting.
 - `examples/setprop` prints nothing on stdout on success (it printed the
   name and value); AOSP `setprop` (toolbox) prints nothing on success.
   For a name starting with `ro.` it still writes a warning to stderr
@@ -852,7 +859,7 @@ Service (`rsproperties-service`, git dependency only):
   removal is added to Changed, the Migration section gains the omitted
   breaking changes, an error-variant mapping table, newly rejected
   inputs, and changed protocol defaults.
-- The `SystemProperties::wait` rustdoc states that with an index the
+- The `SystemProperties::wait` rustdoc states that the
   returned serial can carry the dirty bit while a writer is mid-update,
   as in 0.6.0 and bionic `__system_property_wait`; `serial` waits (up to
   200 ms) for the clean serial. The `serial` rustdoc lists the cases that
@@ -1190,7 +1197,10 @@ Service (`rsproperties-service`, git dependency only):
     before that context's rename; a read of a context whose area file
     does not exist yet fails, and the next access opens it again. Such a
     reader does not see the restarted writer's updates in the previous
-    files, and `wait` on the global serial does not wake. Start or restart
+    files, and no wait on the global serial wakes (`AreaWatcher`,
+    `wait_for_creation`, `wait_for_value` and a `PropertyWatcher` before
+    the property exists), nor does any `asynchronous` wait of that
+    instance. Start or restart
     readers after the writer's `new_area` / `new_area_locked` (or
     `rsproperties_service::run`) has returned;
   - builder: area files and `properties_serial` get mode 0444 whatever
@@ -1218,7 +1228,7 @@ Service (`rsproperties-service`, git dependency only):
     (0.6.0: `wait` returned `None` for a zero timeout, and for a negative
     or out-of-range one, which `Duration` cannot express). With an
     unchanged serial it returns `Ok(None)` without waiting. A
-    `wait_timeout` with an index and a zero timeout takes
+    `wait_timeout` with a zero timeout takes
     the context node's read lock (0.6.0 returned before taking it), so it
     can wait for that lock while another thread of the same instance is
     opening that area for the first time;
@@ -1539,8 +1549,9 @@ Service (`rsproperties-service`, git dependency only):
     skipped at init, these calls return `Error::FileValidation` instead
     (`add` only after its value-length check; see the empty-names entry
     above).
-  - `SystemProperties::update`, `serial`, `wait` and `read_index_with`
-    with a `PropertyIndex` from another instance return
+  - `SystemProperties::update`, `serial`, `wait`, `wait_timeout` and
+    `read_index_with`, and the `asynchronous` `serial`, `wait` and
+    `read_index_with`, with a `PropertyIndex` from another instance return
     `Error::InvalidArgument`. This includes an index from another instance on the
     same directory — e.g. `rsproperties::system_properties()?.find(..)`
     passed to a writer created with `new_area` — which worked in 0.6.0

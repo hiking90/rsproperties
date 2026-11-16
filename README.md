@@ -23,7 +23,7 @@ and was compared with `getprop` on an API 37 emulator.
 
 - **Complete Android Properties Implementation**: Full Rust implementation of Android's property system - read, write, and monitor properties exactly like Android native code
 - **Cross-Platform Compatibility**: Works seamlessly on both Android devices and Linux systems without modification
-- **Pure Rust Solution**: No dependencies on Android's C libraries or JNI - everything implemented in Rust (`unsafe` is limited to the mmap / shared-memory layer)
+- **Pure Rust Solution**: No dependencies on Android's C libraries or JNI - everything implemented in Rust (`unsafe` is limited to the mmap / shared-memory layer and the `repr(transparent)` reference cast behind `as_async`)
 - **Real-time Property Monitoring**: Watch for property changes in real-time, enabling reactive applications
 - **High Performance**: Optimized for speed with direct memory access and zero-copy operations
 - **Drop-in Replacement**: Compatible with Android's property naming conventions and value constraints
@@ -36,7 +36,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rsproperties = "0.6"
+rsproperties = "0.7"
 ```
 
 Creating property areas (`SystemProperties::new_area`, `build_trie`,
@@ -44,7 +44,7 @@ Creating property areas (`SystemProperties::new_area`, `build_trie`,
 
 ```toml
 [dependencies]
-rsproperties = { version = "0.6", features = ["builder"] }
+rsproperties = { version = "0.7", features = ["builder"] }
 ```
 
 To also run the Linux property service daemon (`rsproperties-service`, not
@@ -227,7 +227,7 @@ blocking a thread on the property service:
 
 ```toml
 [dependencies]
-rsproperties = { version = "0.6", features = ["tokio"] }
+rsproperties = { version = "0.7", features = ["tokio"] }
 ```
 
 ```rust,no_run

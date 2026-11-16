@@ -1,9 +1,9 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! The property service exchange of `asynchronous::set`, on tokio
-//! (docs/async-wait-set.md 3.4). [`prepare`] and [`finish`] are the sync
-//! `set`'s; only the socket I/O differs:
+//! The property service exchange of `asynchronous::set`, on tokio.
+//! [`prepare`] and [`finish`] are the sync `set`'s; only the socket I/O
+//! differs:
 //!
 //! - **connect**: AF_UNIX reports a full listen backlog as `EAGAIN`, which
 //!   tokio's `UnixStream::connect` returns as `WouldBlock` (it waits only
@@ -13,8 +13,9 @@
 //! - **send**: `send(MSG_NOSIGNAL)` through `try_io`, so a closed peer is
 //!   `EPIPE` and never SIGPIPE; tokio's own write is the plain `write(2)`
 //!   the sync path avoids. The whole frame within the same 2 s.
-//! - **V2 reply**: no bound, on every target (3.5). The sync `set` waits
-//!   at most 2 s outside Android; wrap this one in a timeout if needed.
+//! - **V2 reply**: no bound, on every target, so Android and Linux behave
+//!   alike. The sync `set` waits at most 2 s outside Android; wrap this
+//!   one in a timeout if needed.
 //! - **V1 close wait**: `shutdown(Write)`, then reads until EOF for at most
 //!   [`V1_CLOSE_WAIT`]; the outcome is not reported, as in the sync path.
 
@@ -279,7 +280,8 @@ mod tests {
         assert_eq!(server.join().unwrap(), request.frame);
     }
 
-    /// V1: no reply; the server's close ends the wait well before 250 ms.
+    /// V1: no reply; the wait lasts until the server's close, 25 ms after
+    /// it read the frame, and ends well before 250 ms.
     #[tokio::test]
     async fn v1_exchange_ends_at_the_close() {
         let dir = SocketDir::new("v1");
@@ -290,15 +292,18 @@ mod tests {
             route: Route::Default,
             reply: Reply::V1Close,
         };
+        let close_after = Duration::from_millis(25);
         let server = serve(
             UnixListener::bind(&path).unwrap(),
             request.frame.len(),
-            Duration::ZERO,
+            close_after,
             Vec::new(),
         );
         let start = Instant::now();
         assert_eq!(exchange(&request, &one(path)).await.unwrap(), None);
-        assert!(start.elapsed() < V1_CLOSE_WAIT, "{:?}", start.elapsed());
+        let elapsed = start.elapsed();
+        assert!(elapsed >= close_after, "{elapsed:?}");
+        assert!(elapsed < V1_CLOSE_WAIT, "{elapsed:?}");
         assert_eq!(server.join().unwrap(), request.frame);
     }
 
@@ -403,12 +408,15 @@ mod tests {
         assert!(start.elapsed() >= SERVICE_IO_TIMEOUT);
     }
 
-    // Cancellation (docs/async-wait-set.md 3.6). The exchange awaits in
-    // two places only: the connect retries and the reply. A connect that
-    // completes is followed by the send in the same poll — the socket is
-    // writable at once and a frame this small goes out in one `send` — so
-    // a drop lands either before any byte is sent or after the whole
-    // frame is. The two tests below drop at each place.
+    // Cancellation. The exchange awaits in the connect retries, in tokio's
+    // write-readiness wait after `connect(2)` succeeded, and in the V2
+    // reply or the V1 close wait. A drop in the readiness wait leaves a
+    // connection with no byte sent, which the service answers with
+    // `PROP_ERROR_READ_CMD`. A connect that completes is followed by the
+    // send in the same poll — the socket is writable at once and a frame
+    // this small goes out in one `send` — so a drop lands either before
+    // any byte is sent or after the whole frame is. The two tests below
+    // drop in the connect retries and in the V2 reply.
 
     /// Dropped while the connect retries a full backlog: no connection
     /// was made, so the service gets nothing.

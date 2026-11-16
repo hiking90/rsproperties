@@ -1,7 +1,7 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! The wake source of the async waits (docs/async-wait-set.md 2.3–2.6).
+//! The wake source of the async waits.
 //!
 //! A futex has no fd, so a runtime cannot poll it. A [`Waiter`] runs one
 //! thread per `SystemProperties` instance that waits on the global serial —
@@ -21,6 +21,12 @@
 //! - A futex error other than the retried ones ends the thread: it records
 //!   the errno, wakes everyone, and every later `register` returns it.
 //!   Retrying the same call would turn the error into a busy loop.
+//! - When panics unwind, a `wake` that panics (a bug in the executor's
+//!   waker) is caught, and the thread goes on to the other wakers and
+//!   keeps running. A panic that ended it would leave every registered
+//!   future without a wake while `register` still returned `Ok`. With
+//!   `panic = "abort"` (this workspace's `android-release` profile) the
+//!   panic aborts the process instead.
 //! - Dropping the [`Waiter`] sets a stop flag that the thread checks each
 //!   time its timed futex wait returns. `Drop` does not join, so the thread
 //!   and the mapping outlive the instance by at most one slice.
@@ -35,6 +41,7 @@
 // macOS has no futex: `register` fails before any thread code runs.
 #![cfg_attr(target_os = "macos", allow(dead_code))]
 
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Waker;
@@ -105,7 +112,7 @@ impl Shared {
     fn wake_all(&self, spare: &mut Vec<(u64, Waker)>) {
         std::mem::swap(&mut self.lock().wakers, spare);
         for (_, waker) in spare.drain(..) {
-            waker.wake();
+            wake(waker);
         }
     }
 
@@ -120,7 +127,19 @@ impl Shared {
         std::mem::swap(&mut registry.wakers, spare);
         drop(registry);
         for (_, waker) in spare.drain(..) {
-            waker.wake();
+            wake(waker);
+        }
+    }
+}
+
+/// Wakes `waker`, catching a panic of its `wake` (module docs).
+fn wake(waker: Waker) {
+    if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| waker.wake())) {
+        // The payload's `Drop` can panic too, and outside the catch that
+        // panic would end the thread: drop it under a second catch, and
+        // leak the payload of that panic instead of dropping it.
+        if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+            std::mem::forget(payload);
         }
     }
 }
@@ -505,6 +524,87 @@ mod tests {
             assert!(flag.woken_within(LONG));
         }
         assert!(flags.iter().all(|(flag, _)| flag.wakes() == 1));
+    }
+
+    /// A waker whose `wake` panics.
+    struct Panics;
+
+    impl Wake for Panics {
+        fn wake(self: Arc<Self>) {
+            panic!("waker panicked (expected by the test)");
+        }
+    }
+
+    /// A panicking `wake` does not end the thread: the waker registered
+    /// after it in the same change is woken, and so is one at the next
+    /// change.
+    #[test]
+    fn panicking_waker_does_not_end_the_thread() {
+        let mut fx = Fixture::new("waiter_panic");
+        let reader = reader(&fx);
+        let waiter = Waiter::with_slice(Fixture::serial_area_of(&reader), Duration::from_secs(60));
+        let panics = Waker::from(Arc::new(Panics));
+        let (flag, waker) = Flag::waker();
+        let mut first = waiter.registration();
+        let mut second = waiter.registration();
+        first.register(&panics).unwrap();
+        second.register(&waker).unwrap();
+
+        fx.sp.add("debug.rsp.panic", "1").unwrap();
+        assert!(flag.woken_within(LONG));
+
+        second.register(&waker).unwrap();
+        fx.sp.add("debug.rsp.panic.next", "1").unwrap();
+        let start = Instant::now();
+        while flag.wakes() < 2 {
+            assert!(start.elapsed() < LONG, "no wake after the panic");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A panic payload whose `Drop` panics as well.
+    struct PanicsOnDrop;
+
+    impl Drop for PanicsOnDrop {
+        fn drop(&mut self) {
+            panic!("panic payload dropped (expected by the test)");
+        }
+    }
+
+    /// A waker whose `wake` panics with a [`PanicsOnDrop`] payload.
+    struct PanicsWithBadPayload;
+
+    impl Wake for PanicsWithBadPayload {
+        fn wake(self: Arc<Self>) {
+            std::panic::panic_any(PanicsOnDrop);
+        }
+    }
+
+    /// The payload drop of a panicking `wake` panics too, and that does
+    /// not end the thread either: the waker after it in the same change is
+    /// woken, and so is one at the next change.
+    #[test]
+    fn panicking_payload_drop_does_not_end_the_thread() {
+        let mut fx = Fixture::new("waiter_payload");
+        let reader = reader(&fx);
+        let waiter = Waiter::with_slice(Fixture::serial_area_of(&reader), Duration::from_secs(60));
+        let panics = Waker::from(Arc::new(PanicsWithBadPayload));
+        let (flag, waker) = Flag::waker();
+        let mut first = waiter.registration();
+        let mut second = waiter.registration();
+        first.register(&panics).unwrap();
+        second.register(&waker).unwrap();
+
+        fx.sp.add("debug.rsp.payload", "1").unwrap();
+        assert!(flag.woken_within(LONG));
+
+        second.register(&waker).unwrap();
+        fx.sp.add("debug.rsp.payload.next", "1").unwrap();
+        let start = Instant::now();
+        while flag.wakes() < 2 {
+            assert!(start.elapsed() < LONG, "no wake after the payload's panic");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// The thread ends within a slice or two of the waiter's drop and
