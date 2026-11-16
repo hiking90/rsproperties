@@ -422,12 +422,12 @@ impl ServiceConnection {
         // raises SIGPIPE. A Rust `main` ignores SIGPIPE at startup; a
         // staticlib/cdylib/JNI host typically does not, and dies before the
         // EPIPE reaches us. std's `UnixStream::write` is not used here
-        // because it is a plain `write(2)` on older std (1.77 through at
-        // least 1.86, inside this crate's `rust-version` range). Apple
+        // because it is a plain `write(2)` on older std (up to at least
+        // 1.86, which includes this crate's `rust-version`, 1.85). Apple
         // targets get the guarantee from SO_NOSIGPIPE (set in
         // `connect_with_timeout`). A regression to std's `write` passes
         // on current stable; the CI `msrv` job runs this module's tests on
-        // 1.77 to catch it.
+        // 1.85 to catch it.
         let deadline = Instant::now() + SERVICE_IO_TIMEOUT;
         let total = frame.len();
         let mut written = 0usize;
@@ -992,9 +992,9 @@ mod tests {
     /// regression kills only the child.
     ///
     /// Scope: this catches a regression to std's `UnixStream::write` only
-    /// on a toolchain whose std writes with plain `write(2)` (1.77 through
-    /// at least 1.86). Current stable std adds `MSG_NOSIGNAL` itself, so
-    /// the test passes there either way; the CI `msrv` job runs it on 1.77.
+    /// on a toolchain whose std writes with plain `write(2)` (up to at
+    /// least 1.86). Current stable std adds `MSG_NOSIGNAL` itself, so the
+    /// test passes there either way; the CI `msrv` job runs it on 1.85.
     #[test]
     fn test_send_to_closed_peer_is_epipe_not_sigpipe() {
         const CHILD_ENV: &str = "RSPROPERTIES_SIGPIPE_CHILD";

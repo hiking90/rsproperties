@@ -163,8 +163,8 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v7
 
-    - name: Install Rust 1.77 (MSRV)
-      uses: dtolnay/rust-toolchain@1.77
+    - name: Install Rust 1.85 (MSRV)
+      uses: dtolnay/rust-toolchain@1.85
 
     - name: Cache cargo registry
       uses: actions/cache@v6
@@ -177,26 +177,22 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-msrv-
 
-    # The committed manifests and Cargo.lock as they are. Cargo.lock must
-    # stay `version = 3`: cargo 1.77 cannot read v4 (stable since 1.78).
+    # The committed manifests and Cargo.lock as they are.
     - name: Check MSRV
       run: cargo check --locked --all-features
 
-    # Lib unit tests build the dev-dependencies, and two of them cannot be
-    # built by 1.77: clap 4.6 is edition 2024 (cargo 1.77 cannot parse its
-    # manifest) and criterion 0.8 declares rust-version 1.86. Remove them
-    # in this CI checkout only (nothing is committed); `cargo remove` also
-    # prunes Cargo.lock, so `--locked` below still holds. If another
-    # dev-dependency stops building on 1.77, add it to these lines.
-    # Scope: the lib unit tests of both crates. Integration tests,
-    # examples and benches are not built here.
+    # Lib unit tests build the dev-dependencies, and criterion 0.8 declares
+    # rust-version 1.86. Remove it in this CI checkout only (nothing is
+    # committed); `cargo remove` also prunes Cargo.lock, so `--locked`
+    # below still holds. If another dev-dependency stops building on 1.85,
+    # add it to this line. Scope: the lib unit tests of both crates.
+    # Integration tests, examples and benches are not built here.
     - name: Strip dev-dependencies that need a newer toolchain
-      run: |
-        cargo remove --dev -p rsproperties clap criterion
-        cargo remove --dev -p rsproperties-service clap
+      run: cargo remove --dev -p rsproperties criterion
 
     # send() (client) and send_response() (service) must not fall back to
-    # std's UnixStream::write, a plain write(2) — SIGPIPE — on 1.77..=1.86.
+    # std's UnixStream::write, a plain write(2) — SIGPIPE — on std up to at
+    # least 1.86, MSRV included.
     # Current stable passes those regression tests either way, so they run
     # here.
     - name: Lib unit tests on MSRV

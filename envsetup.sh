@@ -191,7 +191,7 @@ function version_update() {
 }
 
 function update_cargo_lock() {
-    echo "Updating Cargo.lock for Rust 1.77 environment..."
+    echo "Updating Cargo.lock for Rust 1.85 environment..."
 
     # Check if rustup is available
     if ! command -v rustup &> /dev/null; then
@@ -199,23 +199,23 @@ function update_cargo_lock() {
         return 1
     fi
 
-    # Install or update to Rust 1.77 if not already installed
-    echo "Ensuring Rust 1.77 toolchain is available..."
-    rustup toolchain install 1.77
+    # Install or update to Rust 1.85 if not already installed
+    echo "Ensuring Rust 1.85 toolchain is available..."
+    rustup toolchain install 1.85
 
     # Remove existing Cargo.lock files to force regeneration
     echo "Removing existing Cargo.lock files..."
     find . -name "Cargo.lock" -type f -delete
 
-    # Update dependencies and regenerate Cargo.lock using Rust 1.77
-    echo "Updating dependencies and regenerating Cargo.lock with Rust 1.77..."
-    rustup run 1.77 cargo update
+    # Update dependencies and regenerate Cargo.lock using Rust 1.85
+    echo "Updating dependencies and regenerating Cargo.lock with Rust 1.85..."
+    rustup run 1.85 cargo update
 
     # Verify the update was successful
     if [ $? -eq 0 ]; then
-        echo "Successfully updated Cargo.lock for Rust 1.77!"
+        echo "Successfully updated Cargo.lock for Rust 1.85!"
         echo "Used Rust version:"
-        rustup run 1.77 rustc --version
+        rustup run 1.85 rustc --version
     else
         echo "Error: Failed to update Cargo.lock"
         return 1

@@ -327,6 +327,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (toolchain):** the minimum supported Rust version is 1.85
+  (0.6.0: 1.77), so `Cargo.lock` can take tokio 1.54, which declares
+  rust-version 1.85; the last tokio release that builds on 1.77 is
+  1.53.3.
 - **Breaking (service):** `rsproperties_service::run(config, options)`
   takes a `ServiceOptions` instead of the property_contexts and build.prop
   file lists: `run(config, contexts, props)` becomes
@@ -1006,6 +1010,8 @@ Service (`rsproperties-service`, git dependency only):
 
 ### Migration from 0.6.0
 
+- **Toolchain:** build with Rust 1.85 or newer. Cargo rejects the crate
+  on an older rustc because of `rust-version`.
 - **Newly rejected inputs** (succeeded in 0.6.0, now `Err` or skipped):
   - an `import` path containing a space: `import <path> <filter>` is now
     split at the first space after the path (AOSP parity), so
