@@ -60,7 +60,7 @@ fn writer(dir: &Path) -> SystemProperties {
 fn assert_serial_and_wait_reject(props: &SystemProperties, foreign: PropertyIndex) {
     let err = props.serial(foreign).unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
-    let got = props.wait(Some(foreign), u32::MAX, Some(Duration::from_millis(1)));
+    let got = props.wait_timeout(foreign, u32::MAX, Duration::from_millis(1));
     assert!(matches!(got, Err(Error::InvalidArgument(_))), "{got:?}");
 }
 

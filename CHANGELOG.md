@@ -25,10 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SystemProperties::read_index_with(index, |name, value, serial| ...)`:
   reads by index without a name lookup and passes the serial the value
   was read under (bionic `__system_property_read_callback`).
-- `SystemProperties::wait_for_creation(name, timeout)` and
-  `wait_for_value(name, expected, timeout)` (libbase
-  `WaitForPropertyCreation` / `WaitForProperty`), with
-  `Option<Duration>` timeouts.
+- `SystemProperties::wait_for_creation(name)` and
+  `wait_for_value(name, expected)` (libbase `WaitForPropertyCreation` /
+  `WaitForProperty`), and `wait_for_creation_timeout(name, timeout)` /
+  `wait_for_value_timeout(name, expected, timeout)` with a `Duration`
+  that bounds the whole call (`Ok(None)` / `Ok(false)` when it expires).
 - `SystemProperties::open(dir)`: a read-only instance on a directory the
   caller names. 0.6.0 had no public read-only constructor, so a process
   could read only the one directory `init` latched, and a library could
@@ -36,11 +37,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SystemProperties::watch(name)` and `PropertyWatcher` (libbase
   `CachedProperty`): `value()` returns the current value, reading the
   store again only when the property's serial has moved, and
-  `wait_for_change(timeout)` blocks until the property is created or
-  updated. Following one property took `find`, `read_index_with` and
+  `wait_for_change()` blocks until the property is created or updated
+  (`wait_for_change_timeout(timeout)`: `Ok(false)` when the timeout
+  expires first). Following one property took `find`, `read_index_with` and
   `wait` in a loop that carried the index and the serial, and a `wait`
   from a serial with the dirty bit set reported one update twice. The
   watcher reports an update once and does not queue changes.
+- `SystemProperties::watch_area()` and `AreaWatcher`: a wait for the next
+  add or update of any property. The watcher keeps the global serial,
+  from its value at `watch_area` on, and moves it only when it reports a
+  change, so a change that lands after a timeout or between two calls
+  returns the next call at once. `wait_for_change_timeout(timeout)`
+  returns `Ok(false)` when the timeout expires first; `serial()` is the
+  serial last reported. It is the only public wait for a change to any
+  property (bionic `__system_property_wait(NULL, ..)`); `wait` takes a
+  property index.
+- `rsproperties::asynchronous`: the waits as `async fn`s, without a
+  feature or a runtime. `asynchronous::SystemProperties`,
+  `asynchronous::PropertyWatcher` and `asynchronous::AreaWatcher` are
+  views of the crate root's types
+  (`SystemProperties::as_async()` / `as_sync()` convert a reference
+  without a copy, `asynchronous::system_properties()` is the process-wide
+  reader), so a `PropertyIndex` works with both. `wait`,
+  `wait_for_creation`, `wait_for_value`, `serial` and the watchers'
+  `wait_for_change` take the sync methods' arguments and
+  no timeout: wrap the future in the runtime's timeout, and drop it to
+  cancel the wait. The futures are `Send` and use only the waker, so they
+  run on any executor. A futex has no fd to poll, so the first wait of
+  an instance that has to block starts one thread per instance; it
+  futex-waits on the global serial and, on a change, wakes the waits
+  whose property's serial moved and every wait on the global serial
+  (creation, area watchers), which check their condition again; a waker
+  whose `wake` panics does not stop the thread (with
+  `panic = "unwind"`). A wait already
+  satisfied returns on its first poll and starts no thread. The
+  process-wide reader's thread runs until the process exits; another
+  instance's thread ends within about a second of the instance's drop.
+  Return conditions are the sync methods', except that a per-property
+  wait returns after the writer's global `FUTEX_WAKE` and async `serial`
+  waits for the clean serial without the sync method's 200 ms bound. A
+  writer that moves the global serial without a wake (bionic in an
+  appcompat override process on API 35–36) is seen at the next change
+  that wakes, as with bionic's own waits. A wait that has to block also
+  fails when the thread cannot be started (the next wait tries again),
+  and once the thread has ended on a futex error, every later blocking
+  wait of the instance fails with that error. The process-wide reader's
+  thread has no timed wakeups while nothing changes. A child forked
+  without exec after the instance's first blocking async wait has no
+  thread: its waits that have to block are never woken (not supported).
+- `asynchronous::set(name, value)` (`tokio` feature): `set` on tokio's
+  I/O and time drivers. The future is `Send + 'static`, for
+  `tokio::spawn`. Name and value are checked when `set` is called; a
+  refused request fails at the `await` with `rsproperties::set`'s error
+  and does not connect. Connect and send keep the 2 s bounds of
+  `rsproperties::set`, and a connect that finds the listen backlog full
+  is retried within them. The V2 reply wait has no bound on any platform
+  (`rsproperties::set`: 2 s outside Android); bound it with
+  `tokio::time::timeout`. Dropped before the request is sent in full,
+  the future leaves the property unchanged; dropped after, the service
+  applies the request and the outcome is not reported. A request that
+  passed the checks panics when polled outside a tokio runtime, or in
+  one without both the time and the I/O driver enabled. The feature
+  adds `tokio` 1.27 or later with `net` and `time` only and no default
+  features (5 crates in the dependency tree: `tokio`, `mio`,
+  `socket2`, `pin-project-lite`, `libc`).
 - `parse::parse_bool` and `parse::parse_int`: libbase `ParseBool` /
   `ParseInt` / `ParseUint` rules (`yes`/`on`/`1`, leading whitespace,
   `0x` hex, no trailing characters).
@@ -267,6 +327,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (toolchain):** the minimum supported Rust version is 1.85
+  (0.6.0: 1.77), so `Cargo.lock` can take tokio 1.54, which declares
+  rust-version 1.85; the last tokio release that builds on 1.77 is
+  1.53.3.
 - **Breaking (service):** `rsproperties_service::run(config, options)`
   takes a `ServiceOptions` instead of the property_contexts and build.prop
   file lists: `run(config, contexts, props)` becomes
@@ -282,22 +346,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `PropertyConfigBuilder`, `PropertyConfig::builder`, `with_*_dir`,
     `with_both_dirs` and the `From<PathBuf | String | &str>` impls are
     removed.
-  - `SystemProperties::wait` takes `Option<Duration>` and returns
-    `Result<Option<u32>>`: `Ok(Some(serial))` on a change, `Ok(None)` on
-    timeout, `Err` on a lookup or futex failure (0.6.0: `None` for all
-    three). `old_serial` is a `u32`, as in bionic's
-    `__system_property_wait`, not an `Option<u32>`: 0.6.0's `None` read
-    the serial inside `wait`, so a change made before the call was
-    missed. `wait_any()` is removed: `wait(None, old_serial, None)` is
-    bionic's deprecated `__system_property_wait_any(old_serial)`. The
+  - `SystemProperties::wait(index, old_serial)` has no timeout argument
+    and returns `Result<u32>`, the new serial;
+    `wait_timeout(index, old_serial, timeout)` takes a `Duration` and
+    returns `Result<Option<u32>>`: `Ok(Some(serial))` on a change,
+    `Ok(None)` on timeout. Both return `Err` on a lookup or futex failure
+    (0.6.0: `None` for all three). `wait(i, old, None)` becomes
+    `wait(i, old)`, and `wait(i, old, Some(&ts))` becomes
+    `wait_timeout(i, old, d)` with `d` a `Duration`. `old_serial` is a
+    `u32`, as in bionic's `__system_property_wait`, not an
+    `Option<u32>`: 0.6.0's `None` read the serial inside `wait`, so a
+    change made before the call was missed. `index` is a
+    `PropertyIndex`, not an `Option<&PropertyIndex>`: the global-serial
+    wait (0.6.0 `wait(None, ..)` and `wait_any()`, bionic
+    `__system_property_wait(NULL, ..)` and the deprecated
+    `__system_property_wait_any`) is `watch_area()`, which keeps the
+    serial between calls. `wait_any()` is removed. The
     `rsproperties::Timespec` re-export is removed too.
   - `SystemProperties::serial` returns `Result<u32>` (0.6.0: `None` for a
     foreign index or a failed lookup).
   - `SystemProperties::context_serial` is renamed `area_serial` (bionic
-    `__system_property_area_serial`): it is the `old_serial` of a
-    `wait(None, ..)`.
+    `__system_property_area_serial`).
   - `PropertyIndex` is passed by value (it is `Copy`): `serial(index)`,
-    `update(index, value)`, `wait(Some(index), ..)`.
+    `update(index, value)`, `wait(index, ..)`.
   - `system_properties()` returns `Result<&'static SystemProperties>`
     and `try_system_properties` is removed, as `init` / `try_init` above
     (0.6.0 `system_properties()` panicked when the store could not be
@@ -675,24 +746,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SystemProperties::find` returns `Ok(None)`, like bionic
   `__system_property_find`. They returned `Error::Parse` and logged two
   `error` lines per lookup, also from `get_or`.
-- `SystemProperties::update`, `serial` and `wait` reject a `PropertyIndex`
+- `SystemProperties::update`, `serial`, `wait`, `wait_timeout` and
+  `read_index_with`, and the `asynchronous` `serial`, `wait` and
+  `read_index_with`, reject a `PropertyIndex`
   returned by a different `SystemProperties` instance with
   `Error::InvalidArgument`, including another
   instance on the same directory such as the global reader. An index from
   another directory's instance, or from the instance before a writer
   restart, addressed an unrelated layout, and `update` could overwrite
   trie bytes of the area without an error.
-- `SystemProperties::wait` with an index compares the property's serial
+- `SystemProperties::wait_timeout` compares the property's serial
   with `old_serial` before it applies the timeout, like the global-serial
   path and bionic `__system_property_wait` (the kernel's `FUTEX_WAIT`
   returns `EAGAIN` for a changed word with a zero timeout and `EINVAL`
   for an out-of-range one, and bionic reloads the serial after both).
-  With a zero timeout, or a negative or out-of-range one (`tv_nsec` ≥
-  10^9), it returned `None` without comparing, also in 0.6.0, so a
-  zero-timeout poll never reported a change. With an unchanged serial, a
-  negative or out-of-range timeout still returns `None` after that one
-  comparison, without waiting; bionic retries the `EINVAL` in a loop of
-  `futex` syscalls until the serial changes.
+  0.6.0's `wait` with an index and a zero timeout, or a negative or
+  out-of-range one (`tv_nsec` ≥ 10^9), returned `None` without
+  comparing, so a zero-timeout poll never reported a change. With an
+  unchanged serial, a zero timeout returns `Ok(None)` after that one
+  comparison, without waiting.
 - `examples/setprop` prints nothing on stdout on success (it printed the
   name and value); AOSP `setprop` (toolbox) prints nothing on success.
   For a name starting with `ro.` it still writes a warning to stderr
@@ -793,7 +865,7 @@ Service (`rsproperties-service`, git dependency only):
   removal is added to Changed, the Migration section gains the omitted
   breaking changes, an error-variant mapping table, newly rejected
   inputs, and changed protocol defaults.
-- The `SystemProperties::wait` rustdoc states that with an index the
+- The `SystemProperties::wait` rustdoc states that the
   returned serial can carry the dirty bit while a writer is mid-update,
   as in 0.6.0 and bionic `__system_property_wait`; `serial` waits (up to
   200 ms) for the clean serial. The `serial` rustdoc lists the cases that
@@ -938,6 +1010,8 @@ Service (`rsproperties-service`, git dependency only):
 
 ### Migration from 0.6.0
 
+- **Toolchain:** build with Rust 1.85 or newer. Cargo rejects the crate
+  on an older rustc because of `rust-version`.
 - **Newly rejected inputs** (succeeded in 0.6.0, now `Err` or skipped):
   - an `import` path containing a space: `import <path> <filter>` is now
     split at the first space after the path (AOSP parity), so
@@ -1131,7 +1205,10 @@ Service (`rsproperties-service`, git dependency only):
     before that context's rename; a read of a context whose area file
     does not exist yet fails, and the next access opens it again. Such a
     reader does not see the restarted writer's updates in the previous
-    files, and `wait` on the global serial does not wake. Start or restart
+    files, and no wait on the global serial wakes (`AreaWatcher`,
+    `wait_for_creation`, `wait_for_value` and a `PropertyWatcher` before
+    the property exists), nor does any `asynchronous` wait of that
+    instance. Start or restart
     readers after the writer's `new_area` / `new_area_locked` (or
     `rsproperties_service::run`) has returned;
   - builder: area files and `properties_serial` get mode 0444 whatever
@@ -1154,12 +1231,12 @@ Service (`rsproperties-service`, git dependency only):
     counting (0.6.0: the counter wrapped to 0), so serial values from then
     on differ from 0.6.0's. Code that only compares serials for equality
     needs no change;
-  - `SystemProperties::wait(Some(index), Some(old), Some(Duration::ZERO))`
+  - `SystemProperties::wait_timeout(index, old, Duration::ZERO)`
     returns `Ok(Some(serial))` when the serial already differs from `old`
-    (0.6.0: `None` for a zero timeout, and for a negative or out-of-range
-    one, which `Duration` cannot express). With an unchanged serial it
-    returns `Ok(None)` without waiting. Any `wait` with an index and a zero
-    timeout (also with `old_serial` `None`) now takes
+    (0.6.0: `wait` returned `None` for a zero timeout, and for a negative
+    or out-of-range one, which `Duration` cannot express). With an
+    unchanged serial it returns `Ok(None)` without waiting. A
+    `wait_timeout` with a zero timeout takes
     the context node's read lock (0.6.0 returned before taking it), so it
     can wait for that lock while another thread of the same instance is
     opening that area for the first time;
@@ -1284,22 +1361,29 @@ Service (`rsproperties-service`, git dependency only):
     `PropertyConfig::builder()…build()` drops `builder()` / `build()`
     (`PropertyConfig::new()…`); reading `config.properties_dir` /
     `config.socket_dir` is no longer possible — keep the paths yourself;
-  - `wait(index, old, Some(&Timespec { .. }))` becomes
-    `wait(index, old, Some(Duration::..))`, and its result
+  - `wait(index, old, None)` becomes `wait(index, old)`, and its result
+    `Option<u32>` becomes `Result<u32>`: `Some(s)` → `Ok(s)`, a failure
+    → `Err`. `wait(index, old, Some(&Timespec { .. }))` becomes
+    `wait_timeout(index, old, Duration::..)`, and its result
     `Option<u32>` becomes `Result<Option<u32>>`: `Some(s)` →
     `Ok(Some(s))`, a timeout → `Ok(None)`, a failure → `Err` (0.6.0
     returned `None` for both); `rsproperties::Timespec` is gone;
-  - `wait`'s `old_serial` is a `u32`: `wait(index, Some(old), t)` becomes
-    `wait(index, old, t)`. `wait(Some(&index), None, t)` becomes
-    `wait(Some(index), props.serial(index)?, t)`, and
-    `wait(None, None, t)` or `wait_any()` becomes
-    `wait(None, props.area_serial(), t)` (`t = None` for `wait_any`).
+  - `wait`'s `index` is a `PropertyIndex` and its `old_serial` a `u32`:
+    `wait(Some(&index), Some(old), ..)` becomes `wait(index, old)`, and
+    `wait(Some(&index), None, ..)` becomes
+    `wait(index, props.serial(index)?)`; a call that passed a timeout
+    takes the same arguments in `wait_timeout` with the `Duration` last.
     Read the serial before the check that decides to wait, not right
     before `wait`: a change made between the two then returns at once;
+  - `wait(None, ..)` and `wait_any()` become an `AreaWatcher`:
+    `let mut area = props.watch_area();` before the check that decides
+    to wait, then `area.wait_for_change()?` (or
+    `area.wait_for_change_timeout(d)?`, `Ok(false)` on timeout) in place
+    of each wait. `area.serial()` is the serial the wait returned;
   - `context_serial()` becomes `area_serial()`;
   - `&index` arguments become `index`: `serial(&index)` →
     `serial(index)`, `update(&index, v)` → `update(index, v)`,
-    `wait(Some(&index), ..)` → `wait(Some(index), ..)`;
+    `wait(Some(&index), ..)` → `wait(index, ..)`;
   - `serial(index)` returns `Result<u32>`: `.expect(..)` and `?` keep
     working on the success path; `== None` / `.is_some()` checks become
     `.is_err()` / `.is_ok()`;
@@ -1473,8 +1557,9 @@ Service (`rsproperties-service`, git dependency only):
     skipped at init, these calls return `Error::FileValidation` instead
     (`add` only after its value-length check; see the empty-names entry
     above).
-  - `SystemProperties::update`, `serial`, `wait` and `read_index_with`
-    with a `PropertyIndex` from another instance return
+  - `SystemProperties::update`, `serial`, `wait`, `wait_timeout` and
+    `read_index_with`, and the `asynchronous` `serial`, `wait` and
+    `read_index_with`, with a `PropertyIndex` from another instance return
     `Error::InvalidArgument`. This includes an index from another instance on the
     same directory — e.g. `rsproperties::system_properties()?.find(..)`
     passed to a writer created with `new_area` — which worked in 0.6.0

@@ -9,7 +9,10 @@
 //!
 //! - Get system properties.
 //! - Set system properties.
-//! - Wait for system properties.
+//! - Wait for system properties, blocking the thread or, through
+//!   [`asynchronous`], as `async fn`s on any executor.
+//! - Set system properties from tokio without blocking a thread
+//!   (`asynchronous::set`, `tokio` feature).
 //! - Serialize/deserialize the property-info trie (requires the `builder`
 //!   feature).
 //!
@@ -104,6 +107,7 @@ impl PropertyConfig {
     }
 }
 
+pub mod asynchronous;
 mod errors;
 mod from_property;
 pub mod parse;
@@ -111,6 +115,7 @@ pub mod wire;
 pub use errors::{Error, Result, SetRejection};
 pub use from_property::FromProperty;
 
+mod area_watcher;
 #[cfg(feature = "builder")]
 mod build_property_parser;
 mod context_node;
@@ -130,11 +135,15 @@ mod trie_builder;
 mod trie_node_arena;
 #[cfg(feature = "builder")]
 mod trie_serializer;
+mod wait_step;
+mod waiter;
 
 // Compiles the crate README's Rust blocks as doctests, so an example that
 // no longer matches the API fails `cargo test`. One block uses the
-// `builder` API, hence the feature gate.
-#[cfg(all(doctest, feature = "builder"))]
+// `builder` API and one `asynchronous::set`, hence the feature gate. A
+// workspace `cargo test --features builder` has `tokio` on as well:
+// rsproperties-service's dev-dependency enables it.
+#[cfg(all(doctest, feature = "builder", feature = "tokio"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
@@ -268,6 +277,7 @@ pub(crate) mod test_support {
 
 // Explicit re-export lists (not globs) so the public API surface is
 // visible here and additions to the modules don't silently become public.
+pub use area_watcher::AreaWatcher;
 #[cfg(feature = "builder")]
 pub use build_property_parser::{
     load_properties_from_file, load_properties_from_file_with, PropFileOutcome,
@@ -466,8 +476,12 @@ pub fn system_properties() -> Result<&'static system_properties::SystemPropertie
     log::debug!("Initializing global SystemProperties instance from: {dir:?}");
     match system_properties::SystemProperties::open(dir) {
         // Only a holder of `SYSTEM_PROPERTIES_INIT` sets the cell, and it
-        // was empty above, so `props` is the value stored.
-        Ok(props) => Ok(SYSTEM_PROPERTIES.get_or_init(|| props)),
+        // was empty above, so `props` is the value stored — and a `static`
+        // is never dropped.
+        Ok(mut props) => {
+            props.never_dropped();
+            Ok(SYSTEM_PROPERTIES.get_or_init(|| props))
+        }
         Err(e) => {
             if INIT_FAILURE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 log::debug!("SystemProperties from {dir:?} still unavailable: {e}");
@@ -910,22 +924,22 @@ mod tests {
 
         let test_prop = "test.property";
 
-        // Deterministic (no sleeps): sample the serial *before* spawning
-        // the waiter and pass it as `old_serial` — the documented contract
+        // Deterministic (no sleeps): sample the serial (or create the area
+        // watcher) *before* spawning the waiter — the documented contract
         // closes the lost-wakeup window, so it does not matter whether the
         // waiter enters futex_wait before or after the change lands. The
         // old sleep-based sync hung forever (not failed) when the waiter
         // lost the race.
         let reader = system_properties().unwrap();
-        let wait_any_from = |old: u32| {
+        let wait_any = |mut area: AreaWatcher<'static>| {
             std::thread::spawn(move || {
-                let changed = reader.wait(None, old, None).unwrap();
-                assert!(changed.is_some(), "no timeout was given");
+                let old = area.serial();
+                area.wait_for_change().unwrap();
+                assert_ne!(area.serial(), old);
             })
         };
 
-        let old = reader.area_serial();
-        let handle = wait_any_from(old);
+        let handle = wait_any(reader.watch_area());
 
         system_properties_area.add(test_prop, "true").unwrap();
         handle.join().unwrap();
@@ -933,11 +947,11 @@ mod tests {
         let index = reader.find(test_prop).unwrap().expect("just added");
         let old_prop_serial = reader.serial(index).expect("index valid");
         let handle = std::thread::spawn(move || {
-            let changed = reader.wait(Some(index), old_prop_serial, None).unwrap();
-            assert!(changed.is_some(), "no timeout was given");
+            let changed = reader.wait(index, old_prop_serial).unwrap();
+            assert_ne!(changed, old_prop_serial);
         });
 
-        let handle_any = wait_any_from(reader.area_serial());
+        let handle_any = wait_any(reader.watch_area());
 
         let index = system_properties_area.find(test_prop).unwrap();
         system_properties_area

@@ -61,7 +61,7 @@ fn test_wait_for_property_change() {
             barrier.wait();
 
             system_properties
-                .wait(Some(index), old_serial, Some(WAIT_TIMEOUT))
+                .wait_timeout(index, old_serial, WAIT_TIMEOUT)
                 .expect("wait failed")
                 .expect("wait timed out: the change was not observed");
             rsproperties::get::<String>(&prop_name).expect("get after wait")
@@ -88,11 +88,11 @@ fn test_wait_for_any_property_change() {
         let barrier = Arc::clone(&barrier);
         thread::spawn(move || {
             let system_properties = rsproperties::system_properties().expect("global reader");
-            let old_serial = system_properties.area_serial();
+            let mut area = system_properties.watch_area();
 
             barrier.wait();
 
-            system_properties.wait(None, old_serial, Some(WAIT_TIMEOUT))
+            area.wait_for_change_timeout(WAIT_TIMEOUT)
         })
     };
 
@@ -101,7 +101,7 @@ fn test_wait_for_any_property_change() {
 
     let woke = waiter.join().expect("waiter thread panicked");
     assert!(
-        matches!(woke, Ok(Some(_))),
+        matches!(woke, Ok(true)),
         "wait timed out or failed: {woke:?}"
     );
     assert_eq!(
@@ -136,20 +136,20 @@ fn test_watcher_follows_creation_and_update() {
 
             barrier.wait();
             let created = watcher
-                .wait_for_change(Some(WAIT_TIMEOUT))
+                .wait_for_change_timeout(WAIT_TIMEOUT)
                 .expect("creation wait failed");
             assert!(created, "creation wait timed out");
             let first = watcher.value().expect("value").map(str::to_owned);
 
             barrier.wait();
             let updated = watcher
-                .wait_for_change(Some(WAIT_TIMEOUT))
+                .wait_for_change_timeout(WAIT_TIMEOUT)
                 .expect("update wait failed");
             assert!(updated, "update wait timed out");
             let second = watcher.value().expect("value").map(str::to_owned);
 
             let again = watcher
-                .wait_for_change(Some(Duration::ZERO))
+                .wait_for_change_timeout(Duration::ZERO)
                 .expect("poll failed");
             (first, second, again)
         })

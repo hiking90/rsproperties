@@ -227,6 +227,50 @@ pub(crate) fn load_acquire(word: &AtomicU32) -> u32 {
     value
 }
 
+/// A property's `serial` word, kept past the borrow of the mapping that
+/// holds it: the async waiter reads it to decide which registered future a
+/// change concerns (waiter.rs). The holder answers for the mapping
+/// outliving every [`Self::load`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SerialWord(std::ptr::NonNull<AtomicU32>);
+
+// Manual impl so the pointer is never printed: it is an address inside the
+// mapping, which a log should not carry (the `MemoryMap` Debug policy).
+impl Debug for SerialWord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SerialWord").finish_non_exhaustive()
+    }
+}
+
+// SAFETY: a `SerialWord` is a `&AtomicU32` with the lifetime erased (`new`
+// is the only constructor), and `AtomicU32: Sync`, so the pointer may be
+// sent and shared as that reference may. `load` is the only access;
+// liveness is its caller's obligation, not a thread property.
+unsafe impl Send for SerialWord {}
+// SAFETY: as for `Send`; a shared `&SerialWord` yields only a copy of the
+// pointer.
+unsafe impl Sync for SerialWord {}
+
+impl SerialWord {
+    pub(crate) fn new(word: &AtomicU32) -> Self {
+        Self(std::ptr::NonNull::from(word))
+    }
+
+    /// [`load_acquire`] of the word.
+    ///
+    /// # Safety
+    ///
+    /// The `AtomicU32` passed to [`Self::new`] is still live (for an
+    /// area's word: its mapping is still mapped).
+    pub(crate) unsafe fn load(self) -> u32 {
+        // SAFETY: the caller keeps the `AtomicU32` live, so the pointer is
+        // to a live `AtomicU32`; an area's `PropertyInfo::serial` is
+        // accessed only through atomics ([SM2](a)), and a `Relaxed` load is
+        // defined on a `PROT_READ` mapping ([R-RO]).
+        load_acquire(unsafe { self.0.as_ref() })
+    }
+}
+
 /// Marker for types that may be materialized in-place from property-area
 /// mmap bytes via `MemoryMap::to_object` / `MemoryMap::to_object_mut`.
 ///

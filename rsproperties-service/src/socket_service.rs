@@ -1584,10 +1584,10 @@ impl SocketService {
     /// Sends a status reply with `send(MSG_NOSIGNAL)`, so a peer that
     /// already closed yields `EPIPE` instead of `SIGPIPE`.
     ///
-    /// tokio's `write_all` ends in std's `write`, which on Rust 1.77–1.86
-    /// is a plain `write(2)`: a host process that leaves `SIGPIPE` at its
+    /// tokio's `write_all` ends in std's `write`, which up to at least Rust
+    /// 1.86 is a plain `write(2)`: a host process that leaves `SIGPIPE` at its
     /// default (a C or JNI host embedding this service) was killed by the
-    /// signal. Same rule as the client's `ServiceWriter::send` in
+    /// signal. Same rule as the client's `ServiceConnection::send` in
     /// `rsproperties/src/system_property_set.rs`; here it is a readiness
     /// loop, and `CLIENT_TIMEOUT` around the handler bounds the wait. This
     /// crate is Linux-only (see the `compile_error!` in lib.rs), so

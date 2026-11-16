@@ -6,6 +6,7 @@ use std::ffi::CStr;
 use std::path::Path;
 #[cfg(feature = "builder")]
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::errors::*;
 #[cfg(feature = "builder")]
@@ -439,7 +440,11 @@ pub(crate) struct ContextsSerialized {
     /// We keep the slot so that `context_index` values produced by the
     /// property-info parser line up with the vector's indices.
     context_nodes: Vec<Option<ContextNode>>,
-    serial_property_area_map: PropertyAreaMap,
+    /// `properties_serial`. An `Arc` so a thread that waits on the global
+    /// serial for this instance can keep the mapping it reads: the
+    /// instance's own, not a fresh `open` of the path, which a service
+    /// restart points at a new inode.
+    serial_property_area_map: Arc<PropertyAreaMap>,
     /// Writer lock held for the lifetime of a writable instance (`None`
     /// when read-only). `PropertyAreaMap::new_rw` replaces area files, so
     /// without this lock a second writer would silently replace the files
@@ -462,7 +467,7 @@ impl ContextsSerialized {
         Ok(Self {
             property_info_area_file,
             context_nodes,
-            serial_property_area_map,
+            serial_property_area_map: Arc::new(serial_property_area_map),
             #[cfg(feature = "builder")]
             _writer_lock: None,
         })
@@ -513,7 +518,7 @@ impl ContextsSerialized {
         Ok(Self {
             property_info_area_file,
             context_nodes,
-            serial_property_area_map,
+            serial_property_area_map: Arc::new(serial_property_area_map),
             _writer_lock: Some(lock),
         })
     }
@@ -728,6 +733,12 @@ impl ContextsSerialized {
 
     pub(crate) fn serial_prop_area(&self) -> &PropertyArea {
         self.serial_property_area_map.property_area()
+    }
+
+    /// The `properties_serial` mapping itself, for the waiter thread to
+    /// share (`waiter.rs`).
+    pub(crate) fn serial_area_map(&self) -> &Arc<PropertyAreaMap> {
+        &self.serial_property_area_map
     }
 
     /// Whether `properties_serial` is mapped writable (property_area.rs

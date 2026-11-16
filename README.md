@@ -23,7 +23,7 @@ and was compared with `getprop` on an API 37 emulator.
 
 - **Complete Android Properties Implementation**: Full Rust implementation of Android's property system - read, write, and monitor properties exactly like Android native code
 - **Cross-Platform Compatibility**: Works seamlessly on both Android devices and Linux systems without modification
-- **Pure Rust Solution**: No dependencies on Android's C libraries or JNI - everything implemented in Rust (`unsafe` is limited to the mmap / shared-memory layer)
+- **Pure Rust Solution**: No dependencies on Android's C libraries or JNI - everything implemented in Rust (`unsafe` is limited to the mmap / shared-memory layer, the `repr(transparent)` reference cast behind `as_async`, and the async waiter's load of a registered serial word)
 - **Real-time Property Monitoring**: Watch for property changes in real-time, enabling reactive applications
 - **High Performance**: Optimized for speed with direct memory access and zero-copy operations
 - **Drop-in Replacement**: Compatible with Android's property naming conventions and value constraints
@@ -36,7 +36,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rsproperties = "0.6"
+rsproperties = "0.7"
 ```
 
 Creating property areas (`SystemProperties::new_area`, `build_trie`,
@@ -44,7 +44,7 @@ Creating property areas (`SystemProperties::new_area`, `build_trie`,
 
 ```toml
 [dependencies]
-rsproperties = { version = "0.6", features = ["builder"] }
+rsproperties = { version = "0.7", features = ["builder"] }
 ```
 
 To also run the Linux property service daemon (`rsproperties-service`, not
@@ -138,7 +138,7 @@ use std::time::Duration;
 fn main() -> rsproperties::Result<()> {
     let props = rsproperties::system_properties()?;
     // Returns when the property exists and equals "1"; `false` is a timeout.
-    if !props.wait_for_value("sys.boot_completed", "1", Some(Duration::from_secs(30)))? {
+    if !props.wait_for_value_timeout("sys.boot_completed", "1", Duration::from_secs(30))? {
         eprintln!("not booted after 30 s");
     }
     Ok(())
@@ -160,7 +160,7 @@ fn main() -> rsproperties::Result<()> {
         println!("log level: {:?}", level.value()?);
         // Blocks until the property is created or updated. A change made
         // since the `value()` above returns at once, so none is missed.
-        level.wait_for_change(None)?;
+        level.wait_for_change()?;
     }
 }
 ```
@@ -169,31 +169,77 @@ One update is reported as one change, also when it stores the value the
 property already had; updates that land between two calls are reported as
 one change with the latest value.
 
-Wait for a change to any property on the global serial:
+Wait for a change to any property with an `AreaWatcher`, which keeps the
+global serial between calls:
 
 ```rust,no_run
 use std::time::Duration;
 
 fn main() -> rsproperties::Result<()> {
     let props = rsproperties::system_properties()?;
-    // `old_serial` is the serial the caller last saw: a change made
-    // between `area_serial()` and `wait` returns at once.
-    let mut serial = props.area_serial();
+    // Starts at the global serial of this call.
+    let mut area = props.watch_area();
     loop {
-        match props.wait(None, serial, Some(Duration::from_secs(60)))? {
-            Some(new_serial) => {
-                println!("a property changed, serial {new_serial}");
-                serial = new_serial;
-            }
-            None => println!("no change for 60 s"),
+        // A change made after a timeout, or while the previous one was
+        // handled, returns the next call at once.
+        if area.wait_for_change_timeout(Duration::from_secs(60))? {
+            println!("a property changed, serial {}", area.serial());
+        } else {
+            println!("no change for 60 s");
         }
     }
 }
 ```
 
-The watcher is built on `find`, `read_index_with` and
-`wait(Some(index), old_serial, timeout)`; they stay public for a caller
-that keeps its own index and serial.
+`PropertyWatcher` is built on `find`, `read_index_with` and
+`wait(index, old_serial)`; they stay public for a caller that keeps its
+own index and serial. A wait for any property is `watch_area()` only;
+`area_serial()` stays for a check without a wait.
+
+### Async Waits and Set
+
+`rsproperties::asynchronous` has the same waits as `async fn`s, with the
+same arguments and no timeout argument (wrap the future in your runtime's
+timeout; dropping it cancels the wait). They need no feature and no
+particular runtime:
+
+```rust,no_run
+async fn follow() -> rsproperties::Result<()> {
+    let props = rsproperties::asynchronous::system_properties()?;
+    props.wait_for_value("sys.boot_completed", "1").await?;
+
+    let mut level = props.watch("debug.my_service.log_level");
+    loop {
+        println!("log level: {:?}", level.value()?);
+        level.wait_for_change().await?;
+    }
+}
+```
+
+A futex has no fd an executor could poll, so the first async wait of an
+instance that has to block starts one thread for that instance. It waits on
+the global serial and, on a change, wakes the waits whose property's serial
+moved, and every wait for a creation or on an area watcher; a wait whose
+condition already holds returns on its first poll and starts nothing.
+`SystemProperties::as_async()` gives the async view of any instance.
+
+With the `tokio` feature, `asynchronous::set` sets a property without
+blocking a thread on the property service:
+
+```toml
+[dependencies]
+rsproperties = { version = "0.7", features = ["tokio"] }
+```
+
+```rust,no_run
+async fn configure() -> rsproperties::Result<()> {
+    rsproperties::asynchronous::set("debug.my_service.workers", 4).await?;
+    Ok(())
+}
+```
+
+Unlike `rsproperties::set`, it waits for the service's reply without a
+bound on Linux as well; use `tokio::time::timeout` to bound it.
 
 ### Custom Configuration
 

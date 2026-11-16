@@ -142,7 +142,7 @@ lookup을 다시 한다. callback은 value만 받는다. `PropertyIndex`로 값�
   `pi->name`으로 판정하는 것과 같다. 기존 `read_with`는 lookup에 쓴 이름으로
   판정하지만, index로 읽을 때는 lookup 이름이 없다.
 - serial 의미는 bionic과 같다. mutable property의 serial에는 dirty bit가
-  켜져 있을 수 있다. 이 serial을 `wait(idx, Some(serial), ..)`에 넘기면 같은
+  켜져 있을 수 있다. 이 serial을 `wait(idx, serial)`에 넘기면 같은
   update의 clean store를 변경 한 번으로 보고한다.
 - 다른 instance의 index는 `Error::InvalidArgument`로 거부한다. `update`와
   같은 규칙이다.
@@ -234,7 +234,7 @@ mount를 하지 않고 reload 함수만 호출한다(`:1842-1847`). init과 writ
 override가 켜진 프로세스에서는 같은 property에 대해 libc
 `__system_property_get`과 rsproperties가 서로 다른 값을 돌려줄 수 있다.
 
-**변경.** read-only instance(`SystemProperties::new`, 전역 reader)를 만들 때
+**변경.** read-only instance(`SystemProperties::open`, 전역 reader)를 만들 때
 환경변수를 한 번 읽어 flag로 저장한다. flag가 켜져 있으면 `find`와
 `read_with`가 bionic처럼 override 이름을 먼저 조회한다.
 - Android에서는 `ro.build.version.sdk`가 37 이상일 때만 환경변수를 따른다.
@@ -279,6 +279,42 @@ override가 켜진 프로세스에서는 같은 property에 대해 libc
     `ro.build.version.sdk`는 37이다. workflow의 matrix는 `api-level: 37`에
     `platform: android-37.0`을 따로 지정한다.
 
+**wait와 override area (분류 (a), 보완하지 않음).** bionic writer는 override
+area의 serial을 바꾸지만 그 word에 `FUTEX_WAKE`를 보내지 않는다.
+- `Update`는 override entry의 serial과 override area의 global serial에
+  store한다(`android-vts-17.0_r1` `system_properties.cpp:339`, `:347`,
+  `:356-358`). `__futex_wake`는 primary의 `&pi->serial`(`:351`)과
+  `serial_pa->serial()`(`:360`)에만 호출한다. `Add`도 override area의 serial을
+  올린 뒤(`:419-422`) primary serial에만 wake를 보낸다(`:439`).
+  `android-16.0.0_r4`도 같다(`:328-337`, `:397-416`). 이 구조는 처음 들어온
+  commit `b8c87b14b`(2023-08-28)부터 같고, commit message와 test에는 wait에
+  대한 언급이 없다. 의도적으로 생략했는지는 확인 필요다.
+- shared futex의 key는 mapping한 file의 inode와 offset이다. bind mount된
+  namespace의 reader는 override file(실측 inode 765)에서 기다리고, writer는
+  primary file(inode 411)을 깨운다. 따라서 그 reader는 wake를 받지 않는다.
+- 영향 범위: API 35–36에서 zygote가 bind mount한 process, 즉 DeviceConfig
+  `app_compat` / `appcompat_sysprop_override_pkgs` 목록에 오른 app이다.
+  API 37 zygote는 bind mount를 하지 않으므로 reader가 primary file에서
+  기다린다.
+- 실측(API 36, `unshare -m`과 `mount -o rprivate none /` 뒤 bind mount, 1 s
+  뒤 `setprop`): bionic `__system_property_wait(NULL, .., 5 s)`는 5.000 s 뒤
+  `false`를 반환했다(namespace 밖에서는 1.003 s에 `true`). 이 crate의 sync
+  global serial 대기도 5 s 뒤 timeout을 반환했다. 측정 당시의 호출은
+  `wait_timeout(None, .., 5 s)`였고, 지금은 같은 경로(`wait_word`의 global
+  분기)를 `AreaWatcher::wait_for_change_timeout`이 쓴다.
+
+이 crate는 이 동작을 보완하지 않는다. bionic의 wait와 같은 조건이고, 보완하려면
+모든 process의 global serial 대기에 timed slice를 넣거나 mountinfo로 override
+namespace를 판정해야 한다. 그 비용을 위 범위의 process를 위해 모든 process에
+지우지 않는다. 결과는 다음과 같다.
+- global serial 대기(sync `AreaWatcher`, `wait_for_creation`, async wait의
+  process-wide reader)는 wake가 오는 다음 변경에서 반환한다. timeout이 있으면
+  timeout에 `Ok(false)`(`wait_for_creation_timeout`은 `Ok(None)`)를 반환한다.
+- per-property sync 대기는 `LOCK_SLICE`(100 ms)마다 다시 비교하므로 실측에서
+  96.8 ms에 감지했다. process-wide reader가 아닌 instance의 async wait는
+  waiter slice(1 s)마다 다시 비교한다. 두 slice는 lock 해제와 thread 종료를
+  위한 것이고, 이 감지는 부수 효과이므로 보장하지 않는다.
+
 ### C4. `WaitForProperty` / `WaitForPropertyCreation`
 
 **AOSP** (`libbase/properties.cpp:246-292`).
@@ -292,27 +328,52 @@ override가 켜진 프로세스에서는 같은 property에 대해 libc
 **rsproperties.** serial 단위 `wait`만 있다. 같은 동작을 사용자가 직접
 조합해야 한다.
 
-**변경.** `SystemProperties::wait_for_creation(name, timeout)`과
-`wait_for_value(name, expected, timeout)`를 추가한다. timeout은
-`Option<Duration>`이며 `None`은 무기한이다.
-- `wait_for_creation`은 `Ok(Some(PropertyIndex))`를 반환한다. libbase는
+**변경.** `SystemProperties::wait_for_creation(name)`과
+`wait_for_value(name, expected)`를 추가한다. timeout이 있는 형태는
+`wait_for_creation_timeout(name, timeout)`과
+`wait_for_value_timeout(name, expected, timeout)`이고, `timeout`은
+`Duration`이다. libbase는 `timeout`의 기본값이
+`std::chrono::milliseconds::max()`이고(`properties.h:63`, `:70`), 이 값을
+`time_t` 최대값으로 자른 timespec으로 넘긴다(`properties.cpp:228`). 그래서
+기본값 호출은 기한 없이 기다린다. 이 crate는 기한 없는 대기를 timeout 인자가
+없는 method로 나눴다.
+`Option<Duration>` 인자 하나로 두면 `None`으로 호출해도 결과 type에 timeout
+case(`None` / `false`)가 남아, 호출자가 일어날 수 없는 분기를 처리해야 한다.
+- `wait_for_creation`은 `Ok(PropertyIndex)`를 반환한다
+  (`wait_for_creation_timeout`은 `Ok(Some(PropertyIndex))`). libbase는
   `bool`을 반환하지만, index를 돌려주면 호출자가 `find`를 다시 하지 않아도
-  된다.
+  된다. `wait_for_value`는 `Ok(())`, `wait_for_value_timeout`은 `Ok(bool)`을
+  반환한다.
 - libbase는 timeout과 futex 실패를 구분하지 않는다. 이 crate는 futex 실패와
   lookup 실패를 `Err`로 반환하고, timeout만 `Ok(None)` / `Ok(false)`로
-  반환한다(b). `wait`도 같은 형태로 바꾼다. timeout은 `Option<Duration>`이고
-  결과는 `Result<Option<u32>>`다. bionic `__system_property_wait`의 `bool`도
+  반환한다(b). `wait`도 같은 형태로 바꾼다. `wait(index, old_serial)`은
+  `Result<u32>`를, `wait_timeout(index, old_serial, timeout)`은
+  `Result<Option<u32>>`를 반환한다. bionic `__system_property_wait`의 `bool`도
   실패를 timeout과 구분하지 않는다.
+- `_timeout` method의 `timeout`은 호출 전체에 적용된다. libbase처럼 시작
+  시각부터 잰 deadline 하나로 생성 대기와 값 대기를 함께 제한한다.
+  `Duration::ZERO`면 기다리지 않고 현재 상태만 확인한다.
 - `wait`의 `old_serial`은 bionic `__system_property_wait`와 같이 필수
   인자(`u32`)다. 0.6.0은 `Option<u32>`였고 `None`이면 `wait` 안에서 현재
   serial을 읽었으므로, 호출 전에 일어난 변경은 반환하지 않았다. bionic에는
   이 형태가 없다.
 - bionic이 deprecated로 둔 `__system_property_wait_any(old_serial)`
   (`system_properties.h:125`)은 `Wait(nullptr, old_serial, &new_serial,
-  nullptr)`다. 대응하던 `wait_any()`는 삭제했고, `wait(None, old_serial,
-  None)`이 같은 호출이다. 이때 `old_serial`은 `area_serial()`
-  (`__system_property_area_serial`, `system_properties.h:150`)에서 얻는다.
-  0.6.0의 `wait_any()`는 인자가 없어 bionic 함수와 signature가 달랐다.
+  nullptr)`다. 대응하던 `wait_any()`는 삭제했다. 0.6.0의 `wait_any()`는
+  인자가 없어 bionic 함수와 signature가 달랐다.
+- global serial 대기(`__system_property_wait(NULL, ..)`)는 `wait`의 형태로
+  두지 않고 `watch_area()`가 돌려주는 `AreaWatcher`로만 제공한다. `wait`의
+  `index`는 `Option`이 아닌 `PropertyIndex`다. AOSP에서 global serial로
+  기다리는 호출은 libbase `WaitForPropertyCreation`(`properties.cpp:255-262`)
+  하나였고, 이 함수는 serial `0`에서 시작해 직전 wait가 돌려준 serial을 다시
+  넘긴다. 즉 현재 serial부터 기다리는 loop이고, `AreaWatcher`가 그 serial을
+  대신 보관한다. 저장해 둔 `__system_property_area_serial()`을 쓰는 곳
+  (libbase `CachedProperty`, bionic `private/CachedProperty.h`, liblog
+  `properties.cpp`)은 기다리지 않고 비교만 하며, 이 용도에는 `area_serial()`이
+  남는다. 포기한 것은 임의의 serial에서 global 대기를 시작하는 호출이다.
+  local checkout(bionic, system/core, system/libbase, system/logging,
+  frameworks/native, hardware/interfaces)에서는 그런 호출을 찾지 못했다.
+  frameworks/base와 vendor code는 확인 필요다.
 - 값 비교는 byte 단위로 한다. 값이 UTF-8이 아니면 `expected`와 같지 않은
   것으로 보고 계속 기다린다.
 
@@ -414,11 +475,14 @@ version을 env var나 기본값으로만 골랐다.
 출력했다.
 
 **변경.** `SystemProperties::watch(name) -> PropertyWatcher<'_>`를 추가한다.
-`value()`가 `Get`에, `wait_for_change(timeout)`이 `WaitForChange`에 대응한다.
+`value()`가 `Get`에, `wait_for_change()`와
+`wait_for_change_timeout(timeout)`이 `WaitForChange`에 대응한다. timeout을
+나눈 이유는 C4와 같다.
 - `value()`의 반환 타입은 `Result<Option<&str>>`이고, property가 없으면
   `Ok(None)`이다(b). libbase `Get`은 property가 없을 때 빈 문자열을 반환하므로
   호출자가 빈 값과 부재를 구분하지 못한다.
-- `wait_for_change`의 반환 타입은 `Result<bool>`이다. timeout은 `Ok(false)`,
+- `wait_for_change`의 반환 타입은 `Result<()>`이고,
+  `wait_for_change_timeout`은 `Result<bool>`이다. timeout은 `Ok(false)`,
   lookup 실패와 futex 실패는 `Err`다(b, C4와 같은 규칙).
 - update 1회를 변경 1회로 보고한다(b). writer는 dirty serial, 값, clean serial
   순서로 store하고 futex wake는 clean store 뒤에 한다. `__system_property_wait`는
@@ -911,8 +975,9 @@ fd에 쓴 뒤 fd를 닫는다.
   들어간 뒤에는 connection task가 끝난 상태이므로 `CLIENT_TIMEOUT`(10 s)이
   적용되지 않고, 그 요청은 connection permit(`MAX_CONCURRENT_CLIENTS` = 64)도
   차지하지 않는다. bionic client와 Android의 `rsproperties` client는 응답이 올
-  때까지 기다린다. 그 밖의 target에서 `rsproperties` client는 2 s 뒤
-  `TimedOut`을 반환한다(`system_property_set.rs` `RESPONSE_TIMEOUT`). client가
+  때까지 기다린다. 그 밖의 target에서 `rsproperties::set`은 2 s 뒤
+  `TimedOut`을 반환하고(`system_property_set.rs` `RESPONSE_TIMEOUT`),
+  `asynchronous::set`(`tokio` feature)은 상한 없이 기다린다. client가
   socket을 닫은 요청도 handler에 전달되고, 그 요청의 응답만 버려진다. init도
   client가 socket을 닫은 control message를 처리한다.
 - blocking thread 사용량. handler 호출이 차지하는 blocking thread는 queue
