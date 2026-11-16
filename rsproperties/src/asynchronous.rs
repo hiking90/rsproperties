@@ -66,12 +66,11 @@ use std::task::Poll;
 
 use crate::area_watcher::AreaChangeWait;
 use crate::errors::*;
-use crate::property_area::SerialWord;
 use crate::property_watcher::ChangeWait;
 use crate::wait_step::{
     CleanSerialWait, CreationWait, SerialWait, Step, ValueWait, WaitOn, WaitStep,
 };
-use crate::waiter::{Until, Waiter};
+use crate::waiter::Waiter;
 use crate::PropertyIndex;
 
 /// [`crate::set`] without blocking the thread on the property service:
@@ -287,35 +286,23 @@ impl PropertyWatcher<'_> {
 /// waits from, so the waiter wakes it only once the word has moved. When
 /// the second check waits from another value (the word moved in between),
 /// the registration is renewed with it and checked again. A wait on the
-/// global serial is woken on every change and needs no renewal.
+/// global serial is woken on every change and needs no renewal. `waiter`
+/// is the waiter of `wait.props()`; registering on a property fails
+/// otherwise ([`crate::waiter::Registration::register_property`]).
 async fn drive<S: WaitStep>(waiter: &Waiter, mut wait: S) -> Result<S::Output> {
     let mut registration = waiter.registration();
-    // The word of the last property waited on, looked up once per index.
-    let mut word: Option<(PropertyIndex, SerialWord)> = None;
     poll_fn(|cx| {
         let mut next = match wait.step()? {
             Step::Done(out) => return Poll::Ready(Ok(out)),
             Step::Wait(w) => w,
         };
         loop {
-            let until = match next.on {
-                WaitOn::Global => None,
+            let registered = match next.on {
+                WaitOn::Global => registration.register(cx.waker(), None),
                 WaitOn::Property(index) => {
-                    let found = match word {
-                        Some((at, found)) if at == index => found,
-                        _ => {
-                            let found = wait.props().serial_word_ref(index)?;
-                            word = Some((index, found));
-                            found
-                        }
-                    };
-                    Some(Until {
-                        word: found,
-                        old: next.old,
-                    })
+                    registration.register_property(cx.waker(), wait.props(), index, next.old)
                 }
             };
-            let registered = registration.register(cx.waker(), until);
             match wait.name() {
                 Some(name) => {
                     registered.with_context_location(|| format!("waiting for property {name:?}"))?
@@ -324,7 +311,7 @@ async fn drive<S: WaitStep>(waiter: &Waiter, mut wait: S) -> Result<S::Output> {
             }
             match wait.step()? {
                 Step::Done(out) => return Poll::Ready(Ok(out)),
-                Step::Wait(w) if w == next || until.is_none() => return Poll::Pending,
+                Step::Wait(w) if w == next || next.on == WaitOn::Global => return Poll::Pending,
                 Step::Wait(w) => next = w,
             }
         }
@@ -333,7 +320,8 @@ async fn drive<S: WaitStep>(waiter: &Waiter, mut wait: S) -> Result<S::Output> {
 }
 
 /// Fails the build when a wait's future stops being `Send`: a future of
-/// the process-wide reader must be able to go to `tokio::spawn`.
+/// the process-wide reader must be able to go to `tokio::spawn`. `Sync`
+/// too, for storage that requires it.
 #[allow(dead_code)]
 fn futures_are_send(
     props: &'static SystemProperties,
@@ -341,7 +329,7 @@ fn futures_are_send(
     watcher: &'static mut PropertyWatcher<'static>,
     area: &'static mut AreaWatcher<'static>,
 ) {
-    fn send<T: Send>(_: T) {}
+    fn send<T: Send + Sync>(_: T) {}
     send(props.serial(index));
     send(props.wait(index, 0));
     send(props.wait_for_creation(""));
@@ -650,21 +638,50 @@ mod tests {
     /// word of the instance's mapping. Dropping the instance empties the
     /// registry before it unmaps, so the waiter thread, still running for
     /// up to a slice, loads no word of the gone mapping on the next change.
+    /// The load count is the oracle, not a fault: the freed range may be
+    /// mapped again by then.
     #[test]
     fn leaked_future_outlived_by_no_word_load() {
+        const ATTEMPTS: u32 = 3;
         let mut fx = Fixture::new("async_leak");
         fx.sp.add("debug.rsp.leak", "0").unwrap();
-        let sync = reader(&fx);
-        let index = sync.find("debug.rsp.leak").unwrap().unwrap();
-        let mut leaked = Box::pin(sync.as_async().wait(index, sync.serial(index).unwrap()));
-        assert!(Poller::new().poll(leaked.as_mut()).is_pending());
-        std::mem::forget(leaked);
-        assert_eq!(sync.waiter().registered(), 1);
-        drop(sync);
+        for attempt in 1..=ATTEMPTS {
+            let sync = reader(&fx);
+            let index = sync.find("debug.rsp.leak").unwrap().unwrap();
+            let mut leaked = Box::pin(sync.as_async().wait(index, sync.serial(index).unwrap()));
+            assert!(Poller::new().poll(leaked.as_mut()).is_pending());
+            std::mem::forget(leaked);
+            assert_eq!(sync.waiter().registered(), 1);
+            let probe = sync.waiter().probe();
+            drop(sync);
 
-        fx.sp.set("debug.rsp.leak", "1").unwrap();
-        // The thread wakes on that change and checks the registry.
-        std::thread::sleep(Duration::from_millis(100));
+            fx.sp.set("debug.rsp.leak", &attempt.to_string()).unwrap();
+            let changed = fx.sp.area_serial();
+            // The thread wakes on that change, checks the registry, then
+            // sees the stop flag and ends. It ends without the check when
+            // the slice it was in at the drop ran out before the change:
+            // nothing was checked, so that attempt is run again.
+            // `ended` is read first: once the thread has ended, `handled`
+            // read after it is final, so a change handled just before the
+            // end is not taken for an attempt without the check.
+            let start = std::time::Instant::now();
+            loop {
+                let ended = probe.thread_ended();
+                if probe.handled().is_some_and(|s| s >= changed) {
+                    assert_eq!(probe.word_loads(), 0);
+                    return;
+                }
+                if ended {
+                    break;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "the thread neither handled the change nor ended"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        panic!("the thread ended before the change in all {ATTEMPTS} attempts");
     }
 
     /// `as_async` and `as_sync` are views of one instance: same address,

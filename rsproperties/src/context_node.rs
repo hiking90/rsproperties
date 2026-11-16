@@ -11,6 +11,8 @@ use std::sync::{RwLock, RwLockReadGuard};
 use log::error;
 
 use crate::errors::*;
+#[cfg(feature = "builder")]
+use crate::property_area::EntryOffset;
 use crate::property_area::PropertyAreaMap;
 
 pub(crate) struct ContextNode {
@@ -28,6 +30,13 @@ pub(crate) struct ContextNode {
     /// `*Guard` types below skip the `expect()` runtime panic. The
     /// invariant is enforced by keeping the field private and only
     /// exposing it through this module's API.
+    ///
+    /// Rule: a `PropertyAreaMap` once stored here is neither replaced nor
+    /// dropped until the node drops, so its mapping lives as long as the
+    /// `SystemProperties` instance. The async waiter loads serial words of
+    /// that mapping after the node's lock is released (`SerialWord`,
+    /// `SystemProperties::serial_word_ref`, waiter.rs); replacing the value
+    /// would unmap a word the waiter thread still loads.
     property_area: RwLock<Option<PropertyAreaMap>>,
     /// `foreach` was denied opening this area; it does not try again. See
     /// [`Self::property_area_for_foreach`].
@@ -160,7 +169,7 @@ impl ContextNode {
         // Never lazily initialize here: the only mapping this path could
         // create is a read-only one (`new_ro`), and handing out a mut
         // guard over a PROT_READ mapping would SIGSEGV on first write.
-        // Writable areas are opened eagerly by `ContextsSerialized::new`
+        // Writable areas are opened eagerly by `ContextsSerialized::new_rw`
         // via `open()`. Also reject a map that exists but is read-only
         // (e.g. lazily created by the *read* path before this call) — the
         // borrow-level guard must never wrap a PROT_READ mapping.
@@ -249,9 +258,47 @@ impl<'a> PropertyAreaMutGuard<'a> {
         Self { guard }
     }
 
-    pub(crate) fn property_area_mut(&mut self) -> &mut PropertyAreaMap {
-        self.guard.as_mut().expect(
+    /// The node's area, to write through. Returns [`PropertyAreaMut`], not
+    /// `&mut PropertyAreaMap`, so the caller cannot replace the value
+    /// (`*pa = …`, `mem::replace`, `mem::swap`): see the rule on
+    /// `ContextNode::property_area`.
+    pub(crate) fn property_area_mut(&mut self) -> PropertyAreaMut<'_> {
+        PropertyAreaMut(self.guard.as_mut().expect(
             "PropertyAreaMutGuard constructed only from Some(...); see ContextNode invariant",
-        )
+        ))
+    }
+}
+
+/// Write access to a node's area that cannot replace it (rule on
+/// `ContextNode::property_area`). Reads go through `Deref`; the writes that
+/// need `&mut PropertyAreaMap` are forwarded. The `&mut` stays in a private
+/// field, so no code outside this module can name it.
+#[cfg(feature = "builder")]
+pub(crate) struct PropertyAreaMut<'g>(&'g mut PropertyAreaMap);
+
+#[cfg(feature = "builder")]
+impl std::ops::Deref for PropertyAreaMut<'_> {
+    type Target = PropertyAreaMap;
+
+    fn deref(&self) -> &PropertyAreaMap {
+        self.0
+    }
+}
+
+#[cfg(feature = "builder")]
+impl PropertyAreaMut<'_> {
+    /// [`PropertyAreaMap::add`].
+    pub(crate) fn add(&mut self, name: &str, value: &str) -> Result<()> {
+        self.0.add(name, value)
+    }
+
+    /// [`PropertyAreaMap::backup_and_apply_write`].
+    pub(crate) fn backup_and_apply_write(
+        &mut self,
+        pi_offset: EntryOffset,
+        backup: &[u8],
+        value: &str,
+    ) -> Result<()> {
+        self.0.backup_and_apply_write(pi_offset, backup, value)
     }
 }

@@ -979,7 +979,7 @@ impl SystemProperties {
                 return Err(e);
             }
         };
-        let pa = res.property_area_mut();
+        let mut pa = res.property_area_mut();
 
         // Inspect through `&pi` first: validate ro., snapshot backup into a
         // stack buffer. `pi` borrow is dropped at the end of this block so
@@ -1104,7 +1104,7 @@ impl SystemProperties {
                 return Err(e);
             }
         };
-        let pa = res.0.property_area_mut();
+        let mut pa = res.0.property_area_mut();
 
         match pa.add(name, value) {
             Ok(_) => {}
@@ -1231,7 +1231,8 @@ impl SystemProperties {
     /// The serial word of the property at `idx`, for the async waiter to
     /// read after the node's lock is released. Its mapping stays as long
     /// as this instance: a context node's area, once mapped, is never
-    /// replaced or unmapped before the instance drops (context_node.rs).
+    /// replaced or unmapped before the instance drops (the rule on the
+    /// `ContextNode::property_area` field, context_node.rs).
     pub(crate) fn serial_word_ref(&self, idx: PropertyIndex) -> Result<SerialWord> {
         self.check_index(idx)?;
         let guard = self.contexts.prop_area_with_index(idx.context_index)?;

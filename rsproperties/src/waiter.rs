@@ -16,12 +16,16 @@
 //!   global serial, so the load after the global change sees it. Waits on
 //!   the global serial (creation, an area watcher) are woken on every
 //!   change.
-//! - The thread loads those words only under the registry mutex. An entry
-//!   there belongs to a registration that has not been dropped, whose
-//!   future borrows the instance, so the instance and its mappings are
-//!   alive. A future leaked with `mem::forget` leaves its entry behind;
-//!   dropping the [`Waiter`] empties the registry, and the instance drops
-//!   its waiter before its mappings.
+//! - The thread loads those words only under the registry mutex. Each was
+//!   registered by [`Registration::register_property`], which takes it from
+//!   the instance that owns this waiter and refuses another instance; no
+//!   code outside this module can build an [`Until`]. An entry there
+//!   belongs to a registration that has not been dropped, whose future
+//!   borrows the instance, so the instance and its mappings are alive: a
+//!   context node's area stays mapped until the instance drops (the
+//!   `property_area` field rule in context_node.rs). A future leaked with
+//!   `mem::forget` leaves its entry behind; dropping the [`Waiter`] empties
+//!   the registry, and the instance drops its waiter before its mappings.
 //!
 //! - The thread starts at the first [`Registration::register`]. A spawn
 //!   failure is that call's `Err`, and the next call tries again.
@@ -68,7 +72,8 @@ use crate::property_area::load_acquire;
 use crate::property_area::{PropertyAreaMap, SerialWord};
 #[cfg(target_os = "macos")]
 use crate::system_properties::no_futex;
-use crate::system_properties::{futex_wait, Deadline};
+use crate::system_properties::{futex_wait, Deadline, SystemProperties};
+use crate::PropertyIndex;
 
 /// How long one futex wait of the thread lasts, for a waiter that can be
 /// dropped: it bounds the thread's exit after the drop. A writer that
@@ -101,14 +106,33 @@ struct Registry {
     /// The serial the thread was started from.
     #[cfg(test)]
     started_from: Option<u32>,
+    /// `SerialWord` loads by [`Entry::due`], counted before each load.
+    #[cfg(test)]
+    word_loads: usize,
+    /// The global serial of the last change the thread finished waking
+    /// for.
+    #[cfg(test)]
+    handled: Option<u32>,
 }
 
 /// The condition of a wait on one property's serial: woken once `word`
-/// differs from `old`, a value the wait has just read from it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// differs from `old`, a value the wait has just read from it. Built only
+/// by [`Registration::register_property`]: the fields are private to this
+/// module, so no word of another mapping reaches the registry.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Until {
-    pub(crate) word: SerialWord,
-    pub(crate) old: u32,
+    word: SerialWord,
+    old: u32,
+}
+
+// Manual impl so the word's address is never printed (the `MemoryMap`
+// Debug policy in property_area.rs).
+impl std::fmt::Debug for Until {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Until")
+            .field("old", &self.old)
+            .finish_non_exhaustive()
+    }
 }
 
 struct Entry {
@@ -125,8 +149,10 @@ impl Entry {
         match self.until {
             None => true,
             // SAFETY: the registry is locked, so this entry's registration
-            // or the waiter is alive, and with it the instance that maps
-            // the word (module docs).
+            // or the waiter is alive, and with it the instance that owns
+            // the waiter. `register_property`, the only place an `Until` is
+            // built, took the word from that instance, whose areas stay
+            // mapped until it drops (module docs).
             Some(Until { word, old }) => old != unsafe { word.load() },
         }
     }
@@ -158,6 +184,11 @@ impl Shared {
         let mut registry = self.lock();
         let mut at = 0;
         while at < registry.wakers.len() {
+            // `due` loads the entry's word exactly when it has an `Until`.
+            #[cfg(test)]
+            if registry.wakers[at].until.is_some() {
+                registry.word_loads += 1;
+            }
             if registry.wakers[at].due() {
                 spare.push(registry.wakers.swap_remove(at));
             } else {
@@ -232,6 +263,7 @@ impl Waiter {
         Registration {
             waiter: self,
             id: None,
+            word: None,
         }
     }
 
@@ -260,6 +292,41 @@ impl Waiter {
     #[cfg(all(test, feature = "builder", target_os = "linux"))]
     fn before_first_wait(&self, hook: impl FnOnce() + Send + 'static) {
         *self.shared.before_first_wait.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(all(test, feature = "builder", target_os = "linux"))]
+    pub(crate) fn probe(&self) -> Probe {
+        Probe(Arc::clone(&self.shared))
+    }
+}
+
+/// What the thread has done, readable after the [`Waiter`] is dropped: it
+/// holds a share of the state the thread works on.
+#[cfg(all(test, feature = "builder", target_os = "linux"))]
+pub(crate) struct Probe(Arc<Shared>);
+
+#[cfg(all(test, feature = "builder", target_os = "linux"))]
+impl Probe {
+    /// The `SerialWord` loads the thread has made.
+    pub(crate) fn word_loads(&self) -> usize {
+        self.0.lock().word_loads
+    }
+
+    /// The global serial of the last change the thread finished waking
+    /// for.
+    pub(crate) fn handled(&self) -> Option<u32> {
+        self.0.lock().handled
+    }
+
+    /// Whether the thread has ended, once the waiter is dropped: then the
+    /// thread's share is the only other one. After `true`, the other
+    /// methods read what the thread last wrote.
+    pub(crate) fn thread_ended(&self) -> bool {
+        let ended = Arc::strong_count(&self.0) == 1;
+        // `strong_count` is a relaxed load. The thread released its share
+        // with a release decrement; this fence orders the reads after it.
+        std::sync::atomic::fence(Ordering::Acquire);
+        ended
     }
 }
 
@@ -292,6 +359,10 @@ fn run(serial: &PropertyAreaMap, shared: &Shared, mut last: u32, slice: Option<D
             Ok(Some(new)) => {
                 last = new;
                 shared.wake_due(&mut spare);
+                #[cfg(test)]
+                {
+                    shared.lock().handled = Some(new);
+                }
             }
             // Slice expired. `last` is not read again: a change after the
             // expiry makes the next futex call return at once (`EAGAIN`).
@@ -311,6 +382,9 @@ fn run(serial: &PropertyAreaMap, shared: &Shared, mut last: u32, slice: Option<D
 pub(crate) struct Registration<'w> {
     waiter: &'w Waiter,
     id: Option<u64>,
+    /// The serial word of the last property registered on, looked up once
+    /// per index.
+    word: Option<(PropertyIndex, SerialWord)>,
 }
 
 impl Registration<'_> {
@@ -321,9 +395,8 @@ impl Registration<'_> {
     /// again after this returns: a change before the registration has no
     /// wake.
     ///
-    /// `until.word` must be a word of the instance that owns this waiter
-    /// (`SystemProperties::serial_word_ref`): the thread loads it as long
-    /// as the entry is registered.
+    /// Outside this module `until` is `None`: an [`Until`] is built only by
+    /// [`Self::register_property`].
     ///
     /// Fails when the thread cannot be started (tried again on the next
     /// call), after the thread ended on a futex error, and on macOS (no
@@ -376,6 +449,43 @@ impl Registration<'_> {
             }
             Ok(())
         }
+    }
+
+    /// [`Self::register`] with the condition that the serial of the
+    /// property at `index` differs from `old`. The thread loads that word
+    /// as long as the entry is registered, so it is taken here from
+    /// `props`, and only when `props` owns this waiter: that instance drops
+    /// the waiter, and with it the entry, before it unmaps the word (module
+    /// docs).
+    ///
+    /// Fails as [`Self::register`] does, when `props` is not the instance
+    /// that owns this waiter, and when `index` is not one of its
+    /// properties.
+    pub(crate) fn register_property(
+        &mut self,
+        waker: &Waker,
+        props: &SystemProperties,
+        index: PropertyIndex,
+        old: u32,
+    ) -> Result<()> {
+        // Both references are live, so equal addresses are one `Waiter`:
+        // the field of `props`.
+        if !std::ptr::eq(props.waiter(), self.waiter) {
+            return Err(Error::InvalidArgument(
+                "the property waiter belongs to a different SystemProperties instance".into(),
+            ));
+        }
+        // The cache holds a word of `props` only: every call checks the
+        // pairing above against the same waiter.
+        let word = match self.word {
+            Some((at, word)) if at == index => word,
+            _ => {
+                let word = props.serial_word_ref(index)?;
+                self.word = Some((index, word));
+                word
+            }
+        };
+        self.register(waker, Some(Until { word, old }))
     }
 }
 
@@ -738,5 +848,36 @@ mod tests {
         // Not a requirement, but a race that never lands after the start
         // tests nothing; report it instead of passing silently.
         println!("{checked} of 100 rounds changed after the thread started");
+    }
+
+    /// A property registration takes its word only from the instance that
+    /// owns the waiter: a word of another instance, on its waiter or on one
+    /// no instance owns, is refused and nothing is registered.
+    #[test]
+    fn property_registration_needs_the_owning_instance() {
+        let mut fx = Fixture::new("waiter_owner");
+        fx.sp.add("debug.rsp.owner", "0").unwrap();
+        let owner = reader(&fx);
+        let other = reader(&fx);
+        let index = other.find("debug.rsp.owner").unwrap().unwrap();
+        let old = other.serial(index).unwrap();
+        let (_, waker) = Flag::waker();
+
+        let mut registration = owner.waiter().registration();
+        let got = registration.register_property(&waker, &other, index, old);
+        assert!(matches!(got, Err(Error::InvalidArgument(_))));
+        assert_eq!(owner.waiter().registered(), 0);
+
+        let standalone = Waiter::with_slice(Fixture::serial_area_of(&other), LONG);
+        let mut registration = standalone.registration();
+        let got = registration.register_property(&waker, &other, index, old);
+        assert!(matches!(got, Err(Error::InvalidArgument(_))));
+        assert_eq!(standalone.registered(), 0);
+
+        let mut registration = other.waiter().registration();
+        registration
+            .register_property(&waker, &other, index, old)
+            .unwrap();
+        assert_eq!(other.waiter().registered(), 1);
     }
 }
