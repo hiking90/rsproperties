@@ -23,7 +23,9 @@
 //! - **One thread per instance.** A futex has no fd an executor could
 //!   poll, so the first wait of an instance that has to block starts a
 //!   thread that waits on the global serial — every add and update moves
-//!   it — and wakes the waiting futures, which check their own condition
+//!   it. On a change it wakes a wait on one property's serial only once
+//!   that serial has moved, and the waits on the global serial (creation,
+//!   an area watcher) every time; a woken future checks its own condition
 //!   again. A wait that is already satisfied returns on its first poll and
 //!   starts nothing. The thread of the process-wide instance runs until
 //!   the process exits; another instance's thread ends within about a
@@ -64,9 +66,12 @@ use std::task::Poll;
 
 use crate::area_watcher::AreaChangeWait;
 use crate::errors::*;
+use crate::property_area::SerialWord;
 use crate::property_watcher::ChangeWait;
-use crate::wait_step::{CleanSerialWait, CreationWait, SerialWait, Step, ValueWait, WaitStep};
-use crate::waiter::Waiter;
+use crate::wait_step::{
+    CleanSerialWait, CreationWait, SerialWait, Step, ValueWait, WaitOn, WaitStep,
+};
+use crate::waiter::{Until, Waiter};
 use crate::PropertyIndex;
 
 /// [`crate::set`] without blocking the thread on the property service:
@@ -277,22 +282,51 @@ impl PropertyWatcher<'_> {
 /// satisfied returns before the registry is touched; the second check
 /// covers a change between the first one and the registration, whose
 /// wake went to the futures registered before.
+///
+/// A wait on one property's serial registers that word and the value it
+/// waits from, so the waiter wakes it only once the word has moved. When
+/// the second check waits from another value (the word moved in between),
+/// the registration is renewed with it and checked again. A wait on the
+/// global serial is woken on every change and needs no renewal.
 async fn drive<S: WaitStep>(waiter: &Waiter, mut wait: S) -> Result<S::Output> {
     let mut registration = waiter.registration();
+    // The word of the last property waited on, looked up once per index.
+    let mut word: Option<(PropertyIndex, SerialWord)> = None;
     poll_fn(|cx| {
-        if let Step::Done(out) = wait.step()? {
-            return Poll::Ready(Ok(out));
-        }
-        let registered = registration.register(cx.waker());
-        match wait.name() {
-            Some(name) => {
-                registered.with_context_location(|| format!("waiting for property {name:?}"))?
+        let mut next = match wait.step()? {
+            Step::Done(out) => return Poll::Ready(Ok(out)),
+            Step::Wait(w) => w,
+        };
+        loop {
+            let until = match next.on {
+                WaitOn::Global => None,
+                WaitOn::Property(index) => {
+                    let found = match word {
+                        Some((at, found)) if at == index => found,
+                        _ => {
+                            let found = wait.props().serial_word_ref(index)?;
+                            word = Some((index, found));
+                            found
+                        }
+                    };
+                    Some(Until {
+                        word: found,
+                        old: next.old,
+                    })
+                }
+            };
+            let registered = registration.register(cx.waker(), until);
+            match wait.name() {
+                Some(name) => {
+                    registered.with_context_location(|| format!("waiting for property {name:?}"))?
+                }
+                None => registered?,
             }
-            None => registered?,
-        }
-        match wait.step()? {
-            Step::Done(out) => Poll::Ready(Ok(out)),
-            Step::Wait(_) => Poll::Pending,
+            match wait.step()? {
+                Step::Done(out) => return Poll::Ready(Ok(out)),
+                Step::Wait(w) if w == next || until.is_none() => return Poll::Pending,
+                Step::Wait(w) => next = w,
+            }
         }
     })
     .await
@@ -556,6 +590,81 @@ mod tests {
         let got = poller.poll(pin!(area.wait_for_change()));
         assert!(matches!(got, Poll::Ready(Ok(()))));
         assert_ne!(area.serial(), before);
+    }
+
+    /// A change to another property wakes no wait on a property's serial:
+    /// the waiter loads each registered word and wakes only the waits
+    /// whose word moved. A wait on the other property, woken by the same
+    /// change, shows the waiter has handled it.
+    #[test]
+    fn other_property_change_wakes_no_property_wait() {
+        let mut fx = Fixture::new("async_filter");
+        fx.sp.add("debug.rsp.filter.a", "0").unwrap();
+        fx.sp.add("debug.rsp.filter.b", "0").unwrap();
+        let sync = reader(&fx);
+        let props = sync.as_async();
+        let a = sync.find("debug.rsp.filter.a").unwrap().unwrap();
+        let b = sync.find("debug.rsp.filter.b").unwrap().unwrap();
+
+        let by_index = Poller::new();
+        let mut wait_a = pin!(props.wait(a, sync.serial(a).unwrap()));
+        assert!(by_index.poll(wait_a.as_mut()).is_pending());
+        let by_value = Poller::new();
+        let mut value_a = pin!(props.wait_for_value("debug.rsp.filter.a", "1"));
+        assert!(by_value.poll(value_a.as_mut()).is_pending());
+        let by_watcher = Poller::new();
+        let mut watcher = props.watch("debug.rsp.filter.a");
+        assert_eq!(watcher.value().unwrap(), Some("0"));
+        let mut change_a = pin!(watcher.wait_for_change());
+        assert!(by_watcher.poll(change_a.as_mut()).is_pending());
+        let sentinel = Poller::new();
+        let mut wait_b = pin!(props.wait(b, sync.serial(b).unwrap()));
+        assert!(sentinel.poll(wait_b.as_mut()).is_pending());
+
+        fx.sp.set("debug.rsp.filter.b", "1").unwrap();
+        assert!(sentinel.woken());
+        // The waiter wakes in one pass; give a wrong wake time to land.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(by_index.wakes(), 0);
+        assert_eq!(by_value.wakes(), 0);
+        assert_eq!(by_watcher.wakes(), 0);
+        assert_eq!(sync.waiter().registered(), 3, "a's waits stay registered");
+
+        fx.sp.set("debug.rsp.filter.a", "1").unwrap();
+        assert!(by_index.woken());
+        assert!(by_value.woken());
+        assert!(by_watcher.woken());
+        let new = sync.serial(a).unwrap();
+        assert!(matches!(by_index.poll(wait_a.as_mut()), Poll::Ready(Ok(s)) if s == new));
+        assert!(matches!(
+            by_value.poll(value_a.as_mut()),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            by_watcher.poll(change_a.as_mut()),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    /// A future leaked while registered leaves its entry, holding a serial
+    /// word of the instance's mapping. Dropping the instance empties the
+    /// registry before it unmaps, so the waiter thread, still running for
+    /// up to a slice, loads no word of the gone mapping on the next change.
+    #[test]
+    fn leaked_future_outlived_by_no_word_load() {
+        let mut fx = Fixture::new("async_leak");
+        fx.sp.add("debug.rsp.leak", "0").unwrap();
+        let sync = reader(&fx);
+        let index = sync.find("debug.rsp.leak").unwrap().unwrap();
+        let mut leaked = Box::pin(sync.as_async().wait(index, sync.serial(index).unwrap()));
+        assert!(Poller::new().poll(leaked.as_mut()).is_pending());
+        std::mem::forget(leaked);
+        assert_eq!(sync.waiter().registered(), 1);
+        drop(sync);
+
+        fx.sp.set("debug.rsp.leak", "1").unwrap();
+        // The thread wakes on that change and checks the registry.
+        std::thread::sleep(Duration::from_millis(100));
     }
 
     /// `as_async` and `as_sync` are views of one instance: same address,

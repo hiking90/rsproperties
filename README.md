@@ -23,7 +23,7 @@ and was compared with `getprop` on an API 37 emulator.
 
 - **Complete Android Properties Implementation**: Full Rust implementation of Android's property system - read, write, and monitor properties exactly like Android native code
 - **Cross-Platform Compatibility**: Works seamlessly on both Android devices and Linux systems without modification
-- **Pure Rust Solution**: No dependencies on Android's C libraries or JNI - everything implemented in Rust (`unsafe` is limited to the mmap / shared-memory layer and the `repr(transparent)` reference cast behind `as_async`)
+- **Pure Rust Solution**: No dependencies on Android's C libraries or JNI - everything implemented in Rust (`unsafe` is limited to the mmap / shared-memory layer, the `repr(transparent)` reference cast behind `as_async`, and the async waiter's load of a registered serial word)
 - **Real-time Property Monitoring**: Watch for property changes in real-time, enabling reactive applications
 - **High Performance**: Optimized for speed with direct memory access and zero-copy operations
 - **Drop-in Replacement**: Compatible with Android's property naming conventions and value constraints
@@ -218,8 +218,9 @@ async fn follow() -> rsproperties::Result<()> {
 
 A futex has no fd an executor could poll, so the first async wait of an
 instance that has to block starts one thread for that instance. It waits on
-the global serial and wakes the waiting futures; a wait whose condition
-already holds returns on its first poll and starts nothing.
+the global serial and, on a change, wakes the waits whose property's serial
+moved, and every wait for a creation or on an area watcher; a wait whose
+condition already holds returns on its first poll and starts nothing.
 `SystemProperties::as_async()` gives the async view of any instance.
 
 With the `tokio` feature, `asynchronous::set` sets a property without

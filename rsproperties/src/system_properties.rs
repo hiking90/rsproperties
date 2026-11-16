@@ -17,7 +17,7 @@ use crate::contexts_serialized::ContextsSerialized;
 // through `load_acquire` (`Relaxed` load + `fence(Acquire)`),
 // property_area.rs [R-RO].
 use crate::area_watcher::AreaWatcher;
-use crate::property_area::{load_acquire, EntryOffset};
+use crate::property_area::{load_acquire, EntryOffset, SerialWord};
 use crate::property_watcher::PropertyWatcher;
 use crate::wait_step::{drive, CreationWait, SerialWait, ValueWait, WaitOn};
 use crate::waiter::Waiter;
@@ -275,6 +275,12 @@ pub struct PropertyIndex {
 /// and `SystemProperties::new_area_locked` create the areas and return the
 /// writer instance.
 pub struct SystemProperties {
+    /// Wake source of this instance's async waits. Its thread starts at
+    /// the first async wait that has to block. Declared before `contexts`
+    /// so it is dropped first: its registry holds serial words of
+    /// `contexts`' mappings, and dropping it empties the registry before
+    /// they are unmapped (waiter.rs).
+    waiter: Waiter,
     contexts: ContextsSerialized,
     /// Unique per instance; recorded in every `PropertyIndex` it returns.
     instance: u64,
@@ -284,9 +290,6 @@ pub struct SystemProperties {
     /// `Init`; writer instances look up names as given, like bionic's
     /// `AreaInit`.
     appcompat_override: bool,
-    /// Wake source of this instance's async waits. Its thread starts at
-    /// the first async wait that has to block.
-    waiter: Waiter,
 }
 
 /// Prints the instance id and the lookup mode only: no property name or
@@ -1223,6 +1226,17 @@ impl SystemProperties {
         let guard = self.contexts.prop_area_with_index(idx.context_index)?;
         let pi = guard.property_area().property_info(idx.property_index)?;
         Ok(load_acquire(&pi.serial))
+    }
+
+    /// The serial word of the property at `idx`, for the async waiter to
+    /// read after the node's lock is released. Its mapping stays as long
+    /// as this instance: a context node's area, once mapped, is never
+    /// replaced or unmapped before the instance drops (context_node.rs).
+    pub(crate) fn serial_word_ref(&self, idx: PropertyIndex) -> Result<SerialWord> {
+        self.check_index(idx)?;
+        let guard = self.contexts.prop_area_with_index(idx.context_index)?;
+        let pi = guard.property_area().property_info(idx.property_index)?;
+        Ok(SerialWord::new(&pi.serial))
     }
 
     /// Waits until the property at `index` changes and returns its new

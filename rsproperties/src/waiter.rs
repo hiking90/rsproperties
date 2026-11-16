@@ -5,9 +5,23 @@
 //!
 //! A futex has no fd, so a runtime cannot poll it. A [`Waiter`] runs one
 //! thread per `SystemProperties` instance that waits on the global serial —
-//! every add and update moves it — and wakes every registered [`Waker`] when
-//! it changes. The thread reports only that something changed; each future
-//! checks its own condition again when it is polled.
+//! every add and update moves it — and, when it changes, wakes the
+//! registered [`Waker`]s the change may concern. Each future checks its own
+//! condition again when it is polled.
+//!
+//! - A registration that waits on one property's serial records that word
+//!   and the value it waits from ([`Until`]). On a change the thread loads
+//!   the word and wakes the future only when it differs; the others stay
+//!   registered. A writer stores the property's serial before it moves the
+//!   global serial, so the load after the global change sees it. Waits on
+//!   the global serial (creation, an area watcher) are woken on every
+//!   change.
+//! - The thread loads those words only under the registry mutex. An entry
+//!   there belongs to a registration that has not been dropped, whose
+//!   future borrows the instance, so the instance and its mappings are
+//!   alive. A future leaked with `mem::forget` leaves its entry behind;
+//!   dropping the [`Waiter`] empties the registry, and the instance drops
+//!   its waiter before its mappings.
 //!
 //! - The thread starts at the first [`Registration::register`]. A spawn
 //!   failure is that call's `Err`, and the next call tries again.
@@ -27,9 +41,10 @@
 //!   future without a wake while `register` still returned `Ok`. With
 //!   `panic = "abort"` (this workspace's `android-release` profile) the
 //!   panic aborts the process instead.
-//! - Dropping the [`Waiter`] sets a stop flag that the thread checks each
-//!   time its timed futex wait returns. `Drop` does not join, so the thread
-//!   and the mapping outlive the instance by at most one slice.
+//! - Dropping the [`Waiter`] empties the registry and sets a stop flag that
+//!   the thread checks each time its timed futex wait returns. `Drop` does
+//!   not join, so the thread and the `properties_serial` mapping outlive the
+//!   instance by at most one slice.
 //! - The process-wide reader is never dropped, so its thread has no stop
 //!   flag to check and waits without a slice ([`Waiter::never_dropped`]):
 //!   it wakes only on a writer's `FUTEX_WAKE`, as bionic's waits do. A
@@ -50,7 +65,7 @@ use std::time::Duration;
 use crate::errors::*;
 #[cfg(not(target_os = "macos"))]
 use crate::property_area::load_acquire;
-use crate::property_area::PropertyAreaMap;
+use crate::property_area::{PropertyAreaMap, SerialWord};
 #[cfg(target_os = "macos")]
 use crate::system_properties::no_futex;
 use crate::system_properties::{futex_wait, Deadline};
@@ -81,11 +96,40 @@ struct Registry {
     thread: Thread,
     /// One entry per registration that has not been woken since it last
     /// registered.
-    wakers: Vec<(u64, Waker)>,
+    wakers: Vec<Entry>,
     next_id: u64,
     /// The serial the thread was started from.
     #[cfg(test)]
     started_from: Option<u32>,
+}
+
+/// The condition of a wait on one property's serial: woken once `word`
+/// differs from `old`, a value the wait has just read from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Until {
+    pub(crate) word: SerialWord,
+    pub(crate) old: u32,
+}
+
+struct Entry {
+    id: u64,
+    waker: Waker,
+    /// `None`: woken on every change.
+    until: Option<Until>,
+}
+
+impl Entry {
+    /// Whether the change the thread just saw may concern this entry.
+    /// Called with the registry locked (module docs).
+    fn due(&self) -> bool {
+        match self.until {
+            None => true,
+            // SAFETY: the registry is locked, so this entry's registration
+            // or the waiter is alive, and with it the instance that maps
+            // the word (module docs).
+            Some(Until { word, old }) => old != unsafe { word.load() },
+        }
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -105,18 +149,28 @@ impl Shared {
         self.registry.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Wakes every registered waker. The list is swapped with `spare`
-    /// under the lock and woken after it, so a woken future that registers
-    /// again does not wait for the others' `wake`, and both vectors keep
-    /// their capacity: no allocation per change once they have grown.
-    fn wake_all(&self, spare: &mut Vec<(u64, Waker)>) {
-        std::mem::swap(&mut self.lock().wakers, spare);
-        for (_, waker) in spare.drain(..) {
-            wake(waker);
+    /// Wakes the registered wakers the change may concern ([`Entry::due`]).
+    /// They are moved to `spare` under the lock and woken after it, so a
+    /// woken future that registers again does not wait for the others'
+    /// `wake`, and both vectors keep their capacity: no allocation per
+    /// change once they have grown.
+    fn wake_due(&self, spare: &mut Vec<Entry>) {
+        let mut registry = self.lock();
+        let mut at = 0;
+        while at < registry.wakers.len() {
+            if registry.wakers[at].due() {
+                spare.push(registry.wakers.swap_remove(at));
+            } else {
+                at += 1;
+            }
+        }
+        drop(registry);
+        for entry in spare.drain(..) {
+            wake(entry.waker);
         }
     }
 
-    fn fail(&self, error: &Error, spare: &mut Vec<(u64, Waker)>) {
+    fn fail(&self, error: &Error, spare: &mut Vec<Entry>) {
         let errno = match error {
             Error::Io(e) => e.raw_os_error(),
             _ => None,
@@ -126,8 +180,8 @@ impl Shared {
         registry.thread = Thread::Failed(errno);
         std::mem::swap(&mut registry.wakers, spare);
         drop(registry);
-        for (_, waker) in spare.drain(..) {
-            wake(waker);
+        for entry in spare.drain(..) {
+            wake(entry.waker);
         }
     }
 }
@@ -210,13 +264,19 @@ impl Waiter {
 }
 
 impl Drop for Waiter {
+    /// Empties the registry, so the thread loads no serial word of the
+    /// instance's mappings after this (module docs). The wakers are dropped
+    /// after the lock is released.
     fn drop(&mut self) {
+        let entries = std::mem::take(&mut self.shared.lock().wakers);
         self.shared.stop.store(true, Ordering::Relaxed);
+        drop(entries);
     }
 }
 
 /// The thread: waits on the global serial from `last` — in timed slices,
-/// or untimed when `slice` is `None` — and wakes everyone on each change.
+/// or untimed when `slice` is `None` — and wakes the due entries on each
+/// change.
 fn run(serial: &PropertyAreaMap, shared: &Shared, mut last: u32, slice: Option<Duration>) {
     #[cfg(test)]
     if let Some(hook) = shared.before_first_wait.lock().unwrap().take() {
@@ -227,10 +287,11 @@ fn run(serial: &PropertyAreaMap, shared: &Shared, mut last: u32, slice: Option<D
     loop {
         match futex_wait(word, last, &Deadline::after(slice)) {
             // `last` is updated only together with a wake: a future that
-            // registered before this change is in the list being woken.
+            // registered before this change is in the list being checked,
+            // and one this change does not concern stays registered.
             Ok(Some(new)) => {
                 last = new;
-                shared.wake_all(&mut spare);
+                shared.wake_due(&mut spare);
             }
             // Slice expired. `last` is not read again: a change after the
             // expiry makes the next futex call return at once (`EAGAIN`).
@@ -254,17 +315,23 @@ pub(crate) struct Registration<'w> {
 
 impl Registration<'_> {
     /// Registers `waker` to be woken at the next change of the global
-    /// serial, replacing the one registered before, and starts the thread
-    /// if it is not running. The caller checks its condition again after
-    /// this returns: a change before the registration has no wake.
+    /// serial — with `until`, at the next one after which its word differs
+    /// from its `old` — replacing what was registered before, and starts
+    /// the thread if it is not running. The caller checks its condition
+    /// again after this returns: a change before the registration has no
+    /// wake.
+    ///
+    /// `until.word` must be a word of the instance that owns this waiter
+    /// (`SystemProperties::serial_word_ref`): the thread loads it as long
+    /// as the entry is registered.
     ///
     /// Fails when the thread cannot be started (tried again on the next
     /// call), after the thread ended on a futex error, and on macOS (no
     /// futex).
-    pub(crate) fn register(&mut self, waker: &Waker) -> Result<()> {
+    pub(crate) fn register(&mut self, waker: &Waker, until: Option<Until>) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
-            let _ = waker;
+            let _ = (waker, until);
             return Err(no_futex());
         }
         #[cfg(not(target_os = "macos"))]
@@ -294,13 +361,18 @@ impl Registration<'_> {
                 registry.next_id += 1;
                 id
             });
-            match registry.wakers.iter_mut().find(|(i, _)| *i == id) {
-                Some((_, registered)) => {
-                    if !registered.will_wake(waker) {
-                        *registered = waker.clone();
+            match registry.wakers.iter_mut().find(|entry| entry.id == id) {
+                Some(entry) => {
+                    if !entry.waker.will_wake(waker) {
+                        entry.waker = waker.clone();
                     }
+                    entry.until = until;
                 }
-                None => registry.wakers.push((id, waker.clone())),
+                None => registry.wakers.push(Entry {
+                    id,
+                    waker: waker.clone(),
+                    until,
+                }),
             }
             Ok(())
         }
@@ -313,7 +385,7 @@ impl Drop for Registration<'_> {
             return;
         };
         let mut registry = self.waiter.shared.lock();
-        if let Some(at) = registry.wakers.iter().position(|(i, _)| *i == id) {
+        if let Some(at) = registry.wakers.iter().position(|entry| entry.id == id) {
             registry.wakers.swap_remove(at);
         }
     }
@@ -385,7 +457,7 @@ mod tests {
         let waiter = Waiter::with_slice(Fixture::serial_area_of(&reader), Duration::from_secs(60));
         let (flag, waker) = Flag::waker();
         let mut registration = waiter.registration();
-        registration.register(&waker).unwrap();
+        registration.register(&waker, None).unwrap();
         assert_eq!(waiter.registered(), 1);
 
         fx.sp.add("debug.rsp.waiter", "1").unwrap();
@@ -408,7 +480,7 @@ mod tests {
         });
         let (flag, waker) = Flag::waker();
         let mut registration = waiter.registration();
-        registration.register(&waker).unwrap();
+        registration.register(&waker, None).unwrap();
 
         fx.sp.add("debug.rsp.r1", "1").unwrap();
         release.send(()).unwrap();
@@ -425,7 +497,7 @@ mod tests {
         let waiter = Waiter::with_slice(Fixture::serial_area_of(&reader), slice);
         let (flag, waker) = Flag::waker();
         let mut registration = waiter.registration();
-        registration.register(&waker).unwrap();
+        registration.register(&waker, None).unwrap();
 
         let start = Instant::now();
         fx.bump_global_serial();
@@ -450,7 +522,7 @@ mod tests {
         });
         let (flag, waker) = Flag::waker();
         let mut registration = waiter.registration();
-        registration.register(&waker).unwrap();
+        registration.register(&waker, None).unwrap();
 
         // A change before the thread is in `FUTEX_WAIT` is seen by the
         // kernel's comparison on entry (R1), so wait until it sleeps.
@@ -495,10 +567,10 @@ mod tests {
         let (_, second_waker) = Flag::waker();
         let mut first = waiter.registration();
         let mut second = waiter.registration();
-        first.register(&first_waker).unwrap();
-        first.register(&first_waker).unwrap();
-        first.register(&second_waker).unwrap();
-        second.register(&second_waker).unwrap();
+        first.register(&first_waker, None).unwrap();
+        first.register(&first_waker, None).unwrap();
+        first.register(&second_waker, None).unwrap();
+        second.register(&second_waker, None).unwrap();
         assert_eq!(waiter.registered(), 2);
         drop(first);
         assert_eq!(waiter.registered(), 1);
@@ -508,7 +580,8 @@ mod tests {
         drop(waiter.registration());
     }
 
-    /// One change wakes every registered waker, each once.
+    /// One change wakes every waker registered without a condition, each
+    /// once.
     #[test]
     fn one_change_wakes_all() {
         let mut fx = Fixture::new("waiter_many");
@@ -517,7 +590,7 @@ mod tests {
         let flags: Vec<_> = (0..100).map(|_| Flag::waker()).collect();
         let mut registrations: Vec<_> = flags.iter().map(|_| waiter.registration()).collect();
         for (registration, (_, waker)) in registrations.iter_mut().zip(&flags) {
-            registration.register(waker).unwrap();
+            registration.register(waker, None).unwrap();
         }
         fx.sp.add("debug.rsp.many", "1").unwrap();
         for (flag, _) in &flags {
@@ -547,13 +620,13 @@ mod tests {
         let (flag, waker) = Flag::waker();
         let mut first = waiter.registration();
         let mut second = waiter.registration();
-        first.register(&panics).unwrap();
-        second.register(&waker).unwrap();
+        first.register(&panics, None).unwrap();
+        second.register(&waker, None).unwrap();
 
         fx.sp.add("debug.rsp.panic", "1").unwrap();
         assert!(flag.woken_within(LONG));
 
-        second.register(&waker).unwrap();
+        second.register(&waker, None).unwrap();
         fx.sp.add("debug.rsp.panic.next", "1").unwrap();
         let start = Instant::now();
         while flag.wakes() < 2 {
@@ -592,13 +665,13 @@ mod tests {
         let (flag, waker) = Flag::waker();
         let mut first = waiter.registration();
         let mut second = waiter.registration();
-        first.register(&panics).unwrap();
-        second.register(&waker).unwrap();
+        first.register(&panics, None).unwrap();
+        second.register(&waker, None).unwrap();
 
         fx.sp.add("debug.rsp.payload", "1").unwrap();
         assert!(flag.woken_within(LONG));
 
-        second.register(&waker).unwrap();
+        second.register(&waker, None).unwrap();
         fx.sp.add("debug.rsp.payload.next", "1").unwrap();
         let start = Instant::now();
         while flag.wakes() < 2 {
@@ -619,7 +692,7 @@ mod tests {
         let waiter = Waiter::with_slice(Arc::clone(&serial), slice);
         let (_, waker) = Flag::waker();
         let mut registration = waiter.registration();
-        registration.register(&waker).unwrap();
+        registration.register(&waker, None).unwrap();
         // The waiter's share and the thread's.
         assert_eq!(Arc::strong_count(&serial), before + 2);
         drop(registration);
@@ -655,7 +728,7 @@ mod tests {
                     sp.set("debug.rsp.race", &round.to_string()).unwrap();
                 });
                 start.wait();
-                registration.register(&waker).unwrap();
+                registration.register(&waker, None).unwrap();
             });
             if waiter.started_from() != Some(reader.area_serial()) {
                 assert!(flag.woken_within(LONG), "round {round}");

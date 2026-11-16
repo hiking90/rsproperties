@@ -65,9 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancel the wait. The futures are `Send` and use only the waker, so they
   run on any executor. A futex has no fd to poll, so the first wait of
   an instance that has to block starts one thread per instance; it
-  futex-waits on the global serial and wakes the registered futures,
-  which check their condition again; a waker whose `wake` panics does
-  not stop the thread (with `panic = "unwind"`). A wait already
+  futex-waits on the global serial and, on a change, wakes the waits
+  whose property's serial moved and every wait on the global serial
+  (creation, area watchers), which check their condition again; a waker
+  whose `wake` panics does not stop the thread (with
+  `panic = "unwind"`). A wait already
   satisfied returns on its first poll and starts no thread. The
   process-wide reader's thread runs until the process exits; another
   instance's thread ends within about a second of the instance's drop.

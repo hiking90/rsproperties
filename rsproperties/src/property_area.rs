@@ -227,6 +227,35 @@ pub(crate) fn load_acquire(word: &AtomicU32) -> u32 {
     value
 }
 
+/// A property's `serial` word, kept past the borrow of the mapping that
+/// holds it: the async waiter reads it to decide which registered future a
+/// change concerns (waiter.rs). The holder answers for the mapping
+/// outliving every [`Self::load`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SerialWord(std::ptr::NonNull<AtomicU32>);
+
+// SAFETY: the pointer names an `AtomicU32` in a shared mapping, which any
+// thread may load ([SM1]); `load` is the only access.
+unsafe impl Send for SerialWord {}
+
+impl SerialWord {
+    pub(crate) fn new(word: &AtomicU32) -> Self {
+        Self(std::ptr::NonNull::from(word))
+    }
+
+    /// [`load_acquire`] of the word.
+    ///
+    /// # Safety
+    ///
+    /// The mapping the word was taken from is still mapped.
+    pub(crate) unsafe fn load(self) -> u32 {
+        // SAFETY: the caller keeps the mapping, so the pointer is to a live
+        // `AtomicU32` ([SM1]); a `Relaxed` load is defined on a `PROT_READ`
+        // mapping ([R-RO]).
+        load_acquire(unsafe { self.0.as_ref() })
+    }
+}
+
 /// Marker for types that may be materialized in-place from property-area
 /// mmap bytes via `MemoryMap::to_object` / `MemoryMap::to_object_mut`.
 ///
