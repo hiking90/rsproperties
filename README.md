@@ -46,7 +46,8 @@ bionic does.
 [crates.io](https://crates.io/crates/rsproperties-service) ·
 [docs.rs](https://docs.rs/rsproperties-service)
 
-A Linux emulation of Android's property service, as a tokio daemon. It
+A Linux emulation of Android's property service, as a library: a host
+binary calls `run` on a tokio runtime and passes the handlers. It
 creates the property areas from `property_contexts` and build.prop files,
 and serves the property service sockets, so `rsproperties` clients can
 `get`, `set` and wait on a Linux host. It handles the V2 set command

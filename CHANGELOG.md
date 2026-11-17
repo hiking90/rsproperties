@@ -909,6 +909,11 @@ Service (`rsproperties-service`; until this release a git dependency only):
   commands (`cargo run -p … --example … -- …`), building and testing. The
   API descriptions and examples it repeated from `rsproperties/README.md`,
   which had drifted apart, are now only in the crate READMEs.
+- The READMEs describe `rsproperties-service` as a library that a host
+  binary runs on tokio (it has no binary target), not as a daemon. Its
+  crates.io categories are `os::linux-apis` and
+  `development-tools::testing` instead of the workspace's
+  `api-bindings`.
 - `rsproperties/README.md` corrections: reads are allocation-free, not
   zero-copy (short values are copied to a stack buffer); `add` leaves an
   existing name unchanged and `update` / `set` refuse a `ro.` property
