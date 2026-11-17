@@ -438,7 +438,7 @@ fn main() -> rsproperties::Result<()> {
 - **Full Emulation**: Complete Android property system emulation
 - **Socket Communication**: Unix domain socket property setting
 - **Memory Mapping**: Efficient memory-mapped property storage
-- **Property Service**: Use with `rsproperties-service` ([crates.io](https://crates.io/crates/rsproperties-service)) for full daemon functionality
+- **Property Service**: Use with `rsproperties-service` ([crates.io](https://crates.io/crates/rsproperties-service)) to run the property service on a Linux host
 
 ## API Reference
 
@@ -842,8 +842,8 @@ cargo run --example setprop debug.my_app.test true
 
 - **[`rsproperties-service`](https://crates.io/crates/rsproperties-service)**
   ([docs](https://docs.rs/rsproperties-service)) - Linux emulation of the
-  Android property service (async daemon; Linux only, not usable on
-  Android):
+  Android property service (a library that a host binary runs on tokio;
+  Linux only, not usable on Android):
 
   ```toml
   [dependencies]

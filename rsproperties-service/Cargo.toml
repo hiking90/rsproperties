@@ -9,7 +9,8 @@ repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/rsproperties-service"
 keywords.workspace = true
-categories.workspace = true
+# Not the workspace's "api-bindings": the service binds no foreign API.
+categories = ["os::linux-apis", "development-tools::testing"]
 description = "Linux emulation of the Android system property service (not usable on Android)"
 
 # The service builds on Linux only.

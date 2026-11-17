@@ -1,6 +1,6 @@
 # rsproperties-service
 
-Linux emulation of the Android system property service: a tokio-based daemon that serves the property socket protocol and the property area files on a Linux host. It is not usable on Android, where init owns the property service, and compiles only for Linux; use the `rsproperties` client crate on Android.
+Linux emulation of the Android system property service, as a library: a host binary calls `run` on a tokio runtime, and the service creates the property area files and serves the property socket protocol on a Linux host. It is not usable on Android, where init owns the property service, and compiles only for Linux; use the `rsproperties` client crate on Android.
 
 [![Crates.io](https://img.shields.io/crates/v/rsproperties-service.svg)](https://crates.io/crates/rsproperties-service)
 [![Documentation](https://docs.rs/rsproperties-service/badge.svg)](https://docs.rs/rsproperties-service)

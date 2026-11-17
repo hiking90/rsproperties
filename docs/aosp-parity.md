@@ -26,23 +26,23 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
 
 | # | 영역 | 항목 | 분류 | 상태 |
 |---|------|------|------|------|
-| C1 | client | property 전체 열거(`__system_property_foreach`) | (d) | 이 branch에서 추가 |
-| C2 | client | index로 name·value·serial 읽기(`__system_property_read_callback`) | (d) | 이 branch에서 추가 |
-| C3 | client | appcompat override 조회(API 35+) | (c) | 이 branch에서 수정 |
-| C4 | client | `WaitForProperty` / `WaitForPropertyCreation` | (d) | 이 branch에서 추가 |
-| C5 | client | `GetBoolProperty` / `GetIntProperty` 파싱 규칙 | (d), (c) | 이 branch에서 추가 |
-| C6 | client | global reader 초기화 실패를 process 수명 동안 유지 | (c), 재시도 방식은 (a) | 이 branch에서 수정 |
-| C7 | client | 한 property의 값 cache와 변경 대기(`CachedProperty`) | (d) | 이 branch에서 추가 |
-| S1 | service | `persist.*` / `next_boot.*` 영속화 | (d) | 이 branch에서 추가 |
-| S2 | service | property type 검사(`CheckType`) | (c) | 이 branch에서 수정. build.prop 값의 `${...}` 확장도 수정했고, 참조를 load 중인 map에서 찾는 점, 확장 결과의 64 KiB 상한, 호출 하나의 확장 값 합계 4 MiB 상한은 (b) |
-| S3 | service | `ctl.*`를 일반 property로 저장 | (c) | 저장은 이 branch에서 수정. handler 호출 순서와 미응답 요청 한도(102)는 init main loop와 같게 구현. 응답은 host가 `ControlReply`로 보내며, init이 fd를 control message와 함께 넘기는 구조와 같다. shutdown 중 `ctl.stop` 응답은 `PowerctlOutcome::ShuttingDown` 또는 `ServiceHandle::stop_handler_calls`로 init과 같아진다. 둘 다 없이 종료하면 거부((b)) |
-| S4 | service | 실패 응답 코드가 항상 `PROP_ERROR` | (c) | 이 branch에서 수정 |
-| S5 | service | `ro.property_service.version` 미설정 | (c) | 이 branch에서 수정 |
+| C1 | client | property 전체 열거(`__system_property_foreach`) | (d) | 0.7.0에서 추가 |
+| C2 | client | index로 name·value·serial 읽기(`__system_property_read_callback`) | (d) | 0.7.0에서 추가 |
+| C3 | client | appcompat override 조회(API 35+) | (c) | 0.7.0에서 수정 |
+| C4 | client | `WaitForProperty` / `WaitForPropertyCreation` | (d) | 0.7.0에서 추가 |
+| C5 | client | `GetBoolProperty` / `GetIntProperty` 파싱 규칙 | (d), (c) | 0.7.0에서 추가 |
+| C6 | client | global reader 초기화 실패를 process 수명 동안 유지 | (c), 재시도 방식은 (a) | 0.7.0에서 수정 |
+| C7 | client | 한 property의 값 cache와 변경 대기(`CachedProperty`) | (d) | 0.7.0에서 추가 |
+| S1 | service | `persist.*` / `next_boot.*` 영속화 | (d) | 0.7.0에서 추가 |
+| S2 | service | property type 검사(`CheckType`) | (c) | 0.7.0에서 수정. build.prop 값의 `${...}` 확장도 수정했고, 참조를 load 중인 map에서 찾는 점, 확장 결과의 64 KiB 상한, 호출 하나의 확장 값 합계 4 MiB 상한은 (b) |
+| S3 | service | `ctl.*`를 일반 property로 저장 | (c) | 저장은 0.7.0에서 수정. handler 호출 순서와 미응답 요청 한도(102)는 init main loop와 같게 구현. 응답은 host가 `ControlReply`로 보내며, init이 fd를 control message와 함께 넘기는 구조와 같다. shutdown 중 `ctl.stop` 응답은 `PowerctlOutcome::ShuttingDown` 또는 `ServiceHandle::stop_handler_calls`로 init과 같아진다. 둘 다 없이 종료하면 거부((b)) |
+| S4 | service | 실패 응답 코드가 항상 `PROP_ERROR` | (c) | 0.7.0에서 수정 |
+| S5 | service | `ro.property_service.version` 미설정 | (c) | 0.7.0에서 수정 |
 | S6 | service | 변경 알림 hook 없음 | (a) | 검토 대상 아님 |
-| S7 | service | properties dir writer lock(`AreaWriterLock`) | (a), 해제 방식은 (b) | lock은 0.6.0부터 있음, 해제 방식은 이 branch에서 수정 |
-| S8 | service, builder | prop 파일을 읽지 못했을 때의 반환값 | open 실패로 시작 실패는 (b) | 시작 실패는 0.6.0부터 있음, skip 반환값은 이 branch에서 추가 |
-| S9 | service | V1(`PROP_MSG_SETPROP`) 미지원 | (b), owner 지시 | 이 branch에서 변경(0.5.0–0.6.0은 V1을 처리했다) |
-| S10 | service | `sys.powerctl`을 일반 property로 저장 | (c), 종료 뒤 거부는 (b) | 이 branch에서 수정. 저장하지 않고 `ServiceOptions::powerctl_handler`로 전달. 대기 command는 init과 같이 하나만 유지 |
+| S7 | service | properties dir writer lock(`AreaWriterLock`) | (a), 해제 방식은 (b) | lock은 0.6.0부터 있음, 해제 방식은 0.7.0에서 수정 |
+| S8 | service, builder | prop 파일을 읽지 못했을 때의 반환값 | open 실패로 시작 실패는 (b) | 시작 실패는 0.6.0부터 있음, skip 반환값은 0.7.0에서 추가 |
+| S9 | service | V1(`PROP_MSG_SETPROP`) 미지원 | (b), owner 지시 | 0.7.0에서 변경(0.5.0–0.6.0은 V1을 처리했다) |
+| S10 | service | `sys.powerctl`을 일반 property로 저장 | (c), 종료 뒤 거부는 (b) | 0.7.0에서 수정. 저장하지 않고 `ServiceOptions::powerctl_handler`로 전달. 대기 command는 init과 같이 하나만 유지 |
 
 ## Client
 
@@ -515,8 +515,9 @@ version을 env var나 기본값으로만 골랐다.
 
 ## Service (Linux)
 
-각 절의 `**변경 전(main).**` 문단은 이 branch 이전(main) 상태를 적는다. 그
-문단이 인용하는 rsproperties 줄 번호는 main 기준이다.
+각 절의 `**변경 전(main).**` 문단은 이 문서를 쓸 때의 main, 즉 commit
+`088cb83`(v0.6.0 뒤 PR #54, #55를 merge한 시점)의 상태를 적는다. 그 문단이
+인용하는 rsproperties 줄 번호도 `088cb83` 기준이다.
 
 ### S1. `persist.*` / `next_boot.*` 영속화 — (d)
 
@@ -1135,8 +1136,8 @@ timeout으로 실패를 응답하면, host가 이미 실행한 action에 실패 
 시점에도 응답을 기다리는 client가 남아 있을 수 있다.
 
 handler가 `bool`을 반환하는 형태(`Fn(&ControlMessage) -> bool`)는 제거했다.
-이 형태는 0.6.0에 없었고 이 branch에서만 존재했다. 반환값으로 응답하면 응답
-시점이 handler 호출의 반환 시점으로 고정되므로, host가 다른 task에서 처리한
+이 형태는 0.6.0에 없었고 0.7.0 개발 중에만 존재했다(release에는 포함되지
+않았다). 반환값으로 응답하면 응답 시점이 handler 호출의 반환 시점으로 고정되므로, host가 다른 task에서 처리한
 결과를 응답하려면 handler 호출 안에서 그 결과를 기다려야 하고 그동안 뒤의
 요청이 전달되지 않는다.
 
@@ -1336,8 +1337,9 @@ partition별 파일은 반환값을 읽지 않거나, `.ok()`로 legacy 경로�
   점이며 (b)로 분류한다. init의 경로 목록에는 기기 구성에 따라 없는 partition
   파일이 들어 있지만, `build_prop_files`는 호출자가 직접 지정한 경로다.
 - group 또는 other write bit가 있는 파일은 읽지 않고
-  `Ok(PropFileOutcome::SkippedWritable { mode })`를 반환한다. 이 branch
-  이전에는 `Ok(())`였고, 읽은 경우와 구분할 수단은 `warn` log뿐이었다.
+  `Ok(PropFileOutcome::SkippedWritable { mode })`를 반환한다. `088cb83`에서는
+  `Ok(())`였고(0.6.0은 이 file을 skip하지 않고 읽었다), 읽은 경우와 구분할
+  수단은 `warn` log뿐이었다.
   umask 002로 checkout한 저장소의 파일은 mode가 0664여서 이 경우에 해당한다.
   이 crate의 test는 그래서 `tests/android/*.prop`의 0644 사본을 만들어
   load한다(`copy_fixture_0644`).
