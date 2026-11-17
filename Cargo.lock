@@ -804,7 +804,7 @@ dependencies = [
 
 [[package]]
 name = "rsproperties"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "android_system_properties",
  "anyhow",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "rsproperties-service"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -834,7 +834,6 @@ dependencies = [
  "rsactor",
  "rsproperties",
  "rustix",
- "thiserror",
  "tokio",
  "tokio-stream",
 ]

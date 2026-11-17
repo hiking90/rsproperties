@@ -2,9 +2,9 @@
 
 [![Crates.io](https://img.shields.io/crates/v/rsproperties.svg)](https://crates.io/crates/rsproperties)
 [![Documentation](https://docs.rs/rsproperties/badge.svg)](https://docs.rs/rsproperties)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/hiking90/rsproperties/blob/main/LICENSE)
 
-A pure Rust implementation of Android's property system, providing cross-platform access to Android system properties on both Linux and Android platforms.
+A pure Rust implementation of Android's property system: access to Android system properties on Linux and Android.
 
 ## Supported Android Versions
 
@@ -14,16 +14,20 @@ and was compared with `getprop` on an API 37 emulator.
 
 ## Features
 
-- **Complete Android Properties Implementation**: Full Rust implementation of Android's property system - read, write, and monitor properties exactly like Android native code
-- **Cross-Platform Compatibility**: Works seamlessly on both Android devices and Linux systems without modification
+- **Complete Android Properties Implementation**: Full Rust implementation of Android's property system - read, write, and monitor properties with bionic's semantics; where an API differs from bionic, its entry below says how
+- **Linux and Android**: The same client API on Android devices and Linux hosts
 - **Pure Rust Solution**: No dependencies on Android's C libraries or JNI - everything implemented in Rust (`unsafe` is limited to the mmap / shared-memory layer, the `repr(transparent)` reference cast behind `as_async`, and the async waiter's load of a registered serial word)
 - **Real-time Property Monitoring**: Watch for property changes in real-time, enabling reactive applications
-- **High Performance**: Optimized for speed with direct memory access and zero-copy operations
+- **High Performance**: Reads map the property areas directly and allocate nothing on the heap (`read_with`): a short value is copied to a stack buffer, a long `ro.` value is read in place from the mmap
 - **Drop-in Replacement**: Compatible with Android's property naming conventions and value constraints
-- **Linux Emulation**: Full Android property system emulation on Linux for development and testing
+- **Linux Emulation**: With the `builder` feature and `rsproperties-service`, the Android property system on a Linux host for development and testing
 - **Thread-Safe Design**: Safe to use across multiple threads without external synchronization
 
 ## Quick Start
+
+`rsproperties` requires Rust 1.85 or newer. Upgrading from 0.6: see
+[Migration from 0.6.0](https://github.com/hiking90/rsproperties/blob/main/CHANGELOG.md#migration-from-060)
+in the changelog.
 
 Add `rsproperties` to your `Cargo.toml`:
 
@@ -90,8 +94,9 @@ fn main() -> rsproperties::Result<()> {
 ```
 
 Each directory is set once per process: by `init`, or by its first use,
-which latches the default (a property read latches the properties dir, a
-`set()` or `socket_dir()` call the socket dir). `init` succeeds when each
+which latches the default (a property read or a `properties_dir()` call
+latches the properties dir, a `set()` or `socket_dir()` call the socket
+dir). `init` succeeds when each
 directory it names is unset or already holds that same path, and fails
 with `Error::AlreadyInitialized` when one holds a different path — then
 it changes neither. Directories absent from the config are left
@@ -217,17 +222,19 @@ async fn follow() -> rsproperties::Result<()> {
 ```
 
 A futex has no fd an executor could poll, so the first async wait of an
-instance that has to block starts one thread for that instance. It waits on
-the global serial and, on a change, wakes the waits whose property's serial
-moved, and every wait for a creation or on an area watcher; a wait whose
-condition already holds returns on its first poll and starts nothing.
-`SystemProperties::as_async()` gives the async view of any instance. See
-the `asynchronous` module docs for where the return conditions differ from
-the blocking waits.
+instance that has to block starts one thread for that instance; a wait
+whose condition already holds returns on its first poll and starts
+nothing.
+`SystemProperties::as_async()` gives the async view of any instance. What
+the thread wakes, how it ends, and where the return conditions differ
+from the blocking waits are listed in the API Reference under
+"`rsproperties::asynchronous`".
 
 ### Setting Properties
 
-Setting properties requires a running property service (like `rsproperties-service`):
+Setting properties requires a running property service: init on Android,
+[`rsproperties-service`](https://crates.io/crates/rsproperties-service) on
+Linux.
 
 ```rust,no_run
 fn main() -> rsproperties::Result<()> {
@@ -240,14 +247,27 @@ fn main() -> rsproperties::Result<()> {
     rsproperties::set("debug.my_app.log_level", "verbose")?;
     rsproperties::set("debug.my_app.port", 8080)?;
 
+    // Vendor and custom application properties
+    rsproperties::set("vendor.my_app.hw_config", "v2")?;
+    rsproperties::set("my.company.app.version", "1.2.3")?;
+
     // Set system properties (may require elevated permissions)
     rsproperties::set("sys.my_service.ready", 1)?;
+    rsproperties::set("sys.my_service.pid", std::process::id())?;
 
-    // Set persistent properties (survive reboots on Android)
+    // Set persistent properties: kept across reboots on Android, and by
+    // `rsproperties-service` when it is given a persistent properties file
     rsproperties::set("persist.my_app.config", "production")?;
     Ok(())
 }
 ```
+
+`set` sends its request with `send(MSG_NOSIGNAL)`, as does
+`asynchronous::set`: a socket the service has already closed is an
+`Error::Io` of kind `BrokenPipe`, never a `SIGPIPE`. This matters for a
+host that keeps `SIGPIPE` at its default — a C/C++ program linking this
+crate as a staticlib or cdylib, or a JNI library — which the signal would
+kill.
 
 #### Property Setting Requirements
 
@@ -258,7 +278,7 @@ fn main() -> rsproperties::Result<()> {
 - System properties may require root or system privileges
 
 **On Linux:**
-- Requires `rsproperties-service` to be running
+- Requires `rsproperties-service` to be running (`rsproperties-service = "0.7"`; see Related Crates)
 - Properties are stored in memory-mapped files
 - `ro.*` properties are write-once here too (enforced by `rsproperties-service`)
 
@@ -292,11 +312,16 @@ V2.
 
 `rsproperties::set` blocks the calling thread on the socket. With the
 `tokio` feature, `asynchronous::set` runs the same request on tokio's I/O
-and time drivers and returns a `Send + 'static` future:
+and time drivers and returns a `Send + 'static` future. The feature adds
+tokio with only its `net` and `time` features and no runtime, so the
+program depends on tokio itself for the runtime (and for `tokio::spawn`
+below), with both the I/O and the time driver enabled (`#[tokio::main]`,
+or `Builder::enable_all()`):
 
 ```toml
 [dependencies]
 rsproperties = { version = "0.7", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
 ```rust,no_run
@@ -320,28 +345,6 @@ async fn configure() -> rsproperties::Result<()> {
   and the outcome is not reported.
 - A request that passed the checks panics when polled outside a tokio
   runtime, or in one without both the time and the I/O driver enabled.
-
-#### Property Setting Examples by Type
-
-```rust,no_run
-fn main() -> rsproperties::Result<()> {
-    // Debug properties - usually writable by applications
-    rsproperties::set("debug.my_app.trace", "enabled")?;
-    rsproperties::set("debug.my_app.verbose", "true")?;
-
-    // Vendor properties - device-specific configuration
-    rsproperties::set("vendor.my_app.hw_config", "v2")?;
-
-    // Custom application properties
-    rsproperties::set("my.company.app.version", "1.2.3")?;
-    rsproperties::set("my.company.app.api_key", "abc123")?;
-
-    // System state properties
-    rsproperties::set("sys.my_service.status", "running")?;
-    rsproperties::set("sys.my_service.pid", std::process::id())?;
-    Ok(())
-}
-```
 
 ### Error Handling
 
@@ -435,7 +438,7 @@ fn main() -> rsproperties::Result<()> {
 - **Full Emulation**: Complete Android property system emulation
 - **Socket Communication**: Unix domain socket property setting
 - **Memory Mapping**: Efficient memory-mapped property storage
-- **Property Service**: Use with `rsproperties-service` for full daemon functionality
+- **Property Service**: Use with `rsproperties-service` ([crates.io](https://crates.io/crates/rsproperties-service)) for full daemon functionality
 
 ## API Reference
 
@@ -448,7 +451,9 @@ fn main() -> rsproperties::Result<()> {
   process-wide setting
 - `init(config)` — set them once per process; `Ok` again for the same
   paths, `Err(AlreadyInitialized)` for a different one
-- `properties_dir()` — currently-configured properties directory
+- `properties_dir()` — currently-configured properties directory; the
+  first call latches the default (`/dev/__properties__`) when `init` set
+  none
 - `socket_dir()` — currently-configured socket directory.
   Priority: `PropertyConfig::socket_dir` (via `init`) >
   `PROPERTY_SERVICE_SOCKET_DIR` env var > `/dev/socket`
@@ -475,9 +480,17 @@ fn main() -> rsproperties::Result<()> {
   init's reply without a timeout, like bionic, while connecting and
   sending keep the 2 s bound (bionic has none).
   `asynchronous::set` (`tokio` feature) is the same request without
-  blocking the thread
+  blocking the thread, and without a bound on the reply wait
 - `system_properties()` — `&'static SystemProperties` or `Err`
   (`Error::Init`); a failure is retried by the next call
+
+Property names follow Android's prefixes: `ro.*` is set once
+(`ro.build.version.sdk`), `persist.*` survives a reboot when the
+property service stores it (`persist.sys.timezone`), `sys.*` holds
+system state (`sys.boot_completed`), `debug.*` is for debugging
+(`debug.my_app.log_level`), `vendor.*` belongs to the vendor partition
+(`vendor.audio.config`), and `ctl.*` sends a control message to init
+instead of being stored.
 
 ### `SystemProperties` (read side)
 
@@ -500,12 +513,17 @@ fn main() -> rsproperties::Result<()> {
   (libcutils `property_list`), in `foreach` order; bytes that are not
   UTF-8 arrive as U+FFFD
 - `serial(index)` / `area_serial()` — a property's serial / the global
-  serial that any change advances (bionic `__system_property_area_serial`)
+  serial that any change advances (bionic `__system_property_area_serial`).
+  While a writer is mid-update (dirty bit set), `serial` waits up to
+  200 ms for the clean serial, where bionic `__system_property_serial`
+  returns the raw one
 - `wait(index, old_serial)` — futex-wait until the property's serial
   differs from `old_serial` (from `serial(index)` or `read_index_with`)
   and return the new serial (bionic `__system_property_wait(pi, ..)`).
-  `Err` on failure. A wait on any property (bionic
-  `__system_property_wait(NULL, ..)`) is `watch_area()`
+  `Err` on failure. As in bionic, the returned serial can carry the dirty
+  bit; passed back as the next `old_serial`, it reports that update's
+  clean store as a second change (`watch` does not). A wait on any
+  property (bionic `__system_property_wait(NULL, ..)`) is `watch_area()`
 - `wait_for_creation(name)` / `wait_for_value(name, expected)` — libbase
   `WaitForPropertyCreation` / `WaitForProperty`; `Ok(index)` / `Ok(())`,
   a failure is `Err`
@@ -531,9 +549,13 @@ fn main() -> rsproperties::Result<()> {
   and `Hash`. Two indexes are equal when the same instance returned them
   for the same entry, so an index can be a `HashMap` key
 
-On Android API 37+, a process started with `BIONIC_APPCOMPAT_OVERRIDE`
-in its environment (zygote sets it) reads `ro.appcompat_override.<name>`
-first, like bionic; see `SystemProperties::read_with`. This follows the
+A read-only instance (the global reader, `SystemProperties::open`)
+created while `BIONIC_APPCOMPAT_OVERRIDE` is set in the environment
+(zygote sets it on Android) looks up `ro.appcompat_override.<name>` first
+in `find` and `read_with`, like bionic — on Android only when
+`ro.build.version.sdk` is 37 or more, on Linux always. Writer instances
+(`new_area`, `new_area_locked`) never do; see
+`SystemProperties::read_with`. This follows the
 AOSP `android-17.0.0_r1` sources and returned the same values as
 `getprop` on an API 37 emulator.
 On API 35–36 the override is a bind mount over `/dev/__properties__`,
@@ -564,8 +586,14 @@ which a reader created in that process follows without extra code.
 The futures are `Send`. The first wait of an instance that has to block
 starts that instance's waiter thread: the global reader's thread runs
 until the process exits, another instance's ends within about a second of
-the instance's drop. A per-property wait wakes on the global serial's
-`FUTEX_WAKE`. A writer that moves the global serial without a wake
+the instance's drop. The thread futex-waits on the global serial and, on
+a change, wakes the waits whose property's serial moved and every wait
+on the global serial (a creation, an area watcher), which check their
+condition again. A per-property wait therefore returns after the
+writer's global `FUTEX_WAKE`. A wait that has to block fails when the
+thread cannot be started (the next wait tries again); once the thread
+has ended on a futex error, every later blocking wait of that instance
+fails with that error. A writer that moves the global serial without a wake
 (bionic in an appcompat override process on API 35–36) is seen at the
 next change that wakes, as with bionic's own waits. A child forked
 without exec after the instance's first blocking async wait has no waiter
@@ -580,8 +608,10 @@ thread, so its waits that have to block are never woken (not supported).
 - `PROP_MSG_SETPROP`, `PROP_MSG_SETPROP2` — command IDs
 - `PROP_SUCCESS` and the `PROP_ERROR_*` codes — V2 response codes, as
   AOSP init sends them (`SetRejection` has one variant per code).
-  `PROP_ERROR` (-1) is the generic code the 0.6.0 service sent for every
-  rejected set; init and the current service do not send it
+  `PROP_ERROR` (-1) is the generic code the 0.6.0 git release of
+  `rsproperties-service` sent for every rejected set
+  (`SetRejection::Unspecified`); init and the current service do not
+  send it
 - `validate_property_name(name)` — name charset; no leading or trailing
   `.`, no `..`
 - `validate_value_len(name, value)` — value-length policy with the
@@ -594,6 +624,25 @@ clients that want to point at a custom socket directory:
 - `PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME` —
   `"property_service_for_system"`
 
+`PROP_DIRNAME` (`"/dev/__properties__"`, the default properties
+directory) is at the crate root as well:
+
+```rust
+use rsproperties::PROP_DIRNAME;
+use rsproperties::wire::{
+    PROP_NAME_MAX, PROP_VALUE_MAX, PROP_MSG_SETPROP2, validate_property_name,
+    validate_value_len,
+};
+
+assert_eq!(PROP_VALUE_MAX, 92);              // buffer size including NUL; content cap = 91 bytes
+assert_eq!(PROP_NAME_MAX, 32);               // V1 wire only; V2 is length-prefixed
+assert_eq!(PROP_DIRNAME, "/dev/__properties__");
+assert_eq!(PROP_MSG_SETPROP2, 0x00020001);
+
+validate_property_name("ro.build.version.sdk").unwrap();
+validate_value_len("ro.long.prop", &"x".repeat(200)).unwrap(); // ro.* may exceed PROP_VALUE_MAX
+```
+
 ### Errors
 
 - `Error` — non-exhaustive enum (`Io`, `NotFound`, `Utf8`, `Parse`,
@@ -604,7 +653,8 @@ clients that want to point at a custom socket directory:
   `Error::SetRejected { name, reason }`: a non-exhaustive enum with one
   variant per `wire::PROP_ERROR_*` code (`ReadOnlyProperty`,
   `InvalidName`, `InvalidValue`, `PermissionDenied`, …) and
-  `Unknown(i32)`; `code()` returns the number
+  `Unknown(i32)` for any other code (`Unspecified` is `wire::PROP_ERROR`,
+  -1); `code()` returns the number
 - `Error::root_cause()` — the error under the `Context` / `Init` layers
 - `Result<T>` = `Result<T, Error>`
 
@@ -614,7 +664,9 @@ clients that want to point at a custom socket directory:
   `SystemProperties::new_area_locked(lock)` — take the directory's
   writer lock, publish `property_info` (0444, temp + rename) and create
   the areas under it; prefer this over writing `property_info` yourself.
-  `lock.dir()` returns the directory the lock guards. Dropping the lock,
+  `acquire` creates a missing `dir` (the last component only, mode 0711
+  minus the umask's bits) and removes the temp files a crashed writer
+  left there. `lock.dir()` returns the directory the lock guards. Dropping the lock,
   or the `SystemProperties` that holds it, releases it with
   `flock(LOCK_UN)`, so the next `acquire` succeeds even while a child
   process that has not yet `exec`ed holds a copy of the fd
@@ -622,10 +674,14 @@ clients that want to point at a custom socket directory:
   `<dir>/property_info`; it takes the writer lock before it reads that
   file, and without the file it fails before `dir` or `.writer_lock` is
   created
-- `SystemProperties::add(name, value)` — append a new entry
+- `SystemProperties::add(name, value)` — append a new entry; for a name
+  that already exists it changes nothing and returns `Ok(())`, like
+  bionic `prop_area::add`
 - `SystemProperties::update(index, value)` — overwrite an existing
-  entry (seqlock-guarded)
-- `SystemProperties::set(name, value)` — add-or-update
+  entry (seqlock-guarded); a `ro.` entry is never updated:
+  `Error::ReadOnlyProperty`, value and serial unchanged
+- `SystemProperties::set(name, value)` — add-or-update; a `ro.` property
+  that already has a value is refused with `Error::ReadOnlyProperty`
 - `SystemProperties::property_type(name)` — the `property_contexts` type
   that `property_info` records for `name` (`"string"`, `"bool"`,
   `"int"`, …), or the trie's default type; `Ok(None)` when there is
@@ -686,7 +742,7 @@ fn main() {
 }
 ```
 
-### Building Property Databases (with `builder` feature)
+## Building Property Databases (`builder` feature)
 
 ```rust,no_run
 use rsproperties::{
@@ -709,8 +765,10 @@ fn main() -> rsproperties::Result<()> {
     // `<dir>/property_info` and create the areas under that lock. Do not write
     // `property_info` with `std::fs::write`: readers map it, so it must only be
     // replaced by rename (see below). Release builds (no `debug-assertions`)
-    // and the `strict-file-validation` feature require `property_info` to be
-    // owned by root (uid 0, gid 0).
+    // and the `strict-file-validation` feature require the property files
+    // (`property_info`, the area files, `properties_serial`) to be owned by
+    // root (uid 0, gid 0), so run this as root there: `publish_property_info`
+    // checks its file with the readers' loader and fails otherwise.
     let (mut entries, _errors) =
         PropertyInfoEntry::parse_from_file(Path::new("property_contexts"), MatchKeyword::Unchecked)?;
     // An entry can also be built without a file.
@@ -761,44 +819,18 @@ wake, and its read of a context whose area file does not exist yet fails
 until that file is renamed into place. Start readers after `new_area` /
 `new_area_locked` (or the service's `run`) has returned.
 
-## Constants
-
-The library exposes Android-compatible constants. `PROP_DIRNAME` is at
-the crate root; the size limits, wire-protocol opcodes and validators
-are in the `wire` module:
-
-```rust
-use rsproperties::PROP_DIRNAME;
-use rsproperties::wire::{
-    PROP_NAME_MAX, PROP_VALUE_MAX, PROP_MSG_SETPROP2, validate_property_name,
-    validate_value_len,
-};
-
-assert_eq!(PROP_VALUE_MAX, 92);              // buffer size including NUL; content cap = 91 bytes
-assert_eq!(PROP_NAME_MAX, 32);               // V1 wire only; V2 is length-prefixed
-assert_eq!(PROP_DIRNAME, "/dev/__properties__");
-assert_eq!(PROP_MSG_SETPROP2, 0x00020001);
-
-validate_property_name("ro.build.version.sdk").unwrap();
-validate_value_len("ro.long.prop", &"x".repeat(200)).unwrap(); // ro.* may exceed PROP_VALUE_MAX
-```
-
-## Performance
-
-- **Memory-mapped access**: Direct memory access for optimal performance
-- **Zero-copy reads**: Efficient property value retrieval
-- **Atomic operations**: Thread-safe property updates
-- **Futex-based waiting**: Efficient property change notifications
-
 ## Examples
 
 The crate includes Android-compatible command-line tools:
 
-- **`getprop.rs`** - Android-compatible property getter with support for custom directories
+- **`getprop.rs`** - Android-compatible property getter with support for custom directories; without arguments it lists every readable property, sorted by name
 - **`setprop.rs`** - Android-compatible property setter with validation and error handling
 
 Run examples with:
 ```bash
+# List all properties
+cargo run --example getprop
+
 # Get a property with default value
 cargo run --example getprop ro.build.version.sdk 0
 
@@ -808,7 +840,22 @@ cargo run --example setprop debug.my_app.test true
 
 ## Related Crates
 
-- **`rsproperties-service`** - Linux emulation of the Android property service (async daemon; Linux only, not usable on Android)
+- **[`rsproperties-service`](https://crates.io/crates/rsproperties-service)**
+  ([docs](https://docs.rs/rsproperties-service)) - Linux emulation of the
+  Android property service (async daemon; Linux only, not usable on
+  Android):
+
+  ```toml
+  [dependencies]
+  rsproperties = "0.7"
+  rsproperties-service = "0.7"
+  ```
+
+  The two crates are released together and carry the same version. Take
+  both crates from the same source: with one from crates.io and the
+  other from git, `rsproperties` is built as two separate crates, and
+  `rsproperties_service::run` does not accept the `PropertyConfig` of the
+  copy your code names.
 
 ## Building
 
@@ -828,7 +875,7 @@ cargo doc --open
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Licensed under the Apache License, Version 2.0. See [LICENSE](https://github.com/hiking90/rsproperties/blob/main/LICENSE) for details.
 
 ## Contributing
 

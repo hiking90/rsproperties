@@ -2,7 +2,9 @@
 
 Linux emulation of the Android system property service: a tokio-based daemon that serves the property socket protocol and the property area files on a Linux host. It is not usable on Android, where init owns the property service, and compiles only for Linux; use the `rsproperties` client crate on Android.
 
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Crates.io](https://img.shields.io/crates/v/rsproperties-service.svg)](https://crates.io/crates/rsproperties-service)
+[![Documentation](https://docs.rs/rsproperties-service/badge.svg)](https://docs.rs/rsproperties-service)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/hiking90/rsproperties/blob/main/LICENSE)
 
 ## Overview
 
@@ -25,12 +27,28 @@ Both are internal: the public API is `run`, `ServiceOptions` and the
 `ServiceHandle` that `run` returns, with the types they use:
 `ControlMessage` (the first argument of the control handler: `action`,
 `target`, and the sender's `pid`, `uid`, `gid`), `ControlReply` (its
-second argument, which answers the client that sent the message; with
-`ControlReplyProbe` for tests of a handler), `PowerctlMessage` (the
-argument of the powerctl handler: `command`, `pid`, `uid`, `gid`),
-`PowerctlOutcome` (what the powerctl handler returns), `StartupError` /
-`StartupStage` (a failed `run`) and `ServiceError` (a failure after
-startup).
+second argument, which answers the client that sent the message),
+`PowerctlMessage` (the argument of the powerctl handler: `command`,
+`pid`, `uid`, `gid`), `PowerctlOutcome` (what the powerctl handler
+returns), `StartupError` / `StartupStage` (a failed `run`) and
+`ServiceError` (a failure after startup).
+
+A handler can be tested without a service: `ControlMessage::new` and
+`PowerctlMessage::new` build messages (`with_uid_gid` adds the sender's
+ids), and `ControlReply::for_test` returns a reply together with a
+`ControlReplyProbe` that reports what the handler answered:
+
+```rust
+use rsproperties_service::{ControlMessage, ControlReply};
+
+fn main() {
+    let handler = |msg: ControlMessage, reply: ControlReply| reply.send(msg.action == "start");
+
+    let (reply, probe) = ControlReply::for_test();
+    handler(ControlMessage::new("start", "my_service", None), reply);
+    assert_eq!(probe.blocking_answer(), Some(true));
+}
+```
 
 ### Properties service
 - Manages the actual property storage and retrieval
@@ -48,20 +66,32 @@ startup).
 
 ## Installation
 
-This crate is not published on crates.io; depend on it via git, and take
-`rsproperties` (used for `PropertyConfig` in the examples below) from the same
-git source. A crates.io `rsproperties` would be a separate crate whose
-`PropertyConfig` `run` does not accept:
-
 ```toml
 [dependencies]
-rsproperties = { git = "https://github.com/hiking90/rsproperties" }
-rsproperties-service = { git = "https://github.com/hiking90/rsproperties" }
+rsproperties = "0.7"
+rsproperties-service = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ```
 
+`rsproperties` provides the `PropertyConfig` that `run` takes. The two
+crates are released together and carry the same version; use the same
+version of both. To build
+from the repository instead, take both crates from the same tag:
+
+```toml
+[dependencies]
+rsproperties = { git = "https://github.com/hiking90/rsproperties", tag = "v0.7.0" }
+rsproperties-service = { git = "https://github.com/hiking90/rsproperties", tag = "v0.7.0" }
+```
+
+Taking the two crates from different sources (one from crates.io, one
+from git) builds `rsproperties` twice, as two separate crates, and `run`
+then does not accept the `PropertyConfig` of the copy you use.
+
 `rsproperties-service` has no Cargo features. It always enables
-`rsproperties/builder`.
+`rsproperties/builder`. The minimum supported Rust version is 1.85.
+Code written for the 0.6.0 git release needs the changes listed in
+[Migration from 0.6.0](https://github.com/hiking90/rsproperties/blob/main/CHANGELOG.md#migration-from-060).
 
 Supported platform: Linux only. On any other target (Android and macOS
 included) the crate fails to compile with a `compile_error!` that names
@@ -144,10 +174,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .properties_dir(properties_dir)
         .socket_dir(socket_dir);
 
-    // Start services with configuration files. `persist.*` properties are
-    // kept in an AOSP-format persistent_properties file (its directory must
-    // exist); `ctl.*` and `sys.powerctl` sets go to the handlers instead
-    // of being stored.
+    // Start services with configuration files. `persist.*` and
+    // `next_boot.*` properties are kept in an AOSP-format
+    // persistent_properties file (its directory must exist; see
+    // "Persistent properties" below); `ctl.*` and `sys.powerctl` sets go
+    // to the handlers instead of being stored.
     let options = rsproperties_service::ServiceOptions::new()
         .property_contexts_files(property_contexts)
         .build_prop_files(build_props)
@@ -289,8 +320,9 @@ powerctl handler for a `sys.powerctl` row:
 None of init's control functions waits for a process: the reply to
 `ctl.stop` follows the `SIGKILL`, not the exit. A host that answers
 only when the process has exited keeps the client waiting for that
-time (an `rsproperties` client outside Android gives up after 2 s with
-`TimedOut`), which init does not.
+time, which init does not. Outside Android, `rsproperties::set` gives up
+after 2 s with `TimedOut`; `rsproperties::asynchronous::set` waits
+without a bound unless its caller wraps it in `tokio::time::timeout`.
 
 The host sets `init.svc.<name>` itself, with `rsproperties::set` from a
 thread that may block (the handler runs on tokio's blocking pool, so the
@@ -320,6 +352,33 @@ The property area files and `property_info` stay in the properties dir
 after the service has ended; readers that mapped them keep working and
 see no further changes.
 
+### Persistent properties
+
+`ServiceOptions::persistent_properties_file(path)` stores `persist.*`
+and `next_boot.*` properties in `path`, in AOSP init's
+`persistent_properties` format, and loads them at startup after the
+build.prop files. Without it nothing is stored, and `persist.*` values
+last only as long as the property areas.
+
+- The directory of `path` must exist; `run` fails otherwise
+  (`StartupStage::PropertiesService`, `NotFound`).
+- The service holds an exclusive `flock` on `<path>.lock` while it runs,
+  so a second service given the same file fails to start (`WouldBlock`).
+- **A file that does not parse is deleted at startup**, as init does. A
+  group- or world-writable file is not loaded and not deleted; the next
+  persistent set replaces it.
+- Each set of such a name that changes the value rewrites the whole file
+  (temp file, `fsync`, rename, directory `fsync`) before the client is
+  answered. A failed write is logged and the set still succeeds, as in
+  init; the change goes into the next write. Do not edit the file while
+  the service runs.
+- A staged `next_boot.<name>` record is set as `<name>` at startup and
+  removed from the file; a `<name>` that starts with `persist.` or
+  `next_boot.` is written back under that name.
+
+The rustdoc of `ServiceOptions::persistent_properties_file` lists the
+remaining cases (transient read errors at startup, repeated names).
+
 ### No in-process actor API
 
 The two actors (socket service, properties service), their argument
@@ -334,13 +393,39 @@ See [Protocol Compatibility](#protocol-compatibility) below.
 If you need to read or set properties from the same process that owns
 the service, use the `rsproperties` crate directly
 (`rsproperties::get_or`, `rsproperties::set`, etc.) — it talks to the
-same socket the external clients use. `set` is blocking socket I/O and
-waits up to 2 s for the reply: called from a task on the runtime that
-runs the service (e.g. a `current_thread` runtime), it keeps the service
-from accepting, returns a timeout error, and the already-sent value may still be
-applied once the runtime resumes. Run the service on its own runtime/thread, or
-call `set` through `tokio::task::spawn_blocking` on a multi-thread
-runtime.
+same socket the external clients use.
+
+From a task on the runtime that runs the service, set with
+`rsproperties::asynchronous::set` (`rsproperties` feature `tokio`). It
+does its socket I/O on tokio's I/O driver, so the service keeps
+accepting while it waits, also on a `current_thread` runtime. Its reply
+wait has no bound; wrap it in `tokio::time::timeout` to give it one:
+
+```toml
+[dependencies]
+rsproperties = { version = "0.7", features = ["tokio"] }
+```
+
+```rust,no_run
+use std::time::Duration;
+
+async fn enable_debug() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        rsproperties::asynchronous::set("debug.my_app.enabled", "1"),
+    )
+    .await??;
+    Ok(())
+}
+```
+
+The blocking `rsproperties::set` waits up to 2 s for the reply: called
+from a task on the runtime that runs the service (e.g. a
+`current_thread` runtime), it keeps the service from accepting, returns
+a timeout error, and the already-sent value may still be applied once
+the runtime resumes. Without the `tokio` feature, run the service on its
+own runtime/thread, or call `set` through `tokio::task::spawn_blocking`
+on a multi-thread runtime.
 
 ## Protocol Compatibility
 
@@ -453,7 +538,8 @@ The socket service implements the Android property service protocol:
 (`StartupStage::Config`, `WriterLock`, `PropertiesService`,
 `SocketService`) and `source()` is the cause — `std::io::Error` from the
 properties service, `rsproperties::Error` from `rsproperties::init`, the
-writer lock or the socket service.
+writer lock or the socket service. `into_source()` returns the cause by
+value.
 
 ```rust,no_run
 use rsproperties_service::{ServiceOptions, StartupStage};
@@ -498,7 +584,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 - **Concurrent Connections**: Each client connection handled in separate tasks
 - **Non-blocking I/O**: All operations use async/await for optimal performance
-- **Memory Efficient**: Property data shared between services using actor references
+- **One writer**: each set reaches the properties service as one message
+  with its name and value; only that actor writes the property areas
 - **Fast Lookups**: Optimized property storage for quick access
 
 ## Directory Structure
@@ -532,6 +619,13 @@ The service creates these files as its own user and reads
 client built the same way refuses the files a non-root service created.
 Run the service as uid 0 with gid 0. No option accepts another owner.
 
+That stage's `source()` is a `std::io::Error` that carries the
+`rsproperties::Error`. To recognise the ownership failure, take
+`source()`, downcast it to `std::io::Error`, take its `get_ref()`,
+downcast that to `rsproperties::Error`, and check that its
+`root_cause()` is `Error::FileOwnership` (the error may sit inside
+`Error::Context`).
+
 A debug build without `strict-file-validation` skips the ownership
 check and logs one warning ("root-ownership check on property files is
 disabled"), so a non-root service starts there. The check first applies
@@ -556,18 +650,23 @@ in the release build.
   (`MAX_WAITING_CLIENTS` = 256); when the waiting room is full the
   connection is closed immediately. The spawned task then waits up to
   `CLIENT_TIMEOUT` (10 s) for one of `MAX_CONCURRENT_CLIENTS` (64)
-  handler permits and drops the connection on timeout. The accept loop
+  handler permits and drops the connection on timeout. The exchange
+  itself is bounded by `CLIENT_TIMEOUT` too: on expiry the connection
+  is closed without a reply, so one connection holds the service for at
+  most 20 s. The accept loop
   never parks, and accepted fds are capped at 64 + 256. A `ctl.*`
   request gives its handler permit back once it is queued for the
   control handler: its connection then belongs to the `ControlReply`,
-  and at
+  which `CLIENT_TIMEOUT` no longer bounds, and at
   most 102 of those exist (see
   [Answering as init does](#answering-as-init-does)), so the service
   holds at most 64 + 256 + 102 client fds.
 - **`TimedOut` has an unknown outcome**: like AOSP init, the service
   applies every request it received in full, also when the client has
-  already stopped waiting. The Linux client waits at most 2 s for the
-  reply, so a `set` that returns `TimedOut` while waiting for the reply
+  already stopped waiting. Outside Android, the blocking
+  `rsproperties::set` waits at most 2 s for the reply (the async
+  `rsproperties::asynchronous::set` waits until its caller's timeout, if
+  any), so a `set` that returns `TimedOut` while waiting for the reply
   may have been applied (a `TimedOut` while connecting or sending means
   the request was not delivered). Retrying with the same value is
   harmless except for `ro.*`, where the retry gets
@@ -576,14 +675,18 @@ in the release build.
   called once per request also when the client has stopped waiting (a
   request stays queued after the client's `TimedOut`, and one the host
   holds stays with the host, so a retry can run the action twice). The
-  service does not time a `ctl.*` reply out, so for `ctl.*` the 2 s are
-  the time the host has to answer such a client; an answer sent later
-  is discarded.
+  service does not time a `ctl.*` reply out, so for `ctl.*` the
+  blocking client's 2 s are the time the host has to answer it; an
+  answer sent later is discarded.
+- **No `SIGPIPE`**: replies are sent with `send(MSG_NOSIGNAL)`, so a
+  client that closed before reading its reply yields `EPIPE`, not
+  `SIGPIPE`, also in a host process that leaves `SIGPIPE` at its
+  default (a C or JNI host embedding the service).
 - **`accept()` back-off**: a 100 ms sleep is inserted after an `accept()`
   error so an `EMFILE`/`ENFILE` storm cannot spin the worker and flood
   the log.
-- **Value masking**: `PropertyMessage::value` is masked in `Debug`
-  output and service logs (`<N bytes>` placeholder). Property values
+- **Value masking**: property values are masked in service logs
+  (`<N bytes>` placeholder). Property values
   may carry tokens or device identifiers; names are still logged in
   full.
 - **Init errors propagate**: `run()` calls `rsproperties::init`, so a
@@ -591,9 +694,8 @@ in the release build.
   (`StartupStage::Config`) rather than silently leaving the service bound
   to whatever paths a previous instance committed.
 - **Deterministic `build.prop` apply order**: entries are collected
-  into a `BTreeMap` before apply, so the order in which they are added
-  to the area (and thus the trie layout) no longer varies per run with
-  `HashMap`'s hash seed. Which file wins a key conflict does not depend
+  into a `BTreeMap` before apply and added to the area in key order, so
+  the trie layout is the same on every run. Which file wins a key conflict does not depend
   on this: `load_properties_from_file_with` overwrites in call order, so
   the later file wins (an entry the type check drops overwrites nothing).
 
@@ -650,13 +752,16 @@ and enforced after the bytes arrive:
 
 ## Logging
 
-The service provides detailed logging at multiple levels:
+The service logs through the `log` crate at multiple levels. To see the
+logs, install a logger in the host, for example `env_logger` (add it to
+your dependencies):
 
 ```rust
-// Enable logging
-env_logger::Builder::from_env(
-    env_logger::Env::default().default_filter_or("info")
-).init();
+fn main() {
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info")
+    ).init();
+}
 ```
 
 Log levels:
@@ -670,7 +775,8 @@ Log levels:
 
 ### Running the Example Service
 
-From the workspace root:
+From the root of a checkout of the
+[repository](https://github.com/hiking90/rsproperties):
 
 ```bash
 cargo run -p rsproperties-service --example example_service -- \
@@ -682,16 +788,22 @@ This is a debug build, which any user can run. With `--release` the
 service has to run as root; see
 [File ownership](#file-ownership-a-release-build-runs-as-root).
 
-### Testing with netcat
+### Talking to the example service
+
+The `rsproperties` examples `setprop` and `getprop` are clients of the
+running service (pass their options after `--`):
 
 ```bash
-# Connect to the property service socket
-nc -U /tmp/test_sockets/property_service
+cargo run -p rsproperties --example setprop -- \
+    --properties-dir /tmp/test_properties --socket-dir /tmp/test_sockets \
+    debug.test 1
+cargo run -p rsproperties --example getprop -- \
+    --properties-dir /tmp/test_properties debug.test
 ```
 
 ## Testing
 
-Run the comprehensive test suite:
+From the root of a checkout of the repository, run the test suite:
 
 ```bash
 # Run all tests
@@ -705,8 +817,11 @@ cargo test --test integration_tests
 cargo test --test performance_tests
 ```
 
-`cargo test --release` and `cargo test --all-features` enforce the
-root-ownership check (see
+From the workspace root, `cargo test --release` and
+`cargo test --all-features` enforce the root-ownership check (this crate
+has no features of its own; inside `rsproperties-service/`,
+`--all-features` does not enable `rsproperties/strict-file-validation`,
+`--features rsproperties/strict-file-validation` does; see
 [File ownership](#file-ownership-a-release-build-runs-as-root)), so as a
 non-root user every test that creates property files fails there. Build
 as yourself and start the test binaries as root through cargo's runner,
@@ -724,17 +839,16 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo test --release
 - **rsactor**: Actor framework for message passing
 - **rsproperties**: Core property system implementation
 - **log**: Logging framework
-- **thiserror**: Error handling
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Licensed under the Apache License, Version 2.0. See [LICENSE](https://github.com/hiking90/rsproperties/blob/main/LICENSE) for details.
 
 ## Contributing
 
-Contributions are welcome! Please see the main [rsproperties](../README.md) project for contribution guidelines.
+Contributions are welcome! Please see the [workspace README](https://github.com/hiking90/rsproperties/blob/main/README.md#contributing) for contribution guidelines.
 
 ## Related Projects
 
-- **[rsproperties](../rsproperties/)**: Core property system library
+- **[rsproperties](https://crates.io/crates/rsproperties)**: Core property system library ([README](https://github.com/hiking90/rsproperties/tree/main/rsproperties))
 - **Android Property System**: Original implementation this project emulates

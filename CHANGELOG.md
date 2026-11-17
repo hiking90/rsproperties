@@ -6,7 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: minor bumps may include API changes).
 
-## [Unreleased]
+## [0.7.0] - 2026-11-17
+
+Async waits and an async `set`, a second pass over the public API, and
+the service's AOSP init behaviour (control and powerctl handlers,
+persistence, type checks against `property_contexts`). Breaking: the
+MSRV is 1.85, the sync wait methods take a `PropertyIndex` and split
+their timeouts out, the global-serial wait moves to `AreaWatcher`, the
+service starts only through `run(config, ServiceOptions)`, and the
+service no longer speaks the V1 protocol. See Migration from 0.6.0.
+
+`rsproperties-service` is published on crates.io for the first time, as
+0.7.0. Until this release it was a git dependency only; it has always
+carried the workspace version, and both crates are released together
+with the same version. The service entries below compare it with the
+git 0.6.0.
 
 ### Added
 
@@ -204,8 +218,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   limits agree while a control message is in its call). An unanswered
   request holds its client's connection and no connection slot of the
   service, and the service sets no time limit for its reply (init sets
-  none for its control functions; an `rsproperties` client outside
-  Android gives up after 2 s). The README section "Answering as init
+  none for its control functions; outside Android the blocking
+  `rsproperties::set` gives up after 2 s, `rsproperties::asynchronous::set`
+  does not). The README section "Answering as init
   does" lists what a host does and answers for each request to match
   init.
 - `PropertyIndex` is exported at the crate root. `find`, `foreach` and
@@ -779,7 +794,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer applies its own length limits
   (256-byte names, 8192-byte values); `set` checks them.
 
-Service (`rsproperties-service`, git dependency only):
+Service (`rsproperties-service`; until this release a git dependency only):
 
 - `property_info` is published under the properties dir's writer lock
   (`AreaWriterLock::publish_property_info`) by writing a temp file and
@@ -871,11 +886,11 @@ Service (`rsproperties-service`, git dependency only):
   200 ms) for the clean serial. The `serial` rustdoc lists the cases that
   return a dirty serial: the 200 ms bound expiring, a failed futex wait
   (returned at once), and macOS (no wait).
-- The Rust blocks of the three READMEs are compiled by `cargo test`:
+- The Rust blocks of both crate READMEs are compiled by `cargo test`:
   `rsproperties/README.md` as a doctest of `rsproperties` (with the
-  `builder` feature), the workspace `README.md` and
-  `rsproperties-service/README.md` as doctests of `rsproperties-service`.
-  Each block is now a complete program; the ones that read the property
+  `builder` and `tokio` features) and `rsproperties-service/README.md` as
+  a doctest of `rsproperties-service`. The workspace `README.md` has no
+  Rust blocks. Each block is now a complete program; the ones that read the property
   store, set a property or start the service are `no_run`. Two examples
   did not compile as written and are corrected: the service example
   passed `vec!["…".into()]` to `property_contexts_files` /
@@ -886,7 +901,41 @@ Service (`rsproperties-service`, git dependency only):
   `#[cfg(feature = "builder")]`.
 - Both READMEs told the reader to enable `builder` with a `[features]`
   table that forwards to `rsproperties/builder`; they now show
-  `rsproperties = { version = "0.6", features = ["builder"] }`.
+  `rsproperties = { version = "0.7", features = ["builder"] }`.
+- The workspace `README.md` is an overview: the two crates with their
+  README, crates.io and docs.rs links, platform support, installation
+  (`rsproperties = "0.7"`, `rsproperties-service = "0.7"`, the same
+  release from git with `tag = "v0.7.0"`), the MSRV, the example
+  commands (`cargo run -p … --example … -- …`), building and testing. The
+  API descriptions and examples it repeated from `rsproperties/README.md`,
+  which had drifted apart, are now only in the crate READMEs.
+- `rsproperties/README.md` corrections: reads are allocation-free, not
+  zero-copy (short values are copied to a stack buffer); `add` leaves an
+  existing name unchanged and `update` / `set` refuse a `ro.` property
+  that has a value; the appcompat-override lookup applies to read-only
+  instances created while `BIONIC_APPCOMPAT_OVERRIDE` is set, on Linux
+  always and on Android from API 37; the `tokio` example adds the tokio
+  dependency and runtime it needs. Added: the MSRV, a link to Migration
+  from 0.6.0, `send(MSG_NOSIGNAL)`, `SetRejection::Unspecified`, the
+  200 ms `serial` bound and the dirty serial `wait` can return, the
+  waiter thread's failure modes, the files the root-ownership check
+  covers, property-name prefixes, and `getprop` listing every property.
+  The `read_with` rustdoc describes API 35–36 as bind-mounted overrides
+  (not an in-memory flag), and the `init` rustdoc states that a
+  `properties_dir()` call also latches the default.
+- `rsproperties-service/README.md` corrections: only the blocking
+  `rsproperties::set` gives up after 2 s (also in the `control_handler`
+  and `ControlReply` rustdoc); a set from the service's own runtime uses
+  `rsproperties::asynchronous::set`; the actors pass messages and share
+  no property data; `thiserror` is not a dependency. Added: installation
+  from crates.io, the MSRV, a "Persistent properties" section (a file
+  that does not parse is deleted at startup, the `<path>.lock` flock,
+  write failures), handler test helpers (`ControlReply::for_test`,
+  `ControlMessage::new`, `PowerctlMessage::new`), the 10 s bound on the
+  exchange itself, `MSG_NOSIGNAL` replies, `StartupError::into_source`,
+  how to recognise `Error::FileOwnership` under `StartupStage::PropertiesService`,
+  and `setprop` / `getprop` instead of netcat to talk to the example
+  service. Links that leave the package are absolute URLs.
 - README fixes:
   - `wait` argument list, boolean parsing, `PropertyConfig`
     construction, `init`/`try_init` error contract, error-variant list,
@@ -896,8 +945,7 @@ Service (`rsproperties-service`, git dependency only):
     create `property_info` before the areas (and `init` the directory
     before reading), the
     service "Hardening highlights" heading no longer dates 0.6.0 behavior
-    to 0.4.0, and the docs.rs badge of the unpublished service crate is
-    removed.
+    to 0.4.0.
   - the service examples' `main` returns
     `Box<dyn Error + Send + Sync>` (the snippets did not compile), the
     builder examples state the root-ownership requirement of release
@@ -905,9 +953,9 @@ Service (`rsproperties-service`, git dependency only):
     `ro.*` is write-once on Linux too, and the service README states its
     access model (socket mode only, no per-property authorization) and
     that `set` blocks the calling thread.
-  - service users take `rsproperties` from the same git
-    source as `rsproperties-service` (a crates.io copy is a separate crate
-    whose `PropertyConfig` `run` rejects) and add `tokio`; the service
+  - service users take `rsproperties` from the same source as
+    `rsproperties-service` (a copy from another source is a separate
+    crate whose `PropertyConfig` `run` rejects) and add `tokio`; the service
     examples state which directories `run` creates. The
     `load_properties_from_file` import-expansion rustdoc states how its
     expansion source differs from AOSP.

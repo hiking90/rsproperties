@@ -186,8 +186,11 @@ function ndk_prepare() {
 function version_update() {
     local NEW_VERSION="$1"
 
-    find . -name "Cargo.toml" -exec sed -i '' "s/^version = \".*\"/version = \"$NEW_VERSION\"/" {} \;
-    find . -name "Cargo.toml" -exec sed -i '' "/version = \"[^\"]*\", path =/ s/version = \"[^\"]*\"/version = \"$NEW_VERSION\"/" {} \;
+    # The workspace version, which both crates inherit.
+    sed -i.bak "s/^version = \".*\"/version = \"$NEW_VERSION\"/" Cargo.toml
+    # The `rsproperties` requirement of the path dependencies.
+    find . -name "Cargo.toml" -not -path "./target/*" -exec sed -i.bak "/version = \"[^\"]*\", path =/ s/version = \"[^\"]*\"/version = \"$NEW_VERSION\"/" {} \;
+    find . -name "Cargo.toml.bak" -not -path "./target/*" -delete
 }
 
 function update_cargo_lock() {

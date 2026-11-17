@@ -41,17 +41,13 @@ mod properties_service;
 mod property_type;
 mod socket_service;
 
-// Compiles the Rust blocks of this crate's README and of the workspace
-// README as doctests. The workspace README is attached here and not to
-// `rsproperties` because its service example needs this crate and tokio,
-// and because a path outside the package would break the doctests of the
-// published `rsproperties` crate (this crate is `publish = false`).
+// Compiles the Rust blocks of this crate's README as doctests. The README
+// is attached only under `cfg(doctest)`, so docs.rs shows the `//!` text
+// above, and the path stays inside the package. The workspace README has
+// no Rust blocks.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
-#[cfg(doctest)]
-#[doc = include_str!("../../README.md")]
-struct WorkspaceReadmeDoctests;
 
 // The two actors are private: their messages are crate-private, so code
 // outside this crate could spawn them but not wait for readiness or send
@@ -400,8 +396,10 @@ impl ServiceOptions {
     ///
     /// The service does not limit the time to the reply. A client of
     /// bionic or of `rsproperties` on Android waits until the reply is
-    /// sent or dropped; an `rsproperties` client on other targets gives up
-    /// after 2 s (`TimedOut`). `handler` is called for a request whose
+    /// sent or dropped. On other targets `rsproperties::set` gives up
+    /// after 2 s (`TimedOut`), while `rsproperties::asynchronous::set`
+    /// waits without a bound unless the caller wraps it in
+    /// `tokio::time::timeout`. `handler` is called for a request whose
     /// client has gone, as in init, and an answer to such a client is
     /// discarded.
     ///
@@ -416,7 +414,8 @@ impl ServiceOptions {
     /// unknown service and an unknown action are failures. A host that
     /// answers only when the process has exited keeps the client waiting
     /// for that time, which init does not. The crate's README lists the
-    /// whole contract ("Answering as init does").
+    /// whole contract, under
+    /// [Answering as init does](https://github.com/hiking90/rsproperties/blob/main/rsproperties-service/README.md#answering-as-init-does).
     ///
     /// # Shutdown
     ///
