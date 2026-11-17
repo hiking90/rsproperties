@@ -4,9 +4,12 @@ A Rust implementation of Android's system property system for Linux and
 Android.
 
 This repository is a Cargo workspace with two crates. This page gives an
-overview, installation, and how to build and test the workspace; the API,
-its behaviour and the code examples are in each crate's README and on
-docs.rs.
+overview, installation, and how to build and test the workspace. The
+API, its behaviour and the code examples are on docs.rs, and the
+service's protocol and security details are in [`docs/`](docs/):
+[service-protocol.md](docs/service-protocol.md) and
+[service-security.md](docs/service-security.md). `docs/design/` holds
+the maintainers' design notes (in Korean).
 
 **Upgrading from 0.6:** 0.7.0 changes the API in many places (pre-1.0, a
 minor release can break it). See
@@ -191,6 +194,12 @@ These runs leave root-owned `rsprops_*_<pid>` directories in the temp
 dir, which a later non-root run cannot remove; run the non-root tests
 first.
 
+Inside `rsproperties-service/`, `--all-features` does not enable
+`rsproperties/strict-file-validation` (the service has no features of
+its own); `--features rsproperties/strict-file-validation` does. One
+integration-test binary runs with `--test <file under tests/>`, for
+example `cargo test -p rsproperties-service --test integration_tests`.
+
 ### Building for Android
 
 Only `rsproperties` builds for Android. CI builds it with the Android NDK
@@ -213,8 +222,9 @@ Contributions are welcome. Before sending a change, check that:
    the change touches file validation or a release-only path.
 2. The code is formatted: `cargo fmt --all`.
 3. Clippy reports nothing: `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
-4. The documentation covers new behaviour: the rustdoc, the crate README,
-   and `CHANGELOG.md`.
+4. The documentation covers new behaviour: the rustdoc of the item
+   (docs.rs shows it; keep the crate READMEs short), `docs/*.md` for the
+   service's protocol and security details, and `CHANGELOG.md`.
 
 ## License
 

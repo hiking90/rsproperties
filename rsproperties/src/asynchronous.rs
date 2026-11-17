@@ -38,7 +38,7 @@
 //!   sync method's 200 ms bound. A writer that moves the global serial
 //!   without `FUTEX_WAKE` — bionic in an appcompat override process on
 //!   API 35–36 — is seen at the next change that wakes, as bionic's own
-//!   waits see it (`docs/aosp-parity.md` C3). A wait that has to block
+//!   waits see it. A wait that has to block
 //!   also fails when the waiter thread cannot be started (the next wait
 //!   tries again), and once that thread has ended on a futex error, every
 //!   later blocking wait of the instance fails with that error.
@@ -93,6 +93,13 @@ use crate::PropertyIndex;
 ///   full leaves the property unchanged: the service applies only a
 ///   complete request. Dropped after that, the service applies it and the
 ///   outcome is not reported, as after [`crate::set`]'s reply timeout.
+///
+/// The protocol version is chosen, and the request sent with
+/// `MSG_NOSIGNAL`, as [`crate::set`] documents.
+///
+/// The `tokio` feature adds tokio with only its `net` and `time` features
+/// and no runtime: the program supplies the runtime, with both drivers
+/// enabled (`#[tokio::main]`, or `Builder::enable_all()`).
 ///
 /// # Panics
 ///

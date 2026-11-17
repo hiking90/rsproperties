@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: minor bumps may include API changes).
 
+## [Unreleased]
+
+### Documentation
+
+- The crate READMEs are short: a description, installation, one
+  example and links. Their usage guides moved to the crate-level rustdoc,
+  so docs.rs shows them; their API reference lists, which repeated the
+  item rustdoc, are removed.
+- Statements that were only in a README are now in the rustdoc of the
+  item they describe: `rsproperties::set` (protocol version choice, V1
+  limits, `MSG_NOSIGNAL`), `asynchronous::set`,
+  `AreaWriterLock::publish_property_info` (why `property_info` is
+  replaced only by rename), `SystemProperties::new_area` (when readers
+  may start).
+- The service's protocol and security details moved to
+  `docs/service-protocol.md` and `docs/service-security.md`; the
+  service's rustdoc links them at the release tag. `docs/aosp-parity.md`
+  (maintainers' notes, in Korean) moved to `docs/design/`.
+
 ## [0.7.0] - 2026-11-17
 
 Async waits and an async `set`, a second pass over the public API, and
