@@ -827,8 +827,7 @@ where
 /// or sending means the request was not delivered. On Android `set`
 /// waits for init's reply without a timeout, like bionic; connecting and
 /// sending keep the 2 s bound there too, where bionic waits without one.
-/// [`asynchronous::set`](asynchronous/fn.set.html) (`tokio` feature) sends
-/// the same request without
+/// [`asynchronous::set`] (`tokio` feature) sends the same request without
 /// blocking the thread and without a bound on the reply wait.
 ///
 /// The request is sent with `send(MSG_NOSIGNAL)`: a socket the service
@@ -857,9 +856,13 @@ where
 /// // "true").
 /// set("persist.sys.timezone", "Asia/Seoul").unwrap();
 /// ```
+///
+/// [`asynchronous::set`]: asynchronous/fn.set.html
 // `asynchronous::set` is linked by HTML path: it does not exist without
 // the `tokio` feature, and the default-feature doc build denies
-// unresolved intra-doc links.
+// unresolved intra-doc links. A reference definition, as in the crate
+// overview: an inline `[..](path)` link is `redundant_explicit_links` on
+// rustdoc 1.100 when the label also resolves (all features).
 pub fn set(name: &str, value: impl std::fmt::Display) -> Result<()> {
     system_property_set::set(name, &value.to_string())
 }
