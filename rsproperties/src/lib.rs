@@ -349,8 +349,8 @@ static INIT_FAILURE_LOGGED: std::sync::atomic::AtomicBool =
 ///
 /// Each directory is set once per process: by an earlier `init`, or by
 /// its first use, which latches the default (the properties directory on
-/// the first property read, the socket directory on the first `set()` or
-/// [`socket_dir`] call). So `init` returns `Ok(())` when every directory
+/// the first property read or [`properties_dir`] call, the socket
+/// directory on the first `set()` or [`socket_dir`] call). So `init` returns `Ok(())` when every directory
 /// it names is unset or already holds that same path, and
 /// `Error::AlreadyInitialized` when one holds a different path — then
 /// neither directory is changed. Paths are compared with [`Path::eq`]

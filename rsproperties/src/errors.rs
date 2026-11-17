@@ -212,7 +212,8 @@ pub enum SetRejection {
     /// (`PROP_ERROR_SET_FAILED`).
     SetFailed,
     /// `PROP_ERROR` (-1), which names no cause. AOSP init never sends it;
-    /// the 0.6.0 service of this crate answers every rejected set with it.
+    /// the 0.6.0 git release of `rsproperties-service` answers every
+    /// rejected set with it.
     Unspecified,
     /// A non-zero code without a variant in this version.
     Unknown(i32),

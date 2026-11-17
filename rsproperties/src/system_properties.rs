@@ -632,10 +632,12 @@ impl SystemProperties {
     /// Instances created with `new_area` / `new_area_locked` never do
     /// this. On Linux the API-level condition does not apply.
     ///
-    /// On API 35–36 bionic enables overrides only in memory (zygote's
-    /// children inherit the flag through `fork`), so this crate cannot see
-    /// whether libc in the same process reads overrides, and reads plain
-    /// names there.
+    /// On API 35–36 bionic neither reads the variable nor looks up the
+    /// prefixed name: zygote bind mounts `/dev/__properties__/appcompat_override`,
+    /// where the writer stores the overrides under their plain names, over
+    /// `/dev/__properties__` in the app's mount namespace. An instance
+    /// created there opens those files and reads the overrides by plain
+    /// name without this lookup, so the lookup stays off on those levels.
     pub fn read_with<R, F>(&self, name: &str, f: F) -> Result<R>
     where
         F: FnOnce(&str) -> R,

@@ -117,8 +117,10 @@ impl ReplyState {
 ///
 /// The client waits until the reply has been answered or dropped. bionic's
 /// `__system_property_set` and the `rsproperties` client on Android wait
-/// without a timeout, as they do for init. The `rsproperties` client on
-/// other targets gives up after 2 s; an answer sent later is discarded.
+/// without a timeout, as they do for init. On other targets
+/// `rsproperties::set` gives up after 2 s, and an answer sent later is
+/// discarded; `rsproperties::asynchronous::set` waits without a bound
+/// unless the caller wraps it in `tokio::time::timeout`.
 ///
 /// # Dropping a reply
 ///

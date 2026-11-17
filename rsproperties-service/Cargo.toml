@@ -7,25 +7,26 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation.workspace = true
+documentation = "https://docs.rs/rsproperties-service"
 keywords.workspace = true
 categories.workspace = true
 description = "Linux emulation of the Android system property service (not usable on Android)"
-# Not released to crates.io — consumed via git/path only.
-publish = false
+
+# The service builds on Linux only.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
-rsproperties = { path = "../rsproperties", features = ["builder"] }
+rsproperties = { version = "0.7.0", path = "../rsproperties", features = ["builder"] }
 rustix.workspace = true
 log.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 rsactor.workspace = true
 
 [dev-dependencies]
 # `asynchronous::set` against a running service.
-rsproperties = { path = "../rsproperties", features = ["builder", "tokio"] }
+rsproperties = { version = "0.7.0", path = "../rsproperties", features = ["builder", "tokio"] }
 env_logger.workspace = true
 ctrlc.workspace = true
 anyhow.workspace = true
