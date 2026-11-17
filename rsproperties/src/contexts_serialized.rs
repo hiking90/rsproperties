@@ -330,9 +330,22 @@ impl AreaWriterLock {
     /// name already exists (another call on this lock is in progress), the
     /// call fails without touching it. May be called more than once.
     ///
+    /// Use this instead of writing `property_info` yourself. Readers map it
+    /// read-only and shared, as bionic does, so a writer must write a
+    /// complete new file and rename it over the old one, and must never
+    /// rewrite the existing file in place (`std::fs::write`,
+    /// `File::create`, `O_TRUNC`): a reader that has the file mapped can
+    /// fault with `SIGBUS` or read a torn trie. Readers log a warning when
+    /// `property_info` has the owner-write bit set, and refuse it with the
+    /// `strict-file-validation` feature; a group- or other-writable or
+    /// symlinked `property_info` is always refused.
+    ///
     /// # Errors
     ///
-    /// `Error::Context` naming the path.
+    /// `Error::Context` naming the path. The readers' loader also checks
+    /// the owner: in a release build (no `debug-assertions`) or with the
+    /// `strict-file-validation` feature, a file not owned by uid 0 / gid 0
+    /// is refused, so the call fails unless the process runs as root.
     pub fn publish_property_info(&self, trie: &[u8]) -> Result<()> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;

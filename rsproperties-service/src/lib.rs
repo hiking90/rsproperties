@@ -1,14 +1,17 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Linux emulation of the Android system property service.
+//! Linux emulation of the Android system property service, as a library.
 //!
-//! Serves the `property_service` / `property_service_for_system` socket protocol
-//! (`PROP_MSG_SETPROP2`) and maintains the property area files on a Linux
-//! host, so `rsproperties` clients can `set`, `get` and `wait` without an Android
-//! device. It is not usable on Android, where init owns the property service; the
-//! crate compiles only for `target_os = "linux"` (on other targets the first error
-//! names the reason).
+//! A host binary calls [`run`] on a tokio runtime. The service creates the
+//! property areas from `property_contexts` and build.prop files, serves
+//! the `property_service` / `property_service_for_system` sockets
+//! (`PROP_MSG_SETPROP2`), and passes `ctl.*` and `sys.powerctl` requests
+//! to handlers the host provides, so `rsproperties` clients can `get`,
+//! `set` and wait on a Linux host. It is not usable on Android, where init
+//! owns the property service; the crate compiles only for
+//! `target_os = "linux"` (on other targets the first error names the
+//! reason).
 //!
 //! The V1 command (`PROP_MSG_SETPROP`), which init still handles, is not
 //! supported: such a request sets nothing and gets
@@ -18,9 +21,145 @@
 //! `rsproperties` clients read to choose the command, and [`run`] fails
 //! when a build.prop file sets that property to a value that selects V1.
 //!
-//! [`run`] starts the service and returns a [`ServiceHandle`]; see there
-//! for how the service is stopped.
-
+//! # Starting the service
+//!
+//! [`run`] takes the directories as an [`rsproperties::PropertyConfig`]
+//! and the inputs and handlers as [`ServiceOptions`], and returns a
+//! [`ServiceHandle`] once the service is ready for clients:
+//!
+//! ```rust,no_run
+//! use rsproperties_service::{PowerctlOutcome, ServiceOptions};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//!     // `run` creates a missing properties dir (last component only, 0711)
+//!     // and socket dir (0755, parents included), both minus the umask's
+//!     // bits, and uses an existing directory as it is: create them
+//!     // beforehand to choose owner and mode. Keep the socket dir and its
+//!     // ancestors writable only by the service's user and root; under
+//!     // `/tmp`, any local user can create the directories first.
+//!     let config = rsproperties::PropertyConfig::new()
+//!         .properties_dir("/run/props")
+//!         .socket_dir("/run/props/sockets");
+//!
+//!     let options = ServiceOptions::new()
+//!         .property_contexts_files(["/system/etc/selinux/property_contexts"])
+//!         .build_prop_files(["/system/build.prop", "/vendor/build.prop"])
+//!         // `persist.*` and `next_boot.*` survive a restart; the file's
+//!         // directory must exist.
+//!         .persistent_properties_file("/data/property/persistent_properties")
+//!         .control_handler(|msg, reply| {
+//!             // No services to control: report failure.
+//!             eprintln!("ctl.{} {} from uid {:?}", msg.action, msg.target, msg.uid);
+//!             reply.send(false);
+//!         })
+//!         .powerctl_handler(|msg| {
+//!             eprintln!("sys.powerctl {}", msg.command);
+//!             PowerctlOutcome::Ignored
+//!         });
+//!
+//!     let mut service = rsproperties_service::run(config, options).await?;
+//!     tokio::select! {
+//!         _ = tokio::signal::ctrl_c() => {}
+//!         // The service ended by itself; `shutdown` returns the same result.
+//!         _ = service.join() => {}
+//!     }
+//!     // Waits until the sockets are unlinked and the writer lock is released.
+//!     service.shutdown().await?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! Start clients after `run` has returned. [`ServiceHandle`] lists how the
+//! service ends (`shutdown`, `join`, dropping the handle);
+//! [`ServiceHandle::stop_handler_calls`] ends only the handler calls, for a
+//! host that is going down.
+//!
+//! # Handlers
+//!
+//! A `ctl.*` request reaches the
+//! [control handler](ServiceOptions::control_handler) with a
+//! [`ControlReply`]; its client is answered when the host answers or drops
+//! the reply, in the handler call or later. `sys.powerctl` reaches the
+//! [powerctl handler](ServiceOptions::powerctl_handler), and the client's
+//! reply does not wait for that call: the call can begin before the reply
+//! is sent, or when the client gets none. Both handlers are called one at
+//! a time, in the order init handles the same requests. A handler can be tested without a service:
+//!
+//! ```rust
+//! use rsproperties_service::{ControlMessage, ControlReply};
+//!
+//! let handler = |msg: ControlMessage, reply: ControlReply| reply.send(msg.action == "start");
+//!
+//! let (reply, probe) = ControlReply::for_test();
+//! handler(ControlMessage::new("start", "my_service", None), reply);
+//! assert_eq!(probe.blocking_answer(), Some(true));
+//! ```
+//!
+//! The service checks no sender beyond the socket's file mode: a handler
+//! that acts on the host must check [`ControlMessage::uid`] (from
+//! `SO_PEERCRED`) itself.
+//!
+//! # Setting from the service's process
+//!
+//! The actors are private; a process sets properties through the socket
+//! like any client. From a task on the runtime that runs the service, use
+//! `rsproperties::asynchronous::set` (`rsproperties` feature `tokio`),
+//! which keeps the runtime free while it waits:
+//!
+//! ```rust,no_run
+//! # async fn enable_debug() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//! use std::time::Duration;
+//!
+//! tokio::time::timeout(
+//!     Duration::from_secs(2),
+//!     rsproperties::asynchronous::set("debug.my_app.enabled", "1"),
+//! )
+//! .await??;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The blocking `rsproperties::set` blocks the thread of its task: on a
+//! `current_thread` runtime the service then cannot serve that request,
+//! `set` returns a timeout error after 2 s, and the value may still be
+//! applied once the runtime resumes. Without the `tokio` feature, run the
+//! service on its own runtime or thread, or call `set` through
+//! `tokio::task::spawn_blocking` on a multi-thread runtime.
+//!
+//! # Errors
+//!
+//! [`run`] fails with a [`StartupError`], whose [`StartupError::stage`]
+//! names the step that failed and whose `source()` is the cause;
+//! [`ServiceHandle::join`] and [`ServiceHandle::shutdown`] return a
+//! [`ServiceError`].
+//!
+//! A release build of `rsproperties` (no `debug-assertions`), or one with
+//! its `strict-file-validation` feature, accepts property files only when
+//! uid 0 / gid 0 own them, so the service then has to run as root; `run`
+//! as another user fails at [`StartupStage::PropertiesService`].
+//!
+//! # Logging
+//!
+//! The service logs through the `log` crate; install a logger in the host
+//! (`env_logger`, for one) to see it. Property values are masked in the
+//! logs (`<N bytes>`); names are logged in full.
+//!
+//! # Further reading
+//!
+#![doc = concat!(
+    "- [Protocol and init behaviour](https://github.com/hiking90/rsproperties/blob/v",
+    env!("CARGO_PKG_VERSION"),
+    "/docs/service-protocol.md): response codes, `sys.powerctl`, the type check, \
+     startup properties, size limits, and how a host answers `ctl.*` as init does.\n",
+    "- [Files, access control and hardening](https://github.com/hiking90/rsproperties/blob/v",
+    env!("CARGO_PKG_VERSION"),
+    "/docs/service-security.md): the directory layout, file ownership, who may use \
+     the service, socket permissions, backpressure, and the outcome of a `TimedOut`.\n",
+    "- [CHANGELOG.md](https://github.com/hiking90/rsproperties/blob/v",
+    env!("CARGO_PKG_VERSION"),
+    "/CHANGELOG.md): every change, with a migration section per release."
+)]
 #![warn(missing_docs)]
 
 #[cfg(not(target_os = "linux"))]
@@ -43,8 +182,7 @@ mod socket_service;
 
 // Compiles the Rust blocks of this crate's README as doctests. The README
 // is attached only under `cfg(doctest)`, so docs.rs shows the `//!` text
-// above, and the path stays inside the package. The workspace README has
-// no Rust blocks.
+// above, and the path stays inside the package.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
@@ -413,9 +551,13 @@ impl ServiceOptions {
     /// is not running is set to `stopped` at once, also with success. An
     /// unknown service and an unknown action are failures. A host that
     /// answers only when the process has exited keeps the client waiting
-    /// for that time, which init does not. The crate's README lists the
-    /// whole contract, under
-    /// [Answering as init does](https://github.com/hiking90/rsproperties/blob/main/rsproperties-service/README.md#answering-as-init-does).
+    /// for that time, which init does not.
+    #[doc = concat!(
+        "The whole contract is in [Behaving as init does]",
+        "(https://github.com/hiking90/rsproperties/blob/v",
+        env!("CARGO_PKG_VERSION"),
+        "/docs/service-protocol.md#behaving-as-init-does)."
+    )]
     ///
     /// # Shutdown
     ///
