@@ -93,7 +93,7 @@ then does not accept the `PropertyConfig` of the copy you use.
 Code written for the 0.6.0 git release needs the changes listed in
 [Migration from 0.6.0](https://github.com/hiking90/rsproperties/blob/main/CHANGELOG.md#migration-from-060).
 
-Supported platform: Linux only. On any other target (Android and macOS
+Supported platform: Linux only. On any other target (Android
 included) the crate fails to compile with a `compile_error!` that names
 the reason.
 
