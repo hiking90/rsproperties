@@ -545,8 +545,7 @@ git 0.6.0.
 - Supported platforms are stated: the `rsproperties` client (`get`, `set`,
   `wait`) supports Linux and Android; the `builder` feature and
   `rsproperties-service` target Linux hosts (on Android, init creates the
-  property areas). macOS is not supported: the client crate still
-  compiles for it, but CI neither builds nor tests it.
+  property areas).
 - `PropertyIndex` records which `SystemProperties` instance returned it;
   it grows from 8 to 16 bytes and its `Debug` output gains an `instance`
   field (see Fixed).
@@ -965,7 +964,7 @@ Service (`rsproperties-service`; until this release a git dependency only):
     `load_properties_from_file` import-expansion rustdoc states how its
     expansion source differs from AOSP.
   - supported platforms (client: Linux and Android; service
-    and `builder`: Linux; macOS unsupported; the `rsproperties` package
+    and `builder`: Linux; the `rsproperties` package
     description no longer claims cross-platform support); boolean properties use
     `0`/`1` or `true`/`false` depending on the property; the
     `SystemProperties::find` entry lists `Ok(None)` for an empty-segment

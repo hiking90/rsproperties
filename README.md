@@ -60,14 +60,11 @@ Linux: on Android, init owns the property service.
 
 ## Platform Support
 
-| Component | Linux | Android | macOS |
-|---|---|---|---|
-| `rsproperties` client (`get`, `set`, `wait`) | supported | supported | not supported |
-| `builder` feature (creating property areas) | supported | — (init creates the areas) | not supported |
-| `rsproperties-service` | supported | does not compile (init owns the property service) | does not compile |
-
-macOS is not a supported target: the client crate still compiles for it,
-but CI neither builds nor tests it.
+| Component | Linux | Android |
+|---|---|---|
+| `rsproperties` client (`get`, `set`, `wait`) | supported | supported |
+| `builder` feature (creating property areas) | supported | — (init creates the areas) |
+| `rsproperties-service` | supported | does not compile (init owns the property service) |
 
 Supported Android versions are Android 9 (API level 28) to Android 17
 (API level 37). The Android 17 appcompat-override lookup is implemented

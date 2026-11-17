@@ -424,8 +424,6 @@ fn main() -> rsproperties::Result<()> {
   `read_with`) is supported on both.
 - **`builder` feature** (creating property areas): for Linux hosts. On
   Android, init creates the property areas.
-- **macOS**: not supported. The crate still compiles for it, but CI
-  neither builds nor tests it.
 - **`rsproperties-service`** compiles only for Linux.
 
 ### Android
