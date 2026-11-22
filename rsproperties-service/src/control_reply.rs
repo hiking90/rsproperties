@@ -132,9 +132,9 @@ impl ReplyState {
 /// or a powerctl handler that returned
 /// [`PowerctlOutcome::ShuttingDown`](crate::PowerctlOutcome::ShuttingDown)),
 /// a dropped reply to `ctl.stop` answers `PROP_SUCCESS` instead: the reply
-/// a `ctl.stop` request read after the stop gets. A host that is going
-/// down can therefore drop the replies it still holds. `send` always
-/// answers what it was given.
+/// a `ctl.stop` request read after the stop gets, unless an authorizer
+/// denies it. A host that is going down can therefore drop the replies it
+/// still holds. `send` always answers what it was given.
 ///
 /// # What a reply holds
 ///

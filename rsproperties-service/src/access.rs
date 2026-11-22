@@ -79,9 +79,11 @@ impl SocketAccess {
     ///
     /// [`run`](crate::run) fails at
     /// [`StartupStage::Config`](crate::StartupStage::Config) when `mode`
-    /// has a bit outside `0o660`: the setuid, setgid, sticky and execute
-    /// bits have no meaning on a socket, and a bit for others would let
-    /// every local uid set any property.
+    /// has a bit outside `0o666`: the setuid, setgid, sticky and execute
+    /// bits have no meaning on a socket. It fails there too for a bit for
+    /// others (`0o006`) unless the options have an
+    /// [authorizer](crate::ServiceOptions::authorizer): without one, every
+    /// local uid that can reach the socket dir could set any property.
     pub const fn new(mode: u32) -> Self {
         Self { mode, group: None }
     }
@@ -113,8 +115,15 @@ impl SocketAccess {
     }
 
     /// Why [`run`](crate::run) refuses this access for `listener`.
-    pub(crate) fn check(&self, listener: Listener) -> Result<(), rsproperties::Error> {
-        const ALLOWED: u32 = 0o660;
+    /// `has_authorizer`: whether the options have an
+    /// [authorizer](crate::ServiceOptions::authorizer), which a bit for
+    /// others needs.
+    pub(crate) fn check(
+        &self,
+        listener: Listener,
+        has_authorizer: bool,
+    ) -> Result<(), rsproperties::Error> {
+        let allowed: u32 = if has_authorizer { 0o666 } else { 0o660 };
         if self.group == Some(u32::MAX) {
             return Err(rsproperties::Error::InvalidArgument(format!(
                 "socket group {} for {listener} is (gid_t)-1, which chown reads as \
@@ -122,7 +131,7 @@ impl SocketAccess {
                 u32::MAX
             )));
         }
-        if self.mode & !ALLOWED == 0 {
+        if self.mode & !allowed == 0 {
             return Ok(());
         }
         let reason = if self.mode & !0o777 != 0 {
@@ -130,10 +139,11 @@ impl SocketAccess {
         } else if self.mode & 0o111 != 0 {
             "has an execute bit"
         } else {
-            "has a bit for others (with write, every local uid could set any property)"
+            "has a bit for others, which needs ServiceOptions::authorizer (without one, every \
+             local uid that can connect could set any property)"
         };
         Err(rsproperties::Error::InvalidArgument(format!(
-            "socket mode {:#o} for {listener} {reason}; the mode must be within {ALLOWED:#o}",
+            "socket mode {:#o} for {listener} {reason}; the mode must be within {allowed:#o}",
             self.mode
         )))
     }
@@ -151,30 +161,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn modes_outside_0660_are_refused() {
+    fn modes_outside_the_allowed_bits_are_refused() {
         for mode in [0o660, 0o600, 0o640, 0o620, 0o000] {
-            SocketAccess::new(mode).check(Listener::Property).unwrap();
+            for has_authorizer in [false, true] {
+                SocketAccess::new(mode)
+                    .check(Listener::Property, has_authorizer)
+                    .unwrap();
+            }
         }
-        for (mode, reason) in [
-            (0o666, "for others"),
-            (0o662, "for others"),
-            (0o664, "for others"),
-            (0o670, "execute"),
-            (0o760, "execute"),
-            (0o2660, "above 0o777"),
-            (0o4660, "above 0o777"),
-            (0o1660, "above 0o777"),
-            (0o10660, "above 0o777"),
+        // `Some(bound)`: refused with and without an authorizer, and the
+        // message names this bound for the service with one.
+        for (mode, reason, with_authorizer) in [
+            (0o666, "for others", None),
+            (0o662, "for others", None),
+            (0o664, "for others", None),
+            (0o670, "execute", Some("0o666")),
+            (0o760, "execute", Some("0o666")),
+            (0o667, "execute", Some("0o666")),
+            (0o2660, "above 0o777", Some("0o666")),
+            (0o4666, "above 0o777", Some("0o666")),
+            (0o1660, "above 0o777", Some("0o666")),
+            (0o10660, "above 0o777", Some("0o666")),
         ] {
             let err = SocketAccess::new(mode)
-                .check(Listener::System)
+                .check(Listener::System, false)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(reason), "{mode:#o}: {err}");
+            assert!(err.contains("within 0o660"), "{mode:#o}: {err}");
             assert!(
                 err.contains(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME),
                 "{err}"
             );
+            let checked = SocketAccess::new(mode).check(Listener::System, true);
+            match with_authorizer {
+                None => checked.unwrap(),
+                Some(bound) => {
+                    let err = checked.unwrap_err().to_string();
+                    assert!(err.contains(reason), "{mode:#o}: {err}");
+                    assert!(err.contains(bound), "{mode:#o}: {err}");
+                }
+            }
         }
     }
 
@@ -182,17 +209,19 @@ mod tests {
     fn group_minus_one_is_refused() {
         SocketAccess::new(0o660)
             .with_group(0)
-            .check(Listener::Property)
+            .check(Listener::Property, false)
             .unwrap();
         SocketAccess::new(0o660)
             .with_group(u32::MAX - 1)
-            .check(Listener::Property)
+            .check(Listener::Property, false)
             .unwrap();
-        let err = SocketAccess::new(0o660)
-            .with_group(u32::MAX)
-            .check(Listener::Property)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unchanged"), "{err}");
+        for has_authorizer in [false, true] {
+            let err = SocketAccess::new(0o660)
+                .with_group(u32::MAX)
+                .check(Listener::Property, has_authorizer)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("unchanged"), "{err}");
+        }
     }
 }

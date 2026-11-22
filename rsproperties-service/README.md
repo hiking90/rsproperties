@@ -19,9 +19,12 @@ the property service sockets, so
   format, in a file the host names.
 - Passes `ctl.*` and `sys.powerctl` requests to handlers the host
   provides, in the order init handles them.
+- Asks an authorizer the host provides whether each request may go on,
+  where init asks SELinux; the owner group and mode of each socket file
+  are configurable.
 
-It checks no sender beyond the socket's file mode. It compiles only for
-Linux: on Android, init owns the property service.
+Without an authorizer it checks no sender beyond the socket files' modes.
+It compiles only for Linux: on Android, init owns the property service.
 
 ## Installation
 

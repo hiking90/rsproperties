@@ -10,14 +10,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Service: `ServiceOptions::authorizer(|request| -> Decision)` decides
+  each request of a connected client, where init's `CheckPermissions`
+  asks SELinux. The authorizer gets a `SetRequest`: the name, the value,
+  the name's `property_contexts` context (for `ctl.*`, that of
+  `ctl.<action>$<target>`), the `Listener` the request came in on, and
+  the sender's pid, uid and gid (`PeerInfo`, from `SO_PEERCRED`). It is
+  called for a set of an ordinary property, a `ctl.*` request and a
+  `sys.powerctl` set, after the name check and before the type check.
+  `Decision::Deny` is answered with `PROP_ERROR_PERMISSION_DENIED`
+  (`PROP_ERROR_HANDLE_CONTROL_MESSAGE` for `ctl.*`, which is then not
+  passed to the control handler). A request is refused in the same way
+  when the sender's credentials cannot be read, when the properties
+  service fails to start (a request that arrives before it has started
+  waits for it), when the name's context cannot be read, and when the
+  authorizer panics. A name without a `property_contexts` entry is not
+  refused: the authorizer gets it with the default context,
+  `u:object_r:build_prop:s0`. Without an authorizer the
+  service behaves as before: every request of a peer that could connect
+  goes on. `SetRequest::for_test` and `PeerInfo::for_test` build a
+  request to test an authorizer with. The `Debug` output of a
+  `SetRequest` has `<N bytes>` in place of the value. The `Debug`
+  output of `ServiceOptions` has an `authorizer` field.
 - Service: `ServiceOptions::socket_access(Listener, SocketAccess)` sets
   the owner group and mode of each service socket file, in place of mode
   `0o660` and the group the file is created with. `Listener` names the
   two sockets; `SocketAccess::new(mode).with_group(gid)` is the value.
-  `run` refuses a mode with a bit outside `0o660`, or group `u32::MAX`,
-  with `StartupStage::Config`, before `rsproperties::init`. Without the
-  option the sockets are created as before. The `Debug` output of
-  `ServiceOptions` has a `socket_access` field.
+  `run` refuses, with `StartupStage::Config` and before
+  `rsproperties::init`: a mode with an execute, setuid, setgid or sticky
+  bit; a mode with a bit for others (`0o006`) when the options have no
+  authorizer; and group `u32::MAX`. With an authorizer, init's
+  `property_service` mode `0o666` can be used. Without the option the
+  sockets are created as before. The `Debug` output of `ServiceOptions`
+  has a `socket_access` field.
 - `PropertyInfoTrie` (`builder` feature): a checked, 4-byte aligned copy
   of the bytes `build_trie` returns. `context(name)` and
   `property_type(name)` return `&str`s that borrow it, without the

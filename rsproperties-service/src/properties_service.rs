@@ -30,6 +30,12 @@ pub(crate) struct PropertiesServiceArgs {
     /// Stores `persist.*` / `next_boot.*` properties in this file; see
     /// [`crate::ServiceOptions::persistent_properties_file`].
     pub(crate) persistent_properties_file: Option<PathBuf>,
+    /// Gets the trie `on_start` publishes as `property_info`, for the
+    /// socket service's authorizer calls
+    /// ([`crate::authorization::Authorization`]). Sent once `on_start` has
+    /// succeeded; when it fails the sender is dropped without a value, and
+    /// the requests waiting for it are refused.
+    pub(crate) trie_sender: Option<crate::authorization::TrieSender>,
 }
 
 pub(crate) struct PropertiesService {
@@ -71,7 +77,7 @@ fn init_system_properties_sync(
     build_prop_files: Vec<PathBuf>,
     dir: &Path,
     lock: AreaWriterLock,
-) -> std::io::Result<SystemProperties> {
+) -> std::io::Result<(SystemProperties, PropertyInfoTrie)> {
     let mut property_infos = Vec::new();
     for file in property_contexts_files {
         let (mut property_info, errors) =
@@ -181,7 +187,7 @@ fn init_system_properties_sync(
             log::error!("Skipping build.prop entry {key:?}: {e}");
         }
     }
-    Ok(system_properties)
+    Ok((system_properties, trie))
 }
 
 /// The properties AOSP init sets after the build.prop files, in its order:
@@ -334,7 +340,8 @@ impl Actor for PropertiesService {
         // task so the tokio worker that polls this actor is free to drive
         // other tasks (notably the sibling SocketService) while
         // initialisation runs.
-        let (system_properties, persistent) = tokio::task::spawn_blocking(move || {
+        let trie_sender = args.trie_sender;
+        let (system_properties, persistent, trie) = tokio::task::spawn_blocking(move || {
             // Before `property_info` and the areas are written: a missing
             // directory or another service's lock must fail startup while
             // the properties dir is still as it was.
@@ -343,17 +350,25 @@ impl Actor for PropertiesService {
                 .as_deref()
                 .map(PersistentStore::load)
                 .transpose()?;
-            let mut system_properties = init_system_properties_sync(
+            let (mut system_properties, trie) = init_system_properties_sync(
                 args.property_contexts_files,
                 args.build_prop_files,
                 dir,
                 args.writer_lock,
             )?;
             let persistent = apply_startup_properties(&mut system_properties, persistent);
-            Ok::<_, std::io::Error>((system_properties, persistent))
+            Ok::<_, std::io::Error>((system_properties, persistent, trie))
         })
         .await
         .map_err(io_other)??;
+
+        // After every step that can fail: an early return above drops the
+        // sender without a value. An ordinary or `sys.powerctl` set that
+        // passes the authorizer from here on waits in this actor's mailbox
+        // like any other.
+        if let Some(sender) = trie_sender {
+            sender.send_replace(Some(std::sync::Arc::new(trie)));
+        }
 
         Ok(PropertiesService {
             system_properties,
@@ -503,6 +518,7 @@ mod tests {
     ) -> std::io::Result<SystemProperties> {
         let lock = AreaWriterLock::acquire(dir).map_err(io_other)?;
         init_system_properties_sync(property_contexts_files, build_prop_files, dir, lock)
+            .map(|(system_properties, _trie)| system_properties)
     }
 
     /// A reader that already holds the previous `property_info` must keep

@@ -52,18 +52,53 @@ in the release build.
 
 ## Access control
 
-- Each socket file's group and mode (`0o660` by default; see
-  `ServiceOptions::socket_access`) plus the socket dir's permissions are
-  the only access control. Any peer that can connect may set any
-  non-`ro.` property, and any `ro.` property that has no value yet (the
-  first writer fixes it), and send any `ctl.*` control message to the
+- **Who can connect**: each socket file's owner, group and mode (`0o660`
+  by default; see `ServiceOptions::socket_access`) plus the socket dir's
+  permissions.
+- **What a connected peer may do**: the host's authorizer
+  (`ServiceOptions::authorizer`) decides each request, where init's
+  `CheckPermissions` asks SELinux. It is called for a set of an ordinary
+  property, a `ctl.*` request and a `sys.powerctl` set, after the name
+  check and before the type check, with the name, the value, the
+  context `property_contexts` gives the name (for `ctl.*`, the context
+  of `ctl.<action>$<target>`), the socket the request came in on, and
+  the sender's pid, uid and gid from `SO_PEERCRED`. A name that no
+  `property_contexts` entry matches has the default context,
+  `u:object_r:build_prop:s0`, and is passed to the authorizer with it:
+  the service does not refuse such a name, so an authorizer that allows
+  that context allows every name without an entry. A denied request is
+  answered with `PROP_ERROR_PERMISSION_DENIED`, a denied `ctl.*` request
+  with `PROP_ERROR_HANDLE_CONTROL_MESSAGE` and without a call of the
+  control handler; both are logged at `warn`. A request is refused in
+  the same way, without a call, when the sender's credentials cannot be
+  read, when the properties service fails to start (a request that
+  arrives before that service has started waits for it), and when the
+  name's context cannot be read. A panic in the authorizer is caught:
+  the request is refused with the same codes and logged at `error`. A
+  request whose name passed the name check and whose value is not a
+  string (an interior NUL, not UTF-8) is answered with
+  `PROP_ERROR_INVALID_VALUE` before the authorizer is asked, and is not
+  logged as a denial; init checks the access first.
+  The properties the service sets itself at startup (build.prop files,
+  persistent properties) do not go through the authorizer.
+- **The credentials are those of `connect()`**: `SO_PEERCRED` records
+  the process that connected. A process that was passed the connected
+  descriptor sends with the same credentials, and the pid may have been
+  reused; the gid is the effective gid only, without supplementary
+  groups.
+- **`ro.` properties are write-once, not read-only for clients**: the
+  first set of a `ro.` name without a value is stored, as in init, where
+  sepolicy lets some daemons publish such values. An authorizer that
+  must keep clients from doing that denies names that start with `ro.`.
+- **Without an authorizer** the socket files and the socket dir are the
+  only access control. Any peer that can connect may set any non-`ro.`
+  property, and any `ro.` property that has no value yet (the first
+  writer fixes it), and send any `ctl.*` control message to the
   configured control handler and any `sys.powerctl` command to the
-  configured powerctl handler. A handler that reboots the host must
+  configured powerctl handler. A handler that reboots the host must then
   check the sender (`uid`, `gid`, `pid` from `SO_PEERCRED`) or the
-  command itself.
-- `property_contexts` maps property names to contexts and types (values
-  are type-checked); no per-property (SELinux or `SO_PEERCRED`)
-  authorization is performed.
+  command itself. `property_contexts` maps property names to contexts
+  and types; the values are type-checked, the senders are not.
 - **Socket dir contract**: the service opens the socket dir once at
   startup and changes only entries directly in it named
   `property_service`, `property_service_for_system`, or
@@ -114,12 +149,15 @@ any bits the mode is raised to exactly the configured mode (needs
 fails with `ECONNREFUSED`. Both sockets are bound as `.<name>.tmp-<pid>`
 and renamed onto their final names only after both listen.
 
-A mode may not go beyond `0o660`: `run` refuses a bit for others, which
-would let every local uid set any property, and the setuid, setgid,
-sticky and execute bits. This is stricter than AOSP init, which creates
-`property_service` 0666 (relying on SELinux) and only
-`property_service_for_system` 0660 with group `system`; the latter can be
-reproduced with `SocketAccess::new(0o660).with_group(<system gid>)`.
+`run` refuses the setuid, setgid, sticky and execute bits, and, for a
+service without an authorizer, a bit for others: with such a bit, every local
+uid that can reach the socket dir could set any property. AOSP init
+creates `property_service` 0666, relying on SELinux, and
+`property_service_for_system` 0660 with group `system`. A service with an
+authorizer can do the same: `SocketAccess::new(0o666)` for
+`Listener::Property` and
+`SocketAccess::new(0o660).with_group(<system gid>)` for
+`Listener::System`.
 
 ### Backpressure
 
@@ -168,7 +206,14 @@ discarded.
   default (a C or JNI host embedding the service).
 - **Value masking**: property values are masked in service logs
   (`<N bytes>` placeholder). Property values may carry tokens or device
-  identifiers; names are still logged in full.
+  identifiers; names are still logged in full. One value is logged: the
+  target of a `ctl.*` request (its wire value), at `trace` level, and
+  only by a service that has an authorizer. That service looks the
+  request's context up under the name `ctl.<action>$<target>`, and
+  `rsproperties` logs a name whose lookup ends at an exact
+  `property_contexts` entry (`Property "ctl.<action>$<target>"
+  resolved: ...`, the name escaped as by `{:?}`). A target without such
+  an entry is not logged, and no other log line prints the target.
 - **Init errors propagate**: `run()` calls `rsproperties::init`, so a
   directory already set to a different path surfaces as a `Result`
   (`StartupStage::Config`) rather than silently leaving the service

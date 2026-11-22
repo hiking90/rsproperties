@@ -23,13 +23,14 @@ use rsactor::{Actor, ActorRef, ActorWeak};
 use rsproperties::wire::{
     validate_property_name, MAX_WIRE_NAME_LEN, MAX_WIRE_VALUE_LEN,
     PROP_ERROR_HANDLE_CONTROL_MESSAGE, PROP_ERROR_INVALID_CMD, PROP_ERROR_INVALID_NAME,
-    PROP_ERROR_INVALID_VALUE, PROP_ERROR_READ_CMD, PROP_ERROR_READ_DATA, PROP_ERROR_SET_FAILED,
-    PROP_MSG_SETPROP, PROP_MSG_SETPROP2, PROP_SUCCESS,
+    PROP_ERROR_INVALID_VALUE, PROP_ERROR_PERMISSION_DENIED, PROP_ERROR_READ_CMD,
+    PROP_ERROR_READ_DATA, PROP_ERROR_SET_FAILED, PROP_MSG_SETPROP, PROP_MSG_SETPROP2, PROP_SUCCESS,
 };
 use rsproperties::{
     Error, Result, PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME, PROPERTY_SERVICE_SOCKET_NAME,
 };
 
+use crate::authorization::Authorization;
 use crate::control_reply::{ControlReply, ReplyFd, ReplyState};
 use crate::properties_service::PropertiesService;
 use crate::{Listener, SocketAccess};
@@ -131,24 +132,25 @@ const MAX_UNANSWERED_CONTROL_MESSAGES: usize = 102;
 /// group may connect, others may not. Stricter than AOSP init, which
 /// creates `property_service` 0666 (relying on SELinux) and only
 /// `property_service_for_system` 0660. `crate::ServiceOptions::socket_access`
-/// replaces it per socket, within the same bits. The mode is set on the
+/// replaces it per socket; a bit for others needs an authorizer
+/// ([`SocketAccess::check`]). The mode is set on the
 /// socket fd before `bind` and, if the umask cleared bits, raised to
 /// exactly the configured value before `listen` (see
 /// [`apply_socket_access`]), so it does not depend on the process umask.
 ///
-/// **Access model.** The file's group and mode are the service's *entire*
-/// access control: any peer that can `connect()` (i.e. has write
-/// permission on the socket file — owner or group) may set any non-`ro.`
-/// property, and
+/// **Access model.** The file's owner, group and mode decide who can
+/// `connect()` (write permission on the socket file). What a connected
+/// peer may then do is decided per request by the host's authorizer
+/// ([`Authorization::allows`], init's `CheckPermissions`), when it has
+/// one. Without one the socket file is the service's *entire* access
+/// control: any peer that can connect may set any non-`ro.` property, and
 /// any `ro.` property that has no value yet (the first writer fixes it),
-/// and send any `ctl.*` control message to the configured handler. The
-/// `property_contexts` type check applies to values, not to senders.
-/// Unlike AOSP init, no per-property SO_PEERCRED / property_contexts
-/// authorization is performed, and the "property" / "system" sockets
-/// share one handler; peer credentials are logged for auditability only.
-/// This is an intentional simplification for host-side deployments —
-/// restrict group membership and the socket dir as described on
-/// [`SocketService`].
+/// and send any `ctl.*` control message to the configured handler; peer
+/// credentials are then only logged and passed to the handlers. The
+/// `property_contexts` type check applies to values, not to senders, and
+/// the "property" / "system" sockets share one handler, which an
+/// authorizer can tell apart by the request's listener. Restrict group
+/// membership and the socket dir as described on [`SocketService`].
 pub(crate) const SOCKET_FILE_MODE: u32 = 0o660;
 
 /// Backoff applied when `accept()` returns an error. Without it, a
@@ -522,6 +524,9 @@ pub(crate) struct SocketServiceArgs {
     /// Handle the `ctl.*` and `sys.powerctl` sets. Built by the caller,
     /// which keeps its [`Handlers::drain`] and [`Handlers::stop_switch`].
     pub(crate) handlers: Handlers,
+    /// The host's authorizer, when it has one
+    /// ([`crate::ServiceOptions::authorizer`]).
+    pub(crate) authorization: Option<Authorization>,
     /// Group and mode of each socket file, indexed by [`Listener::index`].
     /// Checked by `crate::run` ([`SocketAccess::check`]).
     pub(crate) socket_access: [SocketAccess; 2],
@@ -562,6 +567,7 @@ pub(crate) struct SocketService {
     /// The two final socket names; unlinked when the service is dropped.
     _socket_files: SocketDirEntries,
     handlers: Handlers,
+    authorization: Option<Authorization>,
 }
 
 impl Actor for SocketService {
@@ -626,6 +632,7 @@ impl Actor for SocketService {
             waiting_sem: Arc::new(Semaphore::new(MAX_WAITING_CLIENTS)),
             _socket_files: entries,
             handlers: args.handlers,
+            authorization: args.authorization,
         })
     }
 
@@ -660,7 +667,7 @@ impl Actor for SocketService {
         };
 
         // Peer credentials: logged for auditability — see the access-model
-        // note on `SOCKET_FILE_MODE` (no per-property authorization).
+        // note on `SOCKET_FILE_MODE`.
         if let Ok(cred) = stream.peer_cred() {
             debug!(
                 "Client connected on {source} listener (uid={}, gid={})",
@@ -692,6 +699,7 @@ impl Actor for SocketService {
         let sem = self.connection_sem.clone();
         let connection_sender = self.properties_service.clone();
         let handlers = self.handlers.clone();
+        let authorization = self.authorization.clone();
         tokio::spawn(async move {
             let permit = {
                 let _waiting = waiting; // released once a handler slot is ours
@@ -721,7 +729,7 @@ impl Actor for SocketService {
             let _permit = permit; // dropped when the task ends
             match tokio::time::timeout(
                 CLIENT_TIMEOUT,
-                Self::handle_client(stream, listener, connection_sender, handlers),
+                Self::handle_client(stream, listener, authorization, connection_sender, handlers),
             )
             .await
             {
@@ -1211,6 +1219,7 @@ impl SocketService {
     async fn handle_client<A>(
         mut stream: UnixStream,
         listener: Listener,
+        authorization: Option<Authorization>,
         service: ActorRef<A>,
         handlers: Handlers,
     ) -> Result<()>
@@ -1257,7 +1266,8 @@ impl SocketService {
                 trace!("Processing SETPROP2 command");
                 // By value: a `ctl.*` request hands the connection over to
                 // its `ControlReply`.
-                Self::handle_setprop2(stream, listener, service, handlers, peer).await?;
+                Self::handle_setprop2(stream, listener, authorization, service, handlers, peer)
+                    .await?;
             }
             _ => {
                 warn!("Unknown command received: 0x{cmd:08X}");
@@ -1464,6 +1474,7 @@ impl SocketService {
     async fn handle_setprop2<A>(
         mut stream: UnixStream,
         listener: Listener,
+        authorization: Option<Authorization>,
         service: ActorRef<A>,
         handlers: Handlers,
         peer: Peer,
@@ -1478,6 +1489,36 @@ impl SocketService {
         // are public on the wire (and surface in getprop output), but
         // values are not.
         debug!("Property value length: {} bytes", value.len());
+
+        // init `CheckPermissions`: the name check, then the access check,
+        // and only then the type check (which the properties service
+        // makes), so a request that is denied gets the access code also
+        // when its value has the wrong type. A denied `ctl.*` request is
+        // answered here and takes no slot of the unanswered-message limit.
+        // Not init's order: a value that is not a string (interior NUL,
+        // not UTF-8) was answered with `PROP_ERROR_INVALID_VALUE`
+        // (`PROP_ERROR_INVALID_NAME` when the name fails the name check) by
+        // `read_setprop2` above, without a call of the authorizer and
+        // without the denial's log line; init checks the value after the
+        // access. The authorizer takes the value as a `&str`.
+        if let Some(mut authorization) = authorization {
+            if let Err(e) = validate_property_name(&name) {
+                error!("Rejected set request: {e}");
+                return Self::send_response(&mut stream, PROP_ERROR_INVALID_NAME).await;
+            }
+            let credentials = (peer.pid, peer.uid, peer.gid);
+            if !authorization
+                .allows(&name, &value, listener, credentials)
+                .await
+            {
+                let code = if name.starts_with("ctl.") {
+                    PROP_ERROR_HANDLE_CONTROL_MESSAGE
+                } else {
+                    PROP_ERROR_PERMISSION_DENIED
+                };
+                return Self::send_response(&mut stream, code).await;
+            }
+        }
 
         info!("Forwarding property: {name:?} ({} bytes)", value.len());
 
@@ -2330,10 +2371,26 @@ pub(crate) mod tests {
 
     /// [`exchange`] with both handlers.
     async fn exchange_with(frame: &[u8], service: ActorRef<Recorder>, handlers: Handlers) -> i32 {
+        exchange_authorized(frame, service, handlers, None).await
+    }
+
+    /// [`exchange_with`] for a service with an authorizer.
+    async fn exchange_authorized(
+        frame: &[u8],
+        service: ActorRef<Recorder>,
+        handlers: Handlers,
+        authorization: Option<Authorization>,
+    ) -> i32 {
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(frame).await.unwrap();
-        let _ = SocketService::handle_client(server, Listener::Property, service, handlers.clone())
-            .await;
+        let _ = SocketService::handle_client(
+            server,
+            Listener::Property,
+            authorization,
+            service,
+            handlers.clone(),
+        )
+        .await;
         let mut reply = [0u8; 4];
         client.read_exact(&mut reply).await.unwrap();
         // Kept until the reply is read, as the socket service keeps its
@@ -2358,6 +2415,112 @@ pub(crate) mod tests {
         frame
     }
 
+    /// With an authorizer the order is init's `CheckPermissions`: the name
+    /// check, then the authorizer. Only an allowed request is forwarded to
+    /// the properties service or queued for the control handler, and a
+    /// denied one gets the code of its kind.
+    #[tokio::test]
+    async fn authorizer_is_asked_after_the_name_check() {
+        use crate::authorization::Authorization;
+        use crate::Decision;
+
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        let (authorization, trie) = Authorization::new(Arc::new(move |request| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            if request.value() == "allow" {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            }
+        }));
+        let bytes = rsproperties::build_trie(&[], "u:object_r:default_prop:s0", "string").unwrap();
+        trie.send_replace(Some(Arc::new(
+            rsproperties::PropertyInfoTrie::new(&bytes).unwrap(),
+        )));
+
+        let (service, forwarded) = recorder();
+        let controlled = Arc::new(AtomicUsize::new(0));
+        let counter = controlled.clone();
+        let control: crate::ControlHandler = Arc::new(move |_message, reply: ControlReply| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            reply.send(true);
+        });
+        let handlers = Handlers::new(Some(control), None);
+
+        // (name, value, reply, authorizer calls, forwarded, control calls),
+        // the three counts after the request.
+        let cases = [
+            ("test.authz", "allow", PROP_SUCCESS, 1, 1, 0),
+            ("test.authz", "deny", PROP_ERROR_PERMISSION_DENIED, 2, 1, 0),
+            (
+                "sys.powerctl",
+                "deny",
+                PROP_ERROR_PERMISSION_DENIED,
+                3,
+                1,
+                0,
+            ),
+            // The recorder would refuse this value; the access code wins.
+            (
+                "test.authz",
+                REFUSED_VALUE,
+                PROP_ERROR_PERMISSION_DENIED,
+                4,
+                1,
+                0,
+            ),
+            ("test..authz", "allow", PROP_ERROR_INVALID_NAME, 4, 1, 0),
+            (
+                "ctl.start",
+                "deny",
+                PROP_ERROR_HANDLE_CONTROL_MESSAGE,
+                5,
+                1,
+                0,
+            ),
+            ("ctl..start", "allow", PROP_ERROR_INVALID_NAME, 5, 1, 0),
+            ("ctl.start", "allow", PROP_SUCCESS, 6, 1, 1),
+        ];
+        for (name, value, code, asked_after, forwarded_after, controlled_after) in cases {
+            let reply = exchange_authorized(
+                &v2_frame(name, value),
+                service.clone(),
+                handlers.clone(),
+                Some(authorization.clone()),
+            )
+            .await;
+            assert_eq!(reply, code, "{name}={value}");
+            assert_eq!(asked.load(Ordering::SeqCst), asked_after, "{name}={value}");
+            assert_eq!(
+                forwarded.load(Ordering::SeqCst),
+                forwarded_after,
+                "{name}={value}"
+            );
+            assert_eq!(
+                controlled.load(Ordering::SeqCst),
+                controlled_after,
+                "{name}={value}"
+            );
+        }
+
+        // Without the trie (the properties service failed to start) every
+        // request is refused without a call.
+        let (authorization, trie) = Authorization::new(Arc::new(|_| Decision::Allow));
+        drop(trie);
+        assert_eq!(
+            exchange_authorized(
+                &v2_frame("test.authz", "allow"),
+                service.clone(),
+                handlers.clone(),
+                Some(authorization),
+            )
+            .await,
+            PROP_ERROR_PERMISSION_DENIED
+        );
+        assert_eq!(forwarded.load(Ordering::SeqCst), 1);
+    }
+
     /// A fully received V2 request is applied even though its client
     /// closed the connection first (AOSP init parity).
     #[tokio::test]
@@ -2374,6 +2537,7 @@ pub(crate) mod tests {
         let _ = SocketService::handle_client(
             server,
             Listener::Property,
+            None,
             service,
             Handlers::new(None, None),
         )
@@ -2393,6 +2557,7 @@ pub(crate) mod tests {
         SocketService::handle_client(
             server,
             Listener::Property,
+            None,
             service,
             Handlers::new(None, None),
         )
@@ -2667,8 +2832,13 @@ pub(crate) mod tests {
             .write_all(&v2_frame(crate::POWERCTL_PROPERTY, "reboot"))
             .await
             .unwrap();
-        let exchange =
-            SocketService::handle_client(server, Listener::Property, service, handlers.clone());
+        let exchange = SocketService::handle_client(
+            server,
+            Listener::Property,
+            None,
+            service,
+            handlers.clone(),
+        );
         tokio::select! {
             _ = exchange => panic!("the exchange must wait for the properties service"),
             r = received.recv() => r.expect("the set must reach the properties service"),
@@ -3361,6 +3531,7 @@ pub(crate) mod tests {
         assert!(SocketService::handle_client(
             server,
             Listener::Property,
+            None,
             service,
             Handlers::new(None, None)
         )
@@ -3392,6 +3563,7 @@ pub(crate) mod tests {
         let _ = SocketService::handle_client(
             server,
             Listener::Property,
+            None,
             service,
             Handlers::new(None, None),
         )
@@ -3418,6 +3590,7 @@ pub(crate) mod tests {
         assert!(SocketService::handle_client(
             server,
             Listener::Property,
+            None,
             service,
             Handlers::new(None, None)
         )
