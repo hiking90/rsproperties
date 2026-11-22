@@ -8,8 +8,8 @@ use rsproperties::wire::{
     PROP_ERROR_SET_FAILED, PROP_SUCCESS,
 };
 use rsproperties::{
-    build_trie, load_properties_from_file_with, property_type_in_trie, AreaWriterLock,
-    MatchKeyword, PropFileOutcome, PropertyInfoEntry, SystemProperties,
+    build_trie, load_properties_from_file_with, AreaWriterLock, MatchKeyword, PropFileOutcome,
+    PropertyInfoEntry, PropertyInfoTrie, SystemProperties,
 };
 
 use crate::persistent_properties::{is_persistent_name, PersistentStore};
@@ -98,8 +98,9 @@ fn init_system_properties_sync(
     // until every input file has been read. The value is not logged
     // (value-masking policy, see `PropertyMessage`'s Debug); the loader
     // logs the file and line of the entry it drops.
-    let mut matches_type = |key: &str, value: &str| match property_type_in_trie(&data, key) {
-        Ok(Some(property_type)) if !check_type(&property_type, value) => {
+    let trie = PropertyInfoTrie::new(&data).map_err(io_other)?;
+    let mut matches_type = |key: &str, value: &str| match trie.property_type(key) {
+        Ok(Some(property_type)) if !check_type(property_type, value) => {
             log::error!("build.prop entry {key:?}: value does not match type {property_type:?}");
             false
         }

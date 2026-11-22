@@ -420,7 +420,7 @@ pub use build_property_parser::{
 #[cfg(feature = "builder")]
 pub use contexts_serialized::AreaWriterLock;
 #[cfg(feature = "builder")]
-pub use property_info_parser::property_type_in_trie;
+pub use property_info_parser::{property_type_in_trie, PropertyInfoTrie};
 #[cfg(feature = "builder")]
 pub use property_info_serializer::{build_trie, MatchKeyword, PropertyInfoEntry};
 pub use property_watcher::PropertyWatcher;

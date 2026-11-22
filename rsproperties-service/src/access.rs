@@ -29,6 +29,15 @@ impl Listener {
         }
     }
 
+    /// `"property"` or `"system"`, as the accept loop's log lines name
+    /// the listener.
+    pub(crate) const fn short_name(self) -> &'static str {
+        match self {
+            Self::Property => "property",
+            Self::System => "system",
+        }
+    }
+
     pub(crate) const fn index(self) -> usize {
         match self {
             Self::Property => 0,

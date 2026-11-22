@@ -571,7 +571,7 @@ impl Actor for SocketService {
     /// tagged with the listener it came from, so logging can name the source.
     /// The accept loop is modelled as `Stream`s of connections subscribed
     /// via `subscribe_idle` (rsactor has no `on_run` hook).
-    type IdleEvent = (std::io::Result<UnixStream>, &'static str);
+    type IdleEvent = (std::io::Result<UnixStream>, Listener);
 
     async fn on_start(
         args: Self::Args,
@@ -612,10 +612,12 @@ impl Actor for SocketService {
         // `subscribe_idle` is synchronous (`try_send`) and the runtime drains
         // queued subscriptions before the first loop iteration.
         actor_ref
-            .subscribe_idle(UnixListenerStream::new(property_listener).map(|r| (r, "property")))
+            .subscribe_idle(
+                UnixListenerStream::new(property_listener).map(|r| (r, Listener::Property)),
+            )
             .map_err(|e| std::io::Error::other(format!("subscribe property listener: {e}")))?;
         actor_ref
-            .subscribe_idle(UnixListenerStream::new(system_listener).map(|r| (r, "system")))
+            .subscribe_idle(UnixListenerStream::new(system_listener).map(|r| (r, Listener::System)))
             .map_err(|e| std::io::Error::other(format!("subscribe system listener: {e}")))?;
 
         Ok(Self {
@@ -636,7 +638,9 @@ impl Actor for SocketService {
         // single `select!` loop — any await that parks here stalls the
         // mailbox (stop/ask) AND the other listener's accepts. Keep this
         // body non-blocking except for the short, bounded error backoff.
-        let (accepted, source) = event;
+        let (accepted, listener) = event;
+        // The log lines keep the short names they had before `Listener`.
+        let source = listener.short_name();
 
         let stream = match accepted {
             Ok(stream) => stream,
@@ -717,7 +721,7 @@ impl Actor for SocketService {
             let _permit = permit; // dropped when the task ends
             match tokio::time::timeout(
                 CLIENT_TIMEOUT,
-                Self::handle_client(stream, connection_sender, handlers),
+                Self::handle_client(stream, listener, connection_sender, handlers),
             )
             .await
             {
@@ -1206,13 +1210,14 @@ impl SocketService {
     /// `PropertiesService`.
     async fn handle_client<A>(
         mut stream: UnixStream,
+        listener: Listener,
         service: ActorRef<A>,
         handlers: Handlers,
     ) -> Result<()>
     where
         A: rsactor::Message<crate::PropertyMessage, Reply = i32>,
     {
-        trace!("Handling new client connection");
+        trace!("Handling new client connection on {listener}");
         let peer = Peer::of(&stream);
 
         // Read the command (u32)
@@ -1252,7 +1257,7 @@ impl SocketService {
                 trace!("Processing SETPROP2 command");
                 // By value: a `ctl.*` request hands the connection over to
                 // its `ControlReply`.
-                Self::handle_setprop2(stream, service, handlers, peer).await?;
+                Self::handle_setprop2(stream, listener, service, handlers, peer).await?;
             }
             _ => {
                 warn!("Unknown command received: 0x{cmd:08X}");
@@ -1458,6 +1463,7 @@ impl SocketService {
     /// [`Self::handle_control`].
     async fn handle_setprop2<A>(
         mut stream: UnixStream,
+        listener: Listener,
         service: ActorRef<A>,
         handlers: Handlers,
         peer: Peer,
@@ -1465,7 +1471,7 @@ impl SocketService {
     where
         A: rsactor::Message<crate::PropertyMessage, Reply = i32>,
     {
-        trace!("Handling SETPROP2 request");
+        trace!("Handling SETPROP2 request on {listener}");
         let (name, value) = Self::read_setprop2(&mut stream).await?;
 
         // Do NOT log the value; it may carry sensitive payloads. Names
@@ -2326,7 +2332,8 @@ pub(crate) mod tests {
     async fn exchange_with(frame: &[u8], service: ActorRef<Recorder>, handlers: Handlers) -> i32 {
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(frame).await.unwrap();
-        let _ = SocketService::handle_client(server, service, handlers.clone()).await;
+        let _ = SocketService::handle_client(server, Listener::Property, service, handlers.clone())
+            .await;
         let mut reply = [0u8; 4];
         client.read_exact(&mut reply).await.unwrap();
         // Kept until the reply is read, as the socket service keeps its
@@ -2364,7 +2371,13 @@ pub(crate) mod tests {
         drop(client);
 
         // The reply then fails with EPIPE; only the forwarding matters.
-        let _ = SocketService::handle_client(server, service, Handlers::new(None, None)).await;
+        let _ = SocketService::handle_client(
+            server,
+            Listener::Property,
+            service,
+            Handlers::new(None, None),
+        )
+        .await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
@@ -2377,9 +2390,14 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        SocketService::handle_client(server, service, Handlers::new(None, None))
-            .await
-            .unwrap();
+        SocketService::handle_client(
+            server,
+            Listener::Property,
+            service,
+            Handlers::new(None, None),
+        )
+        .await
+        .unwrap();
         let mut reply = [0u8; 4];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(i32::from_ne_bytes(reply), PROP_SUCCESS);
@@ -2649,7 +2667,8 @@ pub(crate) mod tests {
             .write_all(&v2_frame(crate::POWERCTL_PROPERTY, "reboot"))
             .await
             .unwrap();
-        let exchange = SocketService::handle_client(server, service, handlers.clone());
+        let exchange =
+            SocketService::handle_client(server, Listener::Property, service, handlers.clone());
         tokio::select! {
             _ = exchange => panic!("the exchange must wait for the properties service"),
             r = received.recv() => r.expect("the set must reach the properties service"),
@@ -3339,11 +3358,14 @@ pub(crate) mod tests {
         client.write_all(&[0u8; 2]).await.unwrap();
         client.shutdown().await.unwrap();
 
-        assert!(
-            SocketService::handle_client(server, service, Handlers::new(None, None))
-                .await
-                .is_ok()
-        );
+        assert!(SocketService::handle_client(
+            server,
+            Listener::Property,
+            service,
+            Handlers::new(None, None)
+        )
+        .await
+        .is_ok());
         let mut reply = [0u8; 4];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(i32::from_ne_bytes(reply), PROP_ERROR_READ_CMD);
@@ -3367,7 +3389,13 @@ pub(crate) mod tests {
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(&truncated).await.unwrap();
         client.shutdown().await.unwrap();
-        let _ = SocketService::handle_client(server, service, Handlers::new(None, None)).await;
+        let _ = SocketService::handle_client(
+            server,
+            Listener::Property,
+            service,
+            Handlers::new(None, None),
+        )
+        .await;
         let mut reply = [0u8; 4];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(i32::from_ne_bytes(reply), PROP_ERROR_READ_DATA);
@@ -3387,11 +3415,14 @@ pub(crate) mod tests {
         client.write_all(&[0u8; 2]).await.unwrap();
         client.shutdown().await.unwrap();
 
-        assert!(
-            SocketService::handle_client(server, service, Handlers::new(None, None))
-                .await
-                .is_err()
-        );
+        assert!(SocketService::handle_client(
+            server,
+            Listener::Property,
+            service,
+            Handlers::new(None, None)
+        )
+        .await
+        .is_err());
         let mut reply = [0u8; 4];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(i32::from_ne_bytes(reply), PROP_ERROR_READ_DATA);

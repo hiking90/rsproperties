@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `StartupStage::Config`, before `rsproperties::init`. Without the
   option the sockets are created as before. The `Debug` output of
   `ServiceOptions` has a `socket_access` field.
+- `PropertyInfoTrie` (`builder` feature): a checked, 4-byte aligned copy
+  of the bytes `build_trie` returns. `context(name)` and
+  `property_type(name)` return `&str`s that borrow it, without the
+  header check and the allocation `property_type_in_trie` does on every
+  call.
 
 ### Changed
 
@@ -50,6 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/service-protocol.md` and `docs/service-security.md`; the
   service's rustdoc links them at the release tag. `docs/aosp-parity.md`
   (maintainers' notes, in Korean) moved to `docs/design/`.
+- The `property_type_in_trie` rustdoc no longer states that every
+  out-of-range offset inside the trie is an error: a trie node or entry
+  that cannot be read is logged at `warn` and skipped, as in the lookups
+  of `SystemProperties`, and the errors are those of the types table and
+  the type string.
 
 ## [0.7.0] - 2026-11-17
 
