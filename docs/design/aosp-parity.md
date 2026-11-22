@@ -997,7 +997,7 @@ fd에 쓴 뒤 fd를 닫는다.
   판정은 구현할 수 없다.
 
 handler가 요청별로 무엇을 실행하고 무엇을 반환해야 init과 같은 결과가 되는지는
-`rsproperties-service/README.md`의 "Answering as init does" 절에 표로 정리했다
+`docs/service-protocol.md`의 "Behaving as init does" 절에 표로 정리했다
 (`ctl.stop`의 `init.svc.<name>` 전이, `sys.powerctl` command 판정).
 
 **service 종료 뒤의 `ctl.*`.** init에는 control message 수신을 끊는 경로가

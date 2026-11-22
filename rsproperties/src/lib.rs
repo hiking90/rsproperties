@@ -1,33 +1,171 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! # Android System Properties for Linux and Android both.
+//! Android's system property system in Rust, for Android and Linux.
 //!
-//! This crate provides a way to access system properties on Linux and Android.
+//! Reads map the property area files directly (read-only, as bionic does)
+//! without calling bionic's `__system_property_*` functions; [`set`] goes
+//! through the property service socket, as bionic does. On Android the
+//! areas are `/dev/__properties__` and the service is init. On a Linux
+//! host the `builder` feature creates the areas, and
+//! [`rsproperties-service`](https://docs.rs/rsproperties-service) serves
+//! the socket. Supported Android versions are Android 9 (API level 28) to
+//! Android 17 (API level 37).
 //!
-//! ## Features
+//! # Features
 //!
-//! - Get system properties.
-//! - Set system properties.
-//! - Wait for system properties, blocking the thread or, through
-//!   [`asynchronous`], as `async fn`s on any executor.
-//! - Set system properties from tokio without blocking a thread
-//!   (`asynchronous::set`, `tokio` feature).
-//! - Serialize/deserialize the property-info trie (requires the `builder`
-//!   feature).
+//! | Feature | Adds |
+//! |---|---|
+//! | `builder` | Creating property areas and `property_info` on a Linux host: [`AreaWriterLock`], [`SystemProperties::new_area`], [`build_trie`], [`load_properties_from_file`] |
+//! | `tokio` | [`asynchronous::set`], which does not block a thread while it waits for the property service. The async waits need no feature. |
+//! | `strict-file-validation` | The root-ownership check on property files also in builds with `debug-assertions`, and refusal of a `property_info` whose owner-write bit is set |
 //!
-//! ## Usage
+//! Without `strict-file-validation`, a build with `debug-assertions` (a
+//! debug build) accepts property files that root does not own, so tests
+//! run as any user; a release build accepts only files owned by uid 0 /
+//! gid 0.
+//!
+//! # Reading
+//!
+//! The free functions read through the process-wide reader,
+//! [`system_properties()`]. [`get_or`] never fails; [`get`] reports why a
+//! read failed. `bool` and the integer types are parsed by AOSP libbase's
+//! rules (see [`FromProperty`]): a `bool` is one of the exact spellings
+//! `"1"`/`"0"`, `"y"`/`"n"`, `"yes"`/`"no"`, `"on"`/`"off"`,
+//! `"true"`/`"false"`; an integer may have leading whitespace and a `0x`
+//! prefix:
 //!
 //! ```rust,no_run
-//! // Get a value of the property.
-//! let value: String = rsproperties::get_or("ro.build.version.sdk", "0".to_owned());
-//! println!("ro.build.version.sdk: {}", value);
-//!
-//! // Set a value of the property - use string literals for compatibility
-//! // with values other Android components write (e.g. "1", not "true").
-//! rsproperties::set("test.property", "test.value").unwrap();
+//! # fn main() -> rsproperties::Result<()> {
+//! let sdk: i32 = rsproperties::get_or("ro.build.version.sdk", 0);
+//! let debuggable: bool = rsproperties::get_or("ro.debuggable", false);
+//! let release: String = rsproperties::get("ro.build.version.release")?;
+//! # Ok(())
+//! # }
 //! ```
-
+//!
+//! [`SystemProperties::read_with`] hands the value to a closure as a
+//! `&str` without allocating, and [`SystemProperties::list`] /
+//! [`SystemProperties::foreach`] walk every readable property.
+//!
+//! [`init`] sets the properties and socket directories once per process,
+//! before their first use; each directory left unset latches its default
+//! at first use (`/dev/__properties__`, and `/dev/socket` or
+//! `PROPERTY_SERVICE_SOCKET_DIR`). Do not set custom directories on an
+//! Android device. A library that must not set the process-wide
+//! directories, or a process that reads a second properties directory,
+//! opens its own reader with [`SystemProperties::open`].
+//!
+//! # Waiting
+//!
+//! Wait for a value or a creation ([`SystemProperties::wait_for_value`],
+//! [`SystemProperties::wait_for_creation`], libbase `WaitForProperty` /
+//! `WaitForPropertyCreation`), follow one property through every change
+//! ([`SystemProperties::watch`], libbase `CachedProperty`), or wait for a
+//! change to any property ([`SystemProperties::watch_area`]):
+//!
+//! ```rust,no_run
+//! # fn main() -> rsproperties::Result<()> {
+//! use std::time::Duration;
+//!
+//! let props = rsproperties::system_properties()?;
+//! if !props.wait_for_value_timeout("sys.boot_completed", "1", Duration::from_secs(30))? {
+//!     eprintln!("not booted after 30 s");
+//! }
+//!
+//! let mut level = props.watch("debug.my_service.log_level");
+//! loop {
+//!     // `None` until the property exists; a change made since this read
+//!     // returns the wait below at once.
+//!     println!("log level: {:?}", level.value()?);
+//!     level.wait_for_change()?;
+//! }
+//! # }
+//! ```
+//!
+//! [`SystemProperties::find`], [`SystemProperties::read_index_with`] and
+//! [`SystemProperties::wait`] are the bionic-level calls `PropertyWatcher`
+//! is built on, for a caller that keeps its own index and serial. [`asynchronous`] has the same waits as `async fn`s that run
+//! on any executor.
+//!
+//! # Setting
+//!
+//! ```rust,no_run
+//! # fn main() -> rsproperties::Result<()> {
+//! rsproperties::set("debug.my_app.log_level", "verbose")?;
+//! rsproperties::set("debug.my_app.port", 8080)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [`set`] documents the protocol version it chooses, its limits, and its
+//! reply timeout; [`asynchronous::set`] is the same request on tokio.
+//!
+//! Property names follow Android's prefixes: `ro.*` is set once
+//! (`ro.build.version.sdk`), `persist.*` survives a reboot when the
+//! property service stores it (`persist.sys.timezone`), `sys.*` holds
+//! system state (`sys.boot_completed`), `debug.*` is for debugging
+//! (`debug.my_app.log_level`), `vendor.*` belongs to the vendor partition
+//! (`vendor.audio.config`), and `ctl.*` sends a control message to init
+//! instead of being stored.
+//!
+//! # Errors
+//!
+//! [`Error`] is non-exhaustive. A failed system call is [`Error::Io`]
+//! unless a more specific variant names the case ([`Error::Lock`] for a
+//! writer lock another instance holds, for example). Some paths
+//! wrap the failure in [`Error::Context`] or [`Error::Init`];
+//! [`Error::root_cause`] returns the error under those layers, so one
+//! `match` covers both forms. A set the service rejects is
+//! [`Error::SetRejected`], whose [`SetRejection`] has one variant per
+//! `PROP_ERROR_*` code.
+//!
+//! # Creating property areas
+//!
+//! With the `builder` feature, a Linux host takes the directory's
+//! [`AreaWriterLock`], publishes `property_info` from a
+//! `property_contexts` file ([`PropertyInfoEntry::parse_from_file`],
+//! [`build_trie`]), creates the areas
+//! ([`SystemProperties::new_area_locked`]) and adds the properties, for
+//! example from build.prop files ([`load_properties_from_file`]).
+//! [`AreaWriterLock`] has the example. `rsproperties-service` does all of
+//! this and serves the socket.
+//!
+//! # Threads and platforms
+//!
+//! Reads, waits and [`set`] can be called from any thread without external
+//! locking, on the process-wide reader or on a shared
+//! [`SystemProperties`]. The writer methods of the `builder` feature
+//! (`add`, `update`, `SystemProperties::set`) take `&mut self`, so a
+//! writer shared between threads needs a lock of its own. `unsafe` is
+//! limited to the mmap / shared-memory layer, the `repr(transparent)`
+//! reference cast behind [`SystemProperties::as_async`], and the async
+//! waiter's load of a registered serial word. The client (reads, waits, [`set`]) supports
+//! Android and Linux; the `builder` feature is for Linux hosts, since init
+//! creates the areas on Android.
+//!
+//! # Upgrading
+//!
+#![doc = concat!(
+    "The changelog lists every change and has a migration section per release: ",
+    "[CHANGELOG.md](https://github.com/hiking90/rsproperties/blob/v",
+    env!("CARGO_PKG_VERSION"),
+    "/CHANGELOG.md)."
+)]
+//!
+//! [`AreaWriterLock`]: struct.AreaWriterLock.html
+//! [`SystemProperties::new_area`]: struct.SystemProperties.html#method.new_area
+//! [`SystemProperties::new_area_locked`]: struct.SystemProperties.html#method.new_area_locked
+//! [`build_trie`]: fn.build_trie.html
+//! [`load_properties_from_file`]: fn.load_properties_from_file.html
+//! [`PropertyInfoEntry::parse_from_file`]: struct.PropertyInfoEntry.html#method.parse_from_file
+//! [`asynchronous::set`]: asynchronous/fn.set.html
+// The overview links items of the `builder` and `tokio` features through
+// the HTML paths above: an intra-doc link to them would be unresolved in
+// the default-feature doc build, which CI runs with `-D warnings` to check
+// every other link. docs.rs builds with all features, where these pages
+// exist. A reference definition in a `cfg_attr` doc fragment is not
+// applied to links in the `//!` text, so it cannot make them conditional.
 // Forward-compat with Rust 2024 edition: `unsafe fn` bodies must wrap
 // individual unsafe ops in their own `unsafe {}` blocks rather than
 // inheriting the function's effect. Enabling this lint as a warning today
@@ -139,11 +277,8 @@ mod wait_step;
 mod waiter;
 
 // Compiles the crate README's Rust blocks as doctests, so an example that
-// no longer matches the API fails `cargo test`. One block uses the
-// `builder` API and one `asynchronous::set`, hence the feature gate. A
-// workspace `cargo test --features builder` has `tokio` on as well:
-// rsproperties-service's dev-dependency enables it.
-#[cfg(all(doctest, feature = "builder", feature = "tokio"))]
+// no longer matches the API fails `cargo test`.
+#[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
@@ -637,26 +772,53 @@ where
     }
 }
 
-/// Set a value of the property with any Display type.
+/// Sets a property through the property service socket, as bionic's
+/// `__system_property_set` does. The value is any `Display` type and is
+/// sent in its `Display` form.
 ///
-/// **Important**: All values are converted to strings using the `Display` trait before being stored.
-/// This means that when reading properties set by other applications or systems, you should be aware
-/// of potential format differences. For example:
-/// - Boolean values are stored as "true"/"false" (Rust format)
-/// - Numbers may have different precision or formatting
-/// - Different applications may use different string representations for the same logical value
+/// A property service must be running: init on Android,
+/// [`rsproperties-service`](https://docs.rs/rsproperties-service) on Linux.
+/// `ro.*` properties are write-once: setting one that already has a value
+/// is rejected. On Android, init also checks with SELinux whether the
+/// sender may set the property, so some properties need system privileges
+/// ([`SetRejection::PermissionDenied`] otherwise).
 ///
-/// For maximum compatibility with existing Android properties, consider using string literals
-/// when setting well-known system properties that may be read by other applications.
+/// `true` is sent as `"true"`. Android components usually write and expect
+/// `"0"`/`"1"` for a boolean property, so pass a string literal for a
+/// property other components read.
 ///
-/// If an error occurs, it returns Err.
-/// The V1 protocol has no status reply: a server-side rejection is not
-/// observable and returns `Ok(())`; only V2 reports `Error::SetRejected`.
+/// # Protocol version
+///
+/// `set` sends the V2 frame (`PROP_MSG_SETPROP2`) unless one of these
+/// selects V1 (`PROP_MSG_SETPROP`), checked in this order:
+///
+/// 1. `ro.property_service.version`, when the process has already opened
+///    the global reader (an earlier [`get`], [`get_or`] or
+///    [`system_properties()`] call; `set` does not open it): a number of 2
+///    or more is V2, any other value is V1.
+/// 2. The `PROPERTY_SERVICE_VERSION` environment variable, when the reader
+///    is not open or the property is missing: a number of 2 or more is V2,
+///    any other value is V1 (logged at `warn` when it is not a number).
+/// 3. V2 when neither is set. bionic sends V1 when the property is missing.
+///
+/// The first `set` after the reader is open fixes the version for the
+/// process; before that, each `set` checks the environment variable again.
+///
+/// A V1 `set` takes a name of at most 31 bytes and a value of at most 91
+/// (`Error::InvalidArgument` otherwise) and reads no reply: it returns
+/// `Ok(())` once the frame is sent, whether or not the value was applied.
+/// Only V2 reports a rejection, as `Error::SetRejected`.
+/// `rsproperties-service` refuses V1 frames, so a V1 `set` to it returns
+/// `Ok(())` and sets nothing; the service sets
+/// `ro.property_service.version=2` at startup.
+///
+/// # Limits and timeouts
+///
 /// V2 names and `ro.` values are limited to 65535 bytes on Android
-/// (`wire::AOSP_MAX_WIRE_STRING_LEN`, AOSP init's limit) and to
+/// ([`wire::AOSP_MAX_WIRE_STRING_LEN`], AOSP init's limit) and to
 /// [`wire::MAX_WIRE_NAME_LEN`] / [`wire::MAX_WIRE_VALUE_LEN`] elsewhere
-/// (this crate's service).
-/// It uses socket communication to set the property. Because it is designed for client applications.
+/// (this crate's service). Other values are at most 91 bytes
+/// ([`wire::validate_value_len`]).
 ///
 /// On Linux a V2 `set` waits at most 2 s for the service's reply. An
 /// `Error::Io` of kind `TimedOut` from that wait does not mean the
@@ -665,6 +827,14 @@ where
 /// or sending means the request was not delivered. On Android `set`
 /// waits for init's reply without a timeout, like bionic; connecting and
 /// sending keep the 2 s bound there too, where bionic waits without one.
+/// [`asynchronous::set`] (`tokio` feature) sends the same request without
+/// blocking the thread and without a bound on the reply wait.
+///
+/// The request is sent with `send(MSG_NOSIGNAL)`: a socket the service
+/// has already closed is an `Error::Io` of kind `BrokenPipe`, never a
+/// `SIGPIPE`. This matters for a host that keeps `SIGPIPE` at its default
+/// — a C/C++ program linking this crate as a staticlib or cdylib, or a
+/// JNI library — which the signal would kill.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -683,15 +853,16 @@ where
 ///
 /// // For well-known system properties, prefer string literals so the
 /// // stored form matches what other Android components expect ("1", not
-/// // "true"). Note `ro.*` properties are write-once: the property service
-/// // rejects setting one that already has a value.
+/// // "true").
 /// set("persist.sys.timezone", "Asia/Seoul").unwrap();
 /// ```
 ///
-/// # Compatibility Notes
-/// - Android system properties typically use "0"/"1" for boolean values, not "true"/"false"
-/// - Numeric properties may have specific formatting requirements
-/// - Always test compatibility when setting properties that will be read by other applications
+/// [`asynchronous::set`]: asynchronous/fn.set.html
+// `asynchronous::set` is linked by HTML path: it does not exist without
+// the `tokio` feature, and the default-feature doc build denies
+// unresolved intra-doc links. A reference definition, as in the crate
+// overview: an inline `[..](path)` link is `redundant_explicit_links` on
+// rustdoc 1.100 when the label also resolves (all features).
 pub fn set(name: &str, value: impl std::fmt::Display) -> Result<()> {
     system_property_set::set(name, &value.to_string())
 }

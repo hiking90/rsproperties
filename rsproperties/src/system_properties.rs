@@ -432,6 +432,18 @@ impl SystemProperties {
     /// write and `new_area`'s lock: take the lock first
     /// (`AreaWriterLock::acquire`, `publish_property_info`,
     /// [`Self::new_area_locked`]).
+    ///
+    /// Each area file is replaced by rename (temp name
+    /// `.area.tmp-<pid>-<n>`), and `properties_serial` last. A reader that
+    /// opened an area before that area's rename, or `properties_serial`
+    /// before its rename, keeps the previous file and does not see the
+    /// restarted writer's updates in it. A reader that starts after the new
+    /// `property_info` is published but before `properties_serial` is
+    /// renamed is bound to the previous `properties_serial` for its
+    /// lifetime, so its global-serial wait does not wake, and its read of a
+    /// context whose area file does not exist yet fails until that file is
+    /// renamed into place. Start readers after `new_area` /
+    /// `new_area_locked` (or `rsproperties_service::run`) has returned.
     #[cfg(feature = "builder")]
     pub fn new_area(dirname: &Path) -> Result<Self> {
         let contexts = match ContextsSerialized::new_rw(dirname, None) {
@@ -608,8 +620,9 @@ impl SystemProperties {
     ///
     /// Mirrors bionic's `__system_property_read_callback` pattern. The
     /// callback runs while the seqlock-validated bytes are still borrowed
-    /// (from `buf` for short properties, from the mmap for long ones), so
-    /// it should be cheap and non-blocking.
+    /// (a short value is copied to a stack buffer; a long `ro.` value is
+    /// read in place from the mmap), so it should be cheap and
+    /// non-blocking.
     ///
     /// The callback also runs while this instance is borrowed and while the
     /// context node's read lock is held, so it should not block: a
