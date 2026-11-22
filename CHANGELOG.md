@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Service: `ServiceOptions::socket_access(Listener, SocketAccess)` sets
+  the owner group and mode of each service socket file, in place of mode
+  `0o660` and the group the file is created with. `Listener` names the
+  two sockets; `SocketAccess::new(mode).with_group(gid)` is the value.
+  `run` refuses a mode with a bit outside `0o660`, or group `u32::MAX`,
+  with `StartupStage::Config`, before `rsproperties::init`. Without the
+  option the sockets are created as before. The `Debug` output of
+  `ServiceOptions` has a `socket_access` field.
+
+### Changed
+
+- Service: `StartupStage::Config` displays as `configuration` (0.7.0:
+  `configuration (init)`), so a `StartupError` of that stage reads
+  `configuration failed to start: …`. The stage now also reports a
+  refused `ServiceOptions` value, which is checked before
+  `rsproperties::init` is called.
+- Service: two startup error messages of `StartupStage::SocketService`
+  have new texts. For a temp socket entry that is not a socket owned by
+  the service's euid: `set group and mode of <path>` with the cause
+  `…; group and mode left unchanged` (0.7.0: `raise mode of <path>`,
+  `…; mode left unchanged`). For a failed chmod through `/proc`: the
+  mode is printed as `0o660` (0.7.0: `0660`) and the hint reads `a umask
+  that keeps those bits` (0.7.0: `keeps group rw`).
+
 ### Documentation
 
 - The crate READMEs are short: a description, installation, one

@@ -52,7 +52,8 @@ in the release build.
 
 ## Access control
 
-- The socket file mode (`0o660`) plus the socket dir's permissions are
+- Each socket file's group and mode (`0o660` by default; see
+  `ServiceOptions::socket_access`) plus the socket dir's permissions are
   the only access control. Any peer that can connect may set any
   non-`ro.` property, and any `ro.` property that has no value yet (the
   first writer fixes it), and send any `ctl.*` control message to the
@@ -72,7 +73,18 @@ in the release build.
   is created at the new location, startup fails, and that socket is left
   there. Any uid other than the service's and root that can write to the
   socket dir or one of its ancestors can replace the sockets with its
-  own and so impersonate the service; that is out of scope. Keep the
+  own and so impersonate the service; that is out of scope. So is what
+  such a uid can do to a socket's group and mode during startup: between
+  `bind` and the `O_PATH` open of the temp name (see
+  [Socket permissions](#socket-permissions)) it can put another entry at
+  that name. The `fstat` check refuses an entry that is not a socket
+  owned by the service's euid, so a socket that uid bound itself fails
+  startup. The check does not establish that the entry is the socket
+  just bound: another socket owned by the service's euid (the service's
+  other temp socket, when the two temp names are exchanged) passes it.
+  That socket then gets the group and mode configured for this name, and
+  the socket just bound listens with the group it was created with and
+  its mode minus the umask's bits; startup reports no error. Keep the
   socket dir and its ancestors writable only by the service's user and
   root. A world-writable socket dir without the sticky bit is reported
   with a warning at startup; this is not an access check. A default ACL
@@ -88,16 +100,26 @@ in the release build.
 
 ### Socket permissions
 
-Each socket's mode is set to `0o660` on the socket fd before `bind`, so
-the file exists only with `0o660` minus the umask's bits; if the umask
-cleared any of those bits, the mode is raised to exactly `0o660` through
-an `O_PATH|O_NOFOLLOW` descriptor (needs `/proc`: `/proc/thread-self/fd`,
-or `/proc/self/fd` on kernels before 3.17). Only then does the socket
-`listen` — a `connect` before that fails with `ECONNREFUSED`. Both
-sockets are bound as `.<name>.tmp-<pid>` and renamed onto their final
-names only after both listen. This is stricter than AOSP init, which
-creates `property_service` 0666 (relying on SELinux) and only
-`property_service_for_system` 0660.
+Each socket's mode — `0o660`, or the one given to
+`ServiceOptions::socket_access` for that socket — is set on the socket
+fd before `bind`, so the file exists only with that mode minus the
+umask's bits. The temp socket is then opened as an `O_PATH|O_NOFOLLOW`
+descriptor and checked with `fstat` to be a socket owned by the
+service's euid (this does not show it to be the socket just bound; see
+the socket dir contract above). Through that descriptor a configured
+group is set (`fchownat` with `AT_EMPTY_PATH`), and if the umask cleared
+any bits the mode is raised to exactly the configured mode (needs
+`/proc`: `/proc/thread-self/fd`, or `/proc/self/fd` on kernels before
+3.17). Only then does the socket `listen` — a `connect` before that
+fails with `ECONNREFUSED`. Both sockets are bound as `.<name>.tmp-<pid>`
+and renamed onto their final names only after both listen.
+
+A mode may not go beyond `0o660`: `run` refuses a bit for others, which
+would let every local uid set any property, and the setuid, setgid,
+sticky and execute bits. This is stricter than AOSP init, which creates
+`property_service` 0666 (relying on SELinux) and only
+`property_service_for_system` 0660 with group `system`; the latter can be
+reproduced with `SocketAccess::new(0o660).with_group(<system gid>)`.
 
 ### Backpressure
 

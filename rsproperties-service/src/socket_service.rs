@@ -32,6 +32,7 @@ use rsproperties::{
 
 use crate::control_reply::{ControlReply, ReplyFd, ReplyState};
 use crate::properties_service::PropertiesService;
+use crate::{Listener, SocketAccess};
 
 /// The error types [`ContextWithLocation`] wraps: `rustix`'s `Errno`, a
 /// `std::io::Error` (both become `Error::Io`) or an `Error`.
@@ -126,17 +127,19 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// are queued.
 const MAX_UNANSWERED_CONTROL_MESSAGES: usize = 102;
 
-/// Mode of both socket files: `0o660` (rw-rw----) — owner and group may
-/// connect, others may not. Stricter than AOSP init, which creates
-/// `property_service` 0666 (relying on SELinux) and only
-/// `property_service_for_system` 0660. The mode is set on the socket fd
-/// before `bind` and, if the umask cleared bits, raised to exactly this
-/// value before `listen` (see `bind_service_sockets`), so it does not
-/// depend on the process umask.
+/// Default mode of both socket files: `0o660` (rw-rw----) — owner and
+/// group may connect, others may not. Stricter than AOSP init, which
+/// creates `property_service` 0666 (relying on SELinux) and only
+/// `property_service_for_system` 0660. `crate::ServiceOptions::socket_access`
+/// replaces it per socket, within the same bits. The mode is set on the
+/// socket fd before `bind` and, if the umask cleared bits, raised to
+/// exactly the configured value before `listen` (see
+/// [`apply_socket_access`]), so it does not depend on the process umask.
 ///
-/// **Access model.** This file mode is the service's *entire* access
-/// control: any peer that can `connect()` (i.e. has write permission on
-/// the socket file — owner or group) may set any non-`ro.` property, and
+/// **Access model.** The file's group and mode are the service's *entire*
+/// access control: any peer that can `connect()` (i.e. has write
+/// permission on the socket file — owner or group) may set any non-`ro.`
+/// property, and
 /// any `ro.` property that has no value yet (the first writer fixes it),
 /// and send any `ctl.*` control message to the configured handler. The
 /// `property_contexts` type check applies to values, not to senders.
@@ -146,7 +149,7 @@ const MAX_UNANSWERED_CONTROL_MESSAGES: usize = 102;
 /// This is an intentional simplification for host-side deployments —
 /// restrict group membership and the socket dir as described on
 /// [`SocketService`].
-const SOCKET_FILE_MODE: u32 = 0o660;
+pub(crate) const SOCKET_FILE_MODE: u32 = 0o660;
 
 /// Backoff applied when `accept()` returns an error. Without it, a
 /// permanent failure (EMFILE, ENFILE, listener torn down) would re-enter
@@ -281,8 +284,8 @@ impl Drop for SocketDirEntries {
 }
 
 /// Creates the socket for `tmp_name` and binds it at `dir/tmp_name`
-/// without listening.
-fn bind_temp(dir: &Path, dirfd: &OwnedFd, tmp_name: &str) -> Result<OwnedFd> {
+/// without listening. The file's mode is a subset of `mode`.
+fn bind_temp(dir: &Path, dirfd: &OwnedFd, tmp_name: &str, mode: u32) -> Result<OwnedFd> {
     let path = dir.join(tmp_name);
     // Our own leftover (pid reuse, or a repeated start in this process).
     match rustix::fs::unlinkat(dirfd, tmp_name, AtFlags::empty()) {
@@ -303,8 +306,8 @@ fn bind_temp(dir: &Path, dirfd: &OwnedFd, tmp_name: &str) -> Result<OwnedFd> {
     // Linux creates the socket file with the socket inode's mode minus the
     // umask (`unix_bind_bsd`; implementation behavior, not documented in
     // unix(7)), so from the moment the path exists its mode is a subset of
-    // 0660. Without this the file starts at 0777 minus the umask.
-    rustix::fs::fchmod(&fd, Mode::from_raw_mode(SOCKET_FILE_MODE))
+    // `mode`. Without this the file starts at 0777 minus the umask.
+    rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode))
         .context_with_location("fchmod unix socket")?;
     // `sun_path` limit: rustix `SocketAddrUnix::new` accepts 108 bytes
     // (0.6.0's std path: 107).
@@ -314,12 +317,19 @@ fn bind_temp(dir: &Path, dirfd: &OwnedFd, tmp_name: &str) -> Result<OwnedFd> {
     Ok(fd)
 }
 
-/// Raises the mode of the socket at `dir/tmp_name` to exactly
-/// `SOCKET_FILE_MODE` when the umask cleared bits at `bind`.
+/// Gives the socket at `dir/tmp_name` `access`: its group, when `access`
+/// has one, and exactly its mode, which the umask may have narrowed at
+/// `bind`.
 ///
 /// The entry is opened `O_PATH|O_NOFOLLOW` relative to the socket dir and
-/// checked with `fstat` to be a socket owned by this process's euid; the
-/// chmod then goes through `/proc/thread-self/fd/N`, which resolves to the
+/// checked with `fstat` to be a socket owned by this process's euid. Both
+/// changes go through that descriptor, so the path is not walked again.
+/// The group comes first, with `fchownat(fd, "", AT_EMPTY_PATH)` (Linux
+/// 2.6.39), and the mode is compared after it, against a fresh `fstat`,
+/// so the chmod sees the inode's last state. Without `CAP_CHOWN` the
+/// group must be one of this process's groups (`EPERM`).
+///
+/// The chmod goes through `/proc/thread-self/fd/N`, which resolves to the
 /// opened inode without walking the path again. This is how bionic's
 /// `fchmodat(AT_SYMLINK_NOFOLLOW)` works: `fchmod` on an `O_PATH` fd fails
 /// with EBADF, and `fchmodat2` needs Linux 6.6. `thread-self` rather than
@@ -328,11 +338,16 @@ fn bind_temp(dir: &Path, dirfd: &OwnedFd, tmp_name: &str) -> Result<OwnedFd> {
 /// (unverified); the calling thread is alive. `/proc/thread-self` exists
 /// since Linux 3.17; on older kernels the chmod falls back to
 /// `/proc/self/fd/N` (see [`chmod_opened`]). Needs `/proc` — only when
-/// the umask cleared bits of 0660.
+/// the mode differs from `access`'s.
 ///
 /// If the socket dir's path was swapped after it was opened, `bind`
 /// created the socket elsewhere and this `openat` fails with ENOENT.
-fn widen_to_socket_mode(dir: &Path, dirfd: &OwnedFd, tmp_name: &str) -> Result<()> {
+fn apply_socket_access(
+    dir: &Path,
+    dirfd: &OwnedFd,
+    tmp_name: &str,
+    access: SocketAccess,
+) -> Result<()> {
     let path = dir.join(tmp_name);
     let pfd = rustix::fs::openat(
         dirfd,
@@ -341,27 +356,37 @@ fn widen_to_socket_mode(dir: &Path, dirfd: &OwnedFd, tmp_name: &str) -> Result<(
         Mode::empty(),
     )
     .with_context_location(|| format!("open {path:?}"))?;
-    let st = rustix::fs::fstat(&pfd).with_context_location(|| format!("fstat {path:?}"))?;
+    let mut st = rustix::fs::fstat(&pfd).with_context_location(|| format!("fstat {path:?}"))?;
     let euid = rustix::process::geteuid().as_raw();
     if FileType::from_raw_mode(st.st_mode) != FileType::Socket || st.st_uid != euid {
         return Err(Error::FileValidation(format!(
-            "not a socket owned by euid {euid}; mode left unchanged"
+            "not a socket owned by euid {euid}; group and mode left unchanged"
         )))
-        .with_context_location(|| format!("raise mode of {path:?}"));
+        .with_context_location(|| format!("set group and mode of {path:?}"));
     }
-    if Mode::from_raw_mode(st.st_mode).bits() == SOCKET_FILE_MODE {
+    if let Some(gid) = access.group() {
+        if st.st_gid != gid {
+            rustix::fs::chownat(
+                &pfd,
+                "",
+                None,
+                // Not `u32::MAX`, which `chown` reads as "unchanged":
+                // `SocketAccess::check` refuses it.
+                Some(rustix::fs::Gid::from_raw(gid)),
+                AtFlags::EMPTY_PATH,
+            )
+            .with_context_location(|| format!("change group of {path:?} to {gid}"))?;
+            st = rustix::fs::fstat(&pfd).with_context_location(|| format!("fstat {path:?}"))?;
+        }
+    }
+    let mode = access.mode();
+    if Mode::from_raw_mode(st.st_mode).bits() == mode {
         return Ok(());
     }
-    chmod_opened(
-        &pfd,
-        &st,
-        Mode::from_raw_mode(SOCKET_FILE_MODE),
-        &PROC_FD_DIRS,
-    )
-    .with_context_location(|| {
+    chmod_opened(&pfd, &st, Mode::from_raw_mode(mode), &PROC_FD_DIRS).with_context_location(|| {
         format!(
-            "raising {path:?} to 0660 via /proc/thread-self/fd or /proc/self/fd failed \
-                 (is /proc mounted? or run with a umask that keeps group rw, e.g. 007)"
+            "raising {path:?} to {mode:#o} via /proc/thread-self/fd or /proc/self/fd failed \
+                 (is /proc mounted? or run with a umask that keeps those bits, e.g. 007)"
         )
     })
 }
@@ -403,19 +428,21 @@ fn chmod_opened(pfd: &OwnedFd, st: &rustix::fs::Stat, mode: Mode, fd_dirs: &[&st
 }
 
 /// One socket up to the point where only the rename is left: bind at its
-/// temp name, mode raised, listening. The temp name is registered in
-/// `entries` as soon as `bind` created it.
+/// temp name, group and mode set, listening. The temp name is registered
+/// in `entries` as soon as `bind` created it.
 fn prepare_temp_socket(
     dir: &Path,
     entries: &mut SocketDirEntries,
     tmp_name: &str,
+    access: SocketAccess,
 ) -> Result<OwnedFd> {
-    let fd = bind_temp(dir, &entries.dirfd, tmp_name)?;
+    let fd = bind_temp(dir, &entries.dirfd, tmp_name, access.mode())?;
     entries.names.push(tmp_name.to_owned());
-    widen_to_socket_mode(dir, &entries.dirfd, tmp_name)?;
-    // `listen` only after the mode is final (AOSP `CreateSocket` order:
-    // bind → fchmodat → listen): until then a `connect` fails with
-    // ECONNREFUSED, so no connection is made under an intermediate mode.
+    apply_socket_access(dir, &entries.dirfd, tmp_name, access)?;
+    // `listen` only after the group and mode are final (AOSP
+    // `CreateSocket` order: bind → fchownat → fchmodat → listen): until
+    // then a `connect` fails with ECONNREFUSED, so no connection is made
+    // under an intermediate group or mode.
     // Backlog -1 (SOMAXCONN) as tokio/mio on Linux.
     let path = dir.join(tmp_name);
     rustix::net::listen(&fd, -1).with_context_location(|| format!("listen {path:?}"))?;
@@ -432,17 +459,22 @@ struct BoundSockets {
 
 /// Creates the socket dir if missing, then [`bind_service_sockets_at`].
 /// The sequence and its limits are documented on [`SocketService`].
-fn bind_service_sockets(dir: &Path) -> Result<BoundSockets> {
+fn bind_service_sockets(dir: &Path, access: [SocketAccess; 2]) -> Result<BoundSockets> {
     ensure_socket_dir(dir)?;
     let dirfd = open_socket_dir(dir)?;
-    bind_service_sockets_at(dir, dirfd)
+    bind_service_sockets_at(dir, dirfd, access)
 }
 
-/// Binds both sockets in the directory `dirfd` refers to. `dir` is used
-/// for `bind` and for messages; every other operation goes through
-/// `dirfd`. Both temp sockets are set up before either is renamed, so a
-/// failure on the second leaves the existing final names untouched.
-fn bind_service_sockets_at(dir: &Path, dirfd: OwnedFd) -> Result<BoundSockets> {
+/// Binds both sockets in the directory `dirfd` refers to, with `access`
+/// indexed by [`Listener::index`]. `dir` is used for `bind` and for
+/// messages; every other operation goes through `dirfd`. Both temp
+/// sockets are set up before either is renamed, so a failure on the
+/// second leaves the existing final names untouched.
+fn bind_service_sockets_at(
+    dir: &Path,
+    dirfd: OwnedFd,
+    access: [SocketAccess; 2],
+) -> Result<BoundSockets> {
     let mut entries = SocketDirEntries {
         dirfd,
         names: Vec::with_capacity(2),
@@ -456,8 +488,18 @@ fn bind_service_sockets_at(dir: &Path, dirfd: OwnedFd) -> Result<BoundSockets> {
 
     let property_tmp = temp_name(PROPERTY_SERVICE_SOCKET_NAME);
     let system_tmp = temp_name(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
-    let property = prepare_temp_socket(dir, &mut entries, &property_tmp)?;
-    let system = prepare_temp_socket(dir, &mut entries, &system_tmp)?;
+    let property = prepare_temp_socket(
+        dir,
+        &mut entries,
+        &property_tmp,
+        access[Listener::Property.index()],
+    )?;
+    let system = prepare_temp_socket(
+        dir,
+        &mut entries,
+        &system_tmp,
+        access[Listener::System.index()],
+    )?;
     // `renameat` replaces a socket left by a crashed earlier run without a
     // window in which the name is missing. A failure on the second rename
     // unlinks the first final name (via `entries`): the name belonged to
@@ -480,6 +522,9 @@ pub(crate) struct SocketServiceArgs {
     /// Handle the `ctl.*` and `sys.powerctl` sets. Built by the caller,
     /// which keeps its [`Handlers::drain`] and [`Handlers::stop_switch`].
     pub(crate) handlers: Handlers,
+    /// Group and mode of each socket file, indexed by [`Listener::index`].
+    /// Checked by `crate::run` ([`SocketAccess::check`]).
+    pub(crate) socket_access: [SocketAccess; 2],
 }
 
 /// Spawns the socket service actor with `args`.
@@ -542,7 +587,8 @@ impl Actor for SocketService {
         // All filesystem work is blocking syscalls; one `spawn_blocking`
         // runs it off the runtime threads.
         let dir = args.socket_dir;
-        let bound = tokio::task::spawn_blocking(move || bind_service_sockets(&dir))
+        let access = args.socket_access;
+        let bound = tokio::task::spawn_blocking(move || bind_service_sockets(&dir, access))
             .await
             .map_err(|e| std::io::Error::other(format!("socket bind task failed: {e}")))??;
         // From here to `Ok(Self)`, any early return drops `entries`, which
@@ -1626,6 +1672,7 @@ pub(crate) mod tests {
 
     const PROPERTY: &str = PROPERTY_SERVICE_SOCKET_NAME;
     const SYSTEM: &str = PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME;
+    const DEFAULT_ACCESS: [SocketAccess; 2] = [SocketAccess::new(SOCKET_FILE_MODE); 2];
 
     /// Bytes a fixture adds below its dir for its longest socket path:
     /// `/<subdir>/` and the system temp name (the longer of the two).
@@ -1755,16 +1802,24 @@ pub(crate) mod tests {
         assert_eq!(mode_of(&dir.0.join("a")), 0o755);
         assert_eq!(mode_of(&nested), 0o755);
         let dirfd = open_socket_dir(&dir.0).unwrap();
-        let _open = bind_temp(&dir.0, &dirfd, "umask000").unwrap();
+        let _open = bind_temp(&dir.0, &dirfd, "umask000", SOCKET_FILE_MODE).unwrap();
         assert_eq!(mode_of(&dir.0.join("umask000")), SOCKET_FILE_MODE);
 
         rustix::process::umask(Mode::from_raw_mode(0o077));
-        let _narrow = bind_temp(&dir.0, &dirfd, "umask077").unwrap();
+        let _narrow = bind_temp(&dir.0, &dirfd, "umask077", SOCKET_FILE_MODE).unwrap();
         assert_eq!(mode_of(&dir.0.join("umask077")), 0o600);
         let sockets = SocketDir::new("rsprops_svc_umask_sockets");
-        let _bound = bind_service_sockets(&sockets.0).unwrap();
+        let _bound = bind_service_sockets(&sockets.0, DEFAULT_ACCESS).unwrap();
         assert_eq!(mode_of(&sockets.0.join(PROPERTY)), SOCKET_FILE_MODE);
         assert_eq!(mode_of(&sockets.0.join(SYSTEM)), SOCKET_FILE_MODE);
+
+        // A configured mode is raised the same way, per socket.
+        let custom = SocketDir::new("rsprops_svc_umask_custom");
+        let mut access = DEFAULT_ACCESS;
+        access[Listener::System.index()] = SocketAccess::new(0o620);
+        let _bound = bind_service_sockets(&custom.0, access).unwrap();
+        assert_eq!(mode_of(&custom.0.join(PROPERTY)), SOCKET_FILE_MODE);
+        assert_eq!(mode_of(&custom.0.join(SYSTEM)), 0o620);
     }
 
     /// The mode is raised only on a socket reached without following a
@@ -1780,9 +1835,244 @@ pub(crate) mod tests {
         std::os::unix::fs::symlink(&victim, dir.0.join("link")).unwrap();
         let dirfd = open_socket_dir(&dir.0).unwrap();
 
-        assert!(widen_to_socket_mode(&dir.0, &dirfd, "link").is_err());
-        assert!(widen_to_socket_mode(&dir.0, &dirfd, "victim").is_err());
-        assert_eq!(mode_of(&victim), 0o600);
+        // A gid other than the victim's, where the process has one: with
+        // the victim's own gid the chown is skipped whatever the order of
+        // the checks, and the group half of this test asserts nothing.
+        let victim_gid = std::fs::symlink_metadata(&victim).unwrap().gid();
+        let gid = other_own_gid().unwrap_or(victim_gid);
+        for access in [
+            SocketAccess::default(),
+            SocketAccess::default().with_group(gid),
+        ] {
+            assert!(apply_socket_access(&dir.0, &dirfd, "link", access).is_err());
+            assert!(apply_socket_access(&dir.0, &dirfd, "victim", access).is_err());
+            assert_eq!(mode_of(&victim), 0o600);
+            assert_eq!(
+                std::fs::symlink_metadata(&victim).unwrap().gid(),
+                victim_gid
+            );
+        }
+    }
+
+    /// Whether `id` is in a range of `map` (`/proc/self/uid_map` or
+    /// `gid_map`; each line is `<first id here> <first id outside>
+    /// <count>`). In a user namespace that does not map `id`, `chown` and
+    /// `setuid`/`setgid` to it fail with `EINVAL` even for euid 0. A map
+    /// that cannot be read counts as mapping everything.
+    fn id_is_mapped(map: &str, id: u32) -> bool {
+        let Ok(text) = std::fs::read_to_string(map) else {
+            return true;
+        };
+        text.lines().any(|line| {
+            let mut fields = line.split_whitespace().map(str::parse::<u64>);
+            match (fields.next(), fields.next(), fields.next()) {
+                (Some(Ok(first)), _, Some(Ok(count))) => {
+                    (first..first + count).contains(&u64::from(id))
+                }
+                _ => false,
+            }
+        })
+    }
+
+    /// A gid this process may give a file it owns, other than its egid:
+    /// any gid for root (if its user namespace maps it), a supplementary
+    /// group otherwise.
+    fn other_own_gid() -> Option<u32> {
+        let egid = rustix::process::getegid().as_raw();
+        if rustix::process::geteuid().is_root() {
+            let gid = if egid == 54321 { 54322 } else { 54321 };
+            return id_is_mapped("/proc/self/gid_map", gid).then_some(gid);
+        }
+        rustix::process::getgroups()
+            .unwrap()
+            .into_iter()
+            .map(|g| g.as_raw())
+            .find(|&g| g != egid)
+    }
+
+    /// The configured group is on the final name, with the configured
+    /// mode, on the socket it was given to only.
+    #[test]
+    fn socket_group_is_set() {
+        let Some(gid) = other_own_gid() else {
+            eprintln!(
+                "skipped: no gid to change the socket's group to (no supplementary \
+                 group, or root in a user namespace that does not map the gid)"
+            );
+            return;
+        };
+        let dir = SocketDir::new("rsprops_svc_group");
+        let mut access = DEFAULT_ACCESS;
+        access[Listener::System.index()] = SocketAccess::new(0o640).with_group(gid);
+        let _bound = bind_service_sockets(&dir.0, access).unwrap();
+
+        let system = std::fs::symlink_metadata(dir.0.join(SYSTEM)).unwrap();
+        assert_eq!(system.gid(), gid);
+        assert_eq!(system.mode() & 0o7777, 0o640);
+        // The group a file is created with in this dir: the egid, or the
+        // dir's group if the dir has the setgid bit (inherited from the
+        // fixture's parent).
+        let probe = dir.0.join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        let created_gid = std::fs::symlink_metadata(&probe).unwrap().gid();
+        let property = std::fs::symlink_metadata(dir.0.join(PROPERTY)).unwrap();
+        assert_eq!(property.gid(), created_gid);
+        assert_eq!(property.mode() & 0o7777, SOCKET_FILE_MODE);
+    }
+
+    /// Without `CAP_CHOWN`, a group the process is not in fails startup
+    /// with `EPERM`, and nothing is left in the socket dir.
+    #[test]
+    fn socket_group_outside_own_groups_fails() {
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipped: root may give a file any group");
+            return;
+        }
+        let mut own: Vec<u32> = rustix::process::getgroups()
+            .unwrap()
+            .into_iter()
+            .map(|g| g.as_raw())
+            .collect();
+        own.push(rustix::process::getegid().as_raw());
+        let gid = (0..).find(|g| !own.contains(g)).unwrap();
+        let dir = SocketDir::new("rsprops_svc_group_eperm");
+        let mut access = DEFAULT_ACCESS;
+        access[Listener::Property.index()] = SocketAccess::default().with_group(gid);
+
+        let Err(err) = bind_service_sockets(&dir.0, access) else {
+            panic!("a group outside the process's groups was accepted");
+        };
+        assert!(err.to_string().contains("change group"), "{err}");
+        assert!(names_in(&dir.0).is_empty(), "{:?}", names_in(&dir.0));
+    }
+
+    /// The group is what decides who can connect: a uid in the socket's
+    /// group can, a uid outside it cannot (`EACCES`). Needs root, to
+    /// create the second uid: a forked child drops to uid/gid 65534 with
+    /// the socket's group as its only supplementary group.
+    #[test]
+    fn group_member_of_another_uid_can_connect() {
+        if !rustix::process::geteuid().is_root() {
+            eprintln!("skipped: needs root to connect as another uid");
+            return;
+        }
+        const NOBODY: u32 = 65534;
+        const GROUP: u32 = 54321;
+        // `setgroups`, `setgid`, `setuid` with 32-bit ids. On x86, arm and
+        // sparc the plain numbers are the 16-bit-id syscalls (`setgroups16`
+        // reads a `u16` array), and the 32-bit ones have their own numbers.
+        #[cfg(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc"))]
+        const SET_IDS: [libc::c_long; 3] = [
+            libc::SYS_setgroups32,
+            libc::SYS_setgid32,
+            libc::SYS_setuid32,
+        ];
+        #[cfg(not(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc")))]
+        const SET_IDS: [libc::c_long; 3] =
+            [libc::SYS_setgroups, libc::SYS_setgid, libc::SYS_setuid];
+        if !id_is_mapped("/proc/self/gid_map", GROUP)
+            || !id_is_mapped("/proc/self/gid_map", NOBODY)
+            || !id_is_mapped("/proc/self/uid_map", NOBODY)
+        {
+            eprintln!("skipped: the user namespace does not map uid/gid {NOBODY} and gid {GROUP}");
+            return;
+        }
+        let dir = SocketDir::new("rsprops_svc_group_peer");
+        // uid `NOBODY` reaches the socket dir through the "others" search
+        // bit of every directory above it (a `TMPDIR` under a 0700
+        // directory has none).
+        if let Some(closed) = dir
+            .0
+            .ancestors()
+            .find(|a| std::fs::metadata(a).is_ok_and(|m| m.mode() & 0o001 == 0))
+        {
+            eprintln!("skipped: {closed:?} cannot be searched by uid {NOBODY}");
+            return;
+        }
+        let mut access = DEFAULT_ACCESS;
+        access[Listener::Property.index()] = SocketAccess::default().with_group(GROUP);
+        let _bound = bind_service_sockets(&dir.0, access).unwrap();
+
+        // Built before `fork`: the child must not allocate.
+        let addr = |name: &str| {
+            let path = dir.0.join(name);
+            let bytes = path.as_os_str().as_encoded_bytes();
+            // SAFETY: `sockaddr_un` is plain data; all-zero is valid.
+            let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            assert!(bytes.len() < addr.sun_path.len());
+            for (dst, &src) in addr.sun_path.iter_mut().zip(bytes) {
+                *dst = src as libc::c_char;
+            }
+            addr
+        };
+        let property = addr(PROPERTY);
+        let system = addr(SYSTEM);
+
+        // SAFETY: the test harness has other threads, so the child may
+        // hold a copy of a lock one of them had taken and must stay
+        // async-signal-safe. It does: it changes its ids with `syscall`
+        // (the `setgroups`/`setgid`/`setuid` wrappers are not used: glibc
+        // routes them through its all-threads setxid code, which takes
+        // libc locks, and `setgroups` is not in signal-safety(7)), by the
+        // syscall numbers that take 32-bit ids (`SET_IDS`), calls
+        // `socket`, `connect` and `_exit`, which are in that list, reads
+        // `errno`, uses only data built before the fork, does not
+        // allocate, and never returns.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // SAFETY: every pointer passed is to a local that outlives
+            // the call (`groups` with its length 1, `property`/`system`
+            // with `size_of::<sockaddr_un>()`); `__errno_location`
+            // returns this thread's `errno`, read right after the failed
+            // call. The id syscalls change this thread only, and the
+            // child has no other thread.
+            unsafe {
+                let connect = |addr: &libc::sockaddr_un| -> i32 {
+                    let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                    if fd < 0 {
+                        return -1;
+                    }
+                    let r = libc::connect(
+                        fd,
+                        (addr as *const libc::sockaddr_un).cast(),
+                        std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                    );
+                    if r == 0 {
+                        0
+                    } else {
+                        *libc::__errno_location()
+                    }
+                };
+                let groups = [GROUP as libc::gid_t];
+                if libc::syscall(SET_IDS[0], 1_usize, groups.as_ptr()) != 0
+                    || libc::syscall(SET_IDS[1], NOBODY) != 0
+                    || libc::syscall(SET_IDS[2], NOBODY) != 0
+                {
+                    libc::_exit(10);
+                }
+                let code = match (connect(&property), connect(&system)) {
+                    (0, libc::EACCES) => 0,
+                    (0, 0) => 2,
+                    (0, _) => 3,
+                    (libc::EACCES, _) => 4,
+                    _ => 5,
+                };
+                libc::_exit(code);
+            }
+        }
+        let mut status = 0;
+        // SAFETY: `pid` is this process's child.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child status {status:#x}");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "2: connected without the group; 3: unexpected errno without the group; \
+             4: EACCES with the group (is the socket dir reachable by uid {NOBODY}?); \
+             5: other connect failure; 10: dropping privileges failed"
+        );
     }
 
     /// Kernels before 3.17 have no `/proc/thread-self`: an absent first
@@ -1824,7 +2114,7 @@ pub(crate) mod tests {
         let dir = SocketDir::new("rsprops_svc_listen");
         let dirfd = open_socket_dir(&dir.0).unwrap();
         let tmp = temp_name(PROPERTY);
-        let fd = bind_temp(&dir.0, &dirfd, &tmp).unwrap();
+        let fd = bind_temp(&dir.0, &dirfd, &tmp, SOCKET_FILE_MODE).unwrap();
 
         let err = std::os::unix::net::UnixStream::connect(dir.0.join(&tmp)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
@@ -1857,7 +2147,7 @@ pub(crate) mod tests {
         plant_socket(&existing);
         let ino = std::fs::symlink_metadata(&existing).unwrap().ino();
 
-        assert!(bind_service_sockets(&dir.0).is_err());
+        assert!(bind_service_sockets(&dir.0, DEFAULT_ACCESS).is_err());
         assert_eq!(std::fs::symlink_metadata(&existing).unwrap().ino(), ino);
         assert_eq!(names_in(&dir.0), [PROPERTY]);
     }
@@ -1868,10 +2158,11 @@ pub(crate) mod tests {
     async fn bound_sockets_have_final_mode_and_no_leftover() {
         let dir = SocketDir::new("rsprops_svc_bind_final");
         let path = dir.0.clone();
-        let bound = tokio::task::spawn_blocking(move || bind_service_sockets(&path))
-            .await
-            .unwrap()
-            .unwrap();
+        let bound =
+            tokio::task::spawn_blocking(move || bind_service_sockets(&path, DEFAULT_ACCESS))
+                .await
+                .unwrap()
+                .unwrap();
 
         assert_eq!(mode_of(&dir.0.join(PROPERTY)), SOCKET_FILE_MODE);
         assert_eq!(mode_of(&dir.0.join(SYSTEM)), SOCKET_FILE_MODE);
@@ -1920,7 +2211,7 @@ pub(crate) mod tests {
         std::fs::write(&decoy, b"decoy").unwrap();
         let ino = std::fs::symlink_metadata(&decoy).unwrap().ino();
 
-        assert!(bind_service_sockets_at(&opened, dirfd).is_err());
+        assert!(bind_service_sockets_at(&opened, dirfd, DEFAULT_ACCESS).is_err());
 
         assert_eq!(std::fs::symlink_metadata(&decoy).unwrap().ino(), ino);
         assert_eq!(std::fs::read(&decoy).unwrap(), b"decoy");
@@ -1936,7 +2227,7 @@ pub(crate) mod tests {
     #[test]
     fn bound_sockets_guard_unlinks_on_drop() {
         let dir = SocketDir::new("rsprops_svc_guard");
-        let bound = bind_service_sockets(&dir.0).unwrap();
+        let bound = bind_service_sockets(&dir.0, DEFAULT_ACCESS).unwrap();
         assert_eq!(names_in(&dir.0), [PROPERTY, SYSTEM]);
         drop(bound);
         assert!(names_in(&dir.0).is_empty(), "{:?}", names_in(&dir.0));

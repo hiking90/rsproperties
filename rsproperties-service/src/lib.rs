@@ -174,6 +174,7 @@ use std::sync::Arc;
 
 use rsactor::{Actor, ActorRef, ActorResult};
 
+mod access;
 mod control_reply;
 mod persistent_properties;
 mod properties_service;
@@ -192,6 +193,7 @@ struct ReadmeDoctests;
 // a set, and spawning the socket service without the writer lock lets a
 // second instance replace a running instance's sockets. [`run`] is the
 // only way to start them, and [`ServiceHandle`] the only way to stop them.
+pub use access::{Listener, SocketAccess};
 pub use control_reply::{ControlReply, ControlReplyProbe};
 use properties_service::{PropertiesService, PropertiesServiceArgs};
 use socket_service::{
@@ -372,6 +374,8 @@ pub struct ServiceOptions {
     persistent_properties_file: Option<PathBuf>,
     control_handler: Option<ControlHandler>,
     powerctl_handler: Option<PowerctlHandler>,
+    /// Indexed by [`Listener::index`].
+    socket_access: [SocketAccess; 2],
 }
 
 impl std::fmt::Debug for ServiceOptions {
@@ -385,6 +389,7 @@ impl std::fmt::Debug for ServiceOptions {
             )
             .field("control_handler", &self.control_handler.is_some())
             .field("powerctl_handler", &self.powerctl_handler.is_some())
+            .field("socket_access", &self.socket_access)
             .finish()
     }
 }
@@ -669,6 +674,33 @@ impl ServiceOptions {
         F: Fn(&PowerctlMessage) -> PowerctlOutcome + Send + Sync + 'static,
     {
         self.powerctl_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// The owner group and mode of `listener`'s socket file, in place of
+    /// mode `0o660` and the group the file is created with.
+    ///
+    /// The group is changed and the mode set through a descriptor of the
+    /// temp socket, after `bind` and before `listen`, so no peer connects
+    /// before the file has both (see "Socket files" on [`run`]). [`run`]
+    /// checks the mode first, before it changes anything: a mode outside
+    /// `0o660` fails at [`StartupStage::Config`] (see [`SocketAccess::new`]).
+    ///
+    /// A peer that can connect may set any property and send any `ctl.*`
+    /// and `sys.powerctl` request: the service has no per-request access
+    /// check. Give the group only to uids that may do all of that.
+    ///
+    /// ```
+    /// use rsproperties_service::{Listener, ServiceOptions, SocketAccess};
+    ///
+    /// // init's `property_service_for_system`: 0660, group `system`
+    /// // (AID_SYSTEM, 1000). The service's user must be root or in the
+    /// // group.
+    /// let options = ServiceOptions::new()
+    ///     .socket_access(Listener::System, SocketAccess::new(0o660).with_group(1000));
+    /// ```
+    pub fn socket_access(mut self, listener: Listener, access: SocketAccess) -> Self {
+        self.socket_access[listener.index()] = access;
         self
     }
 }
@@ -1011,8 +1043,11 @@ impl std::error::Error for ServiceError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StartupStage {
+    /// A [`ServiceOptions`] value was refused (a
+    /// [socket mode](SocketAccess::new) outside `0o660`), or
     /// `rsproperties::init` rejected the config: a process-global directory
-    /// was already set to a different path.
+    /// was already set to a different path. The options are checked before
+    /// `init`, so a refused option commits no process-global state.
     Config,
     /// Taking the properties dir's writer lock
     /// ([`rsproperties::AreaWriterLock::acquire`]) failed. A second
@@ -1037,7 +1072,7 @@ pub enum StartupStage {
 impl std::fmt::Display for StartupStage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Config => "configuration (init)",
+            Self::Config => "configuration",
             Self::WriterLock => "properties dir writer lock",
             Self::PropertiesService => "properties service",
             Self::SocketService => "socket service",
@@ -1105,7 +1140,8 @@ impl std::error::Error for StartupError {
 ///
 /// # Startup order
 ///
-/// 1. `rsproperties::init(config)`.
+/// 1. The [`ServiceOptions`] values are checked, then
+///    `rsproperties::init(config)`.
 /// 2. The properties dir's writer lock
 ///    ([`rsproperties::AreaWriterLock::acquire`]); this creates a missing
 ///    properties dir (the last component only). A second instance on the
@@ -1168,16 +1204,19 @@ impl std::error::Error for StartupError {
 /// # Socket files
 ///
 /// Socket files are created as `socket(SOCK_CLOEXEC|SOCK_NONBLOCK)`,
-/// `fchmod(fd, 0660)`, `bind` at `<socket_dir>/.<name>.tmp-<pid>`. The
-/// kernel creates the file with the socket's mode minus the umask, so from
-/// the moment the path exists its mode is a subset of 0660. If the umask
-/// removed any of those bits (e.g. group write under umask 022), the mode
-/// is raised to exactly 0660 through an
-/// `O_PATH|O_NOFOLLOW` descriptor opened relative to the socket dir
-/// (`chmod("/proc/thread-self/fd/N")`, or `/proc/self/fd/N` on kernels
-/// before 3.17; both need `/proc`) after `fstat`
-/// confirms a socket owned by the service's euid. Only then does the
-/// socket `listen`; before that a `connect` fails with `ECONNREFUSED`.
+/// `fchmod(fd, mode)`, `bind` at `<socket_dir>/.<name>.tmp-<pid>`, where
+/// `mode` is 0660 or the one given to [`ServiceOptions::socket_access`].
+/// The kernel creates the file with the socket's mode minus the umask, so
+/// from the moment the path exists its mode is a subset of `mode`. The
+/// temp socket is then opened `O_PATH|O_NOFOLLOW` relative to the socket
+/// dir, and `fstat` must confirm a socket owned by the service's euid.
+/// Through that descriptor, a group given to `socket_access` is set
+/// (`fchownat(fd, "", -1, gid, AT_EMPTY_PATH)`), and if the umask removed
+/// any bits of `mode` (e.g. group write under umask 022), the mode is
+/// raised to exactly `mode` (`chmod("/proc/thread-self/fd/N")`, or
+/// `/proc/self/fd/N` on kernels before 3.17; both need `/proc`). Only then
+/// does the socket `listen`; before that a `connect` fails with
+/// `ECONNREFUSED`.
 /// Both temp sockets are renamed onto their final names only after both
 /// are listening, and a failed start unlinks what it created, final names
 /// included. Both final names are unlinked when the service ends (see
@@ -1197,11 +1236,17 @@ impl std::error::Error for StartupError {
 /// Out of scope: any uid other than the service's euid and root that can
 /// write to the socket dir or any of its ancestors can replace the sockets
 /// with its own and so impersonate the service; nothing in the service can
-/// prevent that. Keep the socket dir and its ancestors writable only by
+/// prevent that. Such a uid can also exchange the two temp sockets' names
+/// during startup, between `bind` and the `O_PATH` open: the `fstat` check
+/// confirms a socket owned by the service's euid, not the socket just
+/// bound, so the other temp socket passes it and gets the group and mode
+/// meant for this name, while the socket just bound listens with the group
+/// it was created with and its mode minus the umask; startup reports no
+/// error. Keep the socket dir and its ancestors writable only by
 /// the service's user and root. A world-writable socket dir without the
 /// sticky bit is reported with a warning at startup; this is not an access
 /// check. A default ACL on the socket dir gives its named users and groups
-/// access beyond the 0660 mode bits; the service does not inspect or
+/// access beyond the socket files' mode bits; the service does not inspect or
 /// remove ACLs.
 ///
 /// # Failure semantics
@@ -1251,6 +1296,14 @@ pub async fn run(
     // default first): starting anyway would bind the service to the
     // previous directories while the caller believes the config took
     // effect.
+    //
+    // The options are checked first: `init` cannot be undone, so a
+    // refused option leaves no process-global state behind.
+    for listener in Listener::ALL {
+        options.socket_access[listener.index()]
+            .check(listener)
+            .map_err(|e| StartupError::new(StartupStage::Config, e))?;
+    }
     rsproperties::init(config).map_err(|e| StartupError::new(StartupStage::Config, e))?;
 
     // The writer lock is taken before either actor is spawned: a second
@@ -1271,6 +1324,7 @@ pub async fn run(
         persistent_properties_file,
         control_handler,
         powerctl_handler,
+        socket_access,
     } = options;
     let (properties_ref, properties_join) = properties_service::spawn(PropertiesServiceArgs {
         property_contexts_files,
@@ -1285,6 +1339,7 @@ pub async fn run(
         socket_dir: rsproperties::socket_dir().to_path_buf(),
         properties_service: properties_ref.clone(),
         handlers,
+        socket_access,
     });
 
     // Sequential readiness checks: the socket service is checked first, so
@@ -1392,11 +1447,40 @@ mod tests {
         assert!(debug.contains("test.key"), "name missing: {debug}");
     }
 
+    /// A socket mode outside 0660 fails at `Config`, naming the socket.
+    /// `run` returns before `init`, so this test leaves no process-global
+    /// state behind for [`run_reports_on_start_cause`].
+    #[tokio::test]
+    async fn run_refuses_socket_mode_outside_0660() {
+        for (listener, mode) in [(Listener::Property, 0o666), (Listener::System, 0o4660)] {
+            let options = ServiceOptions::new().socket_access(listener, SocketAccess::new(mode));
+            let err = match run(rsproperties::PropertyConfig::new(), options).await {
+                Ok(_) => panic!("run must refuse socket mode {mode:#o}"),
+                Err(e) => e,
+            };
+            assert_eq!(err.stage(), StartupStage::Config, "{err}");
+            assert!(
+                err.to_string()
+                    .starts_with("configuration failed to start: "),
+                "{err}"
+            );
+            let source = std::error::Error::source(&err).unwrap();
+            assert!(
+                matches!(
+                    source.downcast_ref::<rsproperties::Error>(),
+                    Some(rsproperties::Error::InvalidArgument(_))
+                ),
+                "{source}"
+            );
+            assert!(err.to_string().contains(listener.socket_name()), "{err}");
+        }
+    }
+
     /// `run` must return the actor's own `on_start` error, not rsactor's
     /// generic mailbox error, tagged with the stage that failed. The only
-    /// test that calls `run` in this process (`init` is
-    /// process-global); the early-request tests below call it in a child
-    /// process.
+    /// test that gets past `init` in this process (`init` is
+    /// process-global); the early-request tests below call `run` in a
+    /// child process.
     #[tokio::test]
     async fn run_reports_on_start_cause() {
         let dir = socket_test_dir("rsprops_svc_run_err", socket_suffix_len("sockets"));
