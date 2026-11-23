@@ -1649,9 +1649,10 @@ service process의 fsgid였다. release build service는 root로만 시작하므
   이 module에만 있다. `SO_PEERSEC`는 LSM이 socket에 label을 붙이는 host에서만
   값을 반환한다. label 형식은 LSM이 정하고, accessor는 끝의 NUL만 제거한다.
   개발 host(LSM: capability, landlock, lockdown, yama, bpf)에서는
-  `ENOPROTOOPT`를 확인했고, SELinux와 AppArmor host에서 label 형식을 실측하지는
-  않았다(확인 필요). 그래서 영어 문서는 SELinux context만 예시로 들고, AppArmor와
-  Smack의 값은 profile이나 label 이름 외의 내용을 포함할 수 있다고 적는다.
+  `ENOPROTOOPT`를 확인했다. SELinux host의 결과는 아래 "실측"에 있다.
+  AppArmor와 Smack host에서는 label 형식을 실측하지 않았다(확인 필요). 그래서
+  영어 문서는 SELinux context만 예시로 들고, AppArmor와 Smack의 값은 profile이나
+  label 이름 외의 내용을 포함할 수 있다고 적는다.
 - (a) authorizer가 없는 service. 0.7.0과 같이 접속할 수 있는 client의 요청을
   모두 허용한다. 이때 access 제어는 socket 파일의 소유자, group, mode뿐이며,
   `run`이 other bit를 거부하므로 접속할 수 있는 것은 소유 uid, group의
@@ -1744,11 +1745,37 @@ service process의 fsgid였다. release build service는 root로만 시작하므
 - `panic = "abort"` build에서 authorizer가 panic하면 process가 SIGABRT로
   종료하고 client는 응답을 받지 못한다. 기본 unwind build에서는 같은 요청이
   0x18을 받고 service가 계속 실행된다.
+- SELinux host(Fedora 41 VM, kernel 6.11, SELinux enforcing)에서
+  root로 실행해야 하는 경로를 확인했다. `cargo test -p rsproperties-service`는
+  비root와 root에서 모두 통과했고, root에서는
+  `group_member_of_another_uid_can_connect`가 건너뛰지 않고 실행되었다.
+  `SO_PEERSEC`는 `unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023`
+  끝에 NUL 1 byte를 붙인 54 byte를 반환했고, 4 byte buffer에는 `ERANGE`를
+  반환했다. accessor는 NUL을 제거하고, `ERANGE`이면 kernel이 알려준 크기로
+  다시 읽는다.
+- 다른 uid의 client. service를 uid 1000으로 실행하고(`0o666` socket,
+  `max_connections_per_uid(2)`, `deny_unmatched` `AccessPolicy`에 uid 54401의
+  `vm.allowed.` prefix 규칙과 gid 54400의 `vm.group` 이름 규칙), uid 54401(보조
+  group 54400), 1000, 0에서 요청을 보냈다.
+
+  | 요청자 | 요청 | 응답 |
+  |--------|------|------|
+  | 54401 | `vm.allowed.a` | 0 (uid 규칙) |
+  | 54401 | `vm.denied.a` | 0x18 |
+  | 54401 | `vm.group` | 0 (보조 group 규칙) |
+  | 54401 | `ro.vm.x` | 0x18 |
+  | 54401 | `ctl.start` | 0x20 |
+  | 54401 | 응답을 기다리지 않는 connection 2개를 연 상태에서 set | 응답 없이 닫힘(`ECONNRESET`), authorizer 호출 없음 |
+  | 54401 | 위 connection 2개를 닫은 뒤 set | 0 |
+  | 1000 (service euid) | `vm.group` | 0x18 (보조 group이 아님) |
+  | 1000, 0 | connection 2개를 연 상태에서 set | 0x18 (한도를 적용하지 않고 정책이 거부) |
+
+  authorizer가 받은 `PeerInfo`의 pid, uid, gid는 요청자의 값이었다.
+  `groups()`는 `[54400, 54401]`을 반환했다. `pidfd()`의 fdinfo `Pid:`는 요청자의
+  pid와 같았다.
 
 **확인 필요.**
-- 다른 uid의 client가 `0o666` socket으로 접속해 authorizer에서 판정받는
-  경로와 `group_member_of_another_uid_can_connect`는 root 권한이 필요해서
-  개발 host에서 실행하지 않았다.
+- AppArmor와 Smack host에서 `SO_PEERSEC`가 반환하는 형식.
 
 **test.** `authorization.rs` `authorizer_sees_the_request_and_decides`,
 `control_request_is_looked_up_with_its_target`, `debug_masks_the_value`,
