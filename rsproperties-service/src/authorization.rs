@@ -10,7 +10,7 @@ use std::sync::Arc;
 use rsproperties::PropertyInfoTrie;
 use tokio::sync::watch;
 
-use crate::{peer_sockopt, Listener};
+use crate::{peer_sockopt, KnownType, Listener};
 
 /// What an [authorizer](crate::ServiceOptions::authorizer) answers for one
 /// request.
@@ -282,6 +282,12 @@ pub(crate) type TrieReceiver = watch::Receiver<Option<Arc<PropertyInfoTrie>>>;
 /// `on_start`.
 pub(crate) type TrieSender = watch::Sender<Option<Arc<PropertyInfoTrie>>>;
 
+/// The request was refused; the reason is logged already. The caller
+/// answers `PROP_ERROR_HANDLE_CONTROL_MESSAGE` for `ctl.*`,
+/// `PROP_ERROR_PERMISSION_DENIED` otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Refused;
+
 /// The authorizer and what a call of it needs. Each connection task has a
 /// clone.
 #[derive(Clone)]
@@ -299,7 +305,14 @@ impl Authorization {
     }
 
     /// Whether the request may go on: init's `CheckPermissions` after its
-    /// name check. `name` must have passed that check.
+    /// name check. `name` must have passed that check. `Err(Refused)` when
+    /// it may not. A request that may go on gets `Ok(Some(_))` with the
+    /// `property_contexts` type of the name, read with the context in one
+    /// lookup: the properties service checks the value against it without
+    /// a lookup of its own. For a control request it is the type of
+    /// `ctl.<action>$<target>`, which nothing reads. It gets `Ok(None)`
+    /// when the type cannot be read; the properties service then looks the
+    /// type up and answers as it does without an authorizer.
     ///
     /// The request is refused without a call when the sender's credentials
     /// could not be read, when the properties service failed to start, or
@@ -311,20 +324,20 @@ impl Authorization {
     ///
     /// Waits for the properties service's `on_start` when it has not
     /// built the trie yet. The caller's deadline bounds the wait.
-    pub(crate) async fn allows(
+    pub(crate) async fn authorize(
         &mut self,
         name: &str,
         value: &str,
         listener: Listener,
         (pid, uid, gid): (Option<i32>, Option<u32>, Option<u32>),
         connection: Option<BorrowedFd<'_>>,
-    ) -> bool {
+    ) -> Result<Option<KnownType>, Refused> {
         let (Some(pid), Some(uid), Some(gid)) = (pid, uid, gid) else {
             log::warn!(
                 "Refused {name:?} on {listener}: the sender's credentials (SO_PEERCRED) could \
                  not be read"
             );
-            return false;
+            return Err(Refused);
         };
         let trie = match self.trie.wait_for(Option::is_some).await {
             // `wait_for` returned for a `Some`.
@@ -336,7 +349,7 @@ impl Authorization {
                 "Refused {name:?} from pid {pid} (uid {uid}, gid {gid}) on {listener}: the \
                  properties service did not start, so the name's context is unknown"
             );
-            return false;
+            return Err(Refused);
         };
         // init looks a control request up as `ctl.<action>$<target>`
         // (`CheckControlPropertyPerms`); the legacy `ctl.<target>` lookup
@@ -348,22 +361,29 @@ impl Authorization {
         } else {
             name
         };
-        let context = match trie.context(lookup) {
-            Ok(Some(context)) => context,
-            Ok(None) => {
-                log::warn!(
-                    "Refused {name:?} from pid {pid} (uid {uid}, gid {gid}) on {listener}: \
-                     property_contexts gives the name no context"
-                );
-                return false;
-            }
-            Err(e) => {
-                log::warn!(
-                    "Refused {name:?} from pid {pid} (uid {uid}, gid {gid}) on {listener}: \
-                     cannot read the name's context: {e}"
-                );
-                return false;
-            }
+        // A type that cannot be read is not the access check's to answer:
+        // the context is read alone, and an allowed request carries no type,
+        // so the properties service looks it up and answers
+        // `PROP_ERROR_SET_FAILED`, as without an authorizer.
+        let (context, property_type) = match trie.context_and_type(lookup) {
+            Ok((context, property_type)) => (context, Some(property_type)),
+            Err(_) => match trie.context(lookup) {
+                Ok(context) => (context, None),
+                Err(e) => {
+                    log::warn!(
+                        "Refused {name:?} from pid {pid} (uid {uid}, gid {gid}) on {listener}: \
+                         cannot read the name's context: {e}"
+                    );
+                    return Err(Refused);
+                }
+            },
+        };
+        let Some(context) = context else {
+            log::warn!(
+                "Refused {name:?} from pid {pid} (uid {uid}, gid {gid}) on {listener}: \
+                 property_contexts gives the name no context"
+            );
+            return Err(Refused);
         };
         let request = SetRequest {
             name,
@@ -385,14 +405,16 @@ impl Authorization {
         // `property_contexts` entry matches it (`{name:?}`, so escaped);
         // no other log line of the service has the target.
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| authorizer(&request))) {
-            Ok(Decision::Allow) => true,
+            Ok(Decision::Allow) => {
+                Ok(property_type.map(|property_type| KnownType(property_type.map(str::to_owned))))
+            }
             Ok(Decision::Deny) => {
                 log::warn!(
                     "The authorizer denied {name:?} ({} bytes, context {context}) from pid {pid} \
                      (uid {uid}, gid {gid}) on {listener}",
                     value.len()
                 );
-                false
+                Err(Refused)
             }
             Err(_) => {
                 log::error!(
@@ -400,7 +422,7 @@ impl Authorization {
                      {pid} (uid {uid}, gid {gid}) on {listener}; the request is refused",
                     value.len()
                 );
-                false
+                Err(Refused)
             }
         }
     }
@@ -414,9 +436,26 @@ mod tests {
 
     const PEER: (Option<i32>, Option<u32>, Option<u32>) = (Some(7), Some(1000), Some(1001));
 
+    impl Authorization {
+        /// Whether [`authorize`](Self::authorize) lets the request through.
+        pub(crate) async fn allows(
+            &mut self,
+            name: &str,
+            value: &str,
+            listener: Listener,
+            credentials: (Option<i32>, Option<u32>, Option<u32>),
+            connection: Option<BorrowedFd<'_>>,
+        ) -> bool {
+            self.authorize(name, value, listener, credentials, connection)
+                .await
+                .is_ok()
+        }
+    }
+
     fn trie() -> Arc<PropertyInfoTrie> {
         let entries = [
             PropertyInfoEntry::prefix("vendor.", "u:object_r:vendor_prop:s0", "string").unwrap(),
+            PropertyInfoEntry::exact("vendor.int", "u:object_r:vendor_prop:s0", "int").unwrap(),
             PropertyInfoEntry::exact("ctl.start$adbd", "u:object_r:ctl_adbd_prop:s0", "string")
                 .unwrap(),
         ];
@@ -464,6 +503,52 @@ mod tests {
                 )]
             );
         }
+    }
+
+    /// An allowed request carries the type of its name, read in the same
+    /// lookup as the context; the default when no entry gives one.
+    #[tokio::test]
+    async fn allowed_request_carries_the_type_of_its_name() {
+        let (mut authorization, sender, _seen) = recording(Decision::Allow);
+        sender.send_replace(Some(trie()));
+        for (name, property_type) in [
+            ("vendor.int", "int"),
+            ("vendor.x", "string"),
+            ("other.x", "string"),
+        ] {
+            let known = authorization
+                .authorize(name, "1", Listener::Property, PEER, None)
+                .await
+                .expect("allowed")
+                .expect("type read");
+            assert_eq!(known.0.as_deref(), Some(property_type), "{name}");
+        }
+    }
+
+    /// A type that cannot be read does not refuse the request: the
+    /// authorizer decides on the context, and an allowed request carries
+    /// no type, so the properties service looks it up and answers
+    /// `PROP_ERROR_SET_FAILED` as it does without an authorizer.
+    #[tokio::test]
+    async fn unreadable_type_is_left_to_the_properties_service() {
+        let entries = [
+            PropertyInfoEntry::exact("vendor.x", "u:object_r:vendor_prop:s0", "double").unwrap(),
+        ];
+        let mut bytes = build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap();
+        let at = bytes
+            .windows(7)
+            .position(|window| window == b"double\0")
+            .expect("type string in the trie");
+        bytes[at] = 0xff;
+        let trie = Arc::new(PropertyInfoTrie::new(&bytes).unwrap());
+        assert!(trie.context_and_type("vendor.x").is_err());
+        let (mut authorization, sender, seen) = recording(Decision::Allow);
+        sender.send_replace(Some(trie));
+        let known = authorization
+            .authorize("vendor.x", "1", Listener::Property, PEER, None)
+            .await;
+        assert_eq!(known, Ok(None));
+        assert_eq!(seen.lock().unwrap()[0].2, "u:object_r:vendor_prop:s0");
     }
 
     /// A control request's context is that of `ctl.<action>$<target>`.

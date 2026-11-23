@@ -82,7 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the bytes `build_trie` returns. `context(name)` and
   `property_type(name)` return `&str`s that borrow it, without the
   header check and the allocation `property_type_in_trie` does on every
-  call.
+  call; `context_and_type(name)` returns both from one walk of the trie.
 
 ### Changed
 

@@ -14,6 +14,7 @@ use rsproperties::{
 
 use crate::persistent_properties::{is_persistent_name, PersistentStore};
 use crate::property_type::check_type;
+use crate::KnownType;
 
 /// What [`spawn`] starts the properties service with.
 pub(crate) struct PropertiesServiceArgs {
@@ -236,7 +237,7 @@ fn apply_startup_properties(
 
 /// init `InitPropertySet`: [`apply_set`], logging a failure.
 fn init_set(system_properties: &mut SystemProperties, name: &str, value: &str) {
-    let code = apply_set(system_properties, name, value);
+    let code = apply_set(system_properties, name, value, None);
     if code != PROP_SUCCESS {
         log::error!("Cannot set {name:?} at startup: error code {code:#x}");
     }
@@ -262,7 +263,16 @@ fn init_set(system_properties: &mut SystemProperties, name: &str, value: &str) {
 ///
 /// No per-property access check: see the access model on the socket
 /// service.
-fn apply_set(system_properties: &mut SystemProperties, name: &str, value: &str) -> i32 {
+///
+/// `known_type` is the name's type when the socket service has read it
+/// already, from the trie published as `property_info` (a service with an
+/// authorizer reads it with the context); `None` looks it up here.
+fn apply_set(
+    system_properties: &mut SystemProperties,
+    name: &str,
+    value: &str,
+    known_type: Option<&KnownType>,
+) -> i32 {
     if let Err(e) = validate_property_name(name) {
         log::error!("Rejected setprop: {e}");
         return PROP_ERROR_INVALID_NAME;
@@ -271,7 +281,11 @@ fn apply_set(system_properties: &mut SystemProperties, name: &str, value: &str) 
         log::error!("Rejected setprop {name:?}: control messages are not stored");
         return PROP_ERROR_HANDLE_CONTROL_MESSAGE;
     }
-    match system_properties.property_type(name) {
+    let property_type = match known_type {
+        Some(KnownType(property_type)) => Ok(property_type.as_deref()),
+        None => system_properties.property_type(name),
+    };
+    match property_type {
         Ok(Some(property_type)) if !check_type(property_type, value) => {
             log::error!("Rejected setprop {name:?}: value does not match type {property_type:?}");
             return PROP_ERROR_INVALID_VALUE;
@@ -413,14 +427,20 @@ impl rsactor::Message<crate::PropertyMessage> for PropertiesService {
         _actor_ref: &ActorRef<Self>,
     ) -> Self::Reply {
         log::debug!("Handling property message: {message:?}");
-        self.client_set(&message.name, message.value).await
+        self.client_set(&message.name, message.value, message.known_type.as_ref())
+            .await
     }
 }
 
 impl PropertiesService {
     /// One set from a client: [`apply_set`], then the persistent file.
-    async fn client_set(&mut self, name: &str, value: String) -> i32 {
-        let code = apply_set(&mut self.system_properties, name, &value);
+    async fn client_set(
+        &mut self,
+        name: &str,
+        value: String,
+        known_type: Option<&KnownType>,
+    ) -> i32 {
+        let code = apply_set(&mut self.system_properties, name, &value, known_type);
         if code != PROP_SUCCESS || !is_persistent_name(name.as_bytes()) {
             return code;
         }
@@ -878,7 +898,11 @@ mod tests {
             ("selinux.restorecon_recursive", "/data/x", PROP_SUCCESS),
         ];
         for &(name, value, code) in cases {
-            assert_eq!(apply_set(&mut sp, name, value), code, "{name:?} {value:?}");
+            assert_eq!(
+                apply_set(&mut sp, name, value, None),
+                code,
+                "{name:?} {value:?}"
+            );
         }
         assert!(
             sp.find("sys.powerctl").unwrap().is_none(),
@@ -968,6 +992,33 @@ mod tests {
         assert!(sp.find("debug.s").unwrap().is_none());
     }
 
+    /// A type the socket service has read is used in place of the lookup:
+    /// the value is checked against it, not against the type the
+    /// `property_contexts` file gives the name.
+    #[test]
+    fn known_type_replaces_the_lookup() {
+        let tmp = TempDir::new("rsprops_svc_known_type");
+        let mut sp = typed_properties(&tmp);
+        let int = KnownType(Some("int".to_owned()));
+        let string = KnownType(Some("string".to_owned()));
+        let untyped = KnownType(None);
+        // `debug.int` is `int` in the file, `debug.other` is `string` (the `debug.` prefix).
+        assert_eq!(
+            apply_set(&mut sp, "debug.int", "x", Some(&string)),
+            PROP_SUCCESS
+        );
+        assert_eq!(
+            apply_set(&mut sp, "debug.other", "x", Some(&int)),
+            PROP_ERROR_INVALID_VALUE
+        );
+        assert_eq!(
+            apply_set(&mut sp, "debug.int", "y", Some(&untyped)),
+            PROP_SUCCESS
+        );
+        assert_eq!(sp.get("debug.int").unwrap(), "y");
+        assert!(sp.find("debug.other").unwrap().is_none());
+    }
+
     #[test]
     fn startup_fails_when_persistent_dir_is_missing() {
         let tmp = TempDir::new("rsprops_svc_startup_nodir");
@@ -979,7 +1030,7 @@ mod tests {
     impl PropertiesService {
         /// A client set.
         async fn set(&mut self, name: &str, value: &str) -> i32 {
-            self.client_set(name, value.into()).await
+            self.client_set(name, value.into(), None).await
         }
     }
 

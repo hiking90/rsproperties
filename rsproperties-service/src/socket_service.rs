@@ -142,16 +142,18 @@ const MAX_UNANSWERED_CONTROL_MESSAGES: usize = 102;
 /// **Access model.** The file's owner, group and mode decide who can
 /// `connect()` (write permission on the socket file). What a connected
 /// peer may then do is decided per request by the host's authorizer
-/// ([`Authorization::allows`], init's `CheckPermissions`), when it has
+/// ([`Authorization::authorize`], init's `CheckPermissions`), when it has
 /// one. Without one the socket file is the service's *entire* access
 /// control: any peer that can connect may set any non-`ro.` property, and
 /// any `ro.` property that has no value yet (the first writer fixes it),
 /// and send any `ctl.*` control message to the configured handler; peer
-/// credentials are then only logged and passed to the handlers. The
-/// `property_contexts` type check applies to values, not to senders, and
-/// the "property" / "system" sockets share one handler, which an
-/// authorizer can tell apart by the request's listener. Restrict group
-/// membership and the socket dir as described on [`SocketService`].
+/// credentials are then only logged, counted against the per-uid
+/// connection limit (`ServiceOptions::max_connections_per_uid`), and
+/// passed to the handlers. The `property_contexts` type check applies to
+/// values, not to senders, and the "property" / "system" sockets share
+/// one handler, which an authorizer can tell apart by the request's
+/// listener. Restrict group membership and the socket dir as described on
+/// [`crate::run`] ("Socket files").
 pub(crate) const SOCKET_FILE_MODE: u32 = 0o660;
 
 /// Backoff applied when `accept()` returns an error. Without it, a
@@ -461,7 +463,8 @@ struct BoundSockets {
 }
 
 /// Creates the socket dir if missing, then [`bind_service_sockets_at`].
-/// The sequence and its limits are documented on [`SocketService`].
+/// The sequence and its limits are documented on [`crate::run`] ("Socket
+/// files").
 fn bind_service_sockets(dir: &Path, access: [SocketAccess; 2]) -> Result<BoundSockets> {
     ensure_socket_dir(dir)?;
     let dirfd = open_socket_dir(dir)?;
@@ -1349,8 +1352,7 @@ impl SocketService {
     /// later; the task still records an accepted command, as init records
     /// every set it has read.
     async fn dispatch<A>(
-        name: String,
-        value: String,
+        message: crate::PropertyMessage,
         peer: Peer,
         service: ActorRef<A>,
         handlers: Handlers,
@@ -1358,12 +1360,12 @@ impl SocketService {
     where
         A: rsactor::Message<crate::PropertyMessage, Reply = i32>,
     {
-        if name != crate::POWERCTL_PROPERTY {
-            return Self::ask_service(&service, crate::PropertyMessage { name, value }).await;
+        if message.name != crate::POWERCTL_PROPERTY {
+            return Self::ask_service(&service, message).await;
         }
         let task = tokio::spawn(async move {
-            let command = value.clone();
-            let code = Self::ask_service(&service, crate::PropertyMessage { name, value }).await;
+            let command = message.value.clone();
+            let code = Self::ask_service(&service, message).await;
             if code == PROP_SUCCESS {
                 Self::notify_powerctl(command, peer, &handlers)
             } else {
@@ -1562,27 +1564,34 @@ impl SocketService {
         // `read_setprop2` above, without a call of the authorizer and
         // without the denial's log line; init checks the value after the
         // access. The authorizer takes the value as a `&str`.
-        if let Some(mut authorization) = authorization {
-            if let Err(e) = validate_property_name(&name) {
-                error!("Rejected set request: {e}");
-                return Self::send_response(&mut stream, PROP_ERROR_INVALID_NAME).await;
-            }
-            let credentials = (peer.pid, peer.uid, peer.gid);
-            // The authorizer may ask the connection for more about its
-            // peer (`PeerInfo::groups` and the like).
-            let connection = Some(stream.as_fd());
-            if !authorization
-                .allows(&name, &value, listener, credentials, connection)
-                .await
-            {
-                let code = if name.starts_with("ctl.") {
-                    PROP_ERROR_HANDLE_CONTROL_MESSAGE
-                } else {
-                    PROP_ERROR_PERMISSION_DENIED
+        let known_type = match authorization {
+            Some(mut authorization) => {
+                if let Err(e) = validate_property_name(&name) {
+                    error!("Rejected set request: {e}");
+                    return Self::send_response(&mut stream, PROP_ERROR_INVALID_NAME).await;
+                }
+                let credentials = (peer.pid, peer.uid, peer.gid);
+                // The authorizer may ask the connection for more about its
+                // peer (`PeerInfo::groups` and the like).
+                let connection = Some(stream.as_fd());
+                let Ok(known_type) = authorization
+                    .authorize(&name, &value, listener, credentials, connection)
+                    .await
+                else {
+                    let code = if name.starts_with("ctl.") {
+                        PROP_ERROR_HANDLE_CONTROL_MESSAGE
+                    } else {
+                        PROP_ERROR_PERMISSION_DENIED
+                    };
+                    return Self::send_response(&mut stream, code).await;
                 };
-                return Self::send_response(&mut stream, code).await;
+                // The properties service checks the value against this
+                // type without looking the name up again (and looks it up
+                // when it is `None`: the type could not be read).
+                known_type
             }
-        }
+            None => None,
+        };
 
         info!("Forwarding property: {name:?} ({} bytes)", value.len());
 
@@ -1600,7 +1609,12 @@ impl SocketService {
         }
         // Held to the end of the exchange.
         let _slot = slot;
-        let code = Self::dispatch(name, value, peer, service, handlers).await;
+        let message = crate::PropertyMessage {
+            name,
+            value,
+            known_type,
+        };
+        let code = Self::dispatch(message, peer, service, handlers).await;
         if code != PROP_SUCCESS {
             warn!("Property set was rejected: error code {code:#x}");
         }
@@ -2390,23 +2404,26 @@ pub(crate) mod tests {
         });
     }
 
-    /// Counts forwarded requests in place of `PropertiesService`, and
-    /// refuses the value [`REFUSED_VALUE`].
-    struct Recorder(Arc<AtomicUsize>);
+    /// The `known_type` of each request a [`Recorder`] was given, in order.
+    type ForwardedTypes = Arc<std::sync::Mutex<Vec<Option<crate::KnownType>>>>;
+
+    /// Counts forwarded requests in place of `PropertiesService`, records
+    /// the type each carried, and refuses the value [`REFUSED_VALUE`].
+    struct Recorder(Arc<AtomicUsize>, ForwardedTypes);
 
     /// The value [`Recorder`] answers with `PROP_ERROR_INVALID_VALUE`.
     const REFUSED_VALUE: &str = "refused-by-recorder";
 
     impl Actor for Recorder {
-        type Args = Arc<AtomicUsize>;
+        type Args = (Arc<AtomicUsize>, ForwardedTypes);
         type Error = std::convert::Infallible;
         type IdleEvent = ();
 
         async fn on_start(
-            count: Self::Args,
+            (count, types): Self::Args,
             _actor_ref: &ActorRef<Self>,
         ) -> std::result::Result<Self, Self::Error> {
-            Ok(Self(count))
+            Ok(Self(count, types))
         }
     }
 
@@ -2419,6 +2436,7 @@ pub(crate) mod tests {
             _actor_ref: &ActorRef<Self>,
         ) -> i32 {
             self.0.fetch_add(1, Ordering::SeqCst);
+            self.1.lock().unwrap().push(message.known_type);
             if message.value == REFUSED_VALUE {
                 return PROP_ERROR_INVALID_VALUE;
             }
@@ -2475,9 +2493,16 @@ pub(crate) mod tests {
     }
 
     fn recorder() -> (ActorRef<Recorder>, Arc<AtomicUsize>) {
-        let count = Arc::new(AtomicUsize::new(0));
-        let (actor_ref, _join) = rsactor::spawn::<Recorder>(count.clone());
+        let (actor_ref, count, _types) = recorder_with_types();
         (actor_ref, count)
+    }
+
+    /// [`recorder`], and the types of the requests it is given.
+    fn recorder_with_types() -> (ActorRef<Recorder>, Arc<AtomicUsize>, ForwardedTypes) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let types = ForwardedTypes::default();
+        let (actor_ref, _join) = rsactor::spawn::<Recorder>((count.clone(), types.clone()));
+        (actor_ref, count, types)
     }
 
     fn v2_frame(name: &str, value: &str) -> Vec<u8> {
@@ -2513,7 +2538,7 @@ pub(crate) mod tests {
             rsproperties::PropertyInfoTrie::new(&bytes).unwrap(),
         )));
 
-        let (service, forwarded) = recorder();
+        let (service, forwarded, types) = recorder_with_types();
         let controlled = Arc::new(AtomicUsize::new(0));
         let counter = controlled.clone();
         let control: crate::ControlHandler = Arc::new(move |_message, reply: ControlReply| {
@@ -2593,6 +2618,22 @@ pub(crate) mod tests {
             PROP_ERROR_PERMISSION_DENIED
         );
         assert_eq!(forwarded.load(Ordering::SeqCst), 1);
+
+        // The one forwarded set carried the type read with its context, so
+        // the properties service does not look the name up again; without
+        // an authorizer nothing is read and the type is left to it.
+        assert_eq!(
+            *types.lock().unwrap(),
+            [Some(crate::KnownType(Some("string".to_owned())))]
+        );
+        assert_eq!(
+            exchange_authorized(&v2_frame("test.authz", "allow"), service, handlers, None).await,
+            PROP_SUCCESS
+        );
+        assert_eq!(
+            *types.lock().unwrap(),
+            [Some(crate::KnownType(Some("string".to_owned()))), None]
+        );
     }
 
     /// A fully received V2 request is applied even though its client

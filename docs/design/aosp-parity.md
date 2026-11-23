@@ -1564,8 +1564,8 @@ service process의 fsgid였다. release build service는 root로만 시작하므
 - **authorizer.** `ServiceOptions::authorizer(|req: &SetRequest<'_>| ->
   Decision)`이다. `SetRequest`는 이름, 값, target context, 요청이 들어온
   `Listener`, `PeerInfo`(pid, uid, gid)를 담는다. target context는
-  `PropertyInfoTrie::context`로 조회하며, init이 `CheckMacPerms`에 넘기는 값과
-  같다. `ctl.*` 요청은 init의 새 방식과 같이 `ctl.<action>$<target>` 이름으로
+  `PropertyInfoTrie::context_and_type`으로 type과 함께 한 번에 조회하며, init이
+  `CheckMacPerms`에 넘기는 값과 같다. `ctl.*` 요청은 init의 새 방식과 같이 `ctl.<action>$<target>` 이름으로
   조회한다.
 - **적용 대상.** socket으로 들어온 일반 set, `ctl.*`, `sys.powerctl`이다.
   build.prop, persistent property, `ro.property_service.version` 같은 startup
@@ -1573,7 +1573,10 @@ service process의 fsgid였다. release build service는 root로만 시작하므
 - **호출 위치.** connection task의 `handle_setprop2`다. 이름 검사
   (`validate_property_name`) 다음, `PropertiesService` actor에 `ask`하기
   전이다. type 검사는 actor가 하므로 순서는 init의 `CheckPermissions`와 같은
-  이름 검사, access 검사, type 검사다. 거부된 `ctl.*` 요청은 queue에 들어가지
+  이름 검사, access 검사, type 검사다. connection task는 context와 함께 읽은
+  type을 `PropertyMessage`에 실어 보내고, actor는 그 type으로 검사하므로 type을
+  읽으려고 같은 이름을 다시 조회하지 않는다. authorizer가 없는 service와 startup set은
+  이 변경 전과 같이 actor가 type을 조회한다. 거부된 `ctl.*` 요청은 queue에 들어가지
   않으므로 미응답 한도(S3)의 slot을 차지하지 않는다. actor 안에서 호출하지
   않은 이유는 actor가 모든 set을 순서대로 처리하기 때문이다. actor 안에서
   호출하면 authorizer의 실행 시간만큼 다른 client의 set이 모두 대기한다.
@@ -1582,7 +1585,11 @@ service process의 fsgid였다. release build service는 root로만 시작하므
   `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 받는다. authorizer가 panic한 경우,
   `SO_PEERCRED`를 읽지 못한 경우, properties service가 시작에 실패한 경우,
   target context를 읽지 못한 경우에도 같은 code로 거부한다. 뒤의 세 경우에는
-  authorizer를 호출하지 않는다.
+  authorizer를 호출하지 않는다. context는 읽었지만 type을 읽지 못한 요청은
+  거부하지 않는다. authorizer가 허용하면 일반 set과 `sys.powerctl`은 type 없이
+  actor로 보내고, actor가 type을 다시 조회해 authorizer가 없는 service와 같은
+  `PROP_ERROR_SET_FAILED`로 응답한다. `ctl.*` 요청은 조회 이름의 type을 쓰지
+  않으므로 type을 읽지 못해도 control handler로 간다.
 - **trie 전달.** connection task가 target context를 조회하려면
   `property_info` trie가 필요하다. `PropertiesService`의 `on_start`가
   `Arc<PropertyInfoTrie>`를 `tokio::sync::watch` channel로 보내고, connection
@@ -1710,11 +1717,6 @@ service process의 fsgid였다. release build service는 root로만 시작하므
   비교하는 정책에는 await할 대상이 없다. 요청 시점에 I/O가 필요한 정책
   (polkit 조회, 다른 daemon에 질의)은 구현할 수 없다. authorizer는 tokio
   worker thread에서 호출되므로 block하면 그 worker가 멈춘다.
-- trie 조회 중복 제거. authorizer가 있는 service에서는 connection task가
-  context를 조회하고 actor가 type 검사를 위해 같은 이름을 다시 조회한다. 아래
-  측정에서 추가된 조회 1회는 Android `property_contexts` 크기의 trie에서
-  0.15–0.35 µs이고, set 1회의 round trip(약 27 µs)의 1.3% 이하다. 그래서
-  조회 결과를 message에 실어 보내는 변경은 하지 않았다.
 
 **실측.**
 - init의 응답 code와 순서(API 37 emulator `rsbinder-a17`,
@@ -1764,9 +1766,13 @@ service process의 fsgid였다. release build service는 root로만 시작하므
   조회는 AOSP `GetPropertyInfoIndexes`와 같은 방식이다. segment마다 child는
   binary search로 찾고, 지나는 node의 prefix entry와 마지막 node의 exact
   entry는 앞에서부터 하나씩 비교한다. 그래서 시간은 이름의 길이보다 지나는
-  node의 entry 수에 따라 달라진다. authorizer가 있는 service에서 요청마다
-  추가되는 것은 connection task의 `context` 조회 1회다. actor의 type 조회는 이
-  PR 이전에도 있었다.
+  node의 entry 수에 따라 달라진다. connection task는 `context_and_type`으로
+  context와 type을 한 번의 탐색으로 읽는다. 같은 측정에서 이 호출은 `context`
+  단독보다 9–27 ns(type 문자열 하나를 읽는 시간) 더 걸렸고, `context`와
+  `property_type`을 따로 호출한 시간(302–673 ns)의 약 절반이었다. actor는 넘겨받은
+  type으로 검사하므로, authorizer가 있는 service에서도 요청 하나가 context와
+  type을 읽으려고 trie를 탐색하는 횟수는 이 PR 이전과 같은 1회다. 값을 저장하는
+  `SystemProperties::set`의 area 탐색은 이와 별개다.
 - `panic = "abort"` build에서 authorizer가 panic하면 process가 SIGABRT로
   종료하고 client는 응답을 받지 못한다. 기본 unwind build에서는 같은 요청이
   0x18을 받고 service가 계속 실행된다.
@@ -1807,7 +1813,9 @@ service process의 fsgid였다. release build service는 root로만 시작하므
 `unknown_credentials_are_refused_without_a_call`,
 `waits_for_the_trie_and_refuses_when_it_never_comes`,
 `panicking_authorizer_refuses`, `name_without_a_context_is_refused`,
-`access.rs` `modes_outside_the_allowed_bits_are_refused`,
+`allowed_request_carries_the_type_of_its_name`,
+`unreadable_type_is_left_to_the_properties_service`,
+`properties_service.rs` `known_type_replaces_the_lookup`, `access.rs` `modes_outside_the_allowed_bits_are_refused`,
 `group_minus_one_is_refused`, `socket_service.rs`
 `authorizer_is_asked_after_the_name_check`,
 `group_member_of_another_uid_can_connect`(root 전용),

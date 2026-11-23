@@ -944,7 +944,18 @@ pub(crate) struct ReadyMessage;
 pub(crate) struct PropertyMessage {
     pub name: String,
     pub value: String,
+    /// The name's `property_contexts` type when the socket service has
+    /// read it: with an authorizer, it reads the context and the type in
+    /// one lookup of the trie the properties service published
+    /// (`Authorization::authorize`). `None` makes the properties service
+    /// look the type up.
+    pub known_type: Option<KnownType>,
 }
+
+/// The `property_contexts` type a lookup gave a name; `None` when no
+/// entry and no default gives it one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KnownType(pub Option<String>);
 
 // Mask `value` in `Debug` output so log-level captures don't spill
 // property contents. Property names are public knowledge (they cross the
@@ -956,6 +967,7 @@ impl std::fmt::Debug for PropertyMessage {
         f.debug_struct("PropertyMessage")
             .field("name", &self.name)
             .field("value", &format_args!("<{} bytes>", self.value.len()))
+            .field("known_type", &self.known_type)
             .finish()
     }
 }
@@ -1717,6 +1729,7 @@ mod tests {
         let msg = PropertyMessage {
             name: "test.key".to_string(),
             value: "test.value".to_string(),
+            known_type: None,
         };
         let debug = format!("{msg:?}");
         assert!(!debug.contains("test.value"), "value leaked: {debug}");

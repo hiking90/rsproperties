@@ -410,10 +410,28 @@ impl<'a> PropertyInfoArea<'a> {
     #[cfg(feature = "builder")]
     pub(crate) fn property_type(&self, name: &str) -> Result<Option<&'a str>> {
         let (_, type_index) = self.get_property_info_indexes(name);
-        if type_index == NO_INDEX {
+        self.type_at(type_index)
+    }
+
+    /// The context string at `index` of the contexts table, `None` for
+    /// [`NO_INDEX`].
+    #[cfg(feature = "builder")]
+    fn context_at(&self, index: u32) -> Result<Option<&'a str>> {
+        if index == NO_INDEX {
             return Ok(None);
         }
-        let offset = self.type_offset(type_index as usize)?;
+        let offset = self.context_offset(index as usize)?;
+        Ok(Some(self.cstr(offset)?.to_str()?))
+    }
+
+    /// The type string at `index` of the types table, `None` for
+    /// [`NO_INDEX`].
+    #[cfg(feature = "builder")]
+    fn type_at(&self, index: u32) -> Result<Option<&'a str>> {
+        if index == NO_INDEX {
+            return Ok(None);
+        }
+        let offset = self.type_offset(index as usize)?;
         Ok(Some(self.cstr(offset)?.to_str()?))
     }
 
@@ -905,11 +923,7 @@ impl PropertyInfoTrie {
     pub fn context(&self, name: &str) -> Result<Option<&str>> {
         let area = self.area();
         let (context_index, _) = area.get_property_info_indexes(name);
-        if context_index == NO_INDEX {
-            return Ok(None);
-        }
-        let offset = area.context_offset(context_index as usize)?;
-        Ok(Some(area.cstr(offset)?.to_str()?))
+        area.context_at(context_index)
     }
 
     /// The `property_contexts` type of `name` (`"string"`, `"int"`,
@@ -928,6 +942,23 @@ impl PropertyInfoTrie {
     /// `Ok(None)`, or the type of the entries that could be read.
     pub fn property_type(&self, name: &str) -> Result<Option<&str>> {
         self.area().property_type(name)
+    }
+
+    /// [`context`](Self::context) and [`property_type`](Self::property_type)
+    /// of `name`, from one walk of the trie. Each of the two walks the trie
+    /// on its own, and the walk is most of a lookup's time (it compares
+    /// `name` with the entries of every node on its path), so a caller that
+    /// needs both calls this instead.
+    ///
+    /// # Errors
+    ///
+    /// Those of `context` and of `property_type`: a context or a type that
+    /// cannot be read fails the call. A trie node or entry that cannot be
+    /// read is logged and skipped, as in the two.
+    pub fn context_and_type(&self, name: &str) -> Result<(Option<&str>, Option<&str>)> {
+        let area = self.area();
+        let (context_index, type_index) = area.get_property_info_indexes(name);
+        Ok((area.context_at(context_index)?, area.type_at(type_index)?))
     }
 }
 
@@ -1132,6 +1163,11 @@ mod tests {
                 assert_eq!(
                     trie.property_type(name).unwrap(),
                     Some(property_type),
+                    "{name} at +{start}"
+                );
+                assert_eq!(
+                    trie.context_and_type(name).unwrap(),
+                    (Some(context), Some(property_type)),
                     "{name} at +{start}"
                 );
             }
