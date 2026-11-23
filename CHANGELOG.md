@@ -39,10 +39,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   AppArmor or Smack) and a pidfd for the process that connected
   (`SO_PEERPIDFD`, Linux 6.5). Each makes one `getsockopt` when it is
   called, and a second with the size the kernel asked for when the
-  sender has more than 32 groups or a label over 256 bytes, and returns
+  sender has more than 32 groups or a label that does not fit in 256
+  bytes, and returns
   the kernel's error where the option is not available. `rsproperties-service` now depends on `libc` (0.2.174
   or later) for these calls, which are its only `unsafe` code outside
   tests.
+- Service: `AccessPolicy` is an authorizer made of rules, passed as
+  `ServiceOptions::authorizer(policy.into_authorizer())`.
+  `allow_name`, `allow_prefix` and `allow_context` name the senders
+  (`Subjects`: uids, gids, or everyone) that may set a name, the names
+  with a prefix, or the names of a `property_contexts` context; the most
+  specific rule that covers a request decides it, and a `ctl.*` request
+  is matched as `ctl.<action>$<target>`. A gid matches the sender's
+  effective gid or a supplementary group. `AccessPolicy::deny_unmatched`
+  denies a request no rule covers; `AccessPolicy::allow_unmatched`
+  allows it. In both, a request whose name starts with `ro.` or `ctl.`
+  or is `sys.powerctl` is allowed only by a rule that names it: the
+  `allow_name` rule for it, or an `allow_prefix` rule whose prefix
+  itself starts with `ro.` or `ctl.`; a shorter prefix and an
+  `allow_context` rule do not cover it. `trust_uid` allows a uid
+  everything, those requests included.
+  `AccessPolicy::decide` gives the decision for one request, for a
+  closure that adds its own checks (the value, the `Listener`, the
+  security label) around the policy.
 - Service: `ServiceOptions::socket_access(Listener, SocketAccess)` sets
   the owner group and mode of each service socket file, in place of mode
   `0o660` and the group the file is created with. `Listener` names the

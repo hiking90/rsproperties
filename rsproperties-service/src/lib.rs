@@ -126,6 +126,8 @@
 //! request. A handler that acts on the host must then check
 //! [`ControlMessage::uid`] (from `SO_PEERCRED`) itself.
 //!
+//! [`AccessPolicy`] is a ready-made authorizer of uid and gid rules.
+//!
 //! # Setting from the service's process
 //!
 //! The actors are private; a process sets properties through the socket
@@ -210,6 +212,7 @@ mod connection_limit;
 mod control_reply;
 mod peer_sockopt;
 mod persistent_properties;
+mod policy;
 mod properties_service;
 mod property_type;
 mod socket_service;
@@ -231,6 +234,7 @@ use authorization::{Authorization, Authorizer};
 pub use authorization::{Decision, PeerInfo, SetRequest};
 use connection_limit::{UidLimiter, DEFAULT_MAX_CONNECTIONS_PER_UID};
 pub use control_reply::{ControlReply, ControlReplyProbe};
+pub use policy::{AccessPolicy, Subjects};
 use properties_service::{PropertiesService, PropertiesServiceArgs};
 use socket_service::{
     HandlerCallsDrain, HandlerCallsStop, Handlers, SocketService, SocketServiceArgs,
@@ -854,7 +858,10 @@ impl ServiceOptions {
     /// ```
     ///
     /// [`SetRequest::for_test`] builds a request to test an authorizer
-    /// with.
+    /// with. [`AccessPolicy`] is an authorizer made of rules (which uids
+    /// and gids may set which names and contexts), for a host that does
+    /// not need to write its own, passed as
+    /// `authorizer(policy.into_authorizer())`.
     pub fn authorizer<F>(mut self, authorizer: F) -> Self
     where
         F: Fn(&SetRequest<'_>) -> Decision + Send + Sync + 'static,

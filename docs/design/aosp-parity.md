@@ -1600,6 +1600,39 @@ service process의 fsgid였다. release build service는 root로만 시작하므
   (`:400-402`), 값이 없는 `ro.` 이름은 access 검사를 통과한 client가 set할 수
   있다(`set_prop(vold, vold_status_prop)`의 `ro.crypto.state` 등). client의
   `ro.` set을 막으려는 host는 authorizer에서 `Deny`를 반환한다.
+- **규칙 기반 authorizer.** `AccessPolicy`는 규칙으로 판단하는 authorizer
+  구현이다. 규칙은 이름 하나(`allow_name`), 이름 prefix(`allow_prefix`),
+  target context(`allow_context`) 가운데 하나를 key로 하고, 허용할 uid와 gid의
+  집합(`Subjects`)을 값으로 한다. 요청 하나는 그 요청에 해당하는 규칙 가운데
+  가장 구체적인 것 하나가 결정한다. 순서는 이름 규칙, 가장 긴 prefix 규칙,
+  context 규칙이다. 그 규칙의 `Subjects`에 없는 요청자는 더 넓은 규칙이
+  허용하더라도 거부한다. `ctl.*` 요청은 init이 `property_contexts`에서 조회하는
+  이름인 `ctl.<action>$<target>`으로 대조한다. gid는 요청자의 egid와 보조
+  group(`SO_PEERGROUPS`)에 대조한다. 해당하는 규칙이 없는 요청은
+  `deny_unmatched`로 만든 policy에서는 거부하고, `allow_unmatched`로 만든
+  policy에서는 허용한다. 이름이 `ro.`로 시작하는 요청, `ctl.*` 요청,
+  `sys.powerctl` 요청은 두 policy 모두에서 대조할 규칙의 범위를 줄인다. 이
+  요청에 해당하는 규칙은 대조 이름과 같은 이름 규칙, 그리고 prefix 자체가
+  `ro.`(`ro.` 이름) 또는 `ctl.`(`ctl.*` 요청)로 시작하는 prefix 규칙뿐이며,
+  prefix 규칙이 여럿이면 가장 긴 것이 결정한다. `sys.powerctl`에는 이름
+  규칙만 해당한다. 더 짧은 prefix(`""`, `"ro"`, `"c"`, `"sys."`)와 context
+  규칙은 이 요청의 context와 무관하게 대조하지 않고, 해당하는 규칙이 없으면
+  `allow_unmatched` policy에서도 거부한다. context 규칙을 제외한 이유는
+  `property_contexts`에 entry가 없는 이름의 context가 모두
+  `u:object_r:build_prop:s0`이기 때문이다. context 규칙이 이 요청에도
+  해당한다면 그 context의 규칙 하나가 entry가 없는 `ro.` 이름, `ctl.*`,
+  `sys.powerctl`을 모두 허용한다. `trust_uid`로 지정한 uid의 요청은 규칙을
+  대조하기 전에 허용하며, 위 세 종류의 요청도 포함한다. 따라서 `trust_uid`로
+  지정한 uid가 아니고 `ro.` 이름의 이름 규칙이나 `ro.`로 시작하는 prefix
+  규칙이 없으면 client가 값이 없는 `ro.` property의 값을 정할 수 없다. uid
+  0과 service의 uid도 `trust_uid`로 지정해야 허용한다. init의 정책은 요청자의
+  SELinux domain과 target context의 조합이고, 이 policy는 uid와 gid를 요청자의
+  key로 쓴다. init의 sepolicy는 `ctl.*` 요청도 context 단위
+  (`ctl_start_prop`, `ctl_default_prop` 등 `ctl_*_prop`)로 허용하는데, 이
+  policy에서는 `ctl.*` 요청에 이름 규칙이나 `ctl.`로 시작하는 prefix 규칙이
+  필요하다(owner 결정). label을 기준으로 판단하려면 host가
+  `AccessPolicy::decide`를 closure로 감싸거나 authorizer를 직접 작성한다.
+  규칙을 파일에서 읽는 형식은 제공하지 않는다.
 
 **init과 남는 차이.**
 - (a) 판단 주체. init은 SELinux policy를 조회한다. 이 service는 init이 조회에
@@ -1609,8 +1642,8 @@ service process의 fsgid였다. release build service는 root로만 시작하므
   읽는 값과 같으므로, SELinux를 쓰는 host는 authorizer 안에서 init과 같은
   조회를 구현할 수 있다. `PeerInfo::groups`(`SO_PEERGROUPS`)는 보조 group을,
   `PeerInfo::pidfd`(`SO_PEERPIDFD`)는 pidfd를 반환한다. 세 accessor는 호출할
-  때 `getsockopt`을 한 번 실행하고, 보조 group이 32개를 넘거나 label이 256 byte를
-  넘어 처음 buffer에 값이 들어가지 않으면 kernel이 반환한 크기로 한 번 더
+  때 `getsockopt`을 한 번 실행하고, 보조 group이 32개를 넘거나 label이 256 byte
+  buffer에 들어가지 않아 처음 buffer로 값을 받지 못하면 kernel이 반환한 크기로 한 번 더
   실행한다. rustix 1.1에 이 option의 accessor가 없어서
   `libc::getsockopt`을 직접 호출하며(`peer_sockopt.rs`), test 밖의 `unsafe`는
   이 module에만 있다. `SO_PEERSEC`는 LSM이 socket에 label을 붙이는 host에서만
@@ -1705,6 +1738,10 @@ service process의 fsgid였다. release build service는 root로만 시작하므
 `control_request_is_authorized_before_it_is_queued`,
 `powerctl_is_authorized_with_its_listener`, `rsproperties`
 `property_info_parser.rs` `property_info_trie_reads_context_and_type`.
+peer 신원 accessor는 `peer_sockopt.rs`의 unit test와 `authorization.rs`
+`authorizer_can_ask_the_connection_about_its_peer`,
+`test_peer_has_no_connection`, 규칙 기반 authorizer는 `policy.rs`의 unit
+test가 검증한다.
 
 ## 누락으로 보지 않는 것
 

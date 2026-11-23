@@ -38,9 +38,9 @@ pub enum Decision {
 /// [`groups`](Self::groups), [`security_label`](Self::security_label) and
 /// [`pidfd`](Self::pidfd) each ask the kernel when they are called (one
 /// `getsockopt` on the connection, and a second with the size the kernel
-/// asked for when the sender has more than 32 groups or a label over 256
-/// bytes), so an authorizer that does not need them pays nothing for
-/// them. They borrow the connection, which is why a
+/// asked for when the sender has more than 32 groups or a label that does
+/// not fit in 256 bytes), so an authorizer that does not need them pays
+/// nothing for them. They borrow the connection, which is why a
 /// `PeerInfo` cannot be kept after the authorizer has returned. On a value
 /// made by [`for_test`](Self::for_test), which has no connection, they
 /// fail with [`io::ErrorKind::Unsupported`].

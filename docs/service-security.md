@@ -98,7 +98,8 @@ in the release build.
   was not measured for this crate, so read the value on the target host
   before comparing with it. Each is one `getsockopt` made when the
   authorizer calls it (and a second with the size the kernel asked for
-  when the sender has more than 32 groups or a label over 256 bytes),
+  when the sender has more than 32 groups or a label that does not fit
+  in 256 bytes),
   and fails with
   the kernel's error (`ENOPROTOOPT`) where the option does not exist or
   no security module labels sockets. The control and powerctl handlers
@@ -108,6 +109,32 @@ in the release build.
   first set of a `ro.` name without a value is stored, as in init, where
   sepolicy lets some daemons publish such values. An authorizer that
   must keep clients from doing that denies names that start with `ro.`.
+- **A rule-based authorizer**: `AccessPolicy` decides by rules, for a
+  host that does not write its own authorizer:
+  `ServiceOptions::authorizer(policy.into_authorizer())`. A rule names
+  the senders (`Subjects`: uids, gids, or everyone) that may set one
+  name, the names with one prefix, or the names of one
+  `property_contexts` context. One rule decides a request, the most
+  specific that covers it: the rule for its name, else the one with the
+  longest prefix, else the one for its context; a sender that rule does
+  not name is denied, also when a wider rule names it. A `ctl.*` request
+  is matched as `ctl.<action>$<target>`. A gid matches the sender's
+  effective gid or one of its supplementary groups. A request no rule
+  covers is denied, or, in a policy made with
+  `AccessPolicy::allow_unmatched`, allowed. A request whose name starts
+  with `ro.` or `ctl.`, or is `sys.powerctl`, is decided more narrowly,
+  in both kinds of policy: only a rule that names it covers it, which is
+  the rule for its name, or a prefix rule whose prefix itself starts
+  with `ro.` (for a `ro.` name) or `ctl.` (for a `ctl.*` request). A
+  shorter prefix (the empty one, `ro`, `sys.`) and a context rule do
+  not cover it, and without such a rule it is denied. A context rule is
+  left out because a name without a `property_contexts` entry has the
+  default context, so a rule for that context would open `ro.` and
+  `ctl.*` names that nobody listed. No uid is allowed implicitly;
+  `trust_uid(0)` allows root everything, these requests included, with
+  no rule. The policy does not look at the value (other than the target
+  of a `ctl.*` request), the socket or the sender's security label; a
+  closure around `AccessPolicy::decide` adds such checks.
 - **Without an authorizer** the socket files and the socket dir are the
   only access control. Any peer that can connect may set any non-`ro.`
   property, and any `ro.` property that has no value yet (the first
