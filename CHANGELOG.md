@@ -43,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `property_service` mode `0o666` can be used. Without the option the
   sockets are created as before. The `Debug` output of `ServiceOptions`
   has a `socket_access` field.
+- Service: `ServiceOptions::max_connections_per_uid(limit)` sets the
+  most connections one uid may have open at once on both sockets
+  together (see "Changed" for the default). `usize::MAX` removes the
+  limit. The `Debug` output of `ServiceOptions` has a
+  `max_connections_per_uid` field.
 - `PropertyInfoTrie` (`builder` feature): a checked, 4-byte aligned copy
   of the bytes `build_trie` returns. `context(name)` and
   `property_type(name)` return `&str`s that borrow it, without the
@@ -51,6 +56,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Service: one uid has at most 32 connections open at once (0.7.0: no
+  limit per uid, only the service's 64 handler slots, 256 waiting
+  connections and 102 unanswered `ctl.*` requests). A connection beyond
+  the limit is closed without a reply and logged at `warn`; the client's
+  `set` fails. A connection counts from `accept()` until the service
+  closes it, which for a `ctl.*` request is when the host answers or
+  drops its `ControlReply`. uid 0 and the service's own effective uid
+  are not counted, so a service whose clients all run as root or as its
+  own user behaves as before. A deployment where one other uid opens
+  more than 32 connections at once raises the limit with
+  `ServiceOptions::max_connections_per_uid`.
 - Service: `StartupStage::Config` displays as `configuration` (0.7.0:
   `configuration (init)`), so a `StartupError` of that stage reads
   `configuration failed to start: …`. The stage now also reports a

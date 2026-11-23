@@ -176,6 +176,21 @@ handler: its connection then belongs to the `ControlReply`, which
 [Control messages](service-protocol.md#control-messages)), so the
 service holds at most 64 + 256 + 102 client fds.
 
+Before the waiting room, each accepted connection is counted for its
+sender's uid (`SO_PEERCRED`). A uid that already has
+`ServiceOptions::max_connections_per_uid` connections open (32 by
+default) gets the new one closed without a reply, logged at `warn`. A
+connection is counted until the service closes its descriptor: while it
+waits for a handler permit, during its exchange, and, for a `ctl.*`
+request, until the host has answered or dropped the request's
+`ControlReply`. So the clients of one uid hold at most 32 of the 64
+handler permits by connecting and sending nothing, and leave at most 32
+of the 102 `ctl.*` requests unanswered. uid 0 and the service's own
+effective uid are not counted, since a process of either can stop the
+service by other means; connections whose credentials cannot be read are
+counted together. The limit bounds one uid: a client that has several
+uids gets the limit for each. init has no such limit.
+
 After an `accept()` error the accept loop sleeps 100 ms, so an
 `EMFILE`/`ENFILE` storm cannot spin the worker and flood the log.
 

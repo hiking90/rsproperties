@@ -204,6 +204,7 @@ use rsactor::{Actor, ActorRef, ActorResult};
 
 mod access;
 mod authorization;
+mod connection_limit;
 mod control_reply;
 mod persistent_properties;
 mod properties_service;
@@ -225,6 +226,7 @@ struct ReadmeDoctests;
 pub use access::{Listener, SocketAccess};
 use authorization::{Authorization, Authorizer};
 pub use authorization::{Decision, PeerInfo, SetRequest};
+use connection_limit::{UidLimiter, DEFAULT_MAX_CONNECTIONS_PER_UID};
 pub use control_reply::{ControlReply, ControlReplyProbe};
 use properties_service::{PropertiesService, PropertiesServiceArgs};
 use socket_service::{
@@ -412,6 +414,11 @@ pub struct ServiceOptions {
     authorizer: Option<Authorizer>,
     /// Indexed by [`Listener::index`].
     socket_access: [SocketAccess; 2],
+    /// `None`: [`DEFAULT_MAX_CONNECTIONS_PER_UID`].
+    max_connections_per_uid: Option<usize>,
+    /// Counts uid 0 and the service's own uid too. Only the tests set it:
+    /// their clients have the service's uid.
+    count_every_uid: bool,
 }
 
 impl std::fmt::Debug for ServiceOptions {
@@ -427,6 +434,12 @@ impl std::fmt::Debug for ServiceOptions {
             .field("powerctl_handler", &self.powerctl_handler.is_some())
             .field("authorizer", &self.authorizer.is_some())
             .field("socket_access", &self.socket_access)
+            .field(
+                "max_connections_per_uid",
+                &self
+                    .max_connections_per_uid
+                    .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_UID),
+            )
             .finish()
     }
 }
@@ -576,9 +589,13 @@ impl ServiceOptions {
     /// handler being called; init refuses a control message when 101 are
     /// queued, whether or not one is being handled, so the two limits
     /// agree while a control message is in its call. Each unanswered
-    /// request holds its
-    /// client's connection (one fd) and none of the service's connection
-    /// slots, so other sets are served meanwhile.
+    /// request holds its client's connection (one fd) and none of the 64
+    /// handler slots, so other sets are served meanwhile. It does count
+    /// toward its sender's uid
+    /// ([`max_connections_per_uid`](Self::max_connections_per_uid)) until
+    /// it is answered or dropped: a uid with that many unanswered requests
+    /// gets every further connection closed without a reply. uid 0 and
+    /// the service's own effective uid are not counted.
     ///
     /// The service does not limit the time to the reply. A client of
     /// bionic or of `rsproperties` on Android waits until the reply is
@@ -869,6 +886,43 @@ impl ServiceOptions {
     /// ```
     pub fn socket_access(mut self, listener: Listener, access: SocketAccess) -> Self {
         self.socket_access[listener.index()] = access;
+        self
+    }
+
+    /// The most connections one uid may have open at once, on both
+    /// sockets together; 32 by default.
+    ///
+    /// A connection is open from `accept()` until the service closes it:
+    /// while it waits for one of the 64 handler slots, while its request
+    /// is read and answered, and, for a `ctl.*` request, until the host
+    /// has answered or dropped the request's [`ControlReply`]. A
+    /// connection of a uid that already has `limit` open is closed without
+    /// a reply, as one that finds the waiting room full is, and logged at
+    /// `warn`. The uid is the one `SO_PEERCRED` gives: that of the process
+    /// that called `connect()`.
+    ///
+    /// Without the limit, the clients of one uid can take every handler
+    /// slot by connecting and sending nothing, each for the 10 s the
+    /// service gives an exchange, and can leave 102 `ctl.*` requests
+    /// unanswered, after which every other `ctl.*` request is refused.
+    /// With the default, one uid takes at most half of the handler slots.
+    /// The limit bounds one uid, not a client that has several.
+    ///
+    /// uid 0 and the service's own effective uid are not counted: a
+    /// process of either can stop the service by other means. Connections
+    /// whose credentials cannot be read are counted together, as one uid.
+    ///
+    /// A [`ControlReply`] the host keeps counts toward its sender's limit
+    /// for as long as it is kept. `usize::MAX` removes the limit; `0`
+    /// closes every connection of a uid that is counted.
+    ///
+    /// ```
+    /// use rsproperties_service::ServiceOptions;
+    ///
+    /// let options = ServiceOptions::new().max_connections_per_uid(8);
+    /// ```
+    pub fn max_connections_per_uid(mut self, limit: usize) -> Self {
+        self.max_connections_per_uid = Some(limit);
         self
     }
 }
@@ -1522,7 +1576,17 @@ pub async fn run(
         powerctl_handler,
         authorizer,
         socket_access,
+        max_connections_per_uid,
+        count_every_uid,
     } = options;
+    // uid 0 and the service's own uid can stop the service by other means
+    // (signals, ptrace, the files), so a limit on them protects nothing.
+    let own_uid = rustix::process::geteuid().as_raw();
+    let exempt: &[u32] = if count_every_uid { &[] } else { &[0, own_uid] };
+    let uid_limiter = UidLimiter::new(
+        max_connections_per_uid.unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_UID),
+        exempt,
+    );
     // Without an authorizer nothing reads the trie outside the properties
     // service, and no copy of it is shared.
     let (authorization, trie_sender) = authorizer.map(Authorization::new).unzip();
@@ -1542,6 +1606,7 @@ pub async fn run(
         handlers,
         authorization,
         socket_access,
+        uid_limiter,
     });
 
     // Sequential readiness checks: the socket service is checked first, so
@@ -2917,7 +2982,7 @@ mod tests {
         (stream, reply)
     }
 
-    /// A `ctl.*` request the host has not answered holds no connection
+    /// A `ctl.*` request the host has not answered holds no handler
     /// slot: with more of them unanswered than the service handles
     /// connections at once, another set is still applied and answered, and
     /// each request then gets the reply the host sends for it.
@@ -2975,6 +3040,133 @@ mod tests {
                 };
                 assert_eq!(read_reply(&mut stream).await, Some(expected), "svc{i}");
             }
+
+            service.shutdown().await.unwrap();
+        });
+    }
+
+    /// Sends a set of `name` on a new connection to `socket`. `None`: the
+    /// service closed the connection without a reply.
+    async fn try_set(socket: &Path, name: &str) -> Option<i32> {
+        let mut stream = UnixStream::connect(socket).await.unwrap();
+        // A connection the service has closed already fails the write.
+        let _ = stream.write_all(&set_frame(name, "1")).await;
+        read_reply(&mut stream).await
+    }
+
+    /// Repeats [`try_set`] until the service answers. The service gives a
+    /// connection's place back in a task of its own, a moment after the
+    /// client sees the connection end.
+    async fn set_once_admitted(socket: &Path, name: &str) -> i32 {
+        for _ in 0..500 {
+            if let Some(code) = try_set(socket, name).await {
+                return code;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no connection was admitted within 10 s");
+    }
+
+    /// A service whose limit of 2 connections per uid also counts the
+    /// test's own uid, and its two socket paths ("property", "system").
+    async fn service_with_uid_limit(
+        dir: &TempDir,
+        options: ServiceOptions,
+    ) -> (ServiceHandle, PathBuf, PathBuf) {
+        let _ = std::fs::remove_dir_all(&dir.0);
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let socket_dir = dir.0.join("sockets");
+        let mut options = options.max_connections_per_uid(2);
+        options.count_every_uid = true;
+        let service = run(
+            rsproperties::PropertyConfig::new()
+                .properties_dir(dir.0.clone())
+                .socket_dir(socket_dir.clone()),
+            options,
+        )
+        .await
+        .expect("run");
+        (
+            service,
+            socket_dir.join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME),
+            socket_dir.join(rsproperties::PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME),
+        )
+    }
+
+    /// A uid that has `max_connections_per_uid` connections open gets the
+    /// next one closed without a reply, on either socket, and is admitted
+    /// again once it has closed one.
+    #[test]
+    fn connections_beyond_the_uid_limit_are_closed() {
+        const TEST: &str = "tests::connections_beyond_the_uid_limit_are_closed";
+        if !is_child(TEST) {
+            run_in_child(TEST);
+            return;
+        }
+        block_on_child(async {
+            let dir = TempDir(socket_test_dir(
+                "rsprops_svc_uid_limit",
+                socket_suffix_len("sockets"),
+            ));
+            let (service, property, system) =
+                service_with_uid_limit(&dir, ServiceOptions::new()).await;
+
+            // Two connections that send nothing. The service accepts the
+            // connections of one socket in the order they were made, so
+            // both are counted before the next one is.
+            let idle = [
+                UnixStream::connect(&property).await.unwrap(),
+                UnixStream::connect(&property).await.unwrap(),
+            ];
+            assert_eq!(try_set(&property, "debug.limit.third").await, None);
+            assert_eq!(try_set(&system, "debug.limit.system").await, None);
+            assert!(rsproperties::get::<String>("debug.limit.third").is_err());
+            assert!(rsproperties::get::<String>("debug.limit.system").is_err());
+
+            drop(idle);
+            assert_eq!(
+                set_once_admitted(&property, "debug.limit.after").await,
+                PROP_SUCCESS
+            );
+            assert_eq!(
+                rsproperties::get::<String>("debug.limit.after").unwrap(),
+                "1"
+            );
+
+            service.shutdown().await.unwrap();
+        });
+    }
+
+    /// A `ctl.*` request the host has not answered counts toward its
+    /// sender's limit until the host answers it.
+    #[test]
+    fn unanswered_control_requests_count_toward_the_uid_limit() {
+        const TEST: &str = "tests::unanswered_control_requests_count_toward_the_uid_limit";
+        if !is_child(TEST) {
+            run_in_child(TEST);
+            return;
+        }
+        block_on_child(async {
+            let dir = TempDir(socket_test_dir(
+                "rsprops_svc_uid_limit_ctl",
+                socket_suffix_len("sockets"),
+            ));
+            let (handler, mut passed) = deferring_handler();
+            let (service, property, _system) =
+                service_with_uid_limit(&dir, ServiceOptions::new().control_handler(handler)).await;
+
+            // The handler has both requests, so their connection tasks
+            // have ended: the two places are held by the replies alone.
+            let (mut first, first_reply) = send_held_ctl_start(&property, &mut passed, "a").await;
+            let (_second, _second_reply) = send_held_ctl_start(&property, &mut passed, "b").await;
+            assert_eq!(try_set(&property, "debug.limit.held").await, None);
+
+            first_reply.send(true);
+            assert_eq!(read_reply(&mut first).await, Some(PROP_SUCCESS));
+            assert_eq!(
+                set_once_admitted(&property, "debug.limit.answered").await,
+                PROP_SUCCESS
+            );
 
             service.shutdown().await.unwrap();
         });

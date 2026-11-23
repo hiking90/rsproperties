@@ -31,6 +31,7 @@ use rsproperties::{
 };
 
 use crate::authorization::Authorization;
+use crate::connection_limit::{UidLimiter, UidSlot};
 use crate::control_reply::{ControlReply, ReplyFd, ReplyState};
 use crate::properties_service::PropertiesService;
 use crate::{Listener, SocketAccess};
@@ -530,6 +531,9 @@ pub(crate) struct SocketServiceArgs {
     /// Group and mode of each socket file, indexed by [`Listener::index`].
     /// Checked by `crate::run` ([`SocketAccess::check`]).
     pub(crate) socket_access: [SocketAccess; 2],
+    /// Bounds the connections one uid has open
+    /// ([`crate::ServiceOptions::max_connections_per_uid`]).
+    pub(crate) uid_limiter: Arc<UidLimiter>,
 }
 
 /// Spawns the socket service actor with `args`.
@@ -568,6 +572,7 @@ pub(crate) struct SocketService {
     _socket_files: SocketDirEntries,
     handlers: Handlers,
     authorization: Option<Authorization>,
+    uid_limiter: Arc<UidLimiter>,
 }
 
 impl Actor for SocketService {
@@ -633,6 +638,7 @@ impl Actor for SocketService {
             _socket_files: entries,
             handlers: args.handlers,
             authorization: args.authorization,
+            uid_limiter: args.uid_limiter,
         })
     }
 
@@ -666,15 +672,32 @@ impl Actor for SocketService {
             }
         };
 
-        // Peer credentials: logged for auditability — see the access-model
-        // note on `SOCKET_FILE_MODE`.
-        if let Ok(cred) = stream.peer_cred() {
-            debug!(
-                "Client connected on {source} listener (uid={}, gid={})",
-                cred.uid(),
-                cred.gid()
-            );
+        // Peer credentials, read once per connection: logged for
+        // auditability (see the access-model note on `SOCKET_FILE_MODE`),
+        // counted here and passed on to the request's handling.
+        let peer = Peer::of(&stream);
+        if let (Some(uid), Some(gid)) = (peer.uid, peer.gid) {
+            debug!("Client connected on {source} listener (uid={uid}, gid={gid})");
         }
+
+        // One uid cannot take every permit below: a connection beyond its
+        // limit is closed here, before it takes a waiting-room permit. The
+        // slot stays with the connection until its descriptor is closed,
+        // which for a `ctl.*` request is when the host answers
+        // (`ReplyFd`).
+        let Some(slot) = self.uid_limiter.admit(peer.uid) else {
+            match peer.uid {
+                Some(uid) => warn!(
+                    "uid {uid} is at its limit of {} open connections; dropping {source} connection",
+                    self.uid_limiter.limit()
+                ),
+                None => warn!(
+                    "connections without credentials are at their limit of {} open connections; dropping {source} connection",
+                    self.uid_limiter.limit()
+                ),
+            }
+            return Ok(()); // `stream` dropped → connection closed
+        };
 
         // Bound the number of concurrently in-flight client handlers
         // WITHOUT awaiting in the actor loop — the previous inline
@@ -701,6 +724,9 @@ impl Actor for SocketService {
         let handlers = self.handlers.clone();
         let authorization = self.authorization.clone();
         tokio::spawn(async move {
+            // Given back when the task ends, unless the request's
+            // `ReplyFd` took it.
+            let slot = slot;
             let permit = {
                 let _waiting = waiting; // released once a handler slot is ours
 
@@ -729,7 +755,17 @@ impl Actor for SocketService {
             let _permit = permit; // dropped when the task ends
             match tokio::time::timeout(
                 CLIENT_TIMEOUT,
-                Self::handle_client(stream, listener, authorization, connection_sender, handlers),
+                Self::handle_client(
+                    stream,
+                    Connection {
+                        listener,
+                        peer,
+                        slot,
+                    },
+                    authorization,
+                    connection_sender,
+                    handlers,
+                ),
             )
             .await
             {
@@ -799,6 +835,27 @@ impl std::fmt::Display for Peer {
         match self.pid {
             Some(pid) => write!(f, "pid {pid}"),
             None => f.write_str("an unknown pid"),
+        }
+    }
+}
+
+/// What `on_idle` knows about an accepted connection besides its stream.
+struct Connection {
+    listener: Listener,
+    peer: Peer,
+    /// The connection's place in its uid's count; see [`UidLimiter`].
+    slot: UidSlot,
+}
+
+impl Connection {
+    /// A connection that did not come through `on_idle`: the peer is read
+    /// from `stream` and the connection is not counted.
+    #[cfg(test)]
+    fn of(stream: &UnixStream, listener: Listener) -> Self {
+        Self {
+            listener,
+            peer: Peer::of(stream),
+            slot: UidSlot::uncounted(),
         }
     }
 }
@@ -1218,7 +1275,7 @@ impl SocketService {
     /// `PropertiesService`.
     async fn handle_client<A>(
         mut stream: UnixStream,
-        listener: Listener,
+        connection: Connection,
         authorization: Option<Authorization>,
         service: ActorRef<A>,
         handlers: Handlers,
@@ -1226,8 +1283,8 @@ impl SocketService {
     where
         A: rsactor::Message<crate::PropertyMessage, Reply = i32>,
     {
-        trace!("Handling new client connection on {listener}");
-        let peer = Peer::of(&stream);
+        trace!("Handling new client connection on {}", connection.listener);
+        let peer = connection.peer;
 
         // Read the command (u32)
         let mut cmd_buf = [0u8; 4];
@@ -1266,8 +1323,7 @@ impl SocketService {
                 trace!("Processing SETPROP2 command");
                 // By value: a `ctl.*` request hands the connection over to
                 // its `ControlReply`.
-                Self::handle_setprop2(stream, listener, authorization, service, handlers, peer)
-                    .await?;
+                Self::handle_setprop2(stream, connection, authorization, service, handlers).await?;
             }
             _ => {
                 warn!("Unknown command received: 0x{cmd:08X}");
@@ -1425,6 +1481,7 @@ impl SocketService {
         name: String,
         value: String,
         peer: Peer,
+        slot: UidSlot,
         handlers: &Handlers,
     ) -> Result<()> {
         if let Err(e) = validate_property_name(&name) {
@@ -1451,7 +1508,7 @@ impl SocketService {
         };
         // Dropping the stream on an error closes the connection without a
         // reply; the client reads the end of the stream.
-        let fd = ReplyFd::new(stream)?;
+        let fd = ReplyFd::new(stream, slot)?;
         let (refusal, fd) = match shared.queue_control(message, fd) {
             Ok(()) => return Ok(()),
             Err(refused) => refused,
@@ -1473,15 +1530,19 @@ impl SocketService {
     /// [`Self::handle_control`].
     async fn handle_setprop2<A>(
         mut stream: UnixStream,
-        listener: Listener,
+        connection: Connection,
         authorization: Option<Authorization>,
         service: ActorRef<A>,
         handlers: Handlers,
-        peer: Peer,
     ) -> Result<()>
     where
         A: rsactor::Message<crate::PropertyMessage, Reply = i32>,
     {
+        let Connection {
+            listener,
+            peer,
+            slot,
+        } = connection;
         trace!("Handling SETPROP2 request on {listener}");
         let (name, value) = Self::read_setprop2(&mut stream).await?;
 
@@ -1532,8 +1593,10 @@ impl SocketService {
         // properties service, so it is never stored (init:
         // `HandlePropertySet` sends it to `SendControlMessage`).
         if name.starts_with("ctl.") {
-            return Self::handle_control(stream, name, value, peer, &handlers).await;
+            return Self::handle_control(stream, name, value, peer, slot, &handlers).await;
         }
+        // Held to the end of the exchange.
+        let _slot = slot;
         let code = Self::dispatch(name, value, peer, service, handlers).await;
         if code != PROP_SUCCESS {
             warn!("Property set was rejected: error code {code:#x}");
@@ -2369,6 +2432,21 @@ pub(crate) mod tests {
         exchange_with(frame, service, Handlers::new(control, None)).await
     }
 
+    /// `handle_client` for `server`, as a connection on the "property"
+    /// socket that is not counted toward its uid's limit.
+    async fn serve<A>(
+        server: UnixStream,
+        authorization: Option<Authorization>,
+        service: ActorRef<A>,
+        handlers: Handlers,
+    ) -> Result<()>
+    where
+        A: rsactor::Message<crate::PropertyMessage, Reply = i32>,
+    {
+        let connection = Connection::of(&server, Listener::Property);
+        SocketService::handle_client(server, connection, authorization, service, handlers).await
+    }
+
     /// [`exchange`] with both handlers.
     async fn exchange_with(frame: &[u8], service: ActorRef<Recorder>, handlers: Handlers) -> i32 {
         exchange_authorized(frame, service, handlers, None).await
@@ -2383,14 +2461,7 @@ pub(crate) mod tests {
     ) -> i32 {
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(frame).await.unwrap();
-        let _ = SocketService::handle_client(
-            server,
-            Listener::Property,
-            authorization,
-            service,
-            handlers.clone(),
-        )
-        .await;
+        let _ = serve(server, authorization, service, handlers.clone()).await;
         let mut reply = [0u8; 4];
         client.read_exact(&mut reply).await.unwrap();
         // Kept until the reply is read, as the socket service keeps its
@@ -2534,14 +2605,7 @@ pub(crate) mod tests {
         drop(client);
 
         // The reply then fails with EPIPE; only the forwarding matters.
-        let _ = SocketService::handle_client(
-            server,
-            Listener::Property,
-            None,
-            service,
-            Handlers::new(None, None),
-        )
-        .await;
+        let _ = serve(server, None, service, Handlers::new(None, None)).await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
@@ -2554,15 +2618,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        SocketService::handle_client(
-            server,
-            Listener::Property,
-            None,
-            service,
-            Handlers::new(None, None),
-        )
-        .await
-        .unwrap();
+        serve(server, None, service, Handlers::new(None, None))
+            .await
+            .unwrap();
         let mut reply = [0u8; 4];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(i32::from_ne_bytes(reply), PROP_SUCCESS);
@@ -2832,13 +2890,7 @@ pub(crate) mod tests {
             .write_all(&v2_frame(crate::POWERCTL_PROPERTY, "reboot"))
             .await
             .unwrap();
-        let exchange = SocketService::handle_client(
-            server,
-            Listener::Property,
-            None,
-            service,
-            handlers.clone(),
-        );
+        let exchange = serve(server, None, service, handlers.clone());
         tokio::select! {
             _ = exchange => panic!("the exchange must wait for the properties service"),
             r = received.recv() => r.expect("the set must reach the properties service"),
@@ -2946,9 +2998,16 @@ pub(crate) mod tests {
             (handlers.clone(), format!("ctl.{action}"), target.to_owned());
         tokio::spawn(async move {
             let (mut client, server) = UnixStream::pair().unwrap();
-            SocketService::handle_control(server, name, target, Peer::default(), &handlers)
-                .await
-                .unwrap();
+            SocketService::handle_control(
+                server,
+                name,
+                target,
+                Peer::default(),
+                UidSlot::uncounted(),
+                &handlers,
+            )
+            .await
+            .unwrap();
             let mut reply = [0u8; 4];
             client.read_exact(&mut reply).await.unwrap();
             i32::from_ne_bytes(reply)
@@ -3210,6 +3269,7 @@ pub(crate) mod tests {
                     "ctl.start".to_owned(),
                     target,
                     Peer::default(),
+                    UidSlot::uncounted(),
                     &handlers,
                 )
                 .await
@@ -3528,15 +3588,9 @@ pub(crate) mod tests {
         client.write_all(&[0u8; 2]).await.unwrap();
         client.shutdown().await.unwrap();
 
-        assert!(SocketService::handle_client(
-            server,
-            Listener::Property,
-            None,
-            service,
-            Handlers::new(None, None)
-        )
-        .await
-        .is_ok());
+        assert!(serve(server, None, service, Handlers::new(None, None))
+            .await
+            .is_ok());
         let mut reply = [0u8; 4];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(i32::from_ne_bytes(reply), PROP_ERROR_READ_CMD);
@@ -3560,14 +3614,7 @@ pub(crate) mod tests {
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(&truncated).await.unwrap();
         client.shutdown().await.unwrap();
-        let _ = SocketService::handle_client(
-            server,
-            Listener::Property,
-            None,
-            service,
-            Handlers::new(None, None),
-        )
-        .await;
+        let _ = serve(server, None, service, Handlers::new(None, None)).await;
         let mut reply = [0u8; 4];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(i32::from_ne_bytes(reply), PROP_ERROR_READ_DATA);
@@ -3587,15 +3634,9 @@ pub(crate) mod tests {
         client.write_all(&[0u8; 2]).await.unwrap();
         client.shutdown().await.unwrap();
 
-        assert!(SocketService::handle_client(
-            server,
-            Listener::Property,
-            None,
-            service,
-            Handlers::new(None, None)
-        )
-        .await
-        .is_err());
+        assert!(serve(server, None, service, Handlers::new(None, None))
+            .await
+            .is_err());
         let mut reply = [0u8; 4];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(i32::from_ne_bytes(reply), PROP_ERROR_READ_DATA);

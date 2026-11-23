@@ -175,7 +175,11 @@ the two limits agree while a control message is in its call. An
 unanswered request holds one fd (the connection of its client) and none
 of the connection permits under
 [Backpressure](service-security.md#backpressure), so other sets are
-served meanwhile.
+served meanwhile. It does count toward its sender's uid
+(`ServiceOptions::max_connections_per_uid`, also under Backpressure)
+until it is answered or dropped: a uid with that many unanswered
+requests gets every further connection closed without a reply. uid 0
+and the service's own effective uid are not counted.
 
 Once the handler calls are stopped (a powerctl handler returned
 `PowerctlOutcome::ShuttingDown`, or `ServiceHandle::stop_handler_calls`)

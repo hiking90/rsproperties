@@ -1643,6 +1643,17 @@ service process의 fsgid였다. release build service는 root로만 시작하므
   `ctl.<action>$<target>`이 `property_contexts`의 exact entry와 일치하면
   `rsproperties`의 trie 조회가 그 이름을 `trace` level로 출력한다. owner
   결정으로 유지했고 `docs/service-security.md`에 적었다.
+- (b) uid별 connection 한도. `ServiceOptions::max_connections_per_uid`(기본값
+  32)가 한 uid의 열린 connection 수를 제한하고, 한도를 넘는 connection은
+  `accept` 직후 응답 없이 닫는다. connection은 `accept`부터 service가 fd를 닫을
+  때까지 센다. `ctl.*` 요청은 host가 `ControlReply`에 응답하거나 그것을 drop할
+  때까지다. uid 0과 service의 euid는 세지 않는다. init에는 이 한도가 없다.
+  `0o666` socket에서는 host의 모든 uid가 접속할 수 있다. 한도가 없으면 한
+  uid가 요청을 보내지 않는 connection으로 handler permit 64개를
+  `CLIENT_TIMEOUT` 동안 모두 차지하고, 미응답 `ctl.*` 한도 102개(S3)도 모두
+  채울 수 있다. test는 `connection_limit.rs`의 unit test와 `lib.rs`
+  `connections_beyond_the_uid_limit_are_closed`,
+  `unanswered_control_requests_count_toward_the_uid_limit`이다.
 - (a) read 제한 없음. Android는 context별 area 파일의 SELinux label로 읽기를
   제한한다. 이 service의 area 파일은 모두 0444다. context별로 group을 나누는
   방식은 area 파일의 gid 0 소유 검사(`file_validation.rs`)와 충돌하므로 이
