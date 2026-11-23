@@ -8,12 +8,13 @@ use rsproperties::wire::{
     PROP_ERROR_SET_FAILED, PROP_SUCCESS,
 };
 use rsproperties::{
-    build_trie, load_properties_from_file_with, property_type_in_trie, AreaWriterLock,
-    MatchKeyword, PropFileOutcome, PropertyInfoEntry, SystemProperties,
+    build_trie, load_properties_from_file_with, AreaWriterLock, MatchKeyword, PropFileOutcome,
+    PropertyInfoEntry, PropertyInfoTrie, SystemProperties,
 };
 
 use crate::persistent_properties::{is_persistent_name, PersistentStore};
 use crate::property_type::check_type;
+use crate::KnownType;
 
 /// What [`spawn`] starts the properties service with.
 pub(crate) struct PropertiesServiceArgs {
@@ -30,6 +31,12 @@ pub(crate) struct PropertiesServiceArgs {
     /// Stores `persist.*` / `next_boot.*` properties in this file; see
     /// [`crate::ServiceOptions::persistent_properties_file`].
     pub(crate) persistent_properties_file: Option<PathBuf>,
+    /// Gets the trie `on_start` publishes as `property_info`, for the
+    /// socket service's authorizer calls
+    /// ([`crate::authorization::Authorization`]). Sent once `on_start` has
+    /// succeeded; when it fails the sender is dropped without a value, and
+    /// the requests waiting for it are refused.
+    pub(crate) trie_sender: Option<crate::authorization::TrieSender>,
 }
 
 pub(crate) struct PropertiesService {
@@ -71,7 +78,7 @@ fn init_system_properties_sync(
     build_prop_files: Vec<PathBuf>,
     dir: &Path,
     lock: AreaWriterLock,
-) -> std::io::Result<SystemProperties> {
+) -> std::io::Result<(SystemProperties, PropertyInfoTrie)> {
     let mut property_infos = Vec::new();
     for file in property_contexts_files {
         let (mut property_info, errors) =
@@ -98,8 +105,9 @@ fn init_system_properties_sync(
     // until every input file has been read. The value is not logged
     // (value-masking policy, see `PropertyMessage`'s Debug); the loader
     // logs the file and line of the entry it drops.
-    let mut matches_type = |key: &str, value: &str| match property_type_in_trie(&data, key) {
-        Ok(Some(property_type)) if !check_type(&property_type, value) => {
+    let trie = PropertyInfoTrie::new(&data).map_err(io_other)?;
+    let mut matches_type = |key: &str, value: &str| match trie.property_type(key) {
+        Ok(Some(property_type)) if !check_type(property_type, value) => {
             log::error!("build.prop entry {key:?}: value does not match type {property_type:?}");
             false
         }
@@ -180,7 +188,7 @@ fn init_system_properties_sync(
             log::error!("Skipping build.prop entry {key:?}: {e}");
         }
     }
-    Ok(system_properties)
+    Ok((system_properties, trie))
 }
 
 /// The properties AOSP init sets after the build.prop files, in its order:
@@ -229,7 +237,7 @@ fn apply_startup_properties(
 
 /// init `InitPropertySet`: [`apply_set`], logging a failure.
 fn init_set(system_properties: &mut SystemProperties, name: &str, value: &str) {
-    let code = apply_set(system_properties, name, value);
+    let code = apply_set(system_properties, name, value, None);
     if code != PROP_SUCCESS {
         log::error!("Cannot set {name:?} at startup: error code {code:#x}");
     }
@@ -255,7 +263,16 @@ fn init_set(system_properties: &mut SystemProperties, name: &str, value: &str) {
 ///
 /// No per-property access check: see the access model on the socket
 /// service.
-fn apply_set(system_properties: &mut SystemProperties, name: &str, value: &str) -> i32 {
+///
+/// `known_type` is the name's type when the socket service has read it
+/// already, from the trie published as `property_info` (a service with an
+/// authorizer reads it with the context); `None` looks it up here.
+fn apply_set(
+    system_properties: &mut SystemProperties,
+    name: &str,
+    value: &str,
+    known_type: Option<&KnownType>,
+) -> i32 {
     if let Err(e) = validate_property_name(name) {
         log::error!("Rejected setprop: {e}");
         return PROP_ERROR_INVALID_NAME;
@@ -264,7 +281,11 @@ fn apply_set(system_properties: &mut SystemProperties, name: &str, value: &str) 
         log::error!("Rejected setprop {name:?}: control messages are not stored");
         return PROP_ERROR_HANDLE_CONTROL_MESSAGE;
     }
-    match system_properties.property_type(name) {
+    let property_type = match known_type {
+        Some(KnownType(property_type)) => Ok(property_type.as_deref()),
+        None => system_properties.property_type(name),
+    };
+    match property_type {
         Ok(Some(property_type)) if !check_type(property_type, value) => {
             log::error!("Rejected setprop {name:?}: value does not match type {property_type:?}");
             return PROP_ERROR_INVALID_VALUE;
@@ -333,7 +354,8 @@ impl Actor for PropertiesService {
         // task so the tokio worker that polls this actor is free to drive
         // other tasks (notably the sibling SocketService) while
         // initialisation runs.
-        let (system_properties, persistent) = tokio::task::spawn_blocking(move || {
+        let trie_sender = args.trie_sender;
+        let (system_properties, persistent, trie) = tokio::task::spawn_blocking(move || {
             // Before `property_info` and the areas are written: a missing
             // directory or another service's lock must fail startup while
             // the properties dir is still as it was.
@@ -342,17 +364,25 @@ impl Actor for PropertiesService {
                 .as_deref()
                 .map(PersistentStore::load)
                 .transpose()?;
-            let mut system_properties = init_system_properties_sync(
+            let (mut system_properties, trie) = init_system_properties_sync(
                 args.property_contexts_files,
                 args.build_prop_files,
                 dir,
                 args.writer_lock,
             )?;
             let persistent = apply_startup_properties(&mut system_properties, persistent);
-            Ok::<_, std::io::Error>((system_properties, persistent))
+            Ok::<_, std::io::Error>((system_properties, persistent, trie))
         })
         .await
         .map_err(io_other)??;
+
+        // After every step that can fail: an early return above drops the
+        // sender without a value. An ordinary or `sys.powerctl` set that
+        // passes the authorizer from here on waits in this actor's mailbox
+        // like any other.
+        if let Some(sender) = trie_sender {
+            sender.send_replace(Some(std::sync::Arc::new(trie)));
+        }
 
         Ok(PropertiesService {
             system_properties,
@@ -397,14 +427,20 @@ impl rsactor::Message<crate::PropertyMessage> for PropertiesService {
         _actor_ref: &ActorRef<Self>,
     ) -> Self::Reply {
         log::debug!("Handling property message: {message:?}");
-        self.client_set(&message.name, message.value).await
+        self.client_set(&message.name, message.value, message.known_type.as_ref())
+            .await
     }
 }
 
 impl PropertiesService {
     /// One set from a client: [`apply_set`], then the persistent file.
-    async fn client_set(&mut self, name: &str, value: String) -> i32 {
-        let code = apply_set(&mut self.system_properties, name, &value);
+    async fn client_set(
+        &mut self,
+        name: &str,
+        value: String,
+        known_type: Option<&KnownType>,
+    ) -> i32 {
+        let code = apply_set(&mut self.system_properties, name, &value, known_type);
         if code != PROP_SUCCESS || !is_persistent_name(name.as_bytes()) {
             return code;
         }
@@ -502,6 +538,7 @@ mod tests {
     ) -> std::io::Result<SystemProperties> {
         let lock = AreaWriterLock::acquire(dir).map_err(io_other)?;
         init_system_properties_sync(property_contexts_files, build_prop_files, dir, lock)
+            .map(|(system_properties, _trie)| system_properties)
     }
 
     /// A reader that already holds the previous `property_info` must keep
@@ -861,7 +898,11 @@ mod tests {
             ("selinux.restorecon_recursive", "/data/x", PROP_SUCCESS),
         ];
         for &(name, value, code) in cases {
-            assert_eq!(apply_set(&mut sp, name, value), code, "{name:?} {value:?}");
+            assert_eq!(
+                apply_set(&mut sp, name, value, None),
+                code,
+                "{name:?} {value:?}"
+            );
         }
         assert!(
             sp.find("sys.powerctl").unwrap().is_none(),
@@ -951,6 +992,33 @@ mod tests {
         assert!(sp.find("debug.s").unwrap().is_none());
     }
 
+    /// A type the socket service has read is used in place of the lookup:
+    /// the value is checked against it, not against the type the
+    /// `property_contexts` file gives the name.
+    #[test]
+    fn known_type_replaces_the_lookup() {
+        let tmp = TempDir::new("rsprops_svc_known_type");
+        let mut sp = typed_properties(&tmp);
+        let int = KnownType(Some("int".to_owned()));
+        let string = KnownType(Some("string".to_owned()));
+        let untyped = KnownType(None);
+        // `debug.int` is `int` in the file, `debug.other` is `string` (the `debug.` prefix).
+        assert_eq!(
+            apply_set(&mut sp, "debug.int", "x", Some(&string)),
+            PROP_SUCCESS
+        );
+        assert_eq!(
+            apply_set(&mut sp, "debug.other", "x", Some(&int)),
+            PROP_ERROR_INVALID_VALUE
+        );
+        assert_eq!(
+            apply_set(&mut sp, "debug.int", "y", Some(&untyped)),
+            PROP_SUCCESS
+        );
+        assert_eq!(sp.get("debug.int").unwrap(), "y");
+        assert!(sp.find("debug.other").unwrap().is_none());
+    }
+
     #[test]
     fn startup_fails_when_persistent_dir_is_missing() {
         let tmp = TempDir::new("rsprops_svc_startup_nodir");
@@ -962,7 +1030,7 @@ mod tests {
     impl PropertiesService {
         /// A client set.
         async fn set(&mut self, name: &str, value: &str) -> i32 {
-            self.client_set(name, value.into()).await
+            self.client_set(name, value.into(), None).await
         }
     }
 

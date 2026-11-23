@@ -96,9 +96,37 @@
 //! assert_eq!(probe.blocking_answer(), Some(true));
 //! ```
 //!
-//! The service checks no sender beyond the socket's file mode: a handler
-//! that acts on the host must check [`ControlMessage::uid`] (from
-//! `SO_PEERCRED`) itself.
+//! # Who may set what
+//!
+//! Two things decide it. The owner, group and mode of each socket file
+//! decide who can connect ([`ServiceOptions::socket_access`]; mode `0o660`
+//! by default). An authorizer, when the host gives one, then decides each
+//! request of a connected peer: it gets the name, the value, the name's
+//! `property_contexts` context, the socket, and the sender's pid, uid and
+//! gid, where init asks SELinux. [`PeerInfo`] reads the sender's
+//! supplementary groups, security label and pidfd when the authorizer
+//! asks for them.
+//!
+//! ```
+//! use rsproperties_service::{Decision, ServiceOptions};
+//!
+//! let options = ServiceOptions::new().authorizer(|request| {
+//!     // `ctl.*` and `sys.powerctl` requests come through the same call.
+//!     if request.peer().uid() == 0 || request.name().starts_with("debug.") {
+//!         Decision::Allow
+//!     } else {
+//!         Decision::Deny
+//!     }
+//! });
+//! ```
+//!
+//! Without an authorizer the service checks no sender beyond the socket
+//! files: every peer that can connect may set any property that is not a
+//! `ro.` property with a value, and send any `ctl.*` and `sys.powerctl`
+//! request. A handler that acts on the host must then check
+//! [`ControlMessage::uid`] (from `SO_PEERCRED`) itself.
+//!
+//! [`AccessPolicy`] is a ready-made authorizer of uid and gid rules.
 //!
 //! # Setting from the service's process
 //!
@@ -143,7 +171,11 @@
 //!
 //! The service logs through the `log` crate; install a logger in the host
 //! (`env_logger`, for one) to see it. Property values are masked in the
-//! logs (`<N bytes>`); names are logged in full.
+//! logs (`<N bytes>`); names are logged in full. One value is not masked:
+//! in a service with an authorizer, `rsproperties` prints the target of a
+//! `ctl.*` request in a `trace` line when `property_contexts` has an exact
+//! entry for `ctl.<action>$<target>` ("Value masking" on the security page
+//! linked below).
 //!
 //! # Further reading
 //!
@@ -174,8 +206,13 @@ use std::sync::Arc;
 
 use rsactor::{Actor, ActorRef, ActorResult};
 
+mod access;
+mod authorization;
+mod connection_limit;
 mod control_reply;
+mod peer_sockopt;
 mod persistent_properties;
+mod policy;
 mod properties_service;
 mod property_type;
 mod socket_service;
@@ -192,7 +229,12 @@ struct ReadmeDoctests;
 // a set, and spawning the socket service without the writer lock lets a
 // second instance replace a running instance's sockets. [`run`] is the
 // only way to start them, and [`ServiceHandle`] the only way to stop them.
+pub use access::{Listener, SocketAccess};
+use authorization::{Authorization, Authorizer};
+pub use authorization::{Decision, PeerInfo, SetRequest};
+use connection_limit::{UidLimiter, DEFAULT_MAX_CONNECTIONS_PER_UID};
 pub use control_reply::{ControlReply, ControlReplyProbe};
+pub use policy::{AccessPolicy, Subjects};
 use properties_service::{PropertiesService, PropertiesServiceArgs};
 use socket_service::{
     HandlerCallsDrain, HandlerCallsStop, Handlers, SocketService, SocketServiceArgs,
@@ -217,11 +259,13 @@ pub struct ControlMessage {
     pub target: String,
     /// The sender's pid from `SO_PEERCRED`, when available.
     pub pid: Option<i32>,
-    /// The sender's uid from `SO_PEERCRED`, when available. The service
-    /// checks no sender (any process that can connect may send any
-    /// `ctl.*` set), so a handler that must restrict who may control what,
-    /// as init does with SELinux in `CheckControlPropertyPerms`, decides
-    /// by this and [`gid`](Self::gid).
+    /// The sender's uid from `SO_PEERCRED`, when available. Without an
+    /// [authorizer](ServiceOptions::authorizer) the service checks no
+    /// sender (any process that can connect may send any `ctl.*` set), so
+    /// a handler that must restrict who may control what, as init does
+    /// with SELinux in `CheckControlPropertyPerms`, decides by this and
+    /// [`gid`](Self::gid). With an authorizer, a message that gets here
+    /// was allowed by it.
     pub uid: Option<u32>,
     /// The sender's gid from `SO_PEERCRED`, when available.
     pub gid: Option<u32>,
@@ -289,9 +333,11 @@ pub struct PowerctlMessage {
     pub command: String,
     /// The sender's pid from `SO_PEERCRED`, when available.
     pub pid: Option<i32>,
-    /// The sender's uid from `SO_PEERCRED`, when available. The service
-    /// checks no sender, so a handler that must restrict who may shut the
-    /// host down decides by this and [`gid`](Self::gid).
+    /// The sender's uid from `SO_PEERCRED`, when available. Without an
+    /// [authorizer](ServiceOptions::authorizer) the service checks no
+    /// sender, so a handler that must restrict who may shut the host down
+    /// decides by this and [`gid`](Self::gid). With an authorizer, a
+    /// message that gets here was allowed by it.
     pub uid: Option<u32>,
     /// The sender's gid from `SO_PEERCRED`, when available.
     pub gid: Option<u32>,
@@ -372,6 +418,14 @@ pub struct ServiceOptions {
     persistent_properties_file: Option<PathBuf>,
     control_handler: Option<ControlHandler>,
     powerctl_handler: Option<PowerctlHandler>,
+    authorizer: Option<Authorizer>,
+    /// Indexed by [`Listener::index`].
+    socket_access: [SocketAccess; 2],
+    /// `None`: [`DEFAULT_MAX_CONNECTIONS_PER_UID`].
+    max_connections_per_uid: Option<usize>,
+    /// Counts uid 0 and the service's own uid too. Only the tests set it:
+    /// their clients have the service's uid.
+    count_every_uid: bool,
 }
 
 impl std::fmt::Debug for ServiceOptions {
@@ -385,6 +439,14 @@ impl std::fmt::Debug for ServiceOptions {
             )
             .field("control_handler", &self.control_handler.is_some())
             .field("powerctl_handler", &self.powerctl_handler.is_some())
+            .field("authorizer", &self.authorizer.is_some())
+            .field("socket_access", &self.socket_access)
+            .field(
+                "max_connections_per_uid",
+                &self
+                    .max_connections_per_uid
+                    .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_UID),
+            )
             .finish()
     }
 }
@@ -464,7 +526,13 @@ impl ServiceOptions {
     /// `PROP_ERROR_HANDLE_CONTROL_MESSAGE`, as init does when the service
     /// is unknown or the action fails. Without a handler every `ctl.*` set
     /// is refused with `PROP_ERROR_HANDLE_CONTROL_MESSAGE`. Either way,
-    /// `ctl.*` names are never stored.
+    /// `ctl.*` names are never stored. Once the handler calls are stopped
+    /// ([`ServiceHandle::stop_handler_calls`]) no call is made and the
+    /// replies are the ones listed there, also without a handler. A
+    /// service with an [authorizer](Self::authorizer) asks it before any
+    /// of this: a request it denies is refused with
+    /// `PROP_ERROR_HANDLE_CONTROL_MESSAGE`, and `handler` is not called
+    /// for it.
     ///
     /// The reply may be sent in the call or after it has returned, from
     /// any thread. init answers a control message once its main thread
@@ -528,9 +596,13 @@ impl ServiceOptions {
     /// handler being called; init refuses a control message when 101 are
     /// queued, whether or not one is being handled, so the two limits
     /// agree while a control message is in its call. Each unanswered
-    /// request holds its
-    /// client's connection (one fd) and none of the service's connection
-    /// slots, so other sets are served meanwhile.
+    /// request holds its client's connection (one fd) and none of the 64
+    /// handler slots, so other sets are served meanwhile. It does count
+    /// toward its sender's uid
+    /// ([`max_connections_per_uid`](Self::max_connections_per_uid)) until
+    /// it is answered or dropped: a uid with that many unanswered requests
+    /// gets every further connection closed without a reply. uid 0 and
+    /// the service's own effective uid are not counted.
     ///
     /// The service does not limit the time to the reply. A client of
     /// bionic or of `rsproperties` on Android waits until the reply is
@@ -586,9 +658,11 @@ impl ServiceOptions {
 
     /// Handles `sys.powerctl` sets, which init takes as shutdown and
     /// reboot requests. A set that passes the checks of every set (name,
+    /// the [authorizer](Self::authorizer) when the service has one,
     /// `property_contexts` type, value length) is answered with
-    /// `PROP_SUCCESS` and passed to `handler`; the value
-    /// `reboot,userspace` is refused before that with
+    /// `PROP_SUCCESS` and passed to `handler`. A set the authorizer denies
+    /// gets `PROP_ERROR_PERMISSION_DENIED`; of the
+    /// others, the value `reboot,userspace` is refused with
     /// `PROP_ERROR_INVALID_VALUE`, as in init (android-17). The value is
     /// never stored, with or without a handler, so a `get` of
     /// `sys.powerctl` finds nothing; init does not write it to its
@@ -639,8 +713,9 @@ impl ServiceOptions {
     ///     match msg.command.split(',').next() {
     ///         Some("shutdown" | "reboot") => {
     ///             let _ = requests.send(msg.command.clone());
-    ///             // From here on `ctl.stop` is answered with success and
-    ///             // no handler is called; other sets are still applied.
+    ///             // From here on no handler is called, and `ctl.stop` is
+    ///             // answered with success unless an authorizer denies
+    ///             // it; sets of ordinary properties are still applied.
     ///             PowerctlOutcome::ShuttingDown
     ///         }
     ///         _ => PowerctlOutcome::Ignored,
@@ -671,6 +746,195 @@ impl ServiceOptions {
         self.powerctl_handler = Some(Arc::new(handler));
         self
     }
+
+    /// Decides for every request from a client whether it may go on:
+    /// init's `CheckPermissions`, with `authorizer` in the place of
+    /// SELinux. Without one, every request of a peer that could connect is
+    /// allowed.
+    ///
+    /// `authorizer` is called for a set of an ordinary property, for a
+    /// `ctl.*` request and for a `sys.powerctl` set, after the name check
+    /// and before the type check, the order of init. It is not called for
+    /// the properties the service sets itself at startup (build.prop
+    /// files, persistent properties). A [`Decision::Deny`] is answered
+    /// with `PROP_ERROR_HANDLE_CONTROL_MESSAGE` for `ctl.*` and
+    /// `PROP_ERROR_PERMISSION_DENIED` otherwise, and logged at `warn` with
+    /// the sender, the name and its context. A denied `ctl.*` request is
+    /// not queued for the [control handler](Self::control_handler).
+    ///
+    /// A request is refused in the same way, without a call, when the
+    /// sender's credentials cannot be read, when the properties service
+    /// fails to start, and when the name's context cannot be read.
+    /// `authorizer` is called with the name's context, so a request that
+    /// arrives while the service is starting waits in the task of its
+    /// connection until the properties service has started (see "Requests
+    /// that arrive before the property areas exist" on [`run`]). A name
+    /// that no `property_contexts` entry matches is not refused: its
+    /// context is the default one, `u:object_r:build_prop:s0`
+    /// ([`SetRequest::context`]).
+    ///
+    /// A request that cannot be decoded is answered before `authorizer`
+    /// is asked, and is not logged as a denial: a command word that
+    /// cannot be read (`PROP_ERROR_READ_CMD`), a command other than
+    /// `PROP_MSG_SETPROP2` (`PROP_ERROR_INVALID_CMD`), a field that cannot
+    /// be read or whose length is over the wire limit
+    /// (`PROP_ERROR_READ_DATA`), a name that has an interior NUL, is not
+    /// UTF-8 or fails the name check (`PROP_ERROR_INVALID_NAME`, also
+    /// when the value is not a string), and, when the name is none of these, a value that
+    /// has an interior NUL or is not UTF-8 (`PROP_ERROR_INVALID_VALUE`).
+    /// The last one differs from init, which
+    /// makes its access check before it checks the value, so a sender it
+    /// denies gets the access code for such a value too; `authorizer`
+    /// takes the value as a `&str` and cannot be given one that is not
+    /// UTF-8.
+    ///
+    /// `ro.` properties are write-once, not read-only for clients: the
+    /// first set of a `ro.` name that has no value yet is stored. An
+    /// authorizer that must keep clients from doing that denies names that
+    /// start with `ro.`.
+    ///
+    /// # `authorizer` must not block
+    ///
+    /// It is called on a thread of the tokio runtime, from the task of
+    /// the request's connection: while it runs, that thread runs nothing
+    /// else. On a multi-thread runtime the other workers serve the other
+    /// connections and the properties service keeps applying sets. On a
+    /// `current_thread` runtime the whole service waits for the call: no
+    /// connection is accepted or read and no set is applied until it
+    /// returns. Read what the decision needs beforehand; do not wait for
+    /// I/O or another process in the call.
+    ///
+    /// # Shutdown
+    ///
+    /// [`ServiceHandle::shutdown`] and [`ServiceHandle::join`] do not wait
+    /// for the tasks of the connections, and each of those tasks holds a
+    /// clone of `authorizer`. A connection that was accepted before the
+    /// service ended can send its request after either has returned, and
+    /// `authorizer` is then still called for it; the request is not
+    /// applied and no handler is called for it, whatever `authorizer`
+    /// answers. Such a task ends at most 20 s after its connection was
+    /// accepted (up to 10 s waiting for a handler slot, up to 10 s for the
+    /// exchange) and drops its clone then. So, unlike the handlers (see
+    /// "Shutdown" on [`control_handler`](Self::control_handler)),
+    /// `authorizer` can be called, and it and what it captured are
+    /// dropped, up to 20 s after the service has ended.
+    ///
+    /// A drop of the handle differs. It stops neither part itself and
+    /// waits for nothing. The socket service ends once its task finds the
+    /// handle gone; until then requests are handled as before, and from
+    /// then on no connection is accepted and a `ctl.*` or `sys.powerctl`
+    /// request reaches no handler. The properties service is not stopped:
+    /// the tasks of the connections accepted before that keep it running
+    /// until the last of them has ended, and an ordinary set that such a
+    /// connection sends in that time is applied when `authorizer` allows
+    /// it and refused when it denies it. `authorizer` must therefore keep
+    /// deciding as before until its last clone is dropped, up to 20 s
+    /// after the last connection was accepted.
+    ///
+    /// The tasks of a [`run`] that failed to start keep their clones for
+    /// that time too.
+    ///
+    /// # Panics
+    ///
+    /// A panic in `authorizer` is caught: the request is refused as if
+    /// denied, and logged at `error`. In a host built with
+    /// `panic = "abort"` nothing can be caught and the process ends; the
+    /// request is not allowed there either.
+    ///
+    /// ```
+    /// use rsproperties_service::{Decision, Listener, ServiceOptions, SocketAccess};
+    ///
+    /// // Every local uid may connect to `property_service`; root may do
+    /// // anything, others may set `debug.*` only.
+    /// let options = ServiceOptions::new()
+    ///     .socket_access(Listener::Property, SocketAccess::new(0o666))
+    ///     .authorizer(|request| {
+    ///         if request.peer().uid() == 0 || request.name().starts_with("debug.") {
+    ///             Decision::Allow
+    ///         } else {
+    ///             Decision::Deny
+    ///         }
+    ///     });
+    /// ```
+    ///
+    /// [`SetRequest::for_test`] builds a request to test an authorizer
+    /// with. [`AccessPolicy`] is an authorizer made of rules (which uids
+    /// and gids may set which names and contexts), for a host that does
+    /// not need to write its own, passed as
+    /// `authorizer(policy.into_authorizer())`.
+    pub fn authorizer<F>(mut self, authorizer: F) -> Self
+    where
+        F: Fn(&SetRequest<'_>) -> Decision + Send + Sync + 'static,
+    {
+        self.authorizer = Some(Arc::new(authorizer));
+        self
+    }
+
+    /// The owner group and mode of `listener`'s socket file, in place of
+    /// mode `0o660` and the group the file is created with.
+    ///
+    /// The group is changed and the mode set through a descriptor of the
+    /// temp socket, after `bind` and before `listen`, so no peer connects
+    /// before the file has both (see "Socket files" on [`run`]). [`run`]
+    /// checks the mode first, before it changes anything: a mode it
+    /// refuses fails at [`StartupStage::Config`] (see
+    /// [`SocketAccess::new`]).
+    ///
+    /// Without an [authorizer](Self::authorizer), a peer that can connect
+    /// may set any property and send any `ctl.*` and `sys.powerctl`
+    /// request: give the group only to uids that may do all of that. For
+    /// the same reason a mode with a bit for others needs an authorizer.
+    ///
+    /// ```
+    /// use rsproperties_service::{Listener, ServiceOptions, SocketAccess};
+    ///
+    /// // init's `property_service_for_system`: 0660, group `system`
+    /// // (AID_SYSTEM, 1000). The service's user must be root or in the
+    /// // group.
+    /// let options = ServiceOptions::new()
+    ///     .socket_access(Listener::System, SocketAccess::new(0o660).with_group(1000));
+    /// ```
+    pub fn socket_access(mut self, listener: Listener, access: SocketAccess) -> Self {
+        self.socket_access[listener.index()] = access;
+        self
+    }
+
+    /// The most connections one uid may have open at once, on both
+    /// sockets together; 32 by default.
+    ///
+    /// A connection is open from `accept()` until the service closes it:
+    /// while it waits for one of the 64 handler slots, while its request
+    /// is read and answered, and, for a `ctl.*` request, until the host
+    /// has answered or dropped the request's [`ControlReply`]. A
+    /// connection of a uid that already has `limit` open is closed without
+    /// a reply, as one that finds the waiting room full is, and logged at
+    /// `warn`. The uid is the one `SO_PEERCRED` gives: that of the process
+    /// that called `connect()`.
+    ///
+    /// Without the limit, the clients of one uid can take every handler
+    /// slot by connecting and sending nothing, each for the 10 s the
+    /// service gives an exchange, and can leave 102 `ctl.*` requests
+    /// unanswered, after which every other `ctl.*` request is refused.
+    /// With the default, one uid takes at most half of the handler slots.
+    /// The limit bounds one uid, not a client that has several.
+    ///
+    /// uid 0 and the service's own effective uid are not counted: a
+    /// process of either can stop the service by other means. Connections
+    /// whose credentials cannot be read are counted together, as one uid.
+    ///
+    /// A [`ControlReply`] the host keeps counts toward its sender's limit
+    /// for as long as it is kept. `usize::MAX` removes the limit; `0`
+    /// closes every connection of a uid that is counted.
+    ///
+    /// ```
+    /// use rsproperties_service::ServiceOptions;
+    ///
+    /// let options = ServiceOptions::new().max_connections_per_uid(8);
+    /// ```
+    pub fn max_connections_per_uid(mut self, limit: usize) -> Self {
+        self.max_connections_per_uid = Some(limit);
+        self
+    }
 }
 
 pub(crate) struct ReadyMessage;
@@ -680,7 +944,18 @@ pub(crate) struct ReadyMessage;
 pub(crate) struct PropertyMessage {
     pub name: String,
     pub value: String,
+    /// The name's `property_contexts` type when the socket service has
+    /// read it: with an authorizer, it reads the context and the type in
+    /// one lookup of the trie the properties service published
+    /// (`Authorization::authorize`). `None` makes the properties service
+    /// look the type up.
+    pub known_type: Option<KnownType>,
 }
+
+/// The `property_contexts` type a lookup gave a name; `None` when no
+/// entry and no default gives it one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KnownType(pub Option<String>);
 
 // Mask `value` in `Debug` output so log-level captures don't spill
 // property contents. Property names are public knowledge (they cross the
@@ -692,6 +967,7 @@ impl std::fmt::Debug for PropertyMessage {
         f.debug_struct("PropertyMessage")
             .field("name", &self.name)
             .field("value", &format_args!("<{} bytes>", self.value.len()))
+            .field("known_type", &self.known_type)
             .finish()
     }
 }
@@ -806,8 +1082,11 @@ impl ServiceHandle {
     /// signal, for example) and the processes that `ctl.*` requests act on
     /// are being stopped.
     ///
-    /// A request the service reads after this has returned is answered as
-    /// init answers it during its shutdown, and reaches no handler:
+    /// A request the service reads after this has returned reaches no
+    /// handler. One that the [authorizer](ServiceOptions::authorizer)
+    /// denies gets the reply of a denied request, as before. Any other
+    /// (every request, in a service without an authorizer) is answered as
+    /// init answers it during its shutdown:
     ///
     /// - `ctl.stop`: `PROP_SUCCESS` ("If we're already shutting down and
     ///   you're asking us to stop something, just say we did"). Also
@@ -844,7 +1123,9 @@ impl ServiceHandle {
     /// connections accepted before it; without this call those get the
     /// refusals `shutdown` documents. A set that is read once the
     /// properties service has ended, `sys.powerctl` included, is not
-    /// checked and gets `PROP_ERROR_SET_FAILED` either way.
+    /// checked by that service and gets `PROP_ERROR_SET_FAILED` either
+    /// way; in a service with an authorizer the name check and the
+    /// authorizer still come first, with their own replies.
     pub fn stop_handler_calls(&self) {
         self.handler_stop.stop();
     }
@@ -891,7 +1172,10 @@ impl ServiceHandle {
     /// replies are the ones listed there instead, and so is the
     /// `sys.powerctl` reply until the properties service has ended; a
     /// `sys.powerctl` request read after that still gets
-    /// `PROP_ERROR_SET_FAILED`.
+    /// `PROP_ERROR_SET_FAILED`. In a service with an
+    /// [authorizer](ServiceOptions::authorizer) these are the replies to a
+    /// request it allows: one it denies gets the reply of a denied
+    /// request, also after the service has ended.
     ///
     /// Last, this waits for the handler call that is running when the
     /// socket service ends, and for the powerctl handler call of a
@@ -1011,8 +1295,13 @@ impl std::error::Error for ServiceError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StartupStage {
+    /// A [`ServiceOptions`] value was refused (a
+    /// [socket mode](SocketAccess::new) with a bit the service does not
+    /// accept, or a [socket group](SocketAccess::with_group) of
+    /// `u32::MAX`), or
     /// `rsproperties::init` rejected the config: a process-global directory
-    /// was already set to a different path.
+    /// was already set to a different path. The options are checked before
+    /// `init`, so a refused option commits no process-global state.
     Config,
     /// Taking the properties dir's writer lock
     /// ([`rsproperties::AreaWriterLock::acquire`]) failed. A second
@@ -1037,7 +1326,7 @@ pub enum StartupStage {
 impl std::fmt::Display for StartupStage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Config => "configuration (init)",
+            Self::Config => "configuration",
             Self::WriterLock => "properties dir writer lock",
             Self::PropertiesService => "properties service",
             Self::SocketService => "socket service",
@@ -1105,7 +1394,8 @@ impl std::error::Error for StartupError {
 ///
 /// # Startup order
 ///
-/// 1. `rsproperties::init(config)`.
+/// 1. The [`ServiceOptions`] values are checked, then
+///    `rsproperties::init(config)`.
 /// 2. The properties dir's writer lock
 ///    ([`rsproperties::AreaWriterLock::acquire`]); this creates a missing
 ///    properties dir (the last component only). A second instance on the
@@ -1126,6 +1416,10 @@ impl std::error::Error for StartupError {
 /// lock does not cover the socket dir).
 ///
 /// # Requests that arrive before the property areas exist
+///
+/// This section describes a service without an
+/// [authorizer](ServiceOptions::authorizer) first; its last paragraph says
+/// what differs with one.
 ///
 /// `ctl.*` sets are not queued: they go to the control handler as soon as
 /// they are read, before the areas exist, and are not undone if startup
@@ -1159,6 +1453,20 @@ impl std::error::Error for StartupError {
 /// fails, and the next one tries again (see
 /// `rsproperties::system_properties`).
 ///
+/// With an authorizer, a request whose name passed the name check and
+/// whose sender's credentials could be read, a `ctl.*` request included,
+/// first waits in the task of its connection, not in the mailbox, until
+/// the properties service has created the areas and applied the startup
+/// properties: the authorizer is called with the name's context, which is
+/// known only then. So no `ctl.*` request reaches the control handler
+/// before the areas exist. A request whose connection the socket service
+/// closes after the 10 s while it waits there was never queued: it is not
+/// applied, and neither the authorizer nor a handler is called for it. If
+/// the properties service fails to start, a request that waits there is
+/// refused without a call of the authorizer or of a handler, with the
+/// codes of a denied request: `PROP_ERROR_HANDLE_CONTROL_MESSAGE` for
+/// `ctl.*`, `PROP_ERROR_PERMISSION_DENIED` for any other.
+///
 /// # Requirements
 /// The parent of the properties dir must exist: only the properties dir's
 /// last component is created (mode 0711 minus the umask's bits). A missing
@@ -1168,16 +1476,19 @@ impl std::error::Error for StartupError {
 /// # Socket files
 ///
 /// Socket files are created as `socket(SOCK_CLOEXEC|SOCK_NONBLOCK)`,
-/// `fchmod(fd, 0660)`, `bind` at `<socket_dir>/.<name>.tmp-<pid>`. The
-/// kernel creates the file with the socket's mode minus the umask, so from
-/// the moment the path exists its mode is a subset of 0660. If the umask
-/// removed any of those bits (e.g. group write under umask 022), the mode
-/// is raised to exactly 0660 through an
-/// `O_PATH|O_NOFOLLOW` descriptor opened relative to the socket dir
-/// (`chmod("/proc/thread-self/fd/N")`, or `/proc/self/fd/N` on kernels
-/// before 3.17; both need `/proc`) after `fstat`
-/// confirms a socket owned by the service's euid. Only then does the
-/// socket `listen`; before that a `connect` fails with `ECONNREFUSED`.
+/// `fchmod(fd, mode)`, `bind` at `<socket_dir>/.<name>.tmp-<pid>`, where
+/// `mode` is 0660 or the one given to [`ServiceOptions::socket_access`].
+/// The kernel creates the file with the socket's mode minus the umask, so
+/// from the moment the path exists its mode is a subset of `mode`. The
+/// temp socket is then opened `O_PATH|O_NOFOLLOW` relative to the socket
+/// dir, and `fstat` must confirm a socket owned by the service's euid.
+/// Through that descriptor, a group given to `socket_access` is set
+/// (`fchownat(fd, "", -1, gid, AT_EMPTY_PATH)`), and if the umask removed
+/// any bits of `mode` (e.g. group write under umask 022), the mode is
+/// raised to exactly `mode` (`chmod("/proc/thread-self/fd/N")`, or
+/// `/proc/self/fd/N` on kernels before 3.17; both need `/proc`). Only then
+/// does the socket `listen`; before that a `connect` fails with
+/// `ECONNREFUSED`.
 /// Both temp sockets are renamed onto their final names only after both
 /// are listening, and a failed start unlinks what it created, final names
 /// included. Both final names are unlinked when the service ends (see
@@ -1197,11 +1508,17 @@ impl std::error::Error for StartupError {
 /// Out of scope: any uid other than the service's euid and root that can
 /// write to the socket dir or any of its ancestors can replace the sockets
 /// with its own and so impersonate the service; nothing in the service can
-/// prevent that. Keep the socket dir and its ancestors writable only by
+/// prevent that. Such a uid can also exchange the two temp sockets' names
+/// during startup, between `bind` and the `O_PATH` open: the `fstat` check
+/// confirms a socket owned by the service's euid, not the socket just
+/// bound, so the other temp socket passes it and gets the group and mode
+/// meant for this name, while the socket just bound listens with the group
+/// it was created with and its mode minus the umask; startup reports no
+/// error. Keep the socket dir and its ancestors writable only by
 /// the service's user and root. A world-writable socket dir without the
 /// sticky bit is reported with a warning at startup; this is not an access
 /// check. A default ACL on the socket dir gives its named users and groups
-/// access beyond the 0660 mode bits; the service does not inspect or
+/// access beyond the socket files' mode bits; the service does not inspect or
 /// remove ACLs.
 ///
 /// # Failure semantics
@@ -1251,6 +1568,14 @@ pub async fn run(
     // default first): starting anyway would bind the service to the
     // previous directories while the caller believes the config took
     // effect.
+    //
+    // The options are checked first: `init` cannot be undone, so a
+    // refused option leaves no process-global state behind.
+    for listener in Listener::ALL {
+        options.socket_access[listener.index()]
+            .check(listener, options.authorizer.is_some())
+            .map_err(|e| StartupError::new(StartupStage::Config, e))?;
+    }
     rsproperties::init(config).map_err(|e| StartupError::new(StartupStage::Config, e))?;
 
     // The writer lock is taken before either actor is spawned: a second
@@ -1271,12 +1596,28 @@ pub async fn run(
         persistent_properties_file,
         control_handler,
         powerctl_handler,
+        authorizer,
+        socket_access,
+        max_connections_per_uid,
+        count_every_uid,
     } = options;
+    // uid 0 and the service's own uid can stop the service by other means
+    // (signals, ptrace, the files), so a limit on them protects nothing.
+    let own_uid = rustix::process::geteuid().as_raw();
+    let exempt: &[u32] = if count_every_uid { &[] } else { &[0, own_uid] };
+    let uid_limiter = UidLimiter::new(
+        max_connections_per_uid.unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_UID),
+        exempt,
+    );
+    // Without an authorizer nothing reads the trie outside the properties
+    // service, and no copy of it is shared.
+    let (authorization, trie_sender) = authorizer.map(Authorization::new).unzip();
     let (properties_ref, properties_join) = properties_service::spawn(PropertiesServiceArgs {
         property_contexts_files,
         build_prop_files,
         writer_lock: lock,
         persistent_properties_file,
+        trie_sender,
     });
     let handlers = Handlers::new(control_handler, powerctl_handler);
     let handler_calls = handlers.drain();
@@ -1285,6 +1626,9 @@ pub async fn run(
         socket_dir: rsproperties::socket_dir().to_path_buf(),
         properties_service: properties_ref.clone(),
         handlers,
+        authorization,
+        socket_access,
+        uid_limiter,
     });
 
     // Sequential readiness checks: the socket service is checked first, so
@@ -1385,6 +1729,7 @@ mod tests {
         let msg = PropertyMessage {
             name: "test.key".to_string(),
             value: "test.value".to_string(),
+            known_type: None,
         };
         let debug = format!("{msg:?}");
         assert!(!debug.contains("test.value"), "value leaked: {debug}");
@@ -1392,11 +1737,41 @@ mod tests {
         assert!(debug.contains("test.key"), "name missing: {debug}");
     }
 
+    /// Without an authorizer, a socket mode outside 0660 fails at
+    /// `Config`, naming the socket.
+    /// `run` returns before `init`, so this test leaves no process-global
+    /// state behind for [`run_reports_on_start_cause`].
+    #[tokio::test]
+    async fn run_refuses_socket_mode_outside_0660_without_authorizer() {
+        for (listener, mode) in [(Listener::Property, 0o666), (Listener::System, 0o4660)] {
+            let options = ServiceOptions::new().socket_access(listener, SocketAccess::new(mode));
+            let err = match run(rsproperties::PropertyConfig::new(), options).await {
+                Ok(_) => panic!("run must refuse socket mode {mode:#o}"),
+                Err(e) => e,
+            };
+            assert_eq!(err.stage(), StartupStage::Config, "{err}");
+            assert!(
+                err.to_string()
+                    .starts_with("configuration failed to start: "),
+                "{err}"
+            );
+            let source = std::error::Error::source(&err).unwrap();
+            assert!(
+                matches!(
+                    source.downcast_ref::<rsproperties::Error>(),
+                    Some(rsproperties::Error::InvalidArgument(_))
+                ),
+                "{source}"
+            );
+            assert!(err.to_string().contains(listener.socket_name()), "{err}");
+        }
+    }
+
     /// `run` must return the actor's own `on_start` error, not rsactor's
     /// generic mailbox error, tagged with the stage that failed. The only
-    /// test that calls `run` in this process (`init` is
-    /// process-global); the early-request tests below call it in a child
-    /// process.
+    /// test that gets past `init` in this process (`init` is
+    /// process-global); the early-request tests below call `run` in a
+    /// child process.
     #[tokio::test]
     async fn run_reports_on_start_cause() {
         let dir = socket_test_dir("rsprops_svc_run_err", socket_suffix_len("sockets"));
@@ -2630,7 +3005,7 @@ mod tests {
         (stream, reply)
     }
 
-    /// A `ctl.*` request the host has not answered holds no connection
+    /// A `ctl.*` request the host has not answered holds no handler
     /// slot: with more of them unanswered than the service handles
     /// connections at once, another set is still applied and answered, and
     /// each request then gets the reply the host sends for it.
@@ -2688,6 +3063,133 @@ mod tests {
                 };
                 assert_eq!(read_reply(&mut stream).await, Some(expected), "svc{i}");
             }
+
+            service.shutdown().await.unwrap();
+        });
+    }
+
+    /// Sends a set of `name` on a new connection to `socket`. `None`: the
+    /// service closed the connection without a reply.
+    async fn try_set(socket: &Path, name: &str) -> Option<i32> {
+        let mut stream = UnixStream::connect(socket).await.unwrap();
+        // A connection the service has closed already fails the write.
+        let _ = stream.write_all(&set_frame(name, "1")).await;
+        read_reply(&mut stream).await
+    }
+
+    /// Repeats [`try_set`] until the service answers. The service gives a
+    /// connection's place back in a task of its own, a moment after the
+    /// client sees the connection end.
+    async fn set_once_admitted(socket: &Path, name: &str) -> i32 {
+        for _ in 0..500 {
+            if let Some(code) = try_set(socket, name).await {
+                return code;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no connection was admitted within 10 s");
+    }
+
+    /// A service whose limit of 2 connections per uid also counts the
+    /// test's own uid, and its two socket paths ("property", "system").
+    async fn service_with_uid_limit(
+        dir: &TempDir,
+        options: ServiceOptions,
+    ) -> (ServiceHandle, PathBuf, PathBuf) {
+        let _ = std::fs::remove_dir_all(&dir.0);
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let socket_dir = dir.0.join("sockets");
+        let mut options = options.max_connections_per_uid(2);
+        options.count_every_uid = true;
+        let service = run(
+            rsproperties::PropertyConfig::new()
+                .properties_dir(dir.0.clone())
+                .socket_dir(socket_dir.clone()),
+            options,
+        )
+        .await
+        .expect("run");
+        (
+            service,
+            socket_dir.join(rsproperties::PROPERTY_SERVICE_SOCKET_NAME),
+            socket_dir.join(rsproperties::PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME),
+        )
+    }
+
+    /// A uid that has `max_connections_per_uid` connections open gets the
+    /// next one closed without a reply, on either socket, and is admitted
+    /// again once it has closed one.
+    #[test]
+    fn connections_beyond_the_uid_limit_are_closed() {
+        const TEST: &str = "tests::connections_beyond_the_uid_limit_are_closed";
+        if !is_child(TEST) {
+            run_in_child(TEST);
+            return;
+        }
+        block_on_child(async {
+            let dir = TempDir(socket_test_dir(
+                "rsprops_svc_uid_limit",
+                socket_suffix_len("sockets"),
+            ));
+            let (service, property, system) =
+                service_with_uid_limit(&dir, ServiceOptions::new()).await;
+
+            // Two connections that send nothing. The service accepts the
+            // connections of one socket in the order they were made, so
+            // both are counted before the next one is.
+            let idle = [
+                UnixStream::connect(&property).await.unwrap(),
+                UnixStream::connect(&property).await.unwrap(),
+            ];
+            assert_eq!(try_set(&property, "debug.limit.third").await, None);
+            assert_eq!(try_set(&system, "debug.limit.system").await, None);
+            assert!(rsproperties::get::<String>("debug.limit.third").is_err());
+            assert!(rsproperties::get::<String>("debug.limit.system").is_err());
+
+            drop(idle);
+            assert_eq!(
+                set_once_admitted(&property, "debug.limit.after").await,
+                PROP_SUCCESS
+            );
+            assert_eq!(
+                rsproperties::get::<String>("debug.limit.after").unwrap(),
+                "1"
+            );
+
+            service.shutdown().await.unwrap();
+        });
+    }
+
+    /// A `ctl.*` request the host has not answered counts toward its
+    /// sender's limit until the host answers it.
+    #[test]
+    fn unanswered_control_requests_count_toward_the_uid_limit() {
+        const TEST: &str = "tests::unanswered_control_requests_count_toward_the_uid_limit";
+        if !is_child(TEST) {
+            run_in_child(TEST);
+            return;
+        }
+        block_on_child(async {
+            let dir = TempDir(socket_test_dir(
+                "rsprops_svc_uid_limit_ctl",
+                socket_suffix_len("sockets"),
+            ));
+            let (handler, mut passed) = deferring_handler();
+            let (service, property, _system) =
+                service_with_uid_limit(&dir, ServiceOptions::new().control_handler(handler)).await;
+
+            // The handler has both requests, so their connection tasks
+            // have ended: the two places are held by the replies alone.
+            let (mut first, first_reply) = send_held_ctl_start(&property, &mut passed, "a").await;
+            let (_second, _second_reply) = send_held_ctl_start(&property, &mut passed, "b").await;
+            assert_eq!(try_set(&property, "debug.limit.held").await, None);
+
+            first_reply.send(true);
+            assert_eq!(read_reply(&mut first).await, Some(PROP_SUCCESS));
+            assert_eq!(
+                set_once_admitted(&property, "debug.limit.answered").await,
+                PROP_SUCCESS
+            );
 
             service.shutdown().await.unwrap();
         });

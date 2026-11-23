@@ -31,13 +31,36 @@ The socket service implements the Android property service protocol:
   `INVALID_CMD`, `INVALID_NAME`, `INVALID_VALUE` (`PROP_VALUE_MAX` bytes
   or more for a non-`ro.` name, an interior NUL, not UTF-8, or not
   matching the `property_contexts` type), `READ_ONLY_PROPERTY`,
-  `HANDLE_CONTROL_MESSAGE` (`ctl.*` refused or failed), `SET_FAILED`.
-  Both V2 fields are read before either is checked, and the name is
-  checked first, as in init.
+  `HANDLE_CONTROL_MESSAGE` (`ctl.*` refused or failed), `SET_FAILED`,
+  and `PERMISSION_DENIED`. The service sends `PERMISSION_DENIED` only
+  when it has an authorizer (`ServiceOptions::authorizer`), for a
+  request whose name is not `ctl.*` (`sys.powerctl` included) and
+  passed the name check, in these cases: the authorizer denied it or
+  panicked, the sender's credentials could not be read, the properties
+  service failed to start, or the name's context could not be read. A
+  `ctl.*` request gets `HANDLE_CONTROL_MESSAGE` in the same cases.
+  Both V2 fields are read before either is checked. The checks then
+  come in this order: that the name is a string (no interior NUL,
+  UTF-8); the name check; that the value is a string; the authorizer,
+  when the service has one; then, for a name that is not `ctl.*`, the
+  value's `property_contexts` type, its length, and whether a `ro.`
+  name already has a value. So a request that fails the name check
+  gets `INVALID_NAME` also when its value is not a string. That is
+  init's order (name, access, type) except for a value that is not a
+  string, which init checks after the access: such a request, when its
+  name passed the name check, gets `INVALID_VALUE` here whoever sent
+  it, the authorizer is not asked, and no denial is logged. A frame that
+  cannot be read (`READ_CMD`, `READ_DATA`) and a command other than
+  `PROP_MSG_SETPROP2` (`INVALID_CMD`) are answered before the
+  authorizer too.
 - **`sys.powerctl`**: never stored, as in init, so a `get` finds no
-  value. `reboot,userspace` is answered with `INVALID_VALUE`, as in
-  init (Android 17). Any other value that passes the checks every set
-  gets (name, length, UTF-8, `property_contexts` type) is answered with
+  value. A set the authorizer denies gets `PERMISSION_DENIED`, also when
+  its value is `reboot,userspace`. Of the others, `reboot,userspace` is
+  answered with
+  `INVALID_VALUE`, as in init (Android 17). Any other value that passes
+  the checks every set
+  gets (name, length, UTF-8, `property_contexts` type, and the
+  authorizer when the service has one) is answered with
   `PROP_SUCCESS` and passed to `ServiceOptions::powerctl_handler` with
   the sender's pid. The reply does not wait for the handler and does
   not say whether the command was recognized: init also accepts
@@ -52,7 +75,8 @@ The socket service implements the Android property service protocol:
   after `ServiceHandle::stop_handler_calls`, a set that passes the
   checks is answered with `PROP_SUCCESS` and reaches no handler, as in
   init once it has begun a shutdown. A request read after the service
-  has stopped gets `SET_FAILED`. The value is not logged (init logs it).
+  has stopped gets `SET_FAILED`, or `PERMISSION_DENIED` when the
+  authorizer denies it. The value is not logged (init logs it).
 - **`selinux.restorecon_recursive`**: stored like any property. init
   runs a recursive restorecon on the path and stores the path when that
   is done, so a client that waits for the property to equal the path it
@@ -73,7 +97,8 @@ The socket service implements the Android property service protocol:
   expanded values total more than 4 MiB fails `run`
   (`StartupStage::PropertiesService`) instead.
 - **`ctl.*`**: never stored; passed to `ServiceOptions::control_handler`
-  with a `ControlReply`, or refused without a handler. See
+  with a `ControlReply`, or refused without a handler; a service with
+  an authorizer asks it first and refuses what it denies. See
   [Control messages](#control-messages).
 - **Startup properties**: `ro.property_service.version=2`, the persistent
   properties, then `ro.persistent_properties.ready=true`, after the
@@ -113,6 +138,12 @@ next `ctl.*` request. A call that blocks delays every call behind it;
 init has the same property, since its control functions run on its main
 thread.
 
+In a service with an authorizer, this section describes the requests
+the authorizer allows. A `ctl.*` request it denies is answered with
+`HANDLE_CONTROL_MESSAGE` before any of the following: it is not queued,
+does not count as unanswered, and gets that reply also when it is
+`ctl.stop` and the handler calls are stopped.
+
 A `ctl.*` client is answered when the host answers the `ControlReply`
 of its request: `reply.send(true)` is `PROP_SUCCESS`,
 `reply.send(false)` is `HANDLE_CONTROL_MESSAGE`. `send` does not wait
@@ -144,7 +175,11 @@ the two limits agree while a control message is in its call. An
 unanswered request holds one fd (the connection of its client) and none
 of the connection permits under
 [Backpressure](service-security.md#backpressure), so other sets are
-served meanwhile.
+served meanwhile. It does count toward its sender's uid
+(`ServiceOptions::max_connections_per_uid`, also under Backpressure)
+until it is answered or dropped: a uid with that many unanswered
+requests gets every further connection closed without a reply. uid 0
+and the service's own effective uid are not counted.
 
 Once the handler calls are stopped (a powerctl handler returned
 `PowerctlOutcome::ShuttingDown`, or `ServiceHandle::stop_handler_calls`)
@@ -189,8 +224,10 @@ without a bound unless its caller wraps it in `tokio::time::timeout`.
 
 The host sets `init.svc.<name>` itself, with `rsproperties::set` from a
 thread that may block (the handler runs on tokio's blocking pool, so the
-handler may do it); the service gives the name no special treatment and
-any client that can connect can set it as well. The values init uses
+handler may do it); the service gives the name no special treatment, so
+any client that can connect can set it as well, unless the service has
+an authorizer that denies the request (the host's own set goes through
+the socket and the authorizer like any other). The values init uses
 are `running`, `stopping`, `stopped` and `restarting`. With `running`
 init also sets `ro.boottime.<name>` (once) and
 `init.svc_debug_pid.<name>`.
@@ -198,9 +235,18 @@ init also sets `ro.boottime.<name>` (once) and
 What the service cannot reproduce: init checks with SELinux whether the
 sender may set the `ctl.*` name for that target
 (`CheckControlPropertyPerms`) and answers `HANDLE_CONTROL_MESSAGE`
-before the message is queued. Here every sender that can connect
-reaches the handler, which can refuse by the sender's `uid`, `gid` or
-`pid` (it has no SELinux context to check) with `reply.send(false)`;
-its client then gets the same `HANDLE_CONTROL_MESSAGE`. Such a request
-counts toward the 102 until it is answered, where init refuses it
-before its queue.
+before the message is queued. A service with an authorizer
+(`ServiceOptions::authorizer`) asks it at the same point, before the
+queue, with the context `property_contexts` gives
+`ctl.<action>$<target>`: a request it denies gets
+`HANDLE_CONTROL_MESSAGE`, does not reach the handler and does not count
+toward the 102. The authorizer decides in place of SELinux, by the
+sender's pid, uid and gid, and one lookup of init's is not made: for
+`ctl.start`, `ctl.stop` and `ctl.restart` init first checks the legacy
+name `ctl.<target>` and allows the request when that check passes; here
+the context is always that of `ctl.<action>$<target>`. In a service
+without an authorizer every sender that can connect reaches the
+handler, which can refuse by the sender's `uid`, `gid` or `pid` (it has
+no SELinux context to check) with `reply.send(false)`; its client then
+gets the same `HANDLE_CONTROL_MESSAGE`. Such a request counts toward
+the 102 until it is answered, where init refuses it before its queue.

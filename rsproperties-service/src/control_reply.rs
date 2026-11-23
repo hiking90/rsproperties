@@ -15,6 +15,7 @@ use rustix::net::SendFlags;
 
 use rsproperties::wire::{PROP_ERROR_HANDLE_CONTROL_MESSAGE, PROP_SUCCESS};
 
+use crate::connection_limit::UidSlot;
 use crate::socket_service::HandlerCallsStop;
 
 /// The connection of a `ctl.*` request, taken out of the tokio reactor so
@@ -22,14 +23,23 @@ use crate::socket_service::HandlerCallsStop;
 /// init's `SendControlMessage` releases the socket fd to the queued
 /// message in the same way, and `HandleControlMessages` sends the reply on
 /// it and closes it.
-pub(crate) struct ReplyFd(OwnedFd);
+pub(crate) struct ReplyFd {
+    fd: OwnedFd,
+    /// The connection's place in its uid's count, given back when the
+    /// descriptor is closed: an unanswered request counts toward
+    /// `ServiceOptions::max_connections_per_uid`.
+    _slot: UidSlot,
+}
 
 impl ReplyFd {
     /// Fails only when the reactor cannot deregister the stream; the
     /// connection is closed then.
-    pub(crate) fn new(stream: tokio::net::UnixStream) -> std::io::Result<Self> {
+    pub(crate) fn new(stream: tokio::net::UnixStream, slot: UidSlot) -> std::io::Result<Self> {
         // `into_std` leaves the fd in non-blocking mode.
-        Ok(Self(stream.into_std()?.into()))
+        Ok(Self {
+            fd: stream.into_std()?.into(),
+            _slot: slot,
+        })
     }
 
     /// Sends `code` and closes the connection.
@@ -45,7 +55,7 @@ impl ReplyFd {
         let mut written = 0;
         while written < bytes.len() {
             match rustix::net::send(
-                &self.0,
+                &self.fd,
                 &bytes[written..],
                 SendFlags::NOSIGNAL | SendFlags::DONTWAIT,
             ) {
@@ -132,15 +142,18 @@ impl ReplyState {
 /// or a powerctl handler that returned
 /// [`PowerctlOutcome::ShuttingDown`](crate::PowerctlOutcome::ShuttingDown)),
 /// a dropped reply to `ctl.stop` answers `PROP_SUCCESS` instead: the reply
-/// a `ctl.stop` request read after the stop gets. A host that is going
-/// down can therefore drop the replies it still holds. `send` always
-/// answers what it was given.
+/// a `ctl.stop` request read after the stop gets, unless an authorizer
+/// denies it. A host that is going down can therefore drop the replies it
+/// still holds. `send` always answers what it was given.
 ///
 /// # What a reply holds
 ///
-/// The client's connection (one fd) and nothing else of the service. It
-/// can be answered after [`ServiceHandle::shutdown`](crate::ServiceHandle::shutdown)
-/// has returned and after the tokio runtime has been dropped; neither
+/// The client's connection (one fd) and its place in the sender's
+/// [`max_connections_per_uid`](crate::ServiceOptions::max_connections_per_uid)
+/// count (uid 0 and the service's own effective uid are not counted);
+/// nothing else of the service. It can be answered after
+/// [`ServiceHandle::shutdown`](crate::ServiceHandle::shutdown) has
+/// returned and after the tokio runtime has been dropped; neither
 /// waits for it. While 102 requests are unanswered the service refuses
 /// further `ctl.*` requests (see
 /// [`ServiceOptions::control_handler`](crate::ServiceOptions::control_handler)).
@@ -303,7 +316,7 @@ mod tests {
             .unwrap();
         server.set_nonblocking(true).unwrap();
         let server = tokio::net::UnixStream::from_std(server).unwrap();
-        (client, ReplyFd::new(server).unwrap())
+        (client, ReplyFd::new(server, UidSlot::uncounted()).unwrap())
     }
 
     /// The reply code, then the end of the stream: the reply closes the

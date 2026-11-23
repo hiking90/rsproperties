@@ -410,10 +410,28 @@ impl<'a> PropertyInfoArea<'a> {
     #[cfg(feature = "builder")]
     pub(crate) fn property_type(&self, name: &str) -> Result<Option<&'a str>> {
         let (_, type_index) = self.get_property_info_indexes(name);
-        if type_index == NO_INDEX {
+        self.type_at(type_index)
+    }
+
+    /// The context string at `index` of the contexts table, `None` for
+    /// [`NO_INDEX`].
+    #[cfg(feature = "builder")]
+    fn context_at(&self, index: u32) -> Result<Option<&'a str>> {
+        if index == NO_INDEX {
             return Ok(None);
         }
-        let offset = self.type_offset(type_index as usize)?;
+        let offset = self.context_offset(index as usize)?;
+        Ok(Some(self.cstr(offset)?.to_str()?))
+    }
+
+    /// The type string at `index` of the types table, `None` for
+    /// [`NO_INDEX`].
+    #[cfg(feature = "builder")]
+    fn type_at(&self, index: u32) -> Result<Option<&'a str>> {
+        if index == NO_INDEX {
+            return Ok(None);
+        }
+        let offset = self.type_offset(index as usize)?;
         Ok(Some(self.cstr(offset)?.to_str()?))
     }
 
@@ -774,19 +792,19 @@ impl PropertyInfoAreaFile {
 ///
 /// `Error::FileValidation` when `trie` is shorter than its header, names a
 /// format newer than this crate reads, or records a size other than
-/// `trie.len()`; the errors of the lookup itself when an offset inside
-/// `trie` is out of range.
+/// `trie.len()`, or when the types table, the type's index in it or the
+/// type string is out of range or the string has no NUL terminator;
+/// `Error::Utf8` when the type is not UTF-8.
+///
+/// A trie node or entry that cannot be read (an offset or count out of
+/// range) is not an error: it is logged at `warn` and skipped, as in the
+/// lookups of [`crate::SystemProperties`]. Bytes damaged there give
+/// `Ok(None)`, or the type of the entries that could be read.
 #[cfg(feature = "builder")]
 pub fn property_type_in_trie(trie: &[u8], name: &str) -> Result<Option<String>> {
     use zerocopy::IntoBytes;
 
-    if trie.len() < size_of::<PropertyInfoAreaHeader>() {
-        return Err(Error::FileValidation(format!(
-            "property_info trie of {} bytes is smaller than its header ({} bytes)",
-            trie.len(),
-            size_of::<PropertyInfoAreaHeader>()
-        )));
-    }
+    check_trie_len(trie)?;
     let lookup = |bytes: &[u8]| -> Result<Option<String>> {
         let area = PropertyInfoArea::new(bytes);
         area.check_header(bytes.len(), format_args!("the trie bytes"))?;
@@ -799,6 +817,158 @@ pub fn property_type_in_trie(trie: &[u8], name: &str) -> Result<Option<String>> 
     let mut words = vec![0u32; trie.len().div_ceil(size_of::<u32>())];
     words.as_mut_bytes()[..trie.len()].copy_from_slice(trie);
     lookup(&words.as_bytes()[..trie.len()])
+}
+
+/// `PropertyInfoArea::new` and `header` need room for the header.
+#[cfg(feature = "builder")]
+fn check_trie_len(trie: &[u8]) -> Result<()> {
+    if trie.len() < size_of::<PropertyInfoAreaHeader>() {
+        return Err(Error::FileValidation(format!(
+            "property_info trie of {} bytes is smaller than its header ({} bytes)",
+            trie.len(),
+            size_of::<PropertyInfoAreaHeader>()
+        )));
+    }
+    Ok(())
+}
+
+/// A copy of the bytes [`crate::build_trie`] returns, checked once, for
+/// lookups that borrow from it.
+///
+/// [`property_type_in_trie`] checks the header and allocates its result on
+/// every call. A caller that looks up many names in one trie (a service
+/// that reads the context of every request) builds this once instead: the
+/// lookups then read the copy in place and return `&str`s that borrow it.
+/// The trie is immutable, so one `PropertyInfoTrie` can be shared between
+/// threads.
+///
+/// ```
+/// use rsproperties::{build_trie, PropertyInfoEntry, PropertyInfoTrie};
+///
+/// # fn main() -> rsproperties::Result<()> {
+/// let entries =
+///     [PropertyInfoEntry::prefix("vendor.", "u:object_r:vendor_prop:s0", "string")?];
+/// let trie = PropertyInfoTrie::new(&build_trie(
+///     &entries,
+///     "u:object_r:default_prop:s0",
+///     "string",
+/// )?)?;
+/// assert_eq!(trie.context("vendor.x")?, Some("u:object_r:vendor_prop:s0"));
+/// assert_eq!(trie.context("other.x")?, Some("u:object_r:default_prop:s0"));
+/// assert_eq!(trie.property_type("vendor.x")?, Some("string"));
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "builder")]
+pub struct PropertyInfoTrie {
+    /// `Vec<u32>` backing: its 4-byte alignment is a language guarantee,
+    /// which `PropertyInfoArea` needs. Zero-padded to whole words.
+    words: Box<[u32]>,
+    /// The trie's length in bytes; `words` may hold up to 3 more.
+    len: usize,
+}
+
+#[cfg(feature = "builder")]
+impl PropertyInfoTrie {
+    /// Copies `trie`, which may start at any address, and checks its
+    /// header.
+    ///
+    /// # Errors
+    ///
+    /// `Error::FileValidation` when `trie` is shorter than its header, names
+    /// a format newer than this crate reads, or records a size other than
+    /// `trie.len()`.
+    pub fn new(trie: &[u8]) -> Result<Self> {
+        use zerocopy::IntoBytes;
+
+        check_trie_len(trie)?;
+        let mut words = vec![0u32; trie.len().div_ceil(size_of::<u32>())];
+        words.as_mut_bytes()[..trie.len()].copy_from_slice(trie);
+        let this = Self {
+            words: words.into_boxed_slice(),
+            len: trie.len(),
+        };
+        this.area()
+            .check_header(this.len, format_args!("the trie bytes"))?;
+        Ok(this)
+    }
+
+    fn area(&self) -> PropertyInfoArea<'_> {
+        use zerocopy::IntoBytes;
+
+        PropertyInfoArea::new(&self.words.as_bytes()[..self.len])
+    }
+
+    /// The `property_contexts` context of `name`
+    /// (`"u:object_r:vendor_prop:s0"`), or `None` when no entry and no
+    /// default gives it one.
+    ///
+    /// [`crate::SystemProperties`] resolves `name` to the same context, and
+    /// stores `name` in that context's area when it has one. It makes no
+    /// area for a context name that is empty, not ASCII, not a plain file
+    /// name, starts with `.`, or, compared without ASCII case, is one of
+    /// its own file names (`property_info`, `properties_serial`) or an
+    /// earlier context name; `context` returns such a name all the same.
+    ///
+    /// # Errors
+    ///
+    /// `Error::FileValidation` when the contexts table, the context's index
+    /// in it or the context string is out of range or the string has no
+    /// NUL terminator, and `Error::Utf8` when the context is not UTF-8.
+    ///
+    /// A trie node or entry that cannot be read (an offset or count out of
+    /// range) is not an error: it is logged at `warn` and skipped, as in
+    /// the lookups of [`crate::SystemProperties`]. Bytes damaged there give
+    /// `Ok(None)`, or the context of the entries that could be read.
+    pub fn context(&self, name: &str) -> Result<Option<&str>> {
+        let area = self.area();
+        let (context_index, _) = area.get_property_info_indexes(name);
+        area.context_at(context_index)
+    }
+
+    /// The `property_contexts` type of `name` (`"string"`, `"int"`,
+    /// `"enum a b"`, ...), or `None` when no entry and no default gives it
+    /// one: what [`property_type_in_trie`] returns, without the copy.
+    ///
+    /// # Errors
+    ///
+    /// `Error::FileValidation` when the types table, the type's index in it
+    /// or the type string is out of range or the string has no NUL
+    /// terminator, and `Error::Utf8` when the type is not UTF-8.
+    ///
+    /// A trie node or entry that cannot be read (an offset or count out of
+    /// range) is not an error: it is logged at `warn` and skipped, as in
+    /// the lookups of [`crate::SystemProperties`]. Bytes damaged there give
+    /// `Ok(None)`, or the type of the entries that could be read.
+    pub fn property_type(&self, name: &str) -> Result<Option<&str>> {
+        self.area().property_type(name)
+    }
+
+    /// [`context`](Self::context) and [`property_type`](Self::property_type)
+    /// of `name`, from one walk of the trie. Each of the two walks the trie
+    /// on its own, and the walk is most of a lookup's time (it compares
+    /// `name` with the entries of every node on its path), so a caller that
+    /// needs both calls this instead.
+    ///
+    /// # Errors
+    ///
+    /// Those of `context` and of `property_type`: a context or a type that
+    /// cannot be read fails the call. A trie node or entry that cannot be
+    /// read is logged and skipped, as in the two.
+    pub fn context_and_type(&self, name: &str) -> Result<(Option<&str>, Option<&str>)> {
+        let area = self.area();
+        let (context_index, type_index) = area.get_property_info_indexes(name);
+        Ok((area.context_at(context_index)?, area.type_at(type_index)?))
+    }
+}
+
+#[cfg(feature = "builder")]
+impl std::fmt::Debug for PropertyInfoTrie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PropertyInfoTrie")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(all(test, feature = "builder", not(target_os = "android")))]
@@ -916,6 +1086,104 @@ mod tests {
                 bad.len()
             );
         }
+    }
+
+    /// `PropertyInfoTrie` gives the context and type of each entry, the
+    /// same ones the reader of a published `property_info` and
+    /// `property_type_in_trie` give for those bytes, from source bytes
+    /// that start at any address, and refuses bytes whose length is not
+    /// the header's.
+    #[test]
+    fn property_info_trie_reads_context_and_type() {
+        let entries = vec![
+            PropertyInfoEntry::prefix("typed.", "u:object_r:typed_prop:s0", "string").unwrap(),
+            PropertyInfoEntry::exact("typed.int", "u:object_r:int_prop:s0", "int").unwrap(),
+            PropertyInfoEntry::exact("ctl.start$adbd", "u:object_r:ctl_adbd_prop:s0", "string")
+                .unwrap(),
+        ];
+        let bytes = build_trie(&entries, "u:object_r:default_prop:s0", "double").unwrap();
+        let cases = [
+            ("typed.int", "u:object_r:int_prop:s0", "int"),
+            ("typed.other", "u:object_r:typed_prop:s0", "string"),
+            ("ctl.start$adbd", "u:object_r:ctl_adbd_prop:s0", "string"),
+            // No entry: the defaults.
+            ("ctl.start$other", "u:object_r:default_prop:s0", "double"),
+            ("other.name", "u:object_r:default_prop:s0", "double"),
+        ];
+
+        // The same bytes published as a `property_info` file and read back
+        // through the mmap reader `SystemProperties` uses.
+        let guard = TempDir(
+            std::env::temp_dir().join(format!("rsprops_pinfo_trie_{}", std::process::id())),
+        );
+        let dir = &guard.0;
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("property_info");
+        // 0444, as in `load_path_refuses_symlinked_property_info`: with
+        // `strict-file-validation`, `load_path` refuses an owner-writable
+        // file.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o444)
+            .open(&path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, &bytes))
+            .unwrap();
+        let published = PropertyInfoAreaFile::load_path(&path).unwrap();
+        let area = published.property_info_area();
+        for (name, context, property_type) in cases {
+            let (context_index, _) = area.get_property_info_indexes(name);
+            let offset = area.context_offset(context_index as usize).unwrap();
+            assert_eq!(area.cstr(offset).unwrap().to_str(), Ok(context), "{name}");
+            assert_eq!(
+                area.property_type(name).unwrap(),
+                Some(property_type),
+                "{name}"
+            );
+            assert_eq!(
+                property_type_in_trie(&bytes, name).unwrap().as_deref(),
+                Some(property_type),
+                "{name}"
+            );
+        }
+
+        // Four consecutive start addresses of the source, so the copy is
+        // taken from unaligned bytes too.
+        let mut shifted = vec![0xffu8; bytes.len() + 3];
+        for start in 0..4 {
+            shifted[start..start + bytes.len()].copy_from_slice(&bytes);
+            let trie = PropertyInfoTrie::new(&shifted[start..start + bytes.len()]).unwrap();
+            for (name, context, property_type) in cases {
+                assert_eq!(
+                    trie.context(name).unwrap(),
+                    Some(context),
+                    "{name} at +{start}"
+                );
+                assert_eq!(
+                    trie.property_type(name).unwrap(),
+                    Some(property_type),
+                    "{name} at +{start}"
+                );
+                assert_eq!(
+                    trie.context_and_type(name).unwrap(),
+                    (Some(context), Some(property_type)),
+                    "{name} at +{start}"
+                );
+            }
+        }
+
+        for bad in [&bytes[..4], &bytes[..bytes.len() - 4]] {
+            assert!(
+                matches!(PropertyInfoTrie::new(bad), Err(Error::FileValidation(_))),
+                "{} bytes",
+                bad.len()
+            );
+        }
+
+        // Shared between threads without a lock.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PropertyInfoTrie>();
     }
 
     /// AOSP `AddToTrie` shapes that `add_to_trie` rejects: an empty-named

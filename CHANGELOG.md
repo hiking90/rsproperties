@@ -8,6 +8,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Service: `ServiceOptions::authorizer(|request| -> Decision)` decides
+  each request of a connected client, where init's `CheckPermissions`
+  asks SELinux. The authorizer gets a `SetRequest`: the name, the value,
+  the name's `property_contexts` context (for `ctl.*`, that of
+  `ctl.<action>$<target>`), the `Listener` the request came in on, and
+  the sender's pid, uid and gid (`PeerInfo`, from `SO_PEERCRED`). It is
+  called for a set of an ordinary property, a `ctl.*` request and a
+  `sys.powerctl` set, after the name check and before the type check.
+  `Decision::Deny` is answered with `PROP_ERROR_PERMISSION_DENIED`
+  (`PROP_ERROR_HANDLE_CONTROL_MESSAGE` for `ctl.*`, which is then not
+  passed to the control handler). A request is refused in the same way
+  when the sender's credentials cannot be read, when the properties
+  service fails to start (a request that arrives before it has started
+  waits for it), when the name's context cannot be read, and when the
+  authorizer panics. A name without a `property_contexts` entry is not
+  refused: the authorizer gets it with the default context,
+  `u:object_r:build_prop:s0`. Without an authorizer the
+  service behaves as before: every request of a peer that could connect
+  goes on. `SetRequest::for_test` and `PeerInfo::for_test` build a
+  request to test an authorizer with. The `Debug` output of a
+  `SetRequest` has `<N bytes>` in place of the value. The `Debug`
+  output of `ServiceOptions` has an `authorizer` field.
+- Service: `PeerInfo::groups`, `PeerInfo::security_label` and
+  `PeerInfo::pidfd` give an authorizer the sender's supplementary groups
+  (`SO_PEERGROUPS`), its security label (`SO_PEERSEC`: the SELinux
+  context, or the label in the format of another security module such as
+  AppArmor or Smack) and a pidfd for the process that connected
+  (`SO_PEERPIDFD`, Linux 6.5). Each makes one `getsockopt` when it is
+  called, and a second with the size the kernel asked for when the
+  sender has more than 32 groups or a label that does not fit in 256
+  bytes, and returns
+  the kernel's error where the option is not available. `rsproperties-service` now depends on `libc` (0.2.174
+  or later) for these calls, which are its only `unsafe` code outside
+  tests.
+- Service: `AccessPolicy` is an authorizer made of rules, passed as
+  `ServiceOptions::authorizer(policy.into_authorizer())`.
+  `allow_name`, `allow_prefix` and `allow_context` name the senders
+  (`Subjects`: uids, gids, or everyone) that may set a name, the names
+  with a prefix, or the names of a `property_contexts` context; the most
+  specific rule that covers a request decides it, and a `ctl.*` request
+  is matched as `ctl.<action>$<target>`. A gid matches the sender's
+  effective gid or a supplementary group. `AccessPolicy::deny_unmatched`
+  denies a request no rule covers; `AccessPolicy::allow_unmatched`
+  allows it. In both, a request whose name starts with `ro.` or `ctl.`
+  or is `sys.powerctl` is allowed only by a rule that names it: the
+  `allow_name` rule for it, or an `allow_prefix` rule whose prefix
+  itself starts with `ro.` or `ctl.`; a shorter prefix and an
+  `allow_context` rule do not cover it. `trust_uid` allows a uid
+  everything, those requests included.
+  `AccessPolicy::decide` gives the decision for one request, for a
+  closure that adds its own checks (the value, the `Listener`, the
+  security label) around the policy.
+- Service: `ServiceOptions::socket_access(Listener, SocketAccess)` sets
+  the owner group and mode of each service socket file, in place of mode
+  `0o660` and the group the file is created with. `Listener` names the
+  two sockets; `SocketAccess::new(mode).with_group(gid)` is the value.
+  `run` refuses, with `StartupStage::Config` and before
+  `rsproperties::init`: a mode with an execute, setuid, setgid or sticky
+  bit; a mode with a bit for others (`0o006`) when the options have no
+  authorizer; and group `u32::MAX`. With an authorizer, init's
+  `property_service` mode `0o666` can be used. Without the option the
+  sockets are created as before. The `Debug` output of `ServiceOptions`
+  has a `socket_access` field.
+- Service: `ServiceOptions::max_connections_per_uid(limit)` sets the
+  most connections one uid may have open at once on both sockets
+  together (see "Changed" for the default). `usize::MAX` removes the
+  limit. The `Debug` output of `ServiceOptions` has a
+  `max_connections_per_uid` field.
+- `PropertyInfoTrie` (`builder` feature): a checked, 4-byte aligned copy
+  of the bytes `build_trie` returns. `context(name)` and
+  `property_type(name)` return `&str`s that borrow it, without the
+  header check and the allocation `property_type_in_trie` does on every
+  call; `context_and_type(name)` returns both from one walk of the trie.
+
+### Changed
+
+- Service: one uid has at most 32 connections open at once (0.7.0: no
+  limit per uid, only the service's 64 handler slots, 256 waiting
+  connections and 102 unanswered `ctl.*` requests). A connection beyond
+  the limit is closed without a reply and logged at `warn`; the client's
+  `set` fails. A connection counts from `accept()` until the service
+  closes it, which for a `ctl.*` request is when the host answers or
+  drops its `ControlReply`. uid 0 and the service's own effective uid
+  are not counted, so a service whose clients all run as root or as its
+  own user behaves as before. A deployment where one other uid opens
+  more than 32 connections at once raises the limit with
+  `ServiceOptions::max_connections_per_uid`.
+- Service: `StartupStage::Config` displays as `configuration` (0.7.0:
+  `configuration (init)`), so a `StartupError` of that stage reads
+  `configuration failed to start: …`. The stage now also reports a
+  refused `ServiceOptions` value, which is checked before
+  `rsproperties::init` is called.
+- Service: two startup error messages of `StartupStage::SocketService`
+  have new texts. For a temp socket entry that is not a socket owned by
+  the service's euid: `set group and mode of <path>` with the cause
+  `…; group and mode left unchanged` (0.7.0: `raise mode of <path>`,
+  `…; mode left unchanged`). For a failed chmod through `/proc`: the
+  mode is printed as `0o660` (0.7.0: `0660`) and the hint reads `a umask
+  that keeps those bits` (0.7.0: `keeps group rw`).
+
 ### Documentation
 
 - The crate READMEs are short: a description, installation, one
@@ -24,6 +126,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/service-protocol.md` and `docs/service-security.md`; the
   service's rustdoc links them at the release tag. `docs/aosp-parity.md`
   (maintainers' notes, in Korean) moved to `docs/design/`.
+- The `property_type_in_trie` rustdoc no longer states that every
+  out-of-range offset inside the trie is an error: a trie node or entry
+  that cannot be read is logged at `warn` and skipped, as in the lookups
+  of `SystemProperties`, and the errors are those of the types table and
+  the type string.
 
 ## [0.7.0] - 2026-11-17
 

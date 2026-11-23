@@ -57,9 +57,10 @@ and serves the property service sockets, so `rsproperties` clients can
 (`PROP_MSG_SETPROP2`) only, checks values against their
 `property_contexts` type, can store `persist.*` properties in AOSP's
 `persistent_properties` format, and passes `ctl.*` and `sys.powerctl`
-requests to handlers the host provides. It does not check which process
-may set which property beyond the socket's file mode. It compiles only for
-Linux: on Android, init owns the property service.
+requests to handlers the host provides. It asks an authorizer the host
+provides whether each request may go on, where init asks SELinux; without
+an authorizer it checks no sender beyond the socket files' modes. It
+compiles only for Linux: on Android, init owns the property service.
 
 ## Platform Support
 

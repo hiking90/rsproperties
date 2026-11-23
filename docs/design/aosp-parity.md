@@ -43,6 +43,7 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
 | S8 | service, builder | prop 파일을 읽지 못했을 때의 반환값 | open 실패로 시작 실패는 (b) | 시작 실패는 0.6.0부터 있음, skip 반환값은 0.7.0에서 추가 |
 | S9 | service | V1(`PROP_MSG_SETPROP`) 미지원 | (b), owner 지시 | 0.7.0에서 변경(0.5.0–0.6.0은 V1을 처리했다) |
 | S10 | service | `sys.powerctl`을 일반 property로 저장 | (c), 종료 뒤 거부는 (b) | 0.7.0에서 수정. 저장하지 않고 `ServiceOptions::powerctl_handler`로 전달. 대기 command는 init과 같이 하나만 유지 |
+| S11 | service | set 요청 인가(`CheckPermissions`의 access 검사) 없음 | 판단 주체는 (a), 문자열이 아닌 값의 검사 순서와 `SO_PEERCRED` 실패 응답은 (b) | 0.7.0 다음 release에서 추가. host가 등록한 `ServiceOptions::authorizer`가 요청마다 판단. socket별 group과 mode는 `ServiceOptions::socket_access`. authorizer가 없으면 0.7.0과 같이 전부 허용 |
 
 ## Client
 
@@ -696,7 +697,8 @@ init과 다른 점은 다음과 같다.
   다음 persistent write)가 prefix 검사에 실패해 파일 전체를 지운다.
   device에서는 `property_contexts`가
   `next_boot.*`를 set할 수 있는 주체를 제한하지만, 이 service는
-  per-property 인가를 하지 않는다. init처럼 파일에 썼다면 socket에 접근할 수
+  authorizer(S11)를 등록하지 않으면 per-property 인가를 하지 않는다. init처럼
+  파일에 썼다면 그런 service에서는 socket에 접근할 수
   있는 client는 누구나 set 한 번과 재시작 두 번으로 모든 `persist.*` 값을
   지울 수 있었다. 여기서는 그 record를 파일에 쓰지 않으므로 그 경로가 없다.
   area에 남는 값은 init과 같다. 이런 record를 area에도 적용하지 않는 방법도 있으나,
@@ -986,15 +988,17 @@ fd에 쓴 뒤 fd를 닫는다.
   반환하지 않는 handler가 그 쓰기를 막는 경우는 host runtime의
   `max_blocking_threads`가 1일 때뿐이다.
 - init이 하는 권한 검사(`CheckControlPropertyPerms`,
-  `property_service.cpp:468-495`)는 하지 않는다((a)). init은 요청을 보낸
+  `property_service.cpp:468-495`)는 host가 authorizer를 등록했을 때만
+  한다((a), S11). init은 요청을 보낸
   process의 SELinux context가 대상의 `ctl.*` 이름을 set할 수 있는지 검사하고,
   실패하면 queue에 넣기 전에 `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 보낸다
-  (`:505-512`). 이 service는 socket에 연결할 수 있는 모든 process의 요청을
+  (`:505-512`). authorizer가 있는 service는 같은 위치에서 authorizer를
+  호출하고, 거부된 요청은 같은 code를 받으며 queue에 들어가지 않는다.
+  authorizer가 없는 service는 socket에 연결할 수 있는 모든 process의 요청을
   handler에 전달한다. handler가 `uid`, `gid`, `pid`로 판단해
   `reply.send(false)`를 호출하면 client는 init의 권한 거부와 같은 code를
-  받는다. init에서는 거부된 요청이 queue에 들어가지 않지만, 이 service에서는
-  그 요청도 응답 전까지 미응답 한도에 포함된다. SELinux context를 기준으로 한
-  판정은 구현할 수 없다.
+  받는다. 다만 handler에서 거부하는 요청은 응답 전까지 미응답 한도에
+  포함된다.
 
 handler가 요청별로 무엇을 실행하고 무엇을 반환해야 init과 같은 결과가 되는지는
 `docs/service-protocol.md`의 "Behaving as init does" 절에 표로 정리했다
@@ -1504,9 +1508,12 @@ command` log만 남긴다(`init/reboot.cpp`). 따라서 `PROP_SUCCESS`는 set이
   `TriggerShutdown`이 flag만 설정하고 main loop가 처리하는 구조와 같다.
 - (b) 값 log. init은 `Received sys.powerctl='<value>' from pid`를 남긴다. 이
   service는 값을 log에 쓰지 않는 기존 정책에 따라 길이와 pid만 남긴다.
-- (a) 권한 검사 없음. 다른 property와 같은 access model이다. socket에 연결할 수
-  있는 process는 모두 handler를 호출할 수 있으므로, host를 reboot하는 handler는
-  `uid`, `gid`, `pid`나 command를 직접 검사해야 한다.
+- (a) 권한 검사. 다른 property와 같은 access model이다(S11). authorizer가 있는
+  service는 `sys.powerctl` 요청도 authorizer에 넘기고, 거부하면
+  `PROP_ERROR_PERMISSION_DENIED`로 응답한 뒤 handler를 호출하지 않는다.
+  authorizer가 없는 service에서는 socket에 연결할 수 있는 process가 모두
+  handler를 호출할 수 있으므로, host를 reboot하는 handler는 `uid`, `gid`,
+  `pid`나 command를 직접 검사해야 한다.
 
 **포기한 것.** 0.6.0에서 area의 `sys.powerctl` 값을 `wait`/`watch`로 읽던
 코드는 값을 받지 못한다. handler로 옮겨야 한다. handler가 없을 때 set을
@@ -1523,10 +1530,317 @@ command` log만 남긴다(`init/reboot.cpp`). 따라서 `PROP_SUCCESS`는 set이
 `stop_handler_calls_answers_as_init_during_shutdown`, `properties_service.rs`
 `apply_set_returns_init_codes`.
 
+### S11. set 요청 인가 — 판단 주체는 (a), 문자열이 아닌 값의 검사 순서와 `SO_PEERCRED` 실패 응답은 (b)
+
+**init.** `handle_property_set_fd`가 `SO_PEERCRED`로 요청자의 pid, uid, gid를
+읽고(`property_service.cpp:604`), 읽지 못하면 응답 없이 socket을 닫는다
+(`:604-608`). 요청자의 SELinux context는 `getpeercon`으로 얻는다(`:274`).
+`CheckPermissions`(`:498-535`)는 이름 검사, access 검사, type 검사 순으로
+실행한다. access 검사는 요청 종류에 따라 다르다.
+- 일반 property와 `sys.powerctl`: `CheckMacPerms`가 요청자의 context와
+  `property_contexts`가 그 이름에 정한 target context로
+  `selinux_check_access`를 호출한다(`:162-176`). 실패하면
+  `PROP_ERROR_PERMISSION_DENIED`(0x18)다(`:519-527`). target context가 없으면
+  `CheckMacPerms`가 false를 반환한다(`:164-166`).
+- `ctl.*`: `CheckControlPropertyPerms`(`:468-495`)가 `ctl.<action>$<target>`
+  이름으로 target context를 조회해 같은 검사를 한다(`:487-494`). `ctl.start`,
+  `ctl.stop`, `ctl.restart`는 그 전에 legacy 이름 `ctl.<target>`으로 먼저
+  조회한다(`:472-485`). 실패하면 `PROP_ERROR_HANDLE_CONTROL_MESSAGE`다
+  (`:506-510`).
+
+socket은 두 개이며 mode와 group이 다르다. `property_service_for_system`은 0660에
+gid `AID_SYSTEM`, `property_service`는 0666에 gid 0이다(`:1562-1564`).
+`InitPropertySet`으로 들어오는 init 자신의 set(build.prop, persistent
+property)은 이 검사를 거치지 않는다(`:691`).
+
+**변경 전.** 0.7.0은 `SO_PEERCRED`를 읽어 log와 handler(`ControlMessage`,
+`PowerctlMessage`)에만 넘겼다. 요청을 허용할지 판단하는 지점은 socket 파일의
+소유자, group, mode뿐이었다. 두 socket의 mode는 `0o660`으로 고정이고 group은
+service process의 fsgid였다. release build service는 root로만 시작하므로
+(아래 "누락으로 보지 않는 것"의 root 소유 검사) socket이 root:root `0o660`이
+되어, root가 아닌 client가 접속할 방법이 없었다.
+
+**변경.**
+- **authorizer.** `ServiceOptions::authorizer(|req: &SetRequest<'_>| ->
+  Decision)`이다. `SetRequest`는 이름, 값, target context, 요청이 들어온
+  `Listener`, `PeerInfo`(pid, uid, gid)를 담는다. target context는
+  `PropertyInfoTrie::context_and_type`으로 type과 함께 한 번에 조회하며, init이
+  `CheckMacPerms`에 넘기는 값과 같다. `ctl.*` 요청은 init의 새 방식과 같이 `ctl.<action>$<target>` 이름으로
+  조회한다.
+- **적용 대상.** socket으로 들어온 일반 set, `ctl.*`, `sys.powerctl`이다.
+  build.prop, persistent property, `ro.property_service.version` 같은 startup
+  set은 authorizer를 호출하지 않는다. init의 `InitPropertySet` 경로에 해당한다.
+- **호출 위치.** connection task의 `handle_setprop2`다. 이름 검사
+  (`validate_property_name`) 다음, `PropertiesService` actor에 `ask`하기
+  전이다. type 검사는 actor가 하므로 순서는 init의 `CheckPermissions`와 같은
+  이름 검사, access 검사, type 검사다. connection task는 context와 함께 읽은
+  type을 `PropertyMessage`에 실어 보내고, actor는 그 type으로 검사하므로 type을
+  읽으려고 같은 이름을 다시 조회하지 않는다. authorizer가 없는 service와 startup set은
+  이 변경 전과 같이 actor가 type을 조회한다. 거부된 `ctl.*` 요청은 queue에 들어가지
+  않으므로 미응답 한도(S3)의 slot을 차지하지 않는다. actor 안에서 호출하지
+  않은 이유는 actor가 모든 set을 순서대로 처리하기 때문이다. actor 안에서
+  호출하면 authorizer의 실행 시간만큼 다른 client의 set이 모두 대기한다.
+- **응답.** `Decision::Deny`이면 일반 set과 `sys.powerctl`은
+  `PROP_ERROR_PERMISSION_DENIED`, `ctl.*`는
+  `PROP_ERROR_HANDLE_CONTROL_MESSAGE`를 받는다. authorizer가 panic한 경우,
+  `SO_PEERCRED`를 읽지 못한 경우, properties service가 시작에 실패한 경우,
+  target context를 읽지 못한 경우에도 같은 code로 거부한다. 뒤의 세 경우에는
+  authorizer를 호출하지 않는다. context는 읽었지만 type을 읽지 못한 요청은
+  거부하지 않는다. authorizer가 허용하면 일반 set과 `sys.powerctl`은 type 없이
+  actor로 보내고, actor가 type을 다시 조회해 authorizer가 없는 service와 같은
+  `PROP_ERROR_SET_FAILED`로 응답한다. `ctl.*` 요청은 조회 이름의 type을 쓰지
+  않으므로 type을 읽지 못해도 control handler로 간다.
+- **trie 전달.** connection task가 target context를 조회하려면
+  `property_info` trie가 필요하다. `PropertiesService`의 `on_start`가
+  `Arc<PropertyInfoTrie>`를 `tokio::sync::watch` channel로 보내고, connection
+  task는 값이 올 때까지 `CLIENT_TIMEOUT` 안에서 기다린다. authorizer가 없는
+  service는 channel을 만들지 않으며, 요청마다 추가되는 것은 authorizer 유무를
+  확인하는 분기 하나다.
+- **socket의 group과 mode.** `ServiceOptions::socket_access(listener,
+  SocketAccess::new(mode).with_group(gid))`로 listener별로 정한다. 기본값은
+  0.7.0과 같은 `0o660`이고 group은 바꾸지 않는다. `run`은 `0o666` 밖의 bit를
+  `StartupStage::Config`에서 거부한다. other bit(`0o006`)는 authorizer가 있을
+  때만 허용한다. init과 같은 구성은 system listener에 `0o660`과 지정한 gid,
+  property listener에 `0o666`을 주고 authorizer를 등록한 것이다.
+- **`ro.` property.** write-once 동작은 바꾸지 않았다. init `PropertySet`도
+  property가 이미 있을 때만 `PROP_ERROR_READ_ONLY_PROPERTY`를 반환하고
+  (`:400-402`), 값이 없는 `ro.` 이름은 access 검사를 통과한 client가 set할 수
+  있다(`set_prop(vold, vold_status_prop)`의 `ro.crypto.state` 등). client의
+  `ro.` set을 막으려는 host는 authorizer에서 `Deny`를 반환한다.
+- **규칙 기반 authorizer.** `AccessPolicy`는 규칙으로 판단하는 authorizer
+  구현이다. 규칙은 이름 하나(`allow_name`), 이름 prefix(`allow_prefix`),
+  target context(`allow_context`) 가운데 하나를 key로 하고, 허용할 uid와 gid의
+  집합(`Subjects`)을 값으로 한다. 요청 하나는 그 요청에 해당하는 규칙 가운데
+  가장 구체적인 것 하나가 결정한다. 순서는 이름 규칙, 가장 긴 prefix 규칙,
+  context 규칙이다. 그 규칙의 `Subjects`에 없는 요청자는 더 넓은 규칙이
+  허용하더라도 거부한다. `ctl.*` 요청은 init이 `property_contexts`에서 조회하는
+  이름인 `ctl.<action>$<target>`으로 대조한다. gid는 요청자의 egid와 보조
+  group(`SO_PEERGROUPS`)에 대조한다. 해당하는 규칙이 없는 요청은
+  `deny_unmatched`로 만든 policy에서는 거부하고, `allow_unmatched`로 만든
+  policy에서는 허용한다. 이름이 `ro.`로 시작하는 요청, `ctl.*` 요청,
+  `sys.powerctl` 요청은 두 policy 모두에서 대조할 규칙의 범위를 줄인다. 이
+  요청에 해당하는 규칙은 대조 이름과 같은 이름 규칙, 그리고 prefix 자체가
+  `ro.`(`ro.` 이름) 또는 `ctl.`(`ctl.*` 요청)로 시작하는 prefix 규칙뿐이며,
+  prefix 규칙이 여럿이면 가장 긴 것이 결정한다. `sys.powerctl`에는 이름
+  규칙만 해당한다. 더 짧은 prefix(`""`, `"ro"`, `"c"`, `"sys."`)와 context
+  규칙은 이 요청의 context와 무관하게 대조하지 않고, 해당하는 규칙이 없으면
+  `allow_unmatched` policy에서도 거부한다. context 규칙을 제외한 이유는
+  `property_contexts`에 entry가 없는 이름의 context가 모두
+  `u:object_r:build_prop:s0`이기 때문이다. context 규칙이 이 요청에도
+  해당한다면 그 context의 규칙 하나가 entry가 없는 `ro.` 이름, `ctl.*`,
+  `sys.powerctl`을 모두 허용한다. `trust_uid`로 지정한 uid의 요청은 규칙을
+  대조하기 전에 허용하며, 위 세 종류의 요청도 포함한다. 따라서 `trust_uid`로
+  지정한 uid가 아니고 `ro.` 이름의 이름 규칙이나 `ro.`로 시작하는 prefix
+  규칙이 없으면 client가 값이 없는 `ro.` property의 값을 정할 수 없다. uid
+  0과 service의 uid도 `trust_uid`로 지정해야 허용한다. init의 정책은 요청자의
+  SELinux domain과 target context의 조합이고, 이 policy는 uid와 gid를 요청자의
+  key로 쓴다. init의 sepolicy는 `ctl.*` 요청도 context 단위
+  (`ctl_start_prop`, `ctl_default_prop` 등 `ctl_*_prop`)로 허용하는데, 이
+  policy에서는 `ctl.*` 요청에 이름 규칙이나 `ctl.`로 시작하는 prefix 규칙이
+  필요하다(owner 결정). label을 기준으로 판단하려면 host가
+  `AccessPolicy::decide`를 closure로 감싸거나 authorizer를 직접 작성한다.
+  규칙을 파일에서 읽는 형식은 제공하지 않는다.
+
+**init과 남는 차이.**
+- (a) 판단 주체. init은 SELinux policy를 조회한다. 이 service는 init이 조회에
+  쓰는 입력 가운데 target context와 요청자의 pid, uid, gid를 authorizer에
+  넘기고, 판단은 host의 코드가 한다. 요청자의 LSM label은
+  `PeerInfo::security_label`(`SO_PEERSEC`)로 읽는다. init의 `getpeercon`이
+  읽는 값과 같으므로, SELinux를 쓰는 host는 authorizer 안에서 init과 같은
+  조회를 구현할 수 있다. `PeerInfo::groups`(`SO_PEERGROUPS`)는 보조 group을,
+  `PeerInfo::pidfd`(`SO_PEERPIDFD`)는 pidfd를 반환한다. 세 accessor는 호출할
+  때 `getsockopt`을 한 번 실행하고, 보조 group이 32개를 넘거나 label이 256 byte
+  buffer에 들어가지 않아 처음 buffer로 값을 받지 못하면 kernel이 반환한 크기로 한 번 더
+  실행한다. rustix 1.1에 이 option의 accessor가 없어서
+  `libc::getsockopt`을 직접 호출하며(`peer_sockopt.rs`), test 밖의 `unsafe`는
+  이 module에만 있다. `SO_PEERSEC`는 LSM이 socket에 label을 붙이는 host에서만
+  값을 반환한다. label 형식은 LSM이 정하고, accessor는 끝의 NUL만 제거한다.
+  개발 host(LSM: capability, landlock, lockdown, yama, bpf)에서는
+  `ENOPROTOOPT`를 확인했다. SELinux host의 결과는 아래 "실측"에 있다.
+  AppArmor와 Smack host에서는 label 형식을 실측하지 않았다(확인 필요). 그래서
+  영어 문서는 SELinux context만 예시로 들고, AppArmor와 Smack의 값은 profile이나
+  label 이름 외의 내용을 포함할 수 있다고 적는다.
+- (a) authorizer가 없는 service. 0.7.0과 같이 접속할 수 있는 client의 요청을
+  모두 허용한다. 이때 access 제어는 socket 파일의 소유자, group, mode뿐이며,
+  `run`이 other bit를 거부하므로 접속할 수 있는 것은 소유 uid, group의
+  member, `CAP_DAC_OVERRIDE`를 가진 process다.
+- (a) pid 재사용. `PeerInfo`의 값은 `connect()` 시점의 신원이다. pid는 재사용될
+  수 있으므로 `/proc/<pid>`를 읽어 판단하는 authorizer는 다른 process의 정보를
+  읽을 수 있다. init은 kernel이 socket에 기록한 context를 `getpeercon`으로
+  읽으므로 이 문제가 없다. Linux 6.5 이상에서는 `PeerInfo::pidfd`가 반환하는
+  pidfd로 `connect()`를 호출한 process를 pid 재사용과 무관하게 식별할 수 있다.
+- (a) `ctl.*`의 legacy 조회 없음. `ctl.start`, `ctl.stop`, `ctl.restart`에서
+  init이 먼저 시도하는 `ctl.<target>` 이름의 context는 authorizer에 넘기지
+  않는다. owner 결정이다. 필요한 host는 `SetRequest::name`과 `value`로
+  판단한다.
+- (b) 문자열이 아닌 값. 값에 NUL이 있거나 값이 UTF-8이 아니면
+  `read_setprop2`가 authorizer를 호출하기 전에 `PROP_ERROR_INVALID_VALUE`로
+  응답한다(이름이 이름 검사에 실패하면 `PROP_ERROR_INVALID_NAME`). init은
+  access 검사를 먼저 하므로, 권한이 없는 요청자는 그런 값에도 0x18을 받는다.
+  authorizer가 값을 `&str`로 받기 때문에 순서를 맞추지 않았다. 이 경우 거부
+  log도 남지 않는다.
+- (b) `SO_PEERCRED` 실패. init은 응답 없이 닫는다. authorizer가 있는 service는
+  authorizer를 호출하지 않고 위의 거부 code를 보낸다. V2 실패에 항상 code를
+  보내는 기존 규칙을 따랐다. authorizer가 없는 service는 0.7.0과 같이 요청을
+  처리한다.
+- (a) authorizer의 panic. `catch_unwind`로 잡아 거부로 처리하고 `error` log를
+  남긴다. host를 `panic = "abort"`로 build하면 process가 종료한다. 두 경우
+  모두 요청은 허용되지 않는다.
+- (a) 종료 뒤의 호출. `ServiceHandle::shutdown`이나 `join`이 반환한 뒤에도,
+  이미 요청을 읽은 connection task가 `CLIENT_TIMEOUT` 안에서 authorizer를
+  호출할 수 있다. control handler와 powerctl handler에는 호출이 끝나기를
+  기다리는 장치가 있고(S3, S10) authorizer에는 없다.
+- (b) 값 log. 거부 log는 pid, uid, gid, 이름, context, listener와 값의 길이를
+  남긴다. init은 `CheckPermissions` 실패를 source context, target context와
+  함께 남긴다. 예외가 하나 있다. `ctl.*` 요청의 조회 이름
+  `ctl.<action>$<target>`이 `property_contexts`의 exact entry와 일치하면
+  `rsproperties`의 trie 조회가 그 이름을 `trace` level로 출력한다. owner
+  결정으로 유지했고 `docs/service-security.md`에 적었다.
+- (b) uid별 connection 한도. `ServiceOptions::max_connections_per_uid`(기본값
+  32)가 한 uid의 열린 connection 수를 제한하고, 한도를 넘는 connection은
+  `accept` 직후 응답 없이 닫는다. connection은 `accept`부터 service가 fd를 닫을
+  때까지 센다. `ctl.*` 요청은 host가 `ControlReply`에 응답하거나 그것을 drop할
+  때까지다. uid 0과 service의 euid는 세지 않는다. init에는 이 한도가 없다.
+  `0o666` socket에서는 host의 모든 uid가 접속할 수 있다. 한도가 없으면 한
+  uid가 요청을 보내지 않는 connection으로 handler permit 64개를
+  `CLIENT_TIMEOUT` 동안 모두 차지하고, 미응답 `ctl.*` 한도 102개(S3)도 모두
+  채울 수 있다. test는 `connection_limit.rs`의 unit test와 `lib.rs`
+  `connections_beyond_the_uid_limit_are_closed`,
+  `unanswered_control_requests_count_toward_the_uid_limit`이다.
+- (a) read 제한 없음. Android는 context별 area 파일의 SELinux label로 읽기를
+  제한한다. 이 service의 area 파일은 모두 0444다. context별로 group을 나누는
+  방식은 area 파일의 gid 0 소유 검사(`file_validation.rs`)와 충돌하므로 이
+  변경의 범위에서 제외했다.
+
+**포기한 것.**
+- async authorizer. 요청마다 future를 boxing해야 하고, uid와 context를
+  비교하는 정책에는 await할 대상이 없다. 요청 시점에 I/O가 필요한 정책
+  (polkit 조회, 다른 daemon에 질의)은 구현할 수 없다. authorizer는 tokio
+  worker thread에서 호출되므로 block하면 그 worker가 멈춘다.
+
+**실측.**
+- init의 응답 code와 순서(API 37 emulator `rsbinder-a17`,
+  `CE2A.260420.019` userdebug, `u:r:shell:s0`의 uid 2000에서 SETPROP2를 직접
+  보냈다).
+
+  | 요청 | 응답 | init log |
+  |------|------|----------|
+  | `servicemanager.ready`=`abc` (`exact bool`, shell 권한 없음) | 0x18 | SELinux permission check failed |
+  | `servicemanager.ready`=`true` | 0x18 | 위와 같음 |
+  | `dumpstate.last_id`=`abc` (`exact int`, shell 권한 있음) | 0x14 | Property type check failed |
+  | `dumpstate.last_id`=`5` | 0 | 없음 |
+  | `ro.build.type`=`x` (이미 값이 있음) | 0x18 | SELinux permission check failed |
+  | `ro.rsprobe.unset`=`x` (`default_prop`) | 0x18 | 위와 같음 |
+  | `bad..name`=`x` | 0x10 | Illegal property name |
+  | `ctl.start`=`rsprobe_none`, `ctl.start`=`adbd` | 0x20 | Invalid permissions to perform 'start' |
+
+  이름 검사 → access 검사 → type 검사 순서이고, 거부된 요청은 type이 틀려도
+  0x18을 받는다. `ro.` 이름도 write-once 검사(0x0B) 전에 access 검사에서
+  0x18을 받는다. 이 service가 같은 순서인지는 `socket_service.rs`
+  `authorizer_is_asked_after_the_name_check`가 검증한다.
+- set 처리 시간(개발 host, kernel 7.2.4, client와 service를 CPU 2개에 고정,
+  set마다 새 connection, 20000회씩 5번 측정한 p50 범위). 이 PR 이전 `main`
+  27.47–27.65 µs, authorizer 없음 26.81–27.03 µs, `Decision::Allow`만 반환하는
+  closure 26.98–28.09 µs, uid로 허용하는 `AccessPolicy` 27.06–27.44 µs, 보조
+  group으로 허용하는 `AccessPolicy`(요청마다 `SO_PEERGROUPS` 1회)
+  27.64–28.30 µs다. root 소유 검사를 건너뛰려고 release profile에
+  `debug-assertions`를 켜고 비root로 실행했다. 이 측정의 service에는
+  `property_contexts`가 없어서 trie에 entry가 없었다. 그래서 이 값은 trie
+  조회 비용을 포함하지 않는다.
+- trie 조회 시간. `tests/android`의 `property_contexts` 3개(entry 1212개,
+  trie 86408 byte)로 만든 `PropertyInfoTrie`에서 `context` 1회의 시간을
+  측정했다(release build, CPU 1개에 고정, 200만 회씩 7번 측정한 최솟값,
+  2번 실행한 값의 차이는 2% 이내).
+
+  | 이름 | 지나는 node의 entry | `context` |
+  |------|---------------------|-----------|
+  | `debug.some.long.property.name.with.many.segments.x` | `debug` node에 `some` child가 없어 멈춤 | 152–155 ns |
+  | `servicemanager.ready` | exact | 159 ns |
+  | `dumpstate.last_id` | exact | 185 ns |
+  | `vm.allowed.a` | 일치 없음(default) | 192–195 ns |
+  | `ctl.start$adbd` | `ctl.` 아래 29개 | 238–243 ns |
+  | `persist.sys.timezone` | `persist.sys.` 아래 12개 | 311–315 ns |
+  | `ro.build.fingerprint` | `ro.` 아래 19개, `ro.build.` 아래 13개 | 335 ns |
+  | `ro.vendor.build.version.incremental` | `ro.vendor.build.` 아래 8개 | 341–345 ns |
+
+  조회는 AOSP `GetPropertyInfoIndexes`와 같은 방식이다. segment마다 child는
+  binary search로 찾고, 지나는 node의 prefix entry와 마지막 node의 exact
+  entry는 앞에서부터 하나씩 비교한다. 그래서 시간은 이름의 길이보다 지나는
+  node의 entry 수에 따라 달라진다. connection task는 `context_and_type`으로
+  context와 type을 한 번의 탐색으로 읽는다. 같은 측정에서 이 호출은 `context`
+  단독보다 9–27 ns(type 문자열 하나를 읽는 시간) 더 걸렸고, `context`와
+  `property_type`을 따로 호출한 시간(302–673 ns)의 약 절반이었다. actor는 넘겨받은
+  type으로 검사하므로, authorizer가 있는 service에서도 요청 하나가 context와
+  type을 읽으려고 trie를 탐색하는 횟수는 이 PR 이전과 같은 1회다. 값을 저장하는
+  `SystemProperties::set`의 area 탐색은 이와 별개다.
+- `panic = "abort"` build에서 authorizer가 panic하면 process가 SIGABRT로
+  종료하고 client는 응답을 받지 못한다. 기본 unwind build에서는 같은 요청이
+  0x18을 받고 service가 계속 실행된다.
+- SELinux host(Fedora 41 VM, kernel 6.11, SELinux enforcing)에서
+  root로 실행해야 하는 경로를 확인했다. `cargo test -p rsproperties-service`는
+  비root와 root에서 모두 통과했고, root에서는
+  `group_member_of_another_uid_can_connect`가 건너뛰지 않고 실행되었다.
+  `SO_PEERSEC`는 `unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023`
+  끝에 NUL 1 byte를 붙인 54 byte를 반환했고, 4 byte buffer에는 `ERANGE`를
+  반환했다. accessor는 NUL을 제거하고, `ERANGE`이면 kernel이 알려준 크기로
+  다시 읽는다.
+- 다른 uid의 client. service를 uid 1000으로 실행하고(`0o666` socket,
+  `max_connections_per_uid(2)`, `deny_unmatched` `AccessPolicy`에 uid 54401의
+  `vm.allowed.` prefix 규칙과 gid 54400의 `vm.group` 이름 규칙), uid 54401(보조
+  group 54400), 1000, 0에서 요청을 보냈다.
+
+  | 요청자 | 요청 | 응답 |
+  |--------|------|------|
+  | 54401 | `vm.allowed.a` | 0 (uid 규칙) |
+  | 54401 | `vm.denied.a` | 0x18 |
+  | 54401 | `vm.group` | 0 (보조 group 규칙) |
+  | 54401 | `ro.vm.x` | 0x18 |
+  | 54401 | `ctl.start` | 0x20 |
+  | 54401 | 응답을 기다리지 않는 connection 2개를 연 상태에서 set | 응답 없이 닫힘(`ECONNRESET`), authorizer 호출 없음 |
+  | 54401 | 위 connection 2개를 닫은 뒤 set | 0 |
+  | 1000 (service euid) | `vm.group` | 0x18 (보조 group이 아님) |
+  | 1000, 0 | connection 2개를 연 상태에서 set | 0x18 (한도를 적용하지 않고 정책이 거부) |
+
+  authorizer가 받은 `PeerInfo`의 pid, uid, gid는 요청자의 값이었다.
+  `groups()`는 `[54400, 54401]`을 반환했다. `pidfd()`의 fdinfo `Pid:`는 요청자의
+  pid와 같았다.
+- release build service를 root로 실행한 경우(같은 VM, `example_service`를
+  `--release`로 build, umask 022, `socket_access`와 authorizer 없음). 두 socket은
+  `root:root` `0o660`이었고 socket dir은 `0o755`였다. area 파일은 uid 0, gid 0,
+  `0o444`라서 root 소유 검사를 통과했다. root의 set은 두 socket 모두 0을 받았고,
+  uid 1000(`fedora`)과 uid 65534(`nobody`)의 `connect()`는 두 socket 모두
+  `EACCES`로 실패했다. `socket_access`로 group이나 mode를 정하지 않은 release
+  build service에는 non-root client가 접속할 수 없다는 것을 실측으로 확인했다. 이 VM에서는 area 파일마다 "Failed to set
+  SELinux context" 경고가 한 번씩 나왔다. Fedora policy에 Android context
+  이름(`u:object_r:build_prop:s0`)이 없기 때문이며, `property_area.rs`는 이
+  실패를 의도적으로 fatal로 처리하지 않는다.
+
+**확인 필요.**
+- AppArmor와 Smack host에서 `SO_PEERSEC`가 반환하는 형식.
+
+**test.** `authorization.rs` `authorizer_sees_the_request_and_decides`,
+`control_request_is_looked_up_with_its_target`, `debug_masks_the_value`,
+`unknown_credentials_are_refused_without_a_call`,
+`waits_for_the_trie_and_refuses_when_it_never_comes`,
+`panicking_authorizer_refuses`, `name_without_a_context_is_refused`,
+`allowed_request_carries_the_type_of_its_name`,
+`unreadable_type_is_left_to_the_properties_service`,
+`properties_service.rs` `known_type_replaces_the_lookup`, `access.rs` `modes_outside_the_allowed_bits_are_refused`,
+`group_minus_one_is_refused`, `socket_service.rs`
+`authorizer_is_asked_after_the_name_check`,
+`group_member_of_another_uid_can_connect`(root 전용),
+`tests/authorizer_tests.rs` `socket_mode_for_others_is_applied`,
+`allowed_set_is_stored_and_denied_set_is_not`,
+`control_request_is_authorized_before_it_is_queued`,
+`powerctl_is_authorized_with_its_listener`, `rsproperties`
+`property_info_parser.rs` `property_info_trie_reads_context_and_type`.
+peer 신원 accessor는 `peer_sockopt.rs`의 unit test와 `authorization.rs`
+`authorizer_can_ask_the_connection_about_its_peer`,
+`test_peer_has_no_connection`, 규칙 기반 authorizer는 `policy.rs`의 unit
+test가 검증한다.
+
 ## 누락으로 보지 않는 것
 
-- per-property SELinux / SO_PEERCRED 인가: (a)이며 `socket_service.rs`
-  `SOCKET_FILE_MODE` doc의 Access model 문단에 문서화된 의도적 단순화다.
 - `ContextsSplit` / `ContextsPreSplit` layout: `property_info`가 없는 이전
   Android용 layout이다. 지원 범위(API 28–37) 밖이다.
 - deprecated API(`__system_property_find_nth`, `__system_property_read`,

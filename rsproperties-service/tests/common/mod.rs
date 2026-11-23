@@ -121,7 +121,7 @@ where
     Ok(rsproperties::system_properties()?.read_with(name, |value| value.parse::<T>())??)
 }
 
-async fn start_service() -> ServiceHandle {
+async fn start_service(options: rsproperties_service::ServiceOptions) -> ServiceHandle {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let properties_dir = properties_dir();
@@ -136,7 +136,7 @@ async fn start_service() -> ServiceHandle {
         .properties_dir(properties_dir)
         .socket_dir(socket_dir);
 
-    rsproperties_service::run(config, rsproperties_service::ServiceOptions::new())
+    rsproperties_service::run(config, options)
         .await
         .expect("Failed to start services")
 }
@@ -151,7 +151,16 @@ async fn start_service() -> ServiceHandle {
 /// that no read preceded would take it from `PROPERTY_SERVICE_VERSION`:
 /// with that variable at `1` the client sends V1, the service refuses the
 /// frame, and the client still returns `Ok`.
+#[allow(dead_code)]
 pub async fn init_test() {
+    init_test_with(rsproperties_service::ServiceOptions::new).await;
+}
+
+/// [`init_test`] for a service with the options `options` returns. Every
+/// test of one binary must pass the same options: the first call starts
+/// the service, and `options` is not called again.
+#[allow(dead_code)]
+pub async fn init_test_with(options: fn() -> rsproperties_service::ServiceOptions) {
     SERVICE
         .get_or_init(|| async {
             let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
@@ -163,7 +172,7 @@ pub async fn init_test() {
                     .expect("Failed to create Tokio runtime");
 
                 runtime.block_on(async {
-                    let mut service = start_service().await;
+                    let mut service = start_service(options()).await;
                     let _ = sender.send(());
 
                     if let Err(e) = service.join().await {
