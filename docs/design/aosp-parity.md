@@ -1709,20 +1709,46 @@ service process의 fsgid였다. release build service는 root로만 시작하므
   비교하는 정책에는 await할 대상이 없다. 요청 시점에 I/O가 필요한 정책
   (polkit 조회, 다른 daemon에 질의)은 구현할 수 없다. authorizer는 tokio
   worker thread에서 호출되므로 block하면 그 worker가 멈춘다.
-- trie 조회 중복. authorizer가 있는 service에서는 connection task가 context를
-  조회하고 actor가 type 검사를 위해 같은 이름을 다시 조회한다. 조회 결과를
-  message에 실어 보내는 방법은 측정 뒤에 정한다.
+- trie 조회 중복 제거. authorizer가 있는 service에서는 connection task가
+  context를 조회하고 actor가 type 검사를 위해 같은 이름을 다시 조회한다. 아래
+  측정에서 authorizer 호출과 중복 조회를 합한 비용이 측정 편차 안에 들어가서,
+  조회 결과를 message에 실어 보내는 변경은 하지 않았다.
+
+**실측.**
+- init의 응답 code와 순서(API 37 emulator `rsbinder-a17`,
+  `CE2A.260420.019` userdebug, `u:r:shell:s0`의 uid 2000에서 SETPROP2를 직접
+  보냈다).
+
+  | 요청 | 응답 | init log |
+  |------|------|----------|
+  | `servicemanager.ready`=`abc` (`exact bool`, shell 권한 없음) | 0x18 | SELinux permission check failed |
+  | `servicemanager.ready`=`true` | 0x18 | 위와 같음 |
+  | `dumpstate.last_id`=`abc` (`exact int`, shell 권한 있음) | 0x14 | Property type check failed |
+  | `dumpstate.last_id`=`5` | 0 | 없음 |
+  | `ro.build.type`=`x` (이미 값이 있음) | 0x18 | SELinux permission check failed |
+  | `ro.rsprobe.unset`=`x` (`default_prop`) | 0x18 | 위와 같음 |
+  | `bad..name`=`x` | 0x10 | Illegal property name |
+  | `ctl.start`=`rsprobe_none`, `ctl.start`=`adbd` | 0x20 | Invalid permissions to perform 'start' |
+
+  이름 검사 → access 검사 → type 검사 순서이고, 거부된 요청은 type이 틀려도
+  0x18을 받는다. `ro.` 이름도 write-once 검사(0x0B) 전에 access 검사에서
+  0x18을 받는다. 이 service가 같은 순서인지는 `socket_service.rs`
+  `authorizer_is_asked_after_the_name_check`가 검증한다.
+- set 처리 시간(개발 host, kernel 7.2.4, client와 service를 CPU 2개에 고정,
+  set마다 새 connection, 20000회씩 5번 측정한 p50 범위). 이 PR 이전 `main`
+  27.47–27.65 µs, authorizer 없음 26.81–27.03 µs, `Decision::Allow`만 반환하는
+  closure 26.98–28.09 µs, uid로 허용하는 `AccessPolicy` 27.06–27.44 µs, 보조
+  group으로 허용하는 `AccessPolicy`(요청마다 `SO_PEERGROUPS` 1회)
+  27.64–28.30 µs다. root 소유 검사를 건너뛰려고 release profile에
+  `debug-assertions`를 켜고 비root로 실행했다.
+- `panic = "abort"` build에서 authorizer가 panic하면 process가 SIGABRT로
+  종료하고 client는 응답을 받지 못한다. 기본 unwind build에서는 같은 요청이
+  0x18을 받고 service가 계속 실행된다.
 
 **확인 필요.**
-- init의 응답 code와 순서는 source로만 확인했다. emulator에서 `shell`
-  domain이 set할 수 없는 property에 type이 틀린 값을 보냈을 때 0x18이 먼저
-  나오는지 실측하지 않았다.
 - 다른 uid의 client가 `0o666` socket으로 접속해 authorizer에서 판정받는
   경로와 `group_member_of_another_uid_can_connect`는 root 권한이 필요해서
-  개발 host에서 실행하지 않았다. `panic = "abort"` build의 동작도 실행해
-  확인하지 않았다.
-- authorizer를 등록한 service와 등록하지 않은 service의 set 처리 시간을
-  benchmark로 비교하지 않았다.
+  개발 host에서 실행하지 않았다.
 
 **test.** `authorization.rs` `authorizer_sees_the_request_and_decides`,
 `control_request_is_looked_up_with_its_target`, `debug_masks_the_value`,
