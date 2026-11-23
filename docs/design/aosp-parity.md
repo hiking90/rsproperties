@@ -1712,7 +1712,8 @@ service process의 fsgid였다. release build service는 root로만 시작하므
   worker thread에서 호출되므로 block하면 그 worker가 멈춘다.
 - trie 조회 중복 제거. authorizer가 있는 service에서는 connection task가
   context를 조회하고 actor가 type 검사를 위해 같은 이름을 다시 조회한다. 아래
-  측정에서 authorizer 호출과 중복 조회를 합한 비용이 측정 편차 안에 들어가서,
+  측정에서 추가된 조회 1회는 Android `property_contexts` 크기의 trie에서
+  0.15–0.35 µs이고, set 1회의 round trip(약 27 µs)의 1.3% 이하다. 그래서
   조회 결과를 message에 실어 보내는 변경은 하지 않았다.
 
 **실측.**
@@ -1741,7 +1742,31 @@ service process의 fsgid였다. release build service는 root로만 시작하므
   closure 26.98–28.09 µs, uid로 허용하는 `AccessPolicy` 27.06–27.44 µs, 보조
   group으로 허용하는 `AccessPolicy`(요청마다 `SO_PEERGROUPS` 1회)
   27.64–28.30 µs다. root 소유 검사를 건너뛰려고 release profile에
-  `debug-assertions`를 켜고 비root로 실행했다.
+  `debug-assertions`를 켜고 비root로 실행했다. 이 측정의 service에는
+  `property_contexts`가 없어서 trie에 entry가 없었다. 그래서 이 값은 trie
+  조회 비용을 포함하지 않는다.
+- trie 조회 시간. `tests/android`의 `property_contexts` 3개(entry 1212개,
+  trie 86408 byte)로 만든 `PropertyInfoTrie`에서 `context` 1회의 시간을
+  측정했다(release build, CPU 1개에 고정, 200만 회씩 7번 측정한 최솟값,
+  2번 실행한 값의 차이는 2% 이내).
+
+  | 이름 | 지나는 node의 entry | `context` |
+  |------|---------------------|-----------|
+  | `debug.some.long.property.name.with.many.segments.x` | `debug` node에 `some` child가 없어 멈춤 | 152–155 ns |
+  | `servicemanager.ready` | exact | 159 ns |
+  | `dumpstate.last_id` | exact | 185 ns |
+  | `vm.allowed.a` | 일치 없음(default) | 192–195 ns |
+  | `ctl.start$adbd` | `ctl.` 아래 29개 | 238–243 ns |
+  | `persist.sys.timezone` | `persist.sys.` 아래 12개 | 311–315 ns |
+  | `ro.build.fingerprint` | `ro.` 아래 19개, `ro.build.` 아래 13개 | 335 ns |
+  | `ro.vendor.build.version.incremental` | `ro.vendor.build.` 아래 8개 | 341–345 ns |
+
+  조회는 AOSP `GetPropertyInfoIndexes`와 같은 방식이다. segment마다 child는
+  binary search로 찾고, 지나는 node의 prefix entry와 마지막 node의 exact
+  entry는 앞에서부터 하나씩 비교한다. 그래서 시간은 이름의 길이보다 지나는
+  node의 entry 수에 따라 달라진다. authorizer가 있는 service에서 요청마다
+  추가되는 것은 connection task의 `context` 조회 1회다. actor의 type 조회는 이
+  PR 이전에도 있었다.
 - `panic = "abort"` build에서 authorizer가 panic하면 process가 SIGABRT로
   종료하고 client는 응답을 받지 못한다. 기본 unwind build에서는 같은 요청이
   0x18을 받고 service가 계속 실행된다.
