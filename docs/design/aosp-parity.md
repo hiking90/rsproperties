@@ -1804,6 +1804,16 @@ service process의 fsgid였다. release build service는 root로만 시작하므
   authorizer가 받은 `PeerInfo`의 pid, uid, gid는 요청자의 값이었다.
   `groups()`는 `[54400, 54401]`을 반환했다. `pidfd()`의 fdinfo `Pid:`는 요청자의
   pid와 같았다.
+- release build service를 root로 실행한 경우(같은 VM, `example_service`를
+  `--release`로 build, umask 022, `socket_access`와 authorizer 없음). 두 socket은
+  `root:root` `0o660`이었고 socket dir은 `0o755`였다. area 파일은 uid 0, gid 0,
+  `0o444`라서 root 소유 검사를 통과했다. root의 set은 두 socket 모두 0을 받았고,
+  uid 1000(`fedora`)과 uid 65534(`nobody`)의 `connect()`는 두 socket 모두
+  `EACCES`로 실패했다. `socket_access`로 group이나 mode를 정하지 않은 release
+  build service에는 non-root client가 접속할 수 없다는 것을 실측으로 확인했다. 이 VM에서는 area 파일마다 "Failed to set
+  SELinux context" 경고가 한 번씩 나왔다. Fedora policy에 Android context
+  이름(`u:object_r:build_prop:s0`)이 없기 때문이며, `property_area.rs`는 이
+  실패를 의도적으로 fatal로 처리하지 않는다.
 
 **확인 필요.**
 - AppArmor와 Smack host에서 `SO_PEERSEC`가 반환하는 형식.
