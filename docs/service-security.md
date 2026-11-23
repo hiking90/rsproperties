@@ -86,6 +86,24 @@ in the release build.
   descriptor sends with the same credentials, and the pid may have been
   reused; the gid is the effective gid only, without supplementary
   groups.
+- **More about the sender, on request**: `PeerInfo::groups` gives the
+  sender's supplementary groups (`SO_PEERGROUPS`, Linux 4.13),
+  `PeerInfo::security_label` its security label (`SO_PEERSEC`, the value
+  init's `getpeercon` reads), and `PeerInfo::pidfd` a pidfd for the
+  process that connected (`SO_PEERPIDFD`, Linux 6.5), which a reused pid
+  cannot mislead. The label is in the format of the security module that
+  labels the socket: under SELinux the context
+  (`system_u:system_r:init_t:s0`); other modules (AppArmor, Smack) have
+  their own format, which may hold more than a profile or label name and
+  was not measured for this crate, so read the value on the target host
+  before comparing with it. Each is one `getsockopt` made when the
+  authorizer calls it (and a second with the size the kernel asked for
+  when the sender has more than 32 groups or a label over 256 bytes),
+  and fails with
+  the kernel's error (`ENOPROTOOPT`) where the option does not exist or
+  no security module labels sockets. The control and powerctl handlers
+  do not get them: they run after the connection task, so a decision
+  that needs them is made in the authorizer.
 - **`ro.` properties are write-once, not read-only for clients**: the
   first set of a `ro.` name without a value is stored, as in init, where
   sepolicy lets some daemons publish such values. An authorizer that

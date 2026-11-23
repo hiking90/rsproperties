@@ -1568,8 +1568,11 @@ impl SocketService {
                 return Self::send_response(&mut stream, PROP_ERROR_INVALID_NAME).await;
             }
             let credentials = (peer.pid, peer.uid, peer.gid);
+            // The authorizer may ask the connection for more about its
+            // peer (`PeerInfo::groups` and the like).
+            let connection = Some(stream.as_fd());
             if !authorization
-                .allows(&name, &value, listener, credentials)
+                .allows(&name, &value, listener, credentials, connection)
                 .await
             {
                 let code = if name.starts_with("ctl.") {

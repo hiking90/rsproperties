@@ -3,13 +3,14 @@
 //! ([`SetRequest`], [`PeerInfo`]), what it answers ([`Decision`]), and the
 //! call itself ([`Authorization`]).
 
-use std::marker::PhantomData;
+use std::io;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::sync::Arc;
 
 use rsproperties::PropertyInfoTrie;
 use tokio::sync::watch;
 
-use crate::Listener;
+use crate::{peer_sockopt, Listener};
 
 /// What an [authorizer](crate::ServiceOptions::authorizer) answers for one
 /// request.
@@ -31,31 +32,117 @@ pub enum Decision {
 /// They are those of the process that called `connect()`, at that time. A
 /// process that was handed the connected descriptor sends with the same
 /// credentials, and the pid may have been reused since: do not decide by
-/// what `/proc/<pid>` shows now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// what `/proc/<pid>` shows now; [`pidfd`](Self::pidfd) names the process
+/// itself.
+///
+/// [`groups`](Self::groups), [`security_label`](Self::security_label) and
+/// [`pidfd`](Self::pidfd) each ask the kernel when they are called (one
+/// `getsockopt` on the connection, and a second with the size the kernel
+/// asked for when the sender has more than 32 groups or a label over 256
+/// bytes), so an authorizer that does not need them pays nothing for
+/// them. They borrow the connection, which is why a
+/// `PeerInfo` cannot be kept after the authorizer has returned. On a value
+/// made by [`for_test`](Self::for_test), which has no connection, they
+/// fail with [`io::ErrorKind::Unsupported`].
+///
+/// Two values are equal when their pid, uid and gid are; the `Debug`
+/// output has those three.
+#[derive(Clone, Copy)]
 pub struct PeerInfo<'a> {
     pid: i32,
     uid: u32,
     gid: u32,
-    /// For accessors that will read more from the connection, which an
-    /// authorizer call borrows.
-    connection: PhantomData<&'a ()>,
+    /// The connection the request came on; `None` in a test value.
+    connection: Option<BorrowedFd<'a>>,
 }
 
-impl PeerInfo<'_> {
-    pub(crate) fn new(pid: i32, uid: u32, gid: u32) -> Self {
-        Self {
-            pid,
-            uid,
-            gid,
-            connection: PhantomData,
-        }
+impl PartialEq for PeerInfo<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        (self.pid, self.uid, self.gid) == (other.pid, other.uid, other.gid)
     }
+}
 
+impl Eq for PeerInfo<'_> {}
+
+impl std::fmt::Debug for PeerInfo<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerInfo")
+            .field("pid", &self.pid)
+            .field("uid", &self.uid)
+            .field("gid", &self.gid)
+            .finish()
+    }
+}
+
+impl<'a> PeerInfo<'a> {
     /// A sender with these credentials, to test an authorizer
     /// ([`SetRequest::for_test`]).
     pub fn for_test(pid: i32, uid: u32, gid: u32) -> PeerInfo<'static> {
-        PeerInfo::new(pid, uid, gid)
+        PeerInfo {
+            pid,
+            uid,
+            gid,
+            connection: None,
+        }
+    }
+
+    fn connection(&self) -> io::Result<BorrowedFd<'a>> {
+        self.connection.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a PeerInfo made by for_test has no connection to ask",
+            )
+        })
+    }
+
+    /// The sender's supplementary groups (`SO_PEERGROUPS`, Linux 4.13), as
+    /// they were when it called `connect()`. [`gid`](Self::gid), its
+    /// effective gid, is in the list only when it is also a supplementary
+    /// group. The order is the kernel's.
+    ///
+    /// # Errors
+    ///
+    /// `ENOPROTOOPT` on a kernel without the option; any other error of
+    /// `getsockopt`.
+    pub fn groups(&self) -> io::Result<Vec<u32>> {
+        peer_sockopt::peer_groups(self.connection()?)
+    }
+
+    /// The sender's security label (`SO_PEERSEC`), as the security module
+    /// that labels the socket formats it, without a trailing NUL. Under
+    /// SELinux it is the context (`system_u:system_r:init_t:s0`), the
+    /// value init's `getpeercon` reads. Other modules (AppArmor, Smack)
+    /// have their own format, which may hold more than a profile or label
+    /// name and was not measured for this crate: read the value on the
+    /// target host before comparing with it.
+    ///
+    /// # Errors
+    ///
+    /// `ENOPROTOOPT` when no security module of the kernel labels sockets;
+    /// [`io::ErrorKind::InvalidData`] for a label that is not UTF-8; any
+    /// other error of `getsockopt`.
+    pub fn security_label(&self) -> io::Result<String> {
+        let label = peer_sockopt::peer_security_label(self.connection()?)?;
+        String::from_utf8(label)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the label is not UTF-8"))
+    }
+
+    /// A new pidfd, close-on-exec, for the process that called `connect()`
+    /// (`SO_PEERPIDFD`, Linux 6.5). Unlike [`pid`](Self::pid) it cannot
+    /// come to name another process: `/proc/self/fdinfo/<fd>` gives the
+    /// pid it names now (`-1` once the process was reaped), and
+    /// `pidfd_send_signal` and `waitid(P_PIDFD)` act on that process only.
+    ///
+    /// The descriptor is the caller's to close; every call returns a new
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// `ENOPROTOOPT` on a kernel without the option; `ESRCH` when the
+    /// process has already been reaped (kernels before 6.15); any other
+    /// error of `getsockopt`.
+    pub fn pidfd(&self) -> io::Result<OwnedFd> {
+        peer_sockopt::peer_pidfd(self.connection()?)
     }
 
     /// The sender's pid.
@@ -69,7 +156,7 @@ impl PeerInfo<'_> {
     }
 
     /// The sender's effective gid. Its supplementary groups are not part
-    /// of `SO_PEERCRED`.
+    /// of `SO_PEERCRED`; [`groups`](Self::groups) reads them.
     pub fn gid(&self) -> u32 {
         self.gid
     }
@@ -230,6 +317,7 @@ impl Authorization {
         value: &str,
         listener: Listener,
         (pid, uid, gid): (Option<i32>, Option<u32>, Option<u32>),
+        connection: Option<BorrowedFd<'_>>,
     ) -> bool {
         let (Some(pid), Some(uid), Some(gid)) = (pid, uid, gid) else {
             log::warn!(
@@ -282,7 +370,12 @@ impl Authorization {
             value,
             context,
             listener,
-            peer: PeerInfo::new(pid, uid, gid),
+            peer: PeerInfo {
+                pid,
+                uid,
+                gid,
+                connection,
+            },
         };
         let authorizer = &self.authorizer;
         // The lines below log the value's length, not the value
@@ -357,7 +450,7 @@ mod tests {
             let (mut authorization, sender, seen) = recording(decision);
             sender.send_replace(Some(trie()));
             let allowed = authorization
-                .allows("vendor.x", "secret", Listener::System, PEER)
+                .allows("vendor.x", "secret", Listener::System, PEER, None)
                 .await;
             assert_eq!(allowed, decision == Decision::Allow);
             assert_eq!(
@@ -381,7 +474,7 @@ mod tests {
         for target in ["adbd", "other"] {
             assert!(
                 authorization
-                    .allows("ctl.start", target, Listener::Property, PEER)
+                    .allows("ctl.start", target, Listener::Property, PEER, None)
                     .await
             );
         }
@@ -428,7 +521,7 @@ mod tests {
         ] {
             assert!(
                 !authorization
-                    .allows("vendor.x", "1", Listener::Property, peer)
+                    .allows("vendor.x", "1", Listener::Property, peer, None)
                     .await
             );
         }
@@ -444,7 +537,7 @@ mod tests {
         let mut waiting = authorization.clone();
         let waiter = tokio::spawn(async move {
             waiting
-                .allows("vendor.x", "1", Listener::Property, PEER)
+                .allows("vendor.x", "1", Listener::Property, PEER, None)
                 .await
         });
         tokio::task::yield_now().await;
@@ -457,7 +550,7 @@ mod tests {
         drop(sender);
         assert!(
             authorization
-                .allows("vendor.x", "1", Listener::Property, PEER)
+                .allows("vendor.x", "1", Listener::Property, PEER, None)
                 .await
         );
 
@@ -465,7 +558,7 @@ mod tests {
         drop(sender);
         assert!(
             !authorization
-                .allows("vendor.x", "1", Listener::Property, PEER)
+                .allows("vendor.x", "1", Listener::Property, PEER, None)
                 .await
         );
         assert!(seen.lock().unwrap().is_empty());
@@ -477,13 +570,13 @@ mod tests {
         sender.send_replace(Some(trie()));
         assert!(
             !authorization
-                .allows("vendor.x", "1", Listener::Property, PEER)
+                .allows("vendor.x", "1", Listener::Property, PEER, None)
                 .await
         );
         // The next request is still answered.
         assert!(
             !authorization
-                .allows("vendor.y", "1", Listener::Property, PEER)
+                .allows("vendor.y", "1", Listener::Property, PEER, None)
                 .await
         );
     }
@@ -501,15 +594,97 @@ mod tests {
         sender.send_replace(Some(Arc::new(PropertyInfoTrie::new(&bytes).unwrap())));
         assert!(
             !authorization
-                .allows("other.x", "1", Listener::Property, PEER)
+                .allows("other.x", "1", Listener::Property, PEER, None)
                 .await
         );
         assert!(seen.lock().unwrap().is_empty());
         assert!(
             authorization
-                .allows("vendor.x", "1", Listener::Property, PEER)
+                .allows("vendor.x", "1", Listener::Property, PEER, None)
                 .await
         );
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// The accessors ask the connection the call was given: the groups are
+    /// those of the process that made the pair, and so is the pidfd.
+    #[tokio::test]
+    async fn authorizer_can_ask_the_connection_about_its_peer() {
+        use std::os::fd::{AsFd, AsRawFd};
+
+        type Asked = (std::io::Result<Vec<u32>>, std::io::Result<i32>, bool);
+        let asked: Arc<Mutex<Option<Asked>>> = Arc::default();
+        let record = Arc::clone(&asked);
+        let (mut authorization, sender) = Authorization::new(Arc::new(move |request| {
+            let peer = request.peer();
+            let pid = peer.pidfd().map(|pidfd| {
+                let info =
+                    std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))
+                        .unwrap();
+                info.lines()
+                    .find_map(|line| line.strip_prefix("Pid:"))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap()
+            });
+            // No LSM that labels sockets on the test host is not a failure.
+            let label_ok = match peer.security_label() {
+                Ok(label) => !label.contains('\0'),
+                Err(e) => e.raw_os_error() == Some(libc::ENOPROTOOPT),
+            };
+            *record.lock().unwrap() = Some((peer.groups(), pid, label_ok));
+            Decision::Allow
+        }));
+        sender.send_replace(Some(trie()));
+
+        let (server, _client) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(
+            authorization
+                .allows(
+                    "vendor.x",
+                    "1",
+                    Listener::Property,
+                    PEER,
+                    Some(server.as_fd())
+                )
+                .await
+        );
+        let (groups, pid, label_ok) = asked.lock().unwrap().take().expect("a call");
+        let mut groups = groups.expect("SO_PEERGROUPS");
+        groups.sort_unstable();
+        let mut own: Vec<u32> = rustix::process::getgroups()
+            .unwrap()
+            .into_iter()
+            .map(|gid| gid.as_raw())
+            .collect();
+        own.sort_unstable();
+        assert_eq!(groups, own);
+        assert!(label_ok);
+        match pid {
+            Ok(pid) => assert_eq!(pid, std::process::id() as i32),
+            // Linux before 6.5.
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::ENOPROTOOPT), "{e}"),
+        }
+    }
+
+    /// A test value has no connection: the accessors say so, and equality
+    /// and `Debug` go by the credentials.
+    #[test]
+    fn test_peer_has_no_connection() {
+        let peer = PeerInfo::for_test(7, 1000, 1001);
+        for kind in [
+            peer.groups().unwrap_err().kind(),
+            peer.security_label().unwrap_err().kind(),
+            peer.pidfd().unwrap_err().kind(),
+        ] {
+            assert_eq!(kind, std::io::ErrorKind::Unsupported);
+        }
+        assert_eq!(peer, PeerInfo::for_test(7, 1000, 1001));
+        assert_ne!(peer, PeerInfo::for_test(7, 1000, 1002));
+        assert_eq!(
+            format!("{peer:?}"),
+            "PeerInfo { pid: 7, uid: 1000, gid: 1001 }"
+        );
     }
 }

@@ -1604,10 +1604,21 @@ service process의 fsgid였다. release build service는 root로만 시작하므
 **init과 남는 차이.**
 - (a) 판단 주체. init은 SELinux policy를 조회한다. 이 service는 init이 조회에
   쓰는 입력 가운데 target context와 요청자의 pid, uid, gid를 authorizer에
-  넘기고, 판단은 host의 코드가 한다. 요청자의 SELinux context(`getpeercon`)는
-  넘기지 않는다. `PeerInfo`에 LSM label(`SO_PEERSEC`), 보조 group
-  (`SO_PEERGROUPS`), pidfd(`SO_PEERPIDFD`)를 추가하는 것은 구현하지 않은
-  후속 항목이다.
+  넘기고, 판단은 host의 코드가 한다. 요청자의 LSM label은
+  `PeerInfo::security_label`(`SO_PEERSEC`)로 읽는다. init의 `getpeercon`이
+  읽는 값과 같으므로, SELinux를 쓰는 host는 authorizer 안에서 init과 같은
+  조회를 구현할 수 있다. `PeerInfo::groups`(`SO_PEERGROUPS`)는 보조 group을,
+  `PeerInfo::pidfd`(`SO_PEERPIDFD`)는 pidfd를 반환한다. 세 accessor는 호출할
+  때 `getsockopt`을 한 번 실행하고, 보조 group이 32개를 넘거나 label이 256 byte를
+  넘어 처음 buffer에 값이 들어가지 않으면 kernel이 반환한 크기로 한 번 더
+  실행한다. rustix 1.1에 이 option의 accessor가 없어서
+  `libc::getsockopt`을 직접 호출하며(`peer_sockopt.rs`), test 밖의 `unsafe`는
+  이 module에만 있다. `SO_PEERSEC`는 LSM이 socket에 label을 붙이는 host에서만
+  값을 반환한다. label 형식은 LSM이 정하고, accessor는 끝의 NUL만 제거한다.
+  개발 host(LSM: capability, landlock, lockdown, yama, bpf)에서는
+  `ENOPROTOOPT`를 확인했고, SELinux와 AppArmor host에서 label 형식을 실측하지는
+  않았다(확인 필요). 그래서 영어 문서는 SELinux context만 예시로 들고, AppArmor와
+  Smack의 값은 profile이나 label 이름 외의 내용을 포함할 수 있다고 적는다.
 - (a) authorizer가 없는 service. 0.7.0과 같이 접속할 수 있는 client의 요청을
   모두 허용한다. 이때 access 제어는 socket 파일의 소유자, group, mode뿐이며,
   `run`이 other bit를 거부하므로 접속할 수 있는 것은 소유 uid, group의
@@ -1615,7 +1626,8 @@ service process의 fsgid였다. release build service는 root로만 시작하므
 - (a) pid 재사용. `PeerInfo`의 값은 `connect()` 시점의 신원이다. pid는 재사용될
   수 있으므로 `/proc/<pid>`를 읽어 판단하는 authorizer는 다른 process의 정보를
   읽을 수 있다. init은 kernel이 socket에 기록한 context를 `getpeercon`으로
-  읽으므로 이 문제가 없다.
+  읽으므로 이 문제가 없다. Linux 6.5 이상에서는 `PeerInfo::pidfd`가 반환하는
+  pidfd로 `connect()`를 호출한 process를 pid 재사용과 무관하게 식별할 수 있다.
 - (a) `ctl.*`의 legacy 조회 없음. `ctl.start`, `ctl.stop`, `ctl.restart`에서
   init이 먼저 시도하는 `ctl.<target>` 이름의 context는 authorizer에 넘기지
   않는다. owner 결정이다. 필요한 host는 `SetRequest::name`과 `value`로

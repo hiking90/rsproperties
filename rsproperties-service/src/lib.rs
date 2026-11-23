@@ -103,7 +103,9 @@
 //! by default). An authorizer, when the host gives one, then decides each
 //! request of a connected peer: it gets the name, the value, the name's
 //! `property_contexts` context, the socket, and the sender's pid, uid and
-//! gid, where init asks SELinux.
+//! gid, where init asks SELinux. [`PeerInfo`] reads the sender's
+//! supplementary groups, security label and pidfd when the authorizer
+//! asks for them.
 //!
 //! ```
 //! use rsproperties_service::{Decision, ServiceOptions};
@@ -206,6 +208,7 @@ mod access;
 mod authorization;
 mod connection_limit;
 mod control_reply;
+mod peer_sockopt;
 mod persistent_properties;
 mod properties_service;
 mod property_type;

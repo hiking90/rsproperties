@@ -32,6 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request to test an authorizer with. The `Debug` output of a
   `SetRequest` has `<N bytes>` in place of the value. The `Debug`
   output of `ServiceOptions` has an `authorizer` field.
+- Service: `PeerInfo::groups`, `PeerInfo::security_label` and
+  `PeerInfo::pidfd` give an authorizer the sender's supplementary groups
+  (`SO_PEERGROUPS`), its security label (`SO_PEERSEC`: the SELinux
+  context, or the label in the format of another security module such as
+  AppArmor or Smack) and a pidfd for the process that connected
+  (`SO_PEERPIDFD`, Linux 6.5). Each makes one `getsockopt` when it is
+  called, and a second with the size the kernel asked for when the
+  sender has more than 32 groups or a label over 256 bytes, and returns
+  the kernel's error where the option is not available. `rsproperties-service` now depends on `libc` (0.2.174
+  or later) for these calls, which are its only `unsafe` code outside
+  tests.
 - Service: `ServiceOptions::socket_access(Listener, SocketAccess)` sets
   the owner group and mode of each service socket file, in place of mode
   `0o660` and the group the file is created with. `Listener` names the
