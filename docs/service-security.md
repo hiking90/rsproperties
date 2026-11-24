@@ -98,17 +98,19 @@ in the release build.
   process that connected (`SO_PEERPIDFD`, Linux 6.5), which a reused pid
   cannot mislead. The label is in the format of the security module that
   labels the socket: under SELinux the context
-  (`system_u:system_r:init_t:s0`); other modules (AppArmor, Smack) have
-  their own format, which may hold more than a profile or label name and
-  was not measured for this crate, so read the value on the target host
-  before comparing with it. Each is one `getsockopt` made when the
-  authorizer calls it (and a second with the size the kernel asked for
-  when the sender has more than 32 groups or a label that does not fit
-  in 256 bytes),
-  and fails with
+  (`system_u:system_r:init_t:s0`); under AppArmor the profile followed by
+  its mode (`/usr/bin/client (enforce)`, `client (complain)`), or
+  `unconfined`, so a comparison includes the mode (measured for a single
+  profile outside a policy namespace; a stacked or namespaced label was
+  not measured); under Smack the process label (`_` unless one was set).
+  Each is one `getsockopt` made when the authorizer calls it (and a
+  second with the size the kernel asked for when the sender has more than
+  32 groups or a label that does not fit in 256 bytes), and fails with
   the kernel's error (`ENOPROTOOPT`) where the option does not exist or
-  no security module labels sockets. The control and powerctl handlers
-  do not get them: they run after the connection task, so a decision
+  no security module labels sockets. Under AppArmor the result depends on
+  the kernel: Linux 6.13 answered `ENOPROTOOPT` for confined senders too,
+  Linux 7.2 returned the label. The control and powerctl handlers do not
+  get them: they run after the connection task, so a decision
   that needs them is made in the authorizer.
 - **`ro.` properties are write-once, not read-only for clients**: the
   first set of a `ro.` name without a value is stored, as in init, where

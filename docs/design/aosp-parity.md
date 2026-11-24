@@ -1675,10 +1675,13 @@ service process의 fsgid였다. release build service는 root로만 시작하므
   이 module에만 있다. `SO_PEERSEC`는 LSM이 socket에 label을 붙이는 host에서만
   값을 반환한다. label 형식은 LSM이 정하고, accessor는 끝의 NUL만 제거한다.
   개발 host(LSM: capability, landlock, lockdown, yama, bpf)에서는
-  `ENOPROTOOPT`를 확인했다. SELinux host의 결과는 아래 "실측"에 있다.
-  AppArmor와 Smack host에서는 label 형식을 실측하지 않았다(확인 필요). 그래서
-  영어 문서는 SELinux context만 예시로 들고, AppArmor와 Smack의 값은 profile이나
-  label 이름 외의 내용을 포함할 수 있다고 적는다.
+  `ENOPROTOOPT`를 확인했다. SELinux, AppArmor, Smack host의 결과는 아래
+  "실측"에 있다. AppArmor는 confined process의 label에서 profile 이름 뒤에
+  mode를 붙이고(`name (enforce)`), unconfined process에는 `unconfined`만
+  반환하므로, 영어 문서는 비교할 때 mode까지 포함하라고 적는다.
+  AppArmor는 6.13.8 kernel에서 confined process에도 `ENOPROTOOPT`를
+  반환했으므로, label을 판단에 쓰는 authorizer는 이 error를 거부로 처리해야
+  한다.
 - (a) authorizer가 없는 service. 0.7.0과 같이 접속할 수 있는 client의 요청을
   모두 허용한다. 이때 access 제어는 socket 파일의 소유자, group, mode뿐이며,
   `run`이 other bit를 거부하므로 접속할 수 있는 것은 소유 uid, group의
@@ -1847,9 +1850,44 @@ service process의 fsgid였다. release build service는 root로만 시작하므
   SELinux context" 경고가 한 번씩 나왔다. Fedora policy에 Android context
   이름(`u:object_r:build_prop:s0`)이 없기 때문이며, `property_area.rs`는 이
   실패를 의도적으로 fatal로 처리하지 않는다.
+- AppArmor와 Smack(Arch Linux VM, boot마다 `lsm=` cmdline으로 LSM 하나만
+  켬, 두 kernel 모두 AppArmor userspace 4.0.3). service와 client를 uid 1000으로
+  실행하고, authorizer가 받은 `security_label()`과 `getsockopt(SO_PEERSEC)`의
+  원시 반환값을 기록했다.
+
+  | LSM, kernel | 요청자 | `SO_PEERSEC` 원시 값 | `security_label()` |
+  |-------------|--------|----------------------|--------------------|
+  | AppArmor, 6.13.8 | socketpair: unconfined, 경로 attachment가 없는 profile(enforce), 실행 파일 경로에 attach되는 profile | `ENOPROTOOPT` | — |
+  | AppArmor, 6.13.8 | service에 connect한 client: unconfined, 경로 attachment가 없는 profile(enforce, complain) | — | `Err(ENOPROTOOPT)` |
+  | AppArmor, 7.2.4 | unconfined | `unconfined` (10 byte, NUL 없음) | `unconfined` |
+  | AppArmor, 7.2.4 | 경로 attachment가 없는 profile, enforce | `lsmprobe-enforce (enforce)` (26 byte) | 같은 값 |
+  | AppArmor, 7.2.4 | 경로 attachment가 없는 profile, complain | — | `lsmprobe-complain (complain)` |
+  | AppArmor, 7.2.4 | 실행 파일 경로에 attach되는 profile | — | `/tmp/lsm-probe-attached (enforce)` |
+  | Smack, 7.2.4 | 기본 label | `_\0` (2 byte) | `_` |
+  | Smack, 7.2.4 | label `probeclient` | `probeclient\0` (12 byte) | `probeclient` |
+  | Smack, 7.2.4 | 255 byte label | 256 byte (끝 NUL 포함) | 255 byte label |
+
+  AppArmor 측정에서 service는 경로 attachment가 없는 enforce profile로
+  실행했다. 7.2.4의 경로 attach profile 행만 unconfined service에서 측정했다.
+  Smack 측정에서는 service를 기본 label `_`로 실행했다. 실행 파일 경로에
+  attach되는 profile의 client가 enforce profile service와의 connection에서
+  service의 label을 읽으면 6.13.8에서는 `ENOPROTOOPT`, 7.2.4에서는
+  `lsmprobe-enforce (enforce)`(26 byte)가 나왔다. label을 반환한 경우(AppArmor
+  7.2.4, Smack)에는 buffer가 작으면 `ERANGE`를 반환하고 `optlen`에 필요한 크기를
+  기록했다. Smack 최대 길이(255 byte)의 label은 NUL을 포함해 첫 256 byte
+  buffer에 들어가므로 accessor는 `getsockopt`을 한 번만 실행한다. Smack에서는
+  client label마다 `<label> _ rwx`와 `_ <label> rwx` 두 rule을 함께 load했고,
+  두 rule이 모두 없는 label `norule`의 client는 `connect()`가 `EACCES`로 실패해
+  authorizer까지 오지 않았다. 어느 방향의 rule이 `connect()`에 필요한지는
+  구분해 측정하지 않았다(확인 필요). 두 LSM 모두에서
+  `rsproperties-service` lib test 134개가 통과했다(musl static build).
 
 **확인 필요.**
-- AppArmor와 Smack host에서 `SO_PEERSEC`가 반환하는 형식.
+- AppArmor가 Unix socket의 `SO_PEERSEC`에 label을 반환하기 시작한 upstream
+  kernel version. 6.13.8과 7.2.4 사이이며, upstream commit `c05e7058`("apparmor:
+  add fine grained af_unix mediation")이 이 변화를 만든 것으로 보인다.
+- 이 mediation을 out-of-tree patch로 먼저 넣은 배포판 kernel(Ubuntu 등)의 동작.
+  Ubuntu에서는 실측하지 않았다.
 
 **test.** `authorization.rs` `authorizer_sees_the_request_and_decides`,
 `control_request_is_looked_up_with_its_target`, `debug_masks_the_value`,
