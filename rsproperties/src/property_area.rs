@@ -674,6 +674,38 @@ pub(crate) struct PropertyAreaMap {
     pa_data_size: usize,
 }
 
+/// What a failed `fsetxattr` of an area's SELinux `context` does.
+///
+/// With `fatal` (on Android) the area is not created: bionic records the
+/// failure, `__system_property_area_init` returns -1 and init stops with
+/// `LOG(FATAL)`. A client reads an area only when the policy lets its
+/// domain read the file's type, so an area left with the type the directory
+/// gives a new file would fail later, as unreadable properties on the
+/// client side, instead of at startup.
+///
+/// Otherwise (Linux) it is a warning: the usual hosts of this crate have
+/// no SELinux, and the call fails there as the normal case (`EOPNOTSUPP`,
+/// or `EPERM` for a process that may not set `security.*` attributes).
+fn label_outcome(
+    labeled: rustix::io::Result<()>,
+    fatal: bool,
+    tmp: &Path,
+    filename: &Path,
+    context: &CStr,
+) -> Result<()> {
+    match labeled {
+        Ok(()) => Ok(()),
+        Err(e) if fatal => Err(e).context_with_location(format!(
+            "Failed to set SELinux context {context:?} on {tmp:?}"
+        )),
+        Err(e) => {
+            // The text up to the path is the one 0.7.0 logged.
+            warn!("Failed to set SELinux context for {filename:?} ({context:?}): {e}");
+            Ok(())
+        }
+    }
+}
+
 impl PropertyAreaMap {
     /// Creates a fresh, empty area at `filename`: builds it under a temp
     /// name in the same directory and renames it into place, so a reader
@@ -729,8 +761,8 @@ impl PropertyAreaMap {
         }
     }
 
-    /// `filename` is the final path, for the SELinux `warn` (0.6.0 text);
-    /// the errors name `tmp`, the file they concern.
+    /// `filename` is the final path, for the SELinux `warn`; the errors name
+    /// `tmp`, the file they concern.
     fn init_unpublished(
         file: File,
         tmp: &Path,
@@ -741,24 +773,15 @@ impl PropertyAreaMap {
             // Full xattr name required — the bare "selinux" (no namespace
             // prefix) is rejected by the kernel with EOPNOTSUPP, which made
             // this call fail unconditionally. bionic uses XATTR_NAME_SELINUX,
-            // which is "security.selinux".
-            //
-            // Labeling failure is a warning, NOT fatal — a deliberate
-            // deviation from bionic, where init treats it as fatal. This
-            // crate's primary deployments (non-Android hosts, dev
-            // containers) hit EOPNOTSUPP as the normal case; on an SELinux
-            // enforcing system an unlabeled area instead surfaces later as
-            // reader-side denials. The label moves with the inode on rename.
-            if fs::fsetxattr(
+            // which is "security.selinux". The label moves with the inode
+            // on rename.
+            let labeled = fs::fsetxattr(
                 &file,
                 "security.selinux",
                 context.to_bytes_with_nul(),
                 fs::XattrFlags::empty(),
-            )
-            .is_err()
-            {
-                warn!("Failed to set SELinux context for {filename:?}");
-            }
+            );
+            label_outcome(labeled, cfg!(target_os = "android"), tmp, filename, context)?;
         }
 
         // The umask may have cleared read bits of 0444; readers of other
@@ -2059,5 +2082,53 @@ mod tests {
             }
             other => panic!("expected the name refusal, got {other:?}"),
         }
+    }
+
+    /// A refused label fails the area where it is fatal (Android) and is
+    /// only a warning elsewhere; a label that was set is never an error.
+    #[test]
+    fn label_failure_is_fatal_only_when_asked() {
+        let tmp = Path::new("/props/.area.tmp-1-0");
+        let filename = Path::new("/props/u:object_r:debug_prop:s0");
+        let context = c"u:object_r:debug_prop:s0";
+        for fatal in [false, true] {
+            label_outcome(Ok(()), fatal, tmp, filename, context).unwrap();
+        }
+        label_outcome(
+            Err(rustix::io::Errno::OPNOTSUPP),
+            false,
+            tmp,
+            filename,
+            context,
+        )
+        .unwrap();
+        let err = label_outcome(Err(rustix::io::Errno::ACCESS), true, tmp, filename, context)
+            .unwrap_err();
+        let shown = err.to_string();
+        assert!(
+            shown.contains("debug_prop") && shown.contains(".area.tmp-1-0"),
+            "{shown}"
+        );
+        assert!(
+            matches!(err.root_cause(), Error::Io(io)
+                if io.raw_os_error() == Some(rustix::io::Errno::ACCESS.raw_os_error())),
+            "{err:?}"
+        );
+    }
+
+    /// On Linux the area is created whether or not the kernel takes the
+    /// label. It refuses it for an unprivileged process without SELinux
+    /// (no `security.*` attributes) and under SELinux (a context no policy
+    /// defines); as root without SELinux, or with `mac_admin`, it may take
+    /// it, and then this test does not reach the warning path, which
+    /// `label_failure_is_fatal_only_when_asked` covers.
+    #[test]
+    fn refused_label_creates_the_area_on_linux() {
+        let tmp = TempDir::new("label_warn");
+        let path = tmp.0.join("u:object_r:rsprops_no_such_type:s0");
+        let area =
+            PropertyAreaMap::new_rw(&path, Some(c"u:object_r:rsprops_no_such_type:s0")).unwrap();
+        drop(area);
+        assert!(path.is_file());
     }
 }

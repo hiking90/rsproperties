@@ -122,6 +122,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Error::InvalidArgument` before anything is written, and a label the
   kernel refuses leaves `property_info` unchanged. See Migration from
   0.7.0.
+- On Android, a property area file whose SELinux context cannot be set
+  (`fsetxattr` of `security.selinux`) is not created:
+  `SystemProperties::new_area` and `new_area_locked` fail with an
+  `Error::Context` naming the context and the temp file (0.7.0: a `warn`
+  and an unlabeled area, which clients whose domain may not read that
+  type cannot read), and the service, which builds for Android from this
+  release on, fails at `StartupStage::PropertiesService`. bionic records
+  the same failure and init stops on it. On other targets it stays a
+  `warn`, which now also names the context and the errno after the
+  path. See Migration from 0.7.0.
 - Service: one uid has at most 32 connections open at once (0.7.0: no
   limit per uid, only the service's 64 handler slots, 256 waiting
   connections and 102 unanswered `ctl.*` requests). A connection beyond
@@ -174,6 +184,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `publish_property_info(&trie, None)`; the file is written as before.
   Pass `Some("u:object_r:property_info:s0")` (or the context your policy
   gives `property_info`) to label it.
+- An Android writer (`builder` feature) whose areas could not be labeled
+  ran with unlabeled areas in 0.7.0 and now fails to create them. Run it
+  in a domain the policy lets label files with the `property_contexts`
+  contexts (`relabelto` on those types), on a filesystem that stores
+  `security.*` attributes.
 - Service: a uid other than 0 and the service's own effective uid that
   opens more than 32 connections at once on the two sockets together has
   the connections beyond 32 closed without a reply, and the client's
