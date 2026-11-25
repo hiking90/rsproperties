@@ -1647,7 +1647,7 @@ pub(crate) mod test_fixture {
             assert!(errors.is_empty(), "{errors:?}");
             let trie = build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap();
             let lock = AreaWriterLock::acquire(dir).unwrap();
-            lock.publish_property_info(&trie).unwrap();
+            lock.publish_property_info(&trie, None).unwrap();
             let sp = SystemProperties::new_area_locked(lock).unwrap();
             Self { sp, dir: guard }
         }

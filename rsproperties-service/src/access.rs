@@ -213,18 +213,8 @@ impl SocketAccess {
         }
         if let Some(label) = &self.label {
             // The kernel reads an empty value or one that starts with a
-            // newline as "reset fscreate" (`selinux_lsm_setattr`), and no
-            // context has whitespace or a control byte.
-            if label.is_empty()
-                || label
-                    .bytes()
-                    .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
-            {
-                return Err(rsproperties::Error::InvalidArgument(format!(
-                    "socket label {label:?} for {listener} is empty or has whitespace or a \
-                     control byte, which no SELinux context has"
-                )));
-            }
+            // newline as "reset fscreate" (`selinux_lsm_setattr`).
+            check_label(label, &format!("socket label for {listener}"))?;
         }
         if self.mode & !allowed == 0 {
             return Ok(());
@@ -242,6 +232,22 @@ impl SocketAccess {
             self.mode
         )))
     }
+}
+
+/// Refuses a `label` no SELinux context can be: empty, or with whitespace
+/// or a control byte. `what` names the option in the message.
+pub(crate) fn check_label(label: &str, what: &str) -> Result<(), rsproperties::Error> {
+    if label.is_empty()
+        || label
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(rsproperties::Error::InvalidArgument(format!(
+            "{what} {label:?} is empty or has whitespace or a control byte, which no SELinux \
+             context has"
+        )));
+    }
+    Ok(())
 }
 
 impl Default for SocketAccess {

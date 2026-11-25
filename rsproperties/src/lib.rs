@@ -1050,7 +1050,7 @@ mod tests {
             let mode = std::fs::metadata(dir).unwrap().permissions().mode();
             assert_eq!(mode & 0o066, 0, "{dir:?} mode {:o}", mode & 0o7777);
         }
-        lock.publish_property_info(&data).unwrap();
+        lock.publish_property_info(&data, None).unwrap();
         let mut system_properties = SystemProperties::new_area_locked(lock)
             .unwrap_or_else(|e| panic!("Cannot create system properties in {dir:?}: {e}"));
         for (key, value) in properties.iter() {

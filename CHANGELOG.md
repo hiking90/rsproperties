@@ -94,6 +94,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   options have no authorizer; `authorizer(|_| Decision::Allow)` allows
   every request. Other targets than Linux and Android still do not
   build.
+- Service: `ServiceOptions::property_info_label(context)` publishes
+  `property_info` with that SELinux context, as AOSP init gives it
+  `property_info` from `file_contexts`. `run` refuses an empty label or
+  one with whitespace or a control byte at `StartupStage::Config`, and
+  fails at `StartupStage::PropertiesService`, before any area file is
+  created, when the kernel refuses the label. The `Debug` output of
+  `ServiceOptions` has a `property_info_label` field.
 - `PropertyInfoTrie` (`builder` feature): a checked, 4-byte aligned copy
   of the bytes `build_trie` returns. `context(name)` and
   `property_type(name)` return `&str`s that borrow it, without the
@@ -102,6 +109,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `AreaWriterLock::publish_property_info(trie, label)` (`builder`
+  feature) takes an `Option<&str>` SELinux label (0.7.0:
+  `publish_property_info(trie)`). With `Some(label)`, the file's
+  `security.selinux` is set to `label` by `fsetxattr` on the temp file
+  after the trie is written, synced and checked, before the file is
+  renamed onto `property_info`; under SELinux the writer's domain needs
+  `relabelto rename` on the label's type (and `unlink` on the type of an
+  existing `property_info` it replaces), where AOSP init has only
+  `relabelto`. A
+  label that is empty or has whitespace or a control byte is refused with
+  `Error::InvalidArgument` before anything is written, and a label the
+  kernel refuses leaves `property_info` unchanged. See Migration from
+  0.7.0.
 - Service: one uid has at most 32 connections open at once (0.7.0: no
   limit per uid, only the service's 64 handler slots, 256 waiting
   connections and 102 unanswered `ctl.*` requests). A connection beyond
@@ -147,6 +167,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that cannot be read is logged at `warn` and skipped, as in the lookups
   of `SystemProperties`, and the errors are those of the types table and
   the type string.
+
+### Migration from 0.7.0
+
+- `AreaWriterLock::publish_property_info(&trie)` becomes
+  `publish_property_info(&trie, None)`; the file is written as before.
+  Pass `Some("u:object_r:property_info:s0")` (or the context your policy
+  gives `property_info`) to label it.
+- Service: a uid other than 0 and the service's own effective uid that
+  opens more than 32 connections at once on the two sockets together has
+  the connections beyond 32 closed without a reply, and the client's
+  `set` fails (0.7.0 accepted them). Raise the limit with
+  `ServiceOptions::max_connections_per_uid`; `usize::MAX` removes it.
+- Service: code that matches the text of a `StartupError` must match the
+  new texts (see Changed): `configuration` in place of
+  `configuration (init)` for `StartupStage::Config`, and for
+  `StartupStage::SocketService` `set group and mode of <path>`,
+  `group and mode left unchanged`, `0o660` and `a umask that keeps those
+  bits` in place of `raise mode of <path>`, `mode left unchanged`, `0660`
+  and `keeps group rw`. Matching `StartupError::stage()` instead does not
+  depend on the texts.
 
 ## [0.7.0] - 2026-11-17
 

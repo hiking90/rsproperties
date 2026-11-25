@@ -423,6 +423,7 @@ pub struct ServiceOptions {
     authorizer: Option<Authorizer>,
     /// Indexed by [`Listener::index`].
     socket_access: [SocketAccess; 2],
+    property_info_label: Option<String>,
     /// `None`: [`DEFAULT_MAX_CONNECTIONS_PER_UID`].
     max_connections_per_uid: Option<usize>,
     /// Counts uid 0 and the service's own uid too. Only the tests set it:
@@ -443,6 +444,7 @@ impl std::fmt::Debug for ServiceOptions {
             .field("powerctl_handler", &self.powerctl_handler.is_some())
             .field("authorizer", &self.authorizer.is_some())
             .field("socket_access", &self.socket_access)
+            .field("property_info_label", &self.property_info_label)
             .field(
                 "max_connections_per_uid",
                 &self
@@ -910,6 +912,43 @@ impl ServiceOptions {
         self
     }
 
+    /// Gives `property_info` the SELinux context `label`, as AOSP init
+    /// gives it the context `file_contexts` names for it
+    /// (`u:object_r:property_info:s0`). Clients open `property_info`
+    /// before any area file, so under SELinux a client whose domain may not
+    /// read the file's type reads no property.
+    ///
+    /// The label is set on the temp file after the trie is written, synced
+    /// and checked, and before the file is renamed onto `property_info`
+    /// ([`rsproperties::AreaWriterLock::publish_property_info`]). Under
+    /// SELinux the service's domain therefore needs `relabelto rename` on
+    /// the label's type, and, when a `property_info` already exists (a
+    /// service restart over the same properties dir), `unlink` on that
+    /// existing file's type; AOSP
+    /// init's policy grants only `relabelto` on `property_info`, because
+    /// init writes the file once in place and then relabels it. Without
+    /// this option the file keeps the label the policy gives a new
+    /// file in the properties dir. The properties dir's own label
+    /// (`properties_device` in AOSP) is not set by the service: it is the
+    /// label of the directory the host creates or mounts, or the one the
+    /// policy gives the directory `run` creates.
+    ///
+    /// [`run`] fails at [`StartupStage::Config`] for an empty `label` or
+    /// one with whitespace or a control byte, and at
+    /// [`StartupStage::PropertiesService`] when the kernel refuses the
+    /// label; which errno, and whether a context the policy does not
+    /// define is refused, depend on the security module and its policy.
+    ///
+    /// ```
+    /// use rsproperties_service::ServiceOptions;
+    ///
+    /// let options = ServiceOptions::new().property_info_label("u:object_r:property_info:s0");
+    /// ```
+    pub fn property_info_label(mut self, label: impl Into<String>) -> Self {
+        self.property_info_label = Some(label.into());
+        self
+    }
+
     /// The most connections one uid may have open at once, on both
     /// sockets together; 32 by default.
     ///
@@ -1310,8 +1349,9 @@ pub enum StartupStage {
     /// an [authorizer](ServiceOptions::authorizer); a
     /// [socket mode](SocketAccess::new) with a bit the service does not
     /// accept, a [socket group](SocketAccess::with_group) of
-    /// `u32::MAX`, or a [socket label](SocketAccess::with_label) that is
-    /// empty or has whitespace or a control byte), or
+    /// `u32::MAX`, or a [socket label](SocketAccess::with_label) or
+    /// [`property_info` label](ServiceOptions::property_info_label) that
+    /// is empty or has whitespace or a control byte), or
     /// `rsproperties::init` rejected the config: a process-global directory
     /// was already set to a different path. The options are checked before
     /// `init`, so a refused option commits no process-global state.
@@ -1327,7 +1367,8 @@ pub enum StartupStage {
     /// `fchmod`ed or `flock`ed for another reason, such as `EACCES` or
     /// `ENOLCK`: that errno's kind, with the lock path in the message),
     /// reading the `property_contexts` or build.prop files, publishing
-    /// `property_info`, or creating the property areas — in that order, so
+    /// `property_info` (with its label, when the options give one), or
+    /// creating the property areas — in that order, so
     /// a persistent-file failure leaves the properties dir unchanged. The
     /// source is a `std::io::Error`.
     PropertiesService,
@@ -1597,6 +1638,10 @@ pub async fn run(
             .check(listener, options.authorizer.is_some())
             .map_err(|e| StartupError::new(StartupStage::Config, e))?;
     }
+    if let Some(label) = &options.property_info_label {
+        access::check_label(label, "property_info label")
+            .map_err(|e| StartupError::new(StartupStage::Config, e))?;
+    }
     rsproperties::init(config).map_err(|e| StartupError::new(StartupStage::Config, e))?;
 
     // The writer lock is taken before either actor is spawned: a second
@@ -1619,6 +1664,7 @@ pub async fn run(
         powerctl_handler,
         authorizer,
         socket_access,
+        property_info_label,
         max_connections_per_uid,
         count_every_uid,
     } = options;
@@ -1638,6 +1684,7 @@ pub async fn run(
         build_prop_files,
         writer_lock: lock,
         persistent_properties_file,
+        property_info_label,
         trie_sender,
     });
     let handlers = Handlers::new(control_handler, powerctl_handler);
@@ -1805,6 +1852,29 @@ mod tests {
                 "{source}"
             );
             assert!(err.to_string().contains(listener.socket_name()), "{err}");
+        }
+    }
+
+    /// A `property_info` label no SELinux context can be fails at `Config`.
+    /// `run` returns before `init`, as in the test above.
+    #[tokio::test]
+    async fn run_refuses_a_malformed_property_info_label() {
+        for label in ["", "u:object_r:property_info:s0\n"] {
+            let options = ServiceOptions::new()
+                .authorizer(|_| Decision::Allow)
+                .property_info_label(label);
+            let err = match run(rsproperties::PropertyConfig::new(), options).await {
+                Ok(_) => panic!("run must refuse {label:?}"),
+                Err(e) => e,
+            };
+            assert_eq!(err.stage(), StartupStage::Config, "{err}");
+            assert!(
+                std::error::Error::source(&err)
+                    .unwrap()
+                    .to_string()
+                    .contains("property_info label"),
+                "{err}"
+            );
         }
     }
 

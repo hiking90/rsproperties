@@ -48,7 +48,7 @@ fn build_property_info(dir: &Path) {
     // a group-writable file that readers refuse.
     AreaWriterLock::acquire(dir)
         .unwrap()
-        .publish_property_info(&data)
+        .publish_property_info(&data, None)
         .unwrap();
 }
 
@@ -150,7 +150,7 @@ fn leading_dot_context_is_skipped() {
         b"test. u:object_r:test_prop:s0 prefix string\nhidden. .hidden prefix string\n",
     );
     let lock = AreaWriterLock::acquire(dir).unwrap();
-    lock.publish_property_info(&data).unwrap();
+    lock.publish_property_info(&data, None).unwrap();
     let mut props = SystemProperties::new_area_locked(lock).expect("new_area_locked");
 
     assert!(
@@ -202,11 +202,11 @@ fn locked_loser_leaves_property_info() {
     assert_ne!(trie_a, trie_b);
 
     let first = AreaWriterLock::acquire(dir).unwrap();
-    first.publish_property_info(&trie_a).unwrap();
+    first.publish_property_info(&trie_a, None).unwrap();
 
     let second = AreaWriterLock::acquire(dir);
     if let Ok(second) = &second {
-        let _ = second.publish_property_info(&trie_b);
+        let _ = second.publish_property_info(&trie_b, None);
     }
     assert!(
         matches!(second, Err(Error::Lock(_))),
@@ -291,7 +291,7 @@ fn publish_rejects_invalid_trie() {
     let trie = trie_for(dir, b"test. u:object_r:test_prop:s0 prefix string\n");
 
     let lock = AreaWriterLock::acquire(dir).unwrap();
-    lock.publish_property_info(&trie).unwrap();
+    lock.publish_property_info(&trie, None).unwrap();
     let info = dir.join("property_info");
     let ino = std::fs::metadata(&info).unwrap().ino();
     assert_eq!(std::fs::metadata(&info).unwrap().mode() & 0o777, 0o444);
@@ -299,7 +299,7 @@ fn publish_rejects_invalid_trie() {
     // Header claims a size that does not match the file.
     let mut bad = trie.clone();
     bad.truncate(bad.len() - 4);
-    let err = lock.publish_property_info(&bad).unwrap_err();
+    let err = lock.publish_property_info(&bad, None).unwrap_err();
     assert!(matches!(err, Error::Context { .. }), "{err:?}");
 
     assert_eq!(std::fs::metadata(&info).unwrap().ino(), ino);
@@ -307,7 +307,7 @@ fn publish_rejects_invalid_trie() {
     assert!(leftover_property_info_temps(dir).is_empty());
 
     // Publishing again works and replaces the inode.
-    lock.publish_property_info(&trie).unwrap();
+    lock.publish_property_info(&trie, None).unwrap();
     assert_ne!(std::fs::metadata(&info).unwrap().ino(), ino);
 
     drop(lock);

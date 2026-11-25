@@ -192,7 +192,8 @@ const PROPERTIES_SERIAL_CONTEXT: &CStr = c"u:object_r:properties_serial:s0";
 /// let trie = build_trie(&entries, "u:object_r:default_prop:s0", "string")?;
 ///
 /// let lock = AreaWriterLock::acquire(Path::new("/run/my_properties"))?;
-/// lock.publish_property_info(&trie)?;
+/// // `None`: no SELinux label (see `publish_property_info`).
+/// lock.publish_property_info(&trie, None)?;
 /// let mut props = SystemProperties::new_area_locked(lock)?;
 /// props.set("debug.example", "1")?;
 /// # Ok(())
@@ -340,15 +341,53 @@ impl AreaWriterLock {
     /// `strict-file-validation` feature; a group- or other-writable or
     /// symlinked `property_info` is always refused.
     ///
+    /// With `label`, the file's SELinux context (`security.selinux`) is set
+    /// to it, as AOSP init gives `property_info` the context
+    /// `file_contexts` names for it (`u:object_r:property_info:s0`) with
+    /// `selinux_android_restorecon`. The label is set with `fsetxattr` on
+    /// the temp file after it is written, synced and checked by the loader,
+    /// and before the rename, so the published file has it from the moment
+    /// readers can open it. Under SELinux the caller's domain needs, besides
+    /// what a create and a rename in `dir` need on the directory:
+    /// `create write setattr relabelfrom` and the loader's reads on the
+    /// type a new file in `dir` gets, `relabelto rename` on the label's
+    /// type, and, when a `property_info` already exists, `unlink` on that
+    /// existing file's type (the rename replaces it).
+    /// AOSP init has only `relabelto` on `property_info`: it writes the
+    /// file once in place and then relabels it, which a writer that
+    /// replaces the file while readers have it mapped cannot do. With
+    /// `None` the file keeps the label the policy gives a new file in
+    /// `dir`.
+    ///
     /// # Errors
     ///
-    /// `Error::Context` naming the path. The readers' loader also checks
-    /// the owner: in a release build (no `debug-assertions`) or with the
-    /// `strict-file-validation` feature, a file not owned by uid 0 / gid 0
-    /// is refused, so the call fails unless the process runs as root.
-    pub fn publish_property_info(&self, trie: &[u8]) -> Result<()> {
+    /// `Error::InvalidArgument` for a `label` that is empty or has
+    /// whitespace or a control byte, which no SELinux context has, before
+    /// anything is written. Otherwise `Error::Context` naming the path.
+    /// When the kernel refuses the label, which errno, and whether a context
+    /// the policy does not define is refused, depend on the security module
+    /// and its policy (without SELinux, a filesystem or process that cannot
+    /// set `security.*` attributes answers `EOPNOTSUPP` or `EPERM`). The
+    /// readers' loader also checks the owner: in a release build (no
+    /// `debug-assertions`) or with the `strict-file-validation` feature, a
+    /// file not owned by uid 0 / gid 0 is refused, so the call fails unless
+    /// the process runs as root.
+    pub fn publish_property_info(&self, trie: &[u8], label: Option<&str>) -> Result<()> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+
+        if let Some(label) = label {
+            if label.is_empty()
+                || label
+                    .bytes()
+                    .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "property_info label {label:?} is empty or has whitespace or a control \
+                     byte, which no SELinux context has"
+                )));
+            }
+        }
 
         let path = self.dir.join("property_info");
         let tmp = self
@@ -378,6 +417,22 @@ impl AreaWriterLock {
                 .context_with_location(format!("Failed to sync {tmp:?}"))?;
             PropertyInfoAreaFile::load_path(&tmp)
                 .context_with_location(format!("Rejected property_info trie in {tmp:?}"))?;
+            // After the writes and the loader's read: SELinux checks a
+            // `write` on an fd against the inode's current type, so writing
+            // after the relabel would need `write` on the label's type,
+            // which AOSP init's policy does not grant for `property_info`.
+            if let Some(label) = label {
+                // With the NUL at its end, as for the area files
+                // (`PropertyAreaMap::init_unpublished`) and as libselinux
+                // writes it.
+                let mut value = Vec::with_capacity(label.len() + 1);
+                value.extend_from_slice(label.as_bytes());
+                value.push(0);
+                fs::fsetxattr(&file, "security.selinux", &value, fs::XattrFlags::empty())
+                    .context_with_location(format!(
+                        "Failed to set SELinux label {label:?} on {tmp:?}"
+                    ))?;
+            }
             std::fs::rename(&tmp, &path)
                 .context_with_location(format!("Failed to rename {tmp:?} to {path:?}"))
         };
@@ -997,5 +1052,120 @@ mod tests {
         assert!(dir.is_dir());
         assert_eq!(lock.dir(), dir.as_path());
         assert!(dir.join(".writer_lock").exists());
+    }
+
+    fn small_trie() -> Vec<u8> {
+        crate::build_trie(&[], "u:object_r:default_prop:s0", "string").unwrap()
+    }
+
+    /// The `security.selinux` xattr of `path`, without its trailing NUL.
+    fn selinux_label_of(path: &Path) -> String {
+        let mut buf = [0u8; 256];
+        let len = fs::lgetxattr(path, "security.selinux", &mut buf).unwrap();
+        let label = &buf[..len];
+        String::from_utf8(label.strip_suffix(&[0]).unwrap_or(label).to_vec()).unwrap()
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A label no SELinux context can be is refused before anything is
+    /// written.
+    #[test]
+    fn malformed_property_info_label_is_refused() {
+        let tmp = TempDir::new("label_bad");
+        let lock = AreaWriterLock::acquire(&tmp.0).unwrap();
+        for label in ["", "\nu:object_r:property_info:s0", "u:object_r:a b:s0"] {
+            match lock.publish_property_info(&small_trie(), Some(label)) {
+                Err(Error::InvalidArgument(msg)) => assert!(msg.contains("whitespace"), "{msg}"),
+                other => panic!("{label:?}: {other:?}"),
+            }
+        }
+        assert_eq!(names_in(&tmp.0), [".writer_lock"]);
+    }
+
+    /// Where the kernel refuses the label, `property_info` keeps its
+    /// previous content and the temp file is removed. Without SELinux an
+    /// unprivileged process cannot set `security.*` attributes; with
+    /// SELinux the context is one no policy defines. A kernel that takes it
+    /// anyway (root without SELinux on a filesystem that stores the
+    /// attribute, or `mac_admin`) skips the test.
+    #[test]
+    fn refused_property_info_label_publishes_nothing() {
+        const UNKNOWN: &str = "u:object_r:rsprops_no_such_type:s0";
+        let tmp = TempDir::new("label_refused");
+        let lock = AreaWriterLock::acquire(&tmp.0).unwrap();
+        lock.publish_property_info(&small_trie(), None).unwrap();
+        let before = std::fs::read(tmp.0.join("property_info")).unwrap();
+        let other = crate::build_trie(&[], "u:object_r:other_prop:s0", "string").unwrap();
+        match lock.publish_property_info(&other, Some(UNKNOWN)) {
+            Ok(()) => {
+                eprintln!("skipped: the kernel took {UNKNOWN}");
+                return;
+            }
+            // The failed step names the label: the refusal came from the
+            // `fsetxattr`, not from an earlier step.
+            Err(e) => assert!(format!("{e}").contains(UNKNOWN), "{e:?}"),
+        }
+        assert_eq!(std::fs::read(tmp.0.join("property_info")).unwrap(), before);
+        assert_eq!(names_in(&tmp.0), [".writer_lock", "property_info"]);
+    }
+
+    /// The label is set only after the trie is written, synced and passed
+    /// the loader: bytes the loader rejects fail at the loader even with a
+    /// label the kernel would refuse, so the label step never ran.
+    #[test]
+    fn property_info_label_is_set_after_the_loader_check() {
+        const UNKNOWN: &str = "u:object_r:rsprops_no_such_type:s0";
+        let tmp = TempDir::new("label_order");
+        let lock = AreaWriterLock::acquire(&tmp.0).unwrap();
+        lock.publish_property_info(&small_trie(), None).unwrap();
+        let before = std::fs::read(tmp.0.join("property_info")).unwrap();
+        let mut bad = small_trie();
+        bad.truncate(bad.len() - 4);
+        let e = lock.publish_property_info(&bad, Some(UNKNOWN)).unwrap_err();
+        let msg = format!("{e:?}");
+        assert!(msg.contains("Rejected property_info trie"), "{msg}");
+        assert!(!msg.contains(UNKNOWN), "{msg}");
+        assert_eq!(std::fs::read(tmp.0.join("property_info")).unwrap(), before);
+        assert_eq!(names_in(&tmp.0), [".writer_lock", "property_info"]);
+    }
+
+    /// Under SELinux the published file has the label. The label is the
+    /// one of the process's home dir, when it differs from the one a new
+    /// file in the dir gets; otherwise, or when the policy does not let
+    /// the process relabel to it, the test is skipped.
+    #[test]
+    fn property_info_gets_its_label() {
+        if !Path::new("/sys/fs/selinux/enforce").exists() {
+            eprintln!("skipped: SELinux is off");
+            return;
+        }
+        let tmp = TempDir::new("label_on");
+        let lock = AreaWriterLock::acquire(&tmp.0).unwrap();
+        lock.publish_property_info(&small_trie(), None).unwrap();
+        let default_label = selinux_label_of(&tmp.0.join("property_info"));
+        let Some(label) = std::env::var_os("HOME")
+            .map(|home| selinux_label_of(Path::new(&home)))
+            .filter(|label| *label != default_label)
+        else {
+            eprintln!("skipped: no label other than {default_label} to test with");
+            return;
+        };
+        match lock.publish_property_info(&small_trie(), Some(&label)) {
+            Ok(()) => {}
+            Err(e) if format!("{e:?}").contains("Permission denied") => {
+                eprintln!("skipped: the policy does not let this process set {label}: {e:?}");
+                return;
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+        assert_eq!(selinux_label_of(&tmp.0.join("property_info")), label);
     }
 }
