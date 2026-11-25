@@ -162,6 +162,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- Service: "Running on Android" in the crate rustdoc (an example with
+  init's socket modes and labels, the `property_info` label and an
+  authorizer that checks both contexts init checks) and in
+  `docs/service-security.md` (what the host sets up and what the service
+  does not provide: the mount namespace, the properties dir's label, the
+  permissions the service's domain needs, no `appcompat_override`, no
+  `restorecon` for `selinux.restorecon_recursive`, no V1).
 - The crate READMEs are short: a description, installation, one
   example and links. Their usage guides moved to the crate-level rustdoc,
   so docs.rs shows them; their API reference lists, which repeated the

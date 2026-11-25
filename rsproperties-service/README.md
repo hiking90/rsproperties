@@ -4,12 +4,13 @@
 [![Documentation](https://docs.rs/rsproperties-service/badge.svg)](https://docs.rs/rsproperties-service)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/hiking90/rsproperties/blob/main/LICENSE)
 
-Linux emulation of the Android system property service, as a library: a
-host binary calls `run` on a tokio runtime, and the service creates the
+The Android system property service as a library, for Linux hosts and
+for Android userspaces that run without init's property service: a host
+binary calls `run` on a tokio runtime, and the service creates the
 property areas from `property_contexts` and build.prop files and serves
 the property service sockets, so
-[`rsproperties`](https://crates.io/crates/rsproperties) clients can
-`get`, `set` and wait on a Linux host.
+[`rsproperties`](https://crates.io/crates/rsproperties) and bionic
+clients can `get`, `set` and wait.
 
 - Handles the V2 set command (`PROP_MSG_SETPROP2`) and answers with
   init's `PROP_ERROR_*` codes; the V1 command is refused.
@@ -21,12 +22,14 @@ the property service sockets, so
   provides, in the order init handles them.
 - Asks an authorizer the host provides whether each request may go on,
   where init asks SELinux (`AccessPolicy` is one made of uid and gid
-  rules); the owner group and mode of each socket file are configurable.
+  rules); the owner group, mode and SELinux label of each socket file,
+  and the label of `property_info`, are configurable.
 
 Without an authorizer it checks no sender beyond the socket files' modes.
 It compiles for Linux and Android. On Android, where init normally runs
 the property service, it serves a userspace that runs without one, and
-`run` requires an authorizer.
+`run` requires an authorizer
+([Running on Android](https://github.com/hiking90/rsproperties/blob/main/docs/service-security.md#running-on-android)).
 
 ## Installation
 
@@ -81,8 +84,8 @@ owns them, so a release build of the service runs as root.
   response codes, `sys.powerctl`, the type check, startup properties,
   size limits, and how a host answers `ctl.*` as init does.
 - [Files, access control and hardening](https://github.com/hiking90/rsproperties/blob/main/docs/service-security.md):
-  the directory layout, file ownership, who may use the service, socket
-  permissions and backpressure.
+  the directory layout, file ownership, who may use the service, running
+  on Android, socket permissions and backpressure.
 
 The repository's `example_service` (`rsproperties-service/examples/`)
 runs the service from the command line; the

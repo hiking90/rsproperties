@@ -1,7 +1,8 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Linux emulation of the Android system property service, as a library.
+//! The Android system property service as a library, for Linux hosts and
+//! for Android userspaces that run without init's property service.
 //!
 //! A host binary calls [`run`] on a tokio runtime. The service creates the
 //! property areas from `property_contexts` and build.prop files, serves
@@ -131,6 +132,68 @@
 //!
 //! [`AccessPolicy`] is a ready-made authorizer of uid and gid rules.
 //!
+//! # Running on Android
+//!
+//! On Android the service is for a userspace that runs without init's
+//! property service; it does not replace the device's init. [`run`]
+//! requires an authorizer there. These options give the sockets and
+//! `property_info` init's modes and SELinux labels, and decide each
+//! request as init does, by the SELinux policy. The check itself is the
+//! host's (`selinux_allows` below, through libselinux or selinuxfs); the
+//! service passes it the two contexts init passes. The security page
+//! linked below lists what else the host sets up (mount namespace, the
+//! properties dir's label, the permissions the service's domain needs).
+//!
+//! The `property_contexts` files are the ones init reads, in its order.
+//! init skips the four after `plat_property_contexts` when they cannot be
+//! read; the service fails to start on a file it cannot open, so the
+//! example passes only the files that exist.
+//!
+//! ```
+//! use rsproperties_service::{Decision, Listener, ServiceOptions, SocketAccess};
+//!
+//! # fn selinux_allows(_source: &str, _target: &str) -> bool { false }
+//! const SOCKET: &str = "u:object_r:property_socket:s0";
+//! const CONTEXTS: [&str; 5] = [
+//!     "/system/etc/selinux/plat_property_contexts",
+//!     "/system_ext/etc/selinux/system_ext_property_contexts",
+//!     "/vendor/etc/selinux/vendor_property_contexts",
+//!     "/product/etc/selinux/product_property_contexts",
+//!     "/odm/etc/selinux/odm_property_contexts",
+//! ];
+//!
+//! let options = ServiceOptions::new()
+//!     .property_contexts_files(
+//!         CONTEXTS
+//!             .into_iter()
+//!             .filter(|path| std::path::Path::new(path).exists()),
+//!     )
+//!     .socket_access(Listener::Property, SocketAccess::new(0o666).with_label(SOCKET))
+//!     .socket_access(
+//!         Listener::System,
+//!         // Group `system` (AID_SYSTEM).
+//!         SocketAccess::new(0o660).with_group(1000).with_label(SOCKET),
+//!     )
+//!     .property_info_label("u:object_r:property_info:s0")
+//!     .authorizer(|request| {
+//!         let Ok(source) = request.peer().security_label() else {
+//!             return Decision::Deny;
+//!         };
+//!         // init checks `ctl.<target>` first for start, stop and restart,
+//!         // then `context()`: for `ctl.*` the context of
+//!         // `ctl.<action>$<target>`, for any other set that of the name.
+//!         let allowed = request
+//!             .legacy_control_context()
+//!             .is_some_and(|legacy| selinux_allows(&source, legacy))
+//!             || selinux_allows(&source, request.context());
+//!         if allowed {
+//!             Decision::Allow
+//!         } else {
+//!             Decision::Deny
+//!         }
+//!     });
+//! ```
+//!
 //! # Setting from the service's process
 //!
 //! The actors are private; a process sets properties through the socket
@@ -191,7 +254,8 @@
     "- [Files, access control and hardening](https://github.com/hiking90/rsproperties/blob/v",
     env!("CARGO_PKG_VERSION"),
     "/docs/service-security.md): the directory layout, file ownership, who may use \
-     the service, socket permissions, backpressure, and the outcome of a `TimedOut`.\n",
+     the service, running on Android, socket permissions, backpressure, and the \
+     outcome of a `TimedOut`.\n",
     "- [CHANGELOG.md](https://github.com/hiking90/rsproperties/blob/v",
     env!("CARGO_PKG_VERSION"),
     "/CHANGELOG.md): every change, with a migration section per release."

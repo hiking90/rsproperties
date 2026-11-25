@@ -179,6 +179,83 @@ in the release build.
   `property_info` or the sockets. Run one instance per socket dir: two
   instances with different properties dirs must not share a socket dir.
 
+## Running on Android
+
+On Android the service is for a userspace that runs without init's
+property service, such as a guest in a mount namespace of its own. It
+does not replace the device's init. bionic opens `/dev/__properties__`
+and the sockets in `/dev/socket` (`property_service`, and
+`property_service_for_system` for `sys.powerctl`), and `rsproperties`
+uses the same directories by default, so the host gives the service and
+its clients a mount namespace in which those two directories are the
+service's properties dir and socket dir, and starts the clients there.
+
+What the host sets up, and what init does in its place:
+
+- **An authorizer is required.** `run` fails at `StartupStage::Config`
+  without one: processes of one uid set different properties under the
+  SELinux policy, which the socket files cannot tell apart. init asks
+  `selinux_check_access(source, target, "property_service", "set")` for
+  every request. The authorizer gets both contexts: the source is
+  `PeerInfo::security_label()` (what init reads with `getpeercon`), the
+  target `SetRequest::context()`. For `ctl.start`, `ctl.stop` and
+  `ctl.restart` it also gets `SetRequest::legacy_control_context()`,
+  the context init checks first, and init allows the request when the
+  policy allows either. The service does not make the SELinux check
+  itself; the host calls libselinux or the kernel's selinuxfs from the
+  authorizer.
+- **Socket files.** init creates `property_service` with mode `0666` and
+  `property_service_for_system` with mode `0660` and group `system`
+  (1000), both labeled `u:object_r:property_socket:s0`. The service's
+  defaults are `0o660` without a label on both; pass init's values with
+  `ServiceOptions::socket_access` and `SocketAccess::with_label`.
+- **`property_info`.** init labels it `u:object_r:property_info:s0`;
+  pass that with `ServiceOptions::property_info_label`. The service
+  writes a temp file and renames it onto `property_info`, so its domain
+  needs `relabelto` and `rename` on that type, and `unlink` on the type
+  of an existing `property_info` it replaces (a restart over the same
+  directory). init's own policy grants only `relabelto` there, because
+  init writes the file once in place.
+- **Area files.** Each is labeled with its `property_contexts` context,
+  and `properties_serial` with `u:object_r:properties_serial:s0`, as
+  bionic does. On Android a label that cannot be set fails startup at
+  `StartupStage::PropertiesService`, as it stops init: a client reads an
+  area only when the policy lets its domain read the file's type. Each
+  area is created under a temp name, labeled, given its mode and renamed
+  into place, so the domain needs `write`, `relabelto`, `setattr` and
+  `rename` on each area's type, and `unlink` on the type of an existing
+  file it replaces. init's policy grants these on the types of the
+  context areas (`property_type`), but on `properties_serial` only
+  `write` and `relabelto`: bionic creates that file once in place.
+- **Which domain can run it.** AOSP's policy has `neverallow { domain
+  -init }` rules for writing `property_type`, `properties_device` and
+  `properties_serial` files (`private/domain.te`). On that policy no
+  domain other than `init` can be given write permission on the area
+  files, on `properties_serial`, or on the temp file of `property_info`,
+  which is created with the properties dir's type (`properties_device`).
+  `init` in turn lacks `rename` on `property_info` and `rename` and
+  `setattr` on `properties_serial`. Under an unmodified AOSP policy the
+  service is therefore expected to start only where SELinux does not
+  enforce the policy for its domain (a permissive domain, or SELinux in
+  permissive mode); this was not measured.
+- **The properties dir.** Its label (`properties_device` in AOSP) is the
+  one of the directory the host creates or mounts; the service does not
+  set it.
+- **Not provided.** The service does not create the
+  `appcompat_override` directory, which only API 35–36 readers use:
+  zygote bind mounts it over `/dev/__properties__`, so without it bionic
+  reads every property without overrides. API 37 readers do not use it:
+  in a process with `BIONIC_APPCOMPAT_OVERRIDE` set, bionic looks up
+  `ro.appcompat_override.<name>` in the ordinary areas first, so such an
+  entry stored in this service's areas overrides `<name>` (not measured
+  against this service). The service also does not run `restorecon` for
+  `selinux.restorecon_recursive` (it stores the value), and does not
+  serve the V1 command (bionic sends V2 when `ro.property_service.version`
+  is 2 or more, which the service sets).
+
+The crate documentation's "Running on Android" section has these options
+as code.
+
 ## Hardening
 
 ### Socket permissions
