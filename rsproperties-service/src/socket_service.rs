@@ -1763,8 +1763,8 @@ impl SocketService {
     /// signal. Same rule as the client's `ServiceConnection::send` in
     /// `rsproperties/src/system_property_set.rs`; here it is a readiness
     /// loop, and `CLIENT_TIMEOUT` around the handler bounds the wait. This
-    /// crate is Linux-only (see the `compile_error!` in lib.rs), so
-    /// `MSG_NOSIGNAL` needs no fallback.
+    /// crate builds only for Linux and Android (see the `compile_error!` in
+    /// lib.rs), whose kernel has `MSG_NOSIGNAL`, so it needs no fallback.
     async fn send_response(stream: &mut UnixStream, response: i32) -> Result<()> {
         trace!("Sending response: {response}");
         let bytes = response.to_ne_bytes();
@@ -2151,10 +2151,12 @@ pub(crate) mod tests {
         if pid == 0 {
             // SAFETY: every pointer passed is to a local that outlives
             // the call (`groups` with its length 1, `property`/`system`
-            // with `size_of::<sockaddr_un>()`); `__errno_location`
-            // returns this thread's `errno`, read right after the failed
-            // call. The id syscalls change this thread only, and the
-            // child has no other thread.
+            // with `size_of::<sockaddr_un>()`). The id syscalls change
+            // this thread only, and the child has no other thread.
+            // `io::Error::last_os_error` reads this thread's `errno`
+            // right after the failed call, without allocating; unlike
+            // `libc::__errno_location` it exists in bionic builds too
+            // (bionic names the function `__errno`).
             unsafe {
                 let connect = |addr: &libc::sockaddr_un| -> i32 {
                     let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
@@ -2169,7 +2171,8 @@ pub(crate) mod tests {
                     if r == 0 {
                         0
                     } else {
-                        *libc::__errno_location()
+                        // Always `Some`: `last_os_error` is an OS error.
+                        std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
                     }
                 };
                 let groups = [GROUP as libc::gid_t];

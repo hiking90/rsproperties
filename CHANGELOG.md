@@ -78,6 +78,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   together (see "Changed" for the default). `usize::MAX` removes the
   limit. The `Debug` output of `ServiceOptions` has a
   `max_connections_per_uid` field.
+- Service: `rsproperties-service` builds for Android
+  (`target_os = "android"`; 0.7.0 stopped the build with a
+  `compile_error!`), for a userspace that runs without init's property
+  service. On Android `run` fails at `StartupStage::Config` when the
+  options have no authorizer; `authorizer(|_| Decision::Allow)` allows
+  every request. Other targets than Linux and Android still do not
+  build.
 - `PropertyInfoTrie` (`builder` feature): a checked, 4-byte aligned copy
   of the bytes `build_trie` returns. `context(name)` and
   `property_type(name)` return `&str`s that borrow it, without the

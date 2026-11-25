@@ -24,7 +24,9 @@ the property service sockets, so
   rules); the owner group and mode of each socket file are configurable.
 
 Without an authorizer it checks no sender beyond the socket files' modes.
-It compiles only for Linux: on Android, init owns the property service.
+It compiles for Linux and Android. On Android, where init normally runs
+the property service, it serves a userspace that runs without one, and
+`run` requires an authorizer.
 
 ## Installation
 

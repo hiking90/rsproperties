@@ -11,9 +11,9 @@ documentation = "https://docs.rs/rsproperties-service"
 keywords.workspace = true
 # Not the workspace's "api-bindings": the service binds no foreign API.
 categories = ["os::linux-apis", "development-tools::testing"]
-description = "Linux emulation of the Android system property service (not usable on Android)"
+description = "Linux emulation of the Android system property service, also for Android userspaces without init's property service"
 
-# The service builds on Linux only.
+# docs.rs builds the Linux target only.
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
 

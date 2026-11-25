@@ -8,10 +8,12 @@
 //! the `property_service` / `property_service_for_system` sockets
 //! (`PROP_MSG_SETPROP2`), and passes `ctl.*` and `sys.powerctl` requests
 //! to handlers the host provides, so `rsproperties` clients can `get`,
-//! `set` and wait on a Linux host. It is not usable on Android, where init
-//! owns the property service; the crate compiles only for
-//! `target_os = "linux"` (on other targets the first error names the
-//! reason).
+//! `set` and wait on a Linux host. It also builds for Android, for a
+//! userspace that runs without init's property service (in a mount
+//! namespace of its own, for example); there [`run`] requires an
+//! [authorizer](ServiceOptions::authorizer). The crate compiles only for
+//! `target_os = "linux"` and `"android"` (on other targets the first
+//! error names the reason).
 //!
 //! The V1 command (`PROP_MSG_SETPROP`), which init still handles, is not
 //! supported: such a request sets nothing and gets
@@ -120,7 +122,8 @@
 //! });
 //! ```
 //!
-//! Without an authorizer the service checks no sender beyond the socket
+//! On Android [`run`] fails without an authorizer. On Linux, without one
+//! the service checks no sender beyond the socket
 //! files: every peer that can connect may set any property that is not a
 //! `ro.` property with a value, and send any `ctl.*` and `sys.powerctl`
 //! request. A handler that acts on the host must then check
@@ -194,11 +197,10 @@
 )]
 #![warn(missing_docs)]
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 compile_error!(
-    "rsproperties-service emulates the Android property service on Linux and builds only for \
-     target_os = \"linux\". It is not usable on Android, where init owns the property service; \
-     use the `rsproperties` client crate there."
+    "rsproperties-service serves the Android property protocol over Unix sockets and futexes \
+     and builds only for target_os = \"linux\" and \"android\"."
 );
 
 use std::path::PathBuf;
@@ -749,8 +751,15 @@ impl ServiceOptions {
 
     /// Decides for every request from a client whether it may go on:
     /// init's `CheckPermissions`, with `authorizer` in the place of
-    /// SELinux. Without one, every request of a peer that could connect is
-    /// allowed.
+    /// SELinux. On Linux, without one every request of a peer that could
+    /// connect is allowed.
+    ///
+    /// On Android [`run`] refuses options without an authorizer, at
+    /// [`StartupStage::Config`]. There, init checks every request against
+    /// the SELinux policy, which lets processes of one uid set different
+    /// properties, so access to the socket files cannot stand in for it.
+    /// A host that means to allow every request says so with
+    /// `authorizer(|_| Decision::Allow)`.
     ///
     /// `authorizer` is called for a set of an ordinary property, for a
     /// `ctl.*` request and for a `sys.powerctl` set, after the name check
@@ -1295,7 +1304,8 @@ impl std::error::Error for ServiceError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StartupStage {
-    /// A [`ServiceOptions`] value was refused (a
+    /// A [`ServiceOptions`] value was refused (on Android, options without
+    /// an [authorizer](ServiceOptions::authorizer); a
     /// [socket mode](SocketAccess::new) with a bit the service does not
     /// accept, or a [socket group](SocketAccess::with_group) of
     /// `u32::MAX`), or
@@ -1394,7 +1404,8 @@ impl std::error::Error for StartupError {
 ///
 /// # Startup order
 ///
-/// 1. The [`ServiceOptions`] values are checked, then
+/// 1. The [`ServiceOptions`] values are checked (on Android, the options
+///    must have an [authorizer](ServiceOptions::authorizer)), then
 ///    `rsproperties::init(config)`.
 /// 2. The properties dir's writer lock
 ///    ([`rsproperties::AreaWriterLock::acquire`]); this creates a missing
@@ -1571,6 +1582,8 @@ pub async fn run(
     //
     // The options are checked first: `init` cannot be undone, so a
     // refused option leaves no process-global state behind.
+    check_authorizer_present(cfg!(target_os = "android"), options.authorizer.is_some())
+        .map_err(|e| StartupError::new(StartupStage::Config, e))?;
     for listener in Listener::ALL {
         options.socket_access[listener.index()]
             .check(listener, options.authorizer.is_some())
@@ -1683,6 +1696,26 @@ pub async fn run(
     })
 }
 
+/// Refuses options without an authorizer on Android (`on_android`; a
+/// parameter so the Linux tests can check the Android case). init checks
+/// every request there with SELinux, so a service that checks none would
+/// let any process that can connect set what the policy denies it.
+fn check_authorizer_present(
+    on_android: bool,
+    has_authorizer: bool,
+) -> Result<(), rsproperties::Error> {
+    if on_android && !has_authorizer {
+        return Err(rsproperties::Error::InvalidArgument(
+            "on Android the service needs ServiceOptions::authorizer: init checks every \
+             request with SELinux there, and without an authorizer every process that can \
+             connect could set any property (pass `authorizer(|_| Decision::Allow)` to allow \
+             every request)"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Builds the [`StartupError`] for a failed actor: the cause is the
 /// actor's own failure (normally its `on_start` error) when the join
 /// handle has one, the `JoinError` when the task panicked or was
@@ -1765,6 +1798,20 @@ mod tests {
             );
             assert!(err.to_string().contains(listener.socket_name()), "{err}");
         }
+    }
+
+    /// Only Android requires an authorizer.
+    #[test]
+    fn authorizer_is_required_on_android_only() {
+        let err = check_authorizer_present(true, false).unwrap_err();
+        assert!(
+            matches!(&err, rsproperties::Error::InvalidArgument(msg)
+                if msg.contains("ServiceOptions::authorizer")),
+            "{err}"
+        );
+        check_authorizer_present(true, true).unwrap();
+        check_authorizer_present(false, false).unwrap();
+        check_authorizer_present(false, true).unwrap();
     }
 
     /// `run` must return the actor's own `on_start` error, not rsactor's
