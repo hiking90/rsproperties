@@ -113,19 +113,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `AreaWriterLock::acquire` (`builder` feature) fails with `Error::Lock`
+  only when another writer holds the lock; another `flock` failure is an
+  `Error::Context` with its errno (0.7.0: `Error::Lock` for every `flock`
+  failure, which named another instance for an `EACCES` from SELinux).
+  The callers that take the lock return the same: `SystemProperties::new_area`,
+  and, in the service, the source of a `StartupStage::WriterLock` error.
+  See Migration from 0.7.0.
 - `AreaWriterLock::publish_property_info(trie, label)` (`builder`
   feature) takes an `Option<&str>` SELinux label (0.7.0:
   `publish_property_info(trie)`). With `Some(label)`, the file's
-  `security.selinux` is set to `label` by `fsetxattr` on the temp file
-  after the trie is written, synced and checked, before the file is
-  renamed onto `property_info`; under SELinux the writer's domain needs
-  `relabelto rename` on the label's type (and `unlink` on the type of an
-  existing `property_info` it replaces), where AOSP init has only
-  `relabelto`. A
-  label that is empty or has whitespace or a control byte is refused with
-  `Error::InvalidArgument` before anything is written, and a label the
-  kernel refuses leaves `property_info` unchanged. See Migration from
-  0.7.0.
+  `security.selinux` is set to `label` by `fsetxattr` after the trie is
+  written, synced and checked, before the file is renamed onto
+  `property_info`; under SELinux the writer's domain needs `relabelto
+  rename` on the label's type (and `unlink` on the type of an existing
+  `property_info` it replaces). A label that is empty or has whitespace
+  or a control byte is refused with `Error::InvalidArgument` before
+  anything is written, and a label the kernel refuses leaves
+  `property_info` unchanged. See Migration from 0.7.0.
+- On Android, `AreaWriterLock::publish_property_info` writes
+  `property_info` at its name and labels it last, as init does (0.7.0: a
+  temp file renamed onto it), but creates it with `O_EXCL` where init
+  opens it with `O_TRUNC`, so a file readers may have mapped is never
+  rewritten in place. `SystemProperties::new_area` / `new_area_locked`
+  create `properties_serial` at its name with `O_EXCL`, as bionic does
+  (0.7.0: renamed into place). AOSP's policy lets only init write these
+  files and gives init `relabelto` on `property_info` and `write
+  relabelto` on `properties_serial`, not the `rename` a temp file needs.
+  Both calls therefore fail with `EEXIST` when the file exists, and
+  `new_area` / `new_area_locked` fail before any area file is created
+  or replaced: start an Android writer on a fresh properties dir. The
+  label still needs `relabelfrom` on the type a new file in the
+  properties dir gets, which AOSP's policy gives no domain on
+  `properties_device`; on that policy start on a `tmpfs` directory and
+  relabel it `properties_device` after the writer returns, as init does
+  (see `docs/service-security.md`, not measured). That policy does not
+  give init `lock` on the files it creates there (`init_tmpfs`), which
+  the `flock` of the writer lock (`AreaWriterLock::acquire`, also taken
+  by `new_area`) needs, so on an unmodified policy the writer fails at
+  the lock; the host policy has to add it. On every target an
+  area file is now labeled last, after its mode, its size, its header
+  and its mapping: the `setattr` of the `fchmod`, the `write` of the
+  `ftruncate` and of the header, and the `read write map` of the `mmap`
+  are checked on the type a new file in the properties dir gets, not on
+  the label's type (0.7.0: the label came first, so these were checked
+  on the label's type when the label was set), and a failure before the
+  label removes the file under that type. The header is written with
+  `pwrite` before the file is mapped; its bytes are those 0.7.0 wrote.
+  See Migration from 0.7.0.
 - On Android, a property area file whose SELinux context cannot be set
   (`fsetxattr` of `security.selinux`) is not created:
   `SystemProperties::new_area` and `new_area_locked` fail with an
@@ -166,8 +201,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   init's socket modes and labels, the `property_info` label and an
   authorizer that checks both contexts init checks) and in
   `docs/service-security.md` (what the host sets up and what the service
-  does not provide: the mount namespace, the properties dir's label, the
-  permissions the service's domain needs, no `appcompat_override`, no
+  does not provide: the mount namespace, the properties dir's label (on
+  AOSP's policy a `tmpfs` directory relabeled after `run`, not measured),
+  the permissions the service's domain needs, no `appcompat_override`, no
   `restorecon` for `selinux.restorecon_recursive`, no V1).
 - The crate READMEs are short: a description, installation, one
   example and links. Their usage guides moved to the crate-level rustdoc,
@@ -191,6 +227,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Migration from 0.7.0
 
+- `AreaWriterLock::acquire` returns `Error::Lock` only when another
+  writer holds the lock (`EWOULDBLOCK`); any other `flock` failure, such
+  as `EACCES` from SELinux, is an `Error::Context` with that errno (0.7.0:
+  `Error::Lock` for every `flock` failure), also through
+  `SystemProperties::new_area` and the service's `StartupStage::WriterLock`.
+  Code that took `Error::Lock` for "the directory is in use" now gets the
+  real cause for the others.
 - `AreaWriterLock::publish_property_info(&trie)` becomes
   `publish_property_info(&trie, None)`; the file is written as before.
   Pass `Some("u:object_r:property_info:s0")` (or the context your policy
@@ -200,6 +243,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in a domain the policy lets label files with the `property_contexts`
   contexts (`relabelto` on those types), on a filesystem that stores
   `security.*` attributes.
+- An Android writer that 0.7.0 let restart over the same properties dir
+  now fails with `EEXIST` on `property_info` (`publish_property_info`) or
+  `properties_serial` (`new_area`, `new_area_locked`). Give each start a
+  new directory: AOSP's policy lets no domain unlink `properties_serial`
+  and gives init no `unlink` on `property_info`. Where the policy allows
+  it, removing those two files before the start works too. Start readers
+  only after the writer has returned.
+- An SELinux policy (Linux or Android) that granted the writer
+  `setattr`, `write` or `map` only on the area label types also needs
+  them on the type a new file in the properties dir gets: area creation
+  now fails with `Failed to set mode of …`, `Failed to size property
+  area …`, `Failed to write the header of …` or a failed `mmap`
+  (`EACCES`) without them.
 - Service: a uid other than 0 and the service's own effective uid that
   opens more than 32 connections at once on the two sockets together has
   the connections beyond 32 closed without a reply, and the client's

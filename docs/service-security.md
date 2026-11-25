@@ -10,7 +10,8 @@ is in [service-protocol.md](service-protocol.md).
 ```text
 properties_dir/
 ├── .writer_lock           # flock held by the running writer
-├── property_info          # property contexts trie (replaced by rename)
+├── property_info          # property contexts trie (replaced by rename;
+│                          #   on Android written once at its name)
 ├── properties_serial      # global serial
 └── u:object_r:*:s0        # one area file per SELinux context
 
@@ -32,7 +33,8 @@ feature of `rsproperties`, requires the file to be owned by uid 0 and
 gid 0, as bionic does (`prop_area.cpp`).
 
 The service creates these files as its own user and reads
-`property_info` back before it renames it into place. In such a build,
+`property_info` back before it renames it into place (on Android,
+where it is written at its name, before it labels it). In such a build,
 `run` as any other user fails at `StartupStage::PropertiesService` with
 `Error::FileOwnership` ("File not owned by root: uid=…, gid=…"), and a
 client built the same way refuses the files a non-root service created.
@@ -210,37 +212,116 @@ What the host sets up, and what init does in its place:
   defaults are `0o660` without a label on both; pass init's values with
   `ServiceOptions::socket_access` and `SocketAccess::with_label`.
 - **`property_info`.** init labels it `u:object_r:property_info:s0`;
-  pass that with `ServiceOptions::property_info_label`. The service
-  writes a temp file and renames it onto `property_info`, so its domain
-  needs `relabelto` and `rename` on that type, and `unlink` on the type
-  of an existing `property_info` it replaces (a restart over the same
-  directory). init's own policy grants only `relabelto` there, because
-  init writes the file once in place.
+  pass that with `ServiceOptions::property_info_label`. On Android the
+  service writes the file at `property_info` itself and labels it last,
+  as init does, so on that type its domain needs only `relabelto`, the
+  one permission init's policy grants there. On the type a new file in
+  the properties dir gets, it needs `create`, `write`, `setattr` (the
+  mode), `open read getattr map` (the check that reads the file back),
+  `relabelfrom` (the label) and `unlink` to remove the file when a step
+  fails; see "Which domain can run it".
 - **Area files.** Each is labeled with its `property_contexts` context,
   and `properties_serial` with `u:object_r:properties_serial:s0`, as
   bionic does. On Android a label that cannot be set fails startup at
   `StartupStage::PropertiesService`, as it stops init: a client reads an
-  area only when the policy lets its domain read the file's type. Each
-  area is created under a temp name, labeled, given its mode and renamed
-  into place, so the domain needs `write`, `relabelto`, `setattr` and
-  `rename` on each area's type, and `unlink` on the type of an existing
-  file it replaces. init's policy grants these on the types of the
-  context areas (`property_type`), but on `properties_serial` only
-  `write` and `relabelto`: bionic creates that file once in place.
+  area only when the policy lets its domain read the file's type. The
+  label is the last step (bionic labels first): each file is created,
+  given its mode, sized, has its header written and is mapped before
+  it, which needs `create`, `open read write map`, `setattr` and, for the
+  label, `relabelfrom` on the type a new file in the properties dir
+  gets. A failure up to and including the label removes the file, which
+  needs `unlink` on that type. `properties_serial` is created at its
+  name, as bionic creates it, and nothing follows its label, so on its
+  type it needs only `relabelto`, which init's policy grants. The area
+  of each context is created under a temp name and renamed into place
+  after its label, which needs `relabelto` and `rename` on its type,
+  `unlink` on the type of an existing file it replaces, and `unlink` on
+  its own type to remove the temp file when the rename fails; init's
+  policy grants these on `property_type`.
+- **A fresh properties dir.** Because `property_info` and
+  `properties_serial` are created at their names with `O_EXCL`, `run`
+  fails at `StartupStage::PropertiesService` when either exists: init
+  starts on the tmpfs `/dev` of each boot, and a host restarts the
+  service on a new directory (a new tmpfs, for example). Start the
+  clients after `run` has returned: until then a client can open these
+  files before they are complete.
 - **Which domain can run it.** AOSP's policy has `neverallow { domain
   -init }` rules for writing `property_type`, `properties_device` and
-  `properties_serial` files (`private/domain.te`). On that policy no
-  domain other than `init` can be given write permission on the area
-  files, on `properties_serial`, or on the temp file of `property_info`,
-  which is created with the properties dir's type (`properties_device`).
-  `init` in turn lacks `rename` on `property_info` and `rename` and
-  `setattr` on `properties_serial`. Under an unmodified AOSP policy the
-  service is therefore expected to start only where SELinux does not
-  enforce the policy for its domain (a permissive domain, or SELinux in
-  permissive mode); this was not measured.
-- **The properties dir.** Its label (`properties_device` in AOSP) is the
-  one of the directory the host creates or mounts; the service does not
-  set it.
+  `properties_serial` files (`private/domain.te`); `relabelfrom` is one
+  of the permissions they forbid. On that policy only the `init` domain
+  can write the property files. The permissions listed above on the
+  label types are the ones init's policy has. On the type a new file in
+  the properties dir gets, the service's domain needs, for each file it
+  creates there:
+  - `.writer_lock`, which `run` creates first (`AreaWriterLock::acquire`,
+    `StartupStage::WriterLock`): `create open write` (opened with
+    `O_CREAT`), `setattr` (`fchmod` to `0600`) and `lock` (`flock`). The
+    file keeps that type; it is not relabeled or removed.
+  - The temp file of each context's area and `properties_serial`:
+    `create open read write` (opened read-write), `setattr` (`fchmod`),
+    `write` (`ftruncate` and the header's `pwrite`), `map` (`mmap`),
+    `relabelfrom` (the label) and `unlink` when a step fails.
+  - `property_info`: `create open write`, `setattr`, `read getattr map`
+    (the loader's read back), `relabelfrom` and `unlink` when a step
+    fails.
+
+  Which permissions the policy grants on that type depends on the
+  properties dir's label, because the policy has no type transition for
+  files created in `properties_device`:
+  - In a directory labeled `properties_device`, a new file is
+    `properties_device`. init has `create_file_perms` (`lock` included)
+    on that type but not `relabelfrom` (`private/init.te`), and the
+    neverallow above
+    keeps every other domain from having it, so every label step fails
+    and `run` fails at `StartupStage::PropertiesService`.
+  - init's own files do not have this type. init creates
+    `/dev/__properties__` and its files (`PropertyInit`) before it runs
+    `restorecon` on `/dev` and `/dev/__properties__`
+    (`SelinuxRestoreContext`), so the directory is then still `tmpfs`,
+    and `tmpfs_domain(init)` (`private/init.te`, `public/te_macros`)
+    makes a file init creates in a `tmpfs` directory `init_tmpfs`. On
+    that type init has `read write getattr map` (`tmpfs_domain`) and
+    `create getattr open read write setattr relabelfrom unlink map` (the
+    `file_type` rule in `private/init.te`), and no other file
+    permission, `lock` included (also checked in the compiled
+    `prebuilts/api/202604/202604_plat_sepolicy.cil`). init relabels the
+    directory to `properties_device` afterwards.
+
+  So on that policy the host follows init's order:
+
+  1. Start the service in the `init` domain on a fresh directory labeled
+     `tmpfs`, such as the root of a new tmpfs mount (`fs_use_trans tmpfs`
+     in `private/fs_use`), so each new file gets `init_tmpfs` and init
+     may relabel it (the `file_type` rule above).
+  2. After `run` has returned and before the clients start, relabel the
+     properties dir to `u:object_r:properties_device:s0`, the label
+     `file_contexts` gives `/dev/__properties__`. init does the same:
+     `SelinuxRestoreContext` (`init/selinux.cpp`) runs after
+     `PropertyInit` and restores `/dev/__properties__` without
+     recursion, so the files keep their labels. init's policy grants
+     `tmpfs:dir relabelfrom` and `properties_device:dir relabelto`
+     (`private/init.te`). Every domain may search both directory types
+     (`private/domain.te`).
+
+  Of the permissions listed above on the type a new file gets, init's
+  policy has every one on `init_tmpfs` except `lock`. On an unmodified
+  AOSP policy step 1 therefore fails at the writer lock: the `flock` on
+  `.writer_lock` is refused with `EACCES`, and `run` fails at
+  `StartupStage::WriterLock` with that errno (`Error::Lock`, "already
+  owned by another instance", is only for a lock another writer holds).
+  The writer lock stays on Android: it keeps a second instance from
+  renaming its sockets over the first one's. The procedure needs a host policy
+  that adds `allow init init_tmpfs:file lock;`; no neverallow in AOSP's
+  policy covers that rule (checked in the compiled policy above).
+
+  This sequence is read from the policy and init's source, not
+  measured; whether the service starts this way in the `init` domain,
+  with or without that rule, was not measured either.
+- **The properties dir.** Its label is the one of the directory the host
+  creates or mounts; the service does not set it. That label decides the
+  type each new file in it starts with, so on AOSP's policy the host
+  starts with a `tmpfs` one and relabels it to `properties_device` after
+  `run` (see "Which domain can run it").
 - **Not provided.** The service does not create the
   `appcompat_override` directory, which only API 35–36 readers use:
   zygote bind mounts it over `/dev/__properties__`, so without it bionic

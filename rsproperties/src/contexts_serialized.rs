@@ -251,7 +251,9 @@ impl AreaWriterLock {
     /// with `Error::Lock`, returned as is (not wrapped in
     /// `Error::Context`), before any area file, `property_info` or temp
     /// file in `dir` is changed (only the mode of `.writer_lock` is reset
-    /// to 0600). Other failures are `Error::Context` naming the path.
+    /// to 0600). Other failures are `Error::Context` naming the path, a
+    /// refused `flock` included (`EACCES` when SELinux denies `lock` on the
+    /// file's type, as AOSP's policy does for init on `init_tmpfs`).
     pub fn acquire(dir: &Path) -> Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
 
@@ -296,12 +298,8 @@ impl AreaWriterLock {
         // this closes the window for every open that comes after.)
         fs::fchmod(&lock_file, fs::Mode::RUSR | fs::Mode::WUSR)
             .context_with_location(format!("Failed to restrict mode of {lock_path:?}"))?;
-        fs::flock(&lock_file, fs::FlockOperation::NonBlockingLockExclusive).map_err(|e| {
-            error!("Another writer holds the property area lock {lock_path:?}: {e}");
-            Error::Lock(format!(
-                "Writable property area already owned by another instance ({lock_path:?}): {e}"
-            ))
-        })?;
+        fs::flock(&lock_file, fs::FlockOperation::NonBlockingLockExclusive)
+            .map_err(|e| lock_error(e, &lock_path))?;
 
         // Only under the lock: a temp file in `dir` now belongs to a writer
         // that no longer runs.
@@ -321,19 +319,23 @@ impl AreaWriterLock {
     /// Writes `trie` (the output of [`build_trie`](crate::build_trie)) as
     /// `<dir>/property_info`.
     ///
-    /// The bytes go to `.property_info.tmp-<pid>` (created exclusively,
+    /// Except on Android (see the paragraph on Android below), the bytes go
+    /// to `.property_info.tmp-<pid>` (created exclusively,
     /// mode 0444 regardless of the umask), are synced, are checked by the
     /// same loader readers use, and the temp file is renamed onto
     /// `property_info`. Readers that already opened `property_info` keep
-    /// the previous file (rename keeps the old inode). Bytes the loader
-    /// rejects are not published. Any failure leaves `property_info`
-    /// unchanged and removes the temp file this call created; if the temp
-    /// name already exists (another call on this lock is in progress), the
-    /// call fails without touching it. May be called more than once.
+    /// the previous file (rename keeps the old inode). On that path bytes
+    /// the loader rejects are not published, any failure leaves
+    /// `property_info` unchanged and removes the temp file this call
+    /// created, and, if the temp name already exists (another call on this
+    /// lock is in progress), the call fails without touching it; it may be
+    /// called more than once.
     ///
     /// Use this instead of writing `property_info` yourself. Readers map it
     /// read-only and shared, as bionic does, so a writer must write a
-    /// complete new file and rename it over the old one, and must never
+    /// complete new file and rename it over the old one (or, as this call
+    /// does on Android, write it once at a name where no file exists,
+    /// before any reader starts), and must never
     /// rewrite the existing file in place (`std::fs::write`,
     /// `File::create`, `O_TRUNC`): a reader that has the file mapped can
     /// fault with `SIGBUS` or read a torn trie. Readers log a warning when
@@ -344,20 +346,37 @@ impl AreaWriterLock {
     /// With `label`, the file's SELinux context (`security.selinux`) is set
     /// to it, as AOSP init gives `property_info` the context
     /// `file_contexts` names for it (`u:object_r:property_info:s0`) with
-    /// `selinux_android_restorecon`. The label is set with `fsetxattr` on
-    /// the temp file after it is written, synced and checked by the loader,
-    /// and before the rename, so the published file has it from the moment
-    /// readers can open it. Under SELinux the caller's domain needs, besides
+    /// `selinux_android_restorecon`. The label is set with `fsetxattr`
+    /// after the file is written, synced and checked by the loader, and, on
+    /// the rename path, before the rename, so the published file has it
+    /// from the moment readers can open it. Under SELinux the caller's
+    /// domain needs, besides
     /// what a create and a rename in `dir` need on the directory:
     /// `create write setattr relabelfrom` and the loader's reads on the
-    /// type a new file in `dir` gets, `relabelto rename` on the label's
+    /// type a new file in `dir` gets (and `unlink` there, to remove the
+    /// file after a failure before the label), `relabelto rename` on the label's
     /// type, and, when a `property_info` already exists, `unlink` on that
-    /// existing file's type (the rename replaces it).
-    /// AOSP init has only `relabelto` on `property_info`: it writes the
-    /// file once in place and then relabels it, which a writer that
-    /// replaces the file while readers have it mapped cannot do. With
-    /// `None` the file keeps the label the policy gives a new file in
-    /// `dir`.
+    /// existing file's type (the rename replaces it). With `None` the file
+    /// keeps the label the policy gives a new file in `dir`.
+    ///
+    /// On Android the file is written at `<dir>/property_info` itself and
+    /// labeled last, as init writes it (`WriteStringToFile`) and then
+    /// relabels it (`selinux_android_restorecon`): AOSP's policy lets only
+    /// init write `/dev/__properties__` files and gives init only
+    /// `relabelto` on `property_info`, not `rename` or `unlink`. Unlike
+    /// init, which opens the file with `O_TRUNC`, this call creates it with
+    /// `O_EXCL`, so a `property_info` that readers may have mapped is never
+    /// rewritten in place; the call therefore fails when `property_info`
+    /// exists (start on a fresh directory; init starts on the tmpfs `/dev`
+    /// of each boot), so it can be made once per directory. The domain
+    /// needs no `rename` or `unlink` on the label's type, but still the
+    /// permissions listed above on the type a new file in `dir` gets,
+    /// `relabelfrom` among them. AOSP's policy gives init those on
+    /// `init_tmpfs`, the type of a file init creates in a `tmpfs`
+    /// directory, and no domain `relabelfrom` on `properties_device`, the
+    /// type of a new file in a directory labeled `properties_device`.
+    /// Readers can map the file before it is complete: let no reader start
+    /// before this call has returned.
     ///
     /// # Errors
     ///
@@ -373,9 +392,6 @@ impl AreaWriterLock {
     /// file not owned by uid 0 / gid 0 is refused, so the call fails unless
     /// the process runs as root.
     pub fn publish_property_info(&self, trie: &[u8], label: Option<&str>) -> Result<()> {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-
         if let Some(label) = label {
             if label.is_empty()
                 || label
@@ -388,21 +404,56 @@ impl AreaWriterLock {
                 )));
             }
         }
+        self.publish(trie, label, cfg!(target_os = "android"))
+    }
+
+    /// Writes, checks and labels `property_info`: under a temp name renamed
+    /// onto it, or, with `in_place`, at `property_info` itself, as init
+    /// writes it (`WriteStringToFile` then `selinux_android_restorecon`),
+    /// but with `O_EXCL` instead of init's `O_TRUNC`, so an existing file
+    /// is never rewritten in place (\[IMM\] in property_area.rs). `label`
+    /// is already checked.
+    ///
+    /// In place, the file must not exist yet: AOSP's policy lets only init
+    /// write `/dev/__properties__` files and gives init only `relabelto` on
+    /// `property_info`, not the `rename` that replacing the file needs, or
+    /// an `unlink` of an existing one. Readers can map the file before it
+    /// is complete, so no reader may start before this call has returned
+    /// (\[IMM\]'s write-once case, not checked).
+    fn publish(&self, trie: &[u8], label: Option<&str>, in_place: bool) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
 
         let path = self.dir.join("property_info");
-        let tmp = self
+        let temp = self
             .dir
             .join(format!("{PROPERTY_INFO_TMP_PREFIX}{}", std::process::id()));
+        // The file the bytes are written to (`tmp` in the messages below).
+        let tmp = if in_place { &path } else { &temp };
         // `create_new` = O_CREAT|O_EXCL, which also refuses a symlink at
-        // the temp name. No cleanup when this fails: the existing file is
-        // not ours (a concurrent call on this lock).
-        let file = std::fs::OpenOptions::new()
+        // the name. No cleanup when this fails: the existing file is not
+        // ours (a concurrent call on this lock, or, in place, a
+        // `property_info` this call must not replace).
+        let file = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .custom_flags(fs::OFlags::NOFOLLOW.bits() as _)
             .mode(0o444)
-            .open(&tmp)
-            .context_with_location(format!("Failed to create {tmp:?}"))?;
+            .open(tmp)
+        {
+            Ok(file) => file,
+            Err(e) => {
+                // The hint only for `EEXIST`: an `EACCES` or `EROFS` is not
+                // cured by a fresh directory.
+                let hint = if in_place && e.kind() == std::io::ErrorKind::AlreadyExists {
+                    " (on Android it is created at its name with O_EXCL and must not exist \
+                     yet: start on a fresh properties dir)"
+                } else {
+                    ""
+                };
+                return Err(e).context_with_location(format!("Failed to create {tmp:?}{hint}"));
+            }
+        };
 
         let write_and_rename = || -> Result<()> {
             // The umask may have cleared bits of 0444; readers accept only
@@ -415,7 +466,7 @@ impl AreaWriterLock {
                 .context_with_location(format!("Failed to write {tmp:?}"))?;
             file.sync_all()
                 .context_with_location(format!("Failed to sync {tmp:?}"))?;
-            PropertyInfoAreaFile::load_path(&tmp)
+            PropertyInfoAreaFile::load_path(tmp)
                 .context_with_location(format!("Rejected property_info trie in {tmp:?}"))?;
             // After the writes and the loader's read: SELinux checks a
             // `write` on an fd against the inode's current type, so writing
@@ -433,17 +484,44 @@ impl AreaWriterLock {
                         "Failed to set SELinux label {label:?} on {tmp:?}"
                     ))?;
             }
-            std::fs::rename(&tmp, &path)
+            if in_place {
+                return Ok(());
+            }
+            std::fs::rename(tmp, &path)
                 .context_with_location(format!("Failed to rename {tmp:?} to {path:?}"))
         };
         let result = write_and_rename();
         drop(file);
+        // In place too: a failure leaves the file with the type it was
+        // created with (the label is the last step), which the writer may
+        // unlink.
         result.inspect_err(|_| {
-            if let Err(e) = std::fs::remove_file(&tmp) {
+            if let Err(e) = std::fs::remove_file(tmp) {
                 warn!("Failed to remove {tmp:?}: {e}");
             }
         })
     }
+}
+
+/// The error of a failed non-blocking `flock` on `lock_path`: `Error::Lock`
+/// when another open file description holds the lock (`EWOULDBLOCK`), and
+/// the errno itself, as `Error::Context`, for any other failure, so a
+/// refused `flock` (`EACCES` from SELinux) is not reported as a second
+/// instance. `track_caller`: the context's location is the `flock` call
+/// in `acquire`, not this helper.
+#[cfg(feature = "builder")]
+#[track_caller]
+fn lock_error(e: rustix::io::Errno, lock_path: &Path) -> Error {
+    if e == rustix::io::Errno::WOULDBLOCK {
+        error!("Another writer holds the property area lock {lock_path:?}: {e}");
+        return Error::Lock(format!(
+            "Writable property area already owned by another instance ({lock_path:?}): {e}"
+        ));
+    }
+    error!("Failed to lock {lock_path:?}: {e}");
+    Err::<(), _>(e)
+        .context_with_location(format!("Failed to lock {lock_path:?}"))
+        .unwrap_err()
 }
 
 /// Removes regular files directly in `dir` named
@@ -546,6 +624,18 @@ impl ContextsSerialized {
     /// area.
     #[cfg(feature = "builder")]
     pub(crate) fn new_rw(dirname: &Path, lock: Option<AreaWriterLock>) -> Result<Self> {
+        Self::new_rw_with(dirname, lock, cfg!(target_os = "android"))
+    }
+
+    /// [`Self::new_rw`] with the choice of how `properties_serial` is
+    /// created: with `serial_in_place` (Android) at its name with `O_EXCL`
+    /// (`PropertyAreaMap::new_rw_in_place`), otherwise by rename.
+    #[cfg(feature = "builder")]
+    fn new_rw_with(
+        dirname: &Path,
+        lock: Option<AreaWriterLock>,
+        serial_in_place: bool,
+    ) -> Result<Self> {
         // Must precede the load and the `open()` calls below: the areas
         // must match the `property_info` readers open, and `open()`
         // replaces area files, so a losing second writer has to bail out
@@ -566,6 +656,19 @@ impl ContextsSerialized {
                 AreaWriterLock::acquire(dirname)?
             }
         };
+        let serial_filename = dirname.join("properties_serial");
+        // In place, an existing `properties_serial` fails the `O_EXCL`
+        // create below; fail here instead, before `open()` replaces any
+        // context area, so a stale directory keeps its areas. Under the
+        // lock, so a second writer still gets `Error::Lock`. The create
+        // stays exclusive: this check only moves the failure earlier.
+        // `symlink_metadata`: a symlink counts as present, as for `O_EXCL`.
+        if serial_in_place && std::fs::symlink_metadata(&serial_filename).is_ok() {
+            return Err(rustix::io::Errno::EXIST).context_with_location(format!(
+                "{serial_filename:?} exists (on Android it is created at its name with \
+                 O_EXCL, as bionic creates it: start on a fresh properties dir)"
+            ));
+        }
         // Under the lock no writer of this crate can replace
         // `property_info` (`publish_property_info` needs the lock).
         let (property_info_area_file, context_nodes) = Self::load_nodes(true, dirname, false)?;
@@ -576,12 +679,15 @@ impl ContextsSerialized {
             node.open()?;
         }
 
-        let serial_filename = dirname.join("properties_serial");
-        let serial_property_area_map =
+        // On Android at its final name, as bionic creates it: AOSP's
+        // policy gives init `write` and `relabelto` on `properties_serial`,
+        // not the `rename` of a temp file (`PropertyAreaMap::new_rw_in_place`).
+        let serial_property_area_map = if serial_in_place {
+            PropertyAreaMap::new_rw_in_place(&serial_filename, Some(PROPERTIES_SERIAL_CONTEXT))
+        } else {
             PropertyAreaMap::new_rw(&serial_filename, Some(PROPERTIES_SERIAL_CONTEXT))
-                .inspect_err(|e| {
-                    error!("Failed to map serial property area {serial_filename:?}: {e}")
-                })?;
+        }
+        .inspect_err(|e| error!("Failed to map serial property area {serial_filename:?}: {e}"))?;
 
         Ok(Self {
             property_info_area_file,
@@ -871,6 +977,24 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, b"stale").unwrap();
         path
+    }
+
+    /// Only a held lock is `Error::Lock`; a refused `flock` carries its
+    /// errno.
+    #[test]
+    fn only_a_held_lock_is_a_lock_error() {
+        let path = Path::new("/props/.writer_lock");
+        assert!(matches!(
+            lock_error(rustix::io::Errno::WOULDBLOCK, path),
+            Error::Lock(_)
+        ));
+        let err = lock_error(rustix::io::Errno::ACCESS, path);
+        assert!(matches!(err, Error::Context { .. }), "{err:?}");
+        assert!(
+            matches!(err.root_cause(), Error::Io(io)
+                if io.raw_os_error() == Some(rustix::io::Errno::ACCESS.raw_os_error())),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -1167,5 +1291,97 @@ mod tests {
             Err(e) => panic!("{e:?}"),
         }
         assert_eq!(selinux_label_of(&tmp.0.join("property_info")), label);
+    }
+
+    /// In place (Android), `property_info` is written at its final name,
+    /// with no temp file; a second publish fails without touching the
+    /// first file and names the reason.
+    #[test]
+    fn in_place_property_info_is_written_once() {
+        let tmp = TempDir::new("info_in_place");
+        let lock = AreaWriterLock::acquire(&tmp.0).unwrap();
+        lock.publish(&small_trie(), None, true).unwrap();
+        let info = tmp.0.join("property_info");
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&info).unwrap().permissions(),
+        );
+        assert_eq!(mode & 0o777, 0o444);
+        assert_eq!(std::fs::read(&info).unwrap(), small_trie());
+        assert_eq!(names_in(&tmp.0), [".writer_lock", "property_info"]);
+
+        let other = crate::build_trie(&[], "u:object_r:other_prop:s0", "string").unwrap();
+        let err = lock.publish(&other, None, true).unwrap_err();
+        assert!(format!("{err}").contains("fresh properties dir"), "{err:?}");
+        assert_eq!(std::fs::read(&info).unwrap(), small_trie());
+        assert_eq!(names_in(&tmp.0), [".writer_lock", "property_info"]);
+    }
+
+    /// In place, a create that fails for a reason other than `EEXIST`
+    /// (here `ENOENT`: the directory is gone) carries no "fresh properties
+    /// dir" hint.
+    #[test]
+    fn in_place_create_failure_hints_only_on_eexist() {
+        let tmp = TempDir::new("info_in_place_enoent");
+        let lock = AreaWriterLock::acquire(&tmp.0).unwrap();
+        std::fs::remove_dir_all(&tmp.0).unwrap();
+        let err = lock.publish(&small_trie(), None, true).unwrap_err();
+        assert!(
+            matches!(err.root_cause(), Error::Io(io)
+                if io.kind() == std::io::ErrorKind::NotFound),
+            "{err:?}"
+        );
+        assert!(
+            !format!("{err}").contains("fresh properties dir"),
+            "{err:?}"
+        );
+    }
+
+    /// With `properties_serial` created in place (Android), an existing
+    /// `properties_serial` fails `new_rw` with `EEXIST` before any context
+    /// area is replaced: the previous writer's area keeps its inode.
+    #[test]
+    fn existing_serial_in_place_fails_before_any_area_is_replaced() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new("serial_exists");
+        let lock = AreaWriterLock::acquire(&tmp.0).unwrap();
+        lock.publish(&small_trie(), None, false).unwrap();
+        // A previous writer's directory: its areas and `properties_serial`.
+        drop(ContextsSerialized::new_rw_with(&tmp.0, Some(lock), false).unwrap());
+        let area = tmp.0.join("u:object_r:default_prop:s0");
+        let ino = std::fs::metadata(&area).unwrap().ino();
+
+        let err = match ContextsSerialized::new_rw_with(&tmp.0, None, true) {
+            Ok(_) => panic!("an existing properties_serial must fail new_rw"),
+            Err(e) => e,
+        };
+        assert_eq!(std::fs::metadata(&area).unwrap().ino(), ino);
+        assert!(
+            matches!(err.root_cause(), Error::Io(io)
+                if io.kind() == std::io::ErrorKind::AlreadyExists),
+            "{err:?}"
+        );
+        assert!(format!("{err}").contains("fresh properties dir"), "{err:?}");
+    }
+
+    /// In place, a failure after the create removes the file this call
+    /// made: a trie the loader rejects, and a label the kernel refuses
+    /// (skipped where the kernel takes it).
+    #[test]
+    fn in_place_failure_removes_the_new_file() {
+        let tmp = TempDir::new("info_in_place_fail");
+        let lock = AreaWriterLock::acquire(&tmp.0).unwrap();
+        let mut bad = small_trie();
+        bad.truncate(bad.len() - 4);
+        lock.publish(&bad, None, true).unwrap_err();
+        assert_eq!(names_in(&tmp.0), [".writer_lock"]);
+
+        const UNKNOWN: &str = "u:object_r:rsprops_no_such_type:s0";
+        match lock.publish(&small_trie(), Some(UNKNOWN), true) {
+            Ok(()) => eprintln!("skipped the label case: the kernel took {UNKNOWN}"),
+            Err(e) => {
+                assert!(format!("{e}").contains(UNKNOWN), "{e:?}");
+                assert_eq!(names_in(&tmp.0), [".writer_lock"]);
+            }
+        }
     }
 }

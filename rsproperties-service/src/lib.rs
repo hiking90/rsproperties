@@ -142,7 +142,13 @@
 //! host's (`selinux_allows` below, through libselinux or selinuxfs); the
 //! service passes it the two contexts init passes. The security page
 //! linked below lists what else the host sets up (mount namespace, the
-//! properties dir's label, the permissions the service's domain needs).
+//! permissions the service's domain needs, and, on AOSP's policy, a
+//! `tmpfs` properties dir that the host relabels `properties_device`
+//! after [`run`] returns and before clients start; not measured). AOSP's
+//! policy does not give init `lock` on the files it creates in such a
+//! directory (`init_tmpfs`), which the writer lock's `flock` needs, so on
+//! an unmodified policy [`run`] fails at [`StartupStage::WriterLock`]; the
+//! host policy has to add that permission.
 //!
 //! The `property_contexts` files are the ones init reads, in its order.
 //! init skips the four after `plat_property_contexts` when they cannot be
@@ -983,17 +989,27 @@ impl ServiceOptions {
     /// before any area file, so under SELinux a client whose domain may not
     /// read the file's type reads no property.
     ///
-    /// The label is set on the temp file after the trie is written, synced
-    /// and checked, and before the file is renamed onto `property_info`
-    /// ([`rsproperties::AreaWriterLock::publish_property_info`]). Under
-    /// SELinux the service's domain therefore needs `relabelto rename` on
-    /// the label's type, and, when a `property_info` already exists (a
-    /// service restart over the same properties dir), `unlink` on that
-    /// existing file's type; AOSP
-    /// init's policy grants only `relabelto` on `property_info`, because
-    /// init writes the file once in place and then relabels it. Without
-    /// this option the file keeps the label the policy gives a new
-    /// file in the properties dir. The properties dir's own label
+    /// The label is set after the trie is written, synced and checked
+    /// ([`rsproperties::AreaWriterLock::publish_property_info`]). On Linux
+    /// the file is a temp file then renamed onto `property_info`, so under
+    /// SELinux the service's domain needs `relabelto rename` on the label's
+    /// type, and, when a `property_info` already exists (a service restart
+    /// over the same properties dir), `unlink` on that existing file's
+    /// type. On Android it is written at `property_info` itself and labeled
+    /// last, as init does, which needs only `relabelto` on the label's
+    /// type, the one permission AOSP's policy gives init there; `run` then
+    /// fails at [`StartupStage::PropertiesService`] when the properties dir
+    /// already has a `property_info` or `properties_serial`, so a restart
+    /// starts on a fresh properties dir. On every target the relabel also
+    /// needs `relabelfrom` on the type a new file in the properties dir
+    /// gets; AOSP's policy gives no domain, init included, `relabelfrom`
+    /// on `properties_device`, so there the label fails in a directory
+    /// labeled `properties_device`; start on a `tmpfs` directory and
+    /// relabel it after [`run`] returns, as init does (the security page
+    /// has the details, including the `lock` permission on `init_tmpfs`
+    /// that the writer lock needs and AOSP's policy does not give init).
+    /// Without this option the file keeps the label the policy gives a
+    /// new file in the properties dir. The properties dir's own label
     /// (`properties_device` in AOSP) is not set by the service: it is the
     /// label of the directory the host creates or mounts, or the one the
     /// policy gives the directory `run` creates.
@@ -1424,7 +1440,9 @@ pub enum StartupStage {
     /// Taking the properties dir's writer lock
     /// ([`rsproperties::AreaWriterLock::acquire`]) failed. A second
     /// instance on the same properties dir fails here, with
-    /// `rsproperties::Error::Lock` as the source.
+    /// `rsproperties::Error::Lock` as the source; a `flock` the kernel
+    /// refuses (`EACCES` from SELinux) has that errno in an
+    /// `rsproperties::Error::Context` instead.
     WriterLock,
     /// The properties service failed to start: loading the persistent
     /// properties file (its directory is missing: `NotFound`; it is used

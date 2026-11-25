@@ -109,9 +109,11 @@ pub(crate) fn validate_file_metadata(
 ///
 /// bionic checks only the group/other write bits (done by
 /// [`validate_file_metadata`]). A writer that follows \[IMM\] publishes
-/// the file 0444 by rename, as `AreaWriterLock::publish_property_info` and
-/// AOSP init do; an owner-writable file usually comes from an in-place
-/// writer such as `std::fs::write`, which can SIGBUS readers mapping it.
+/// the file 0444, by rename (`AreaWriterLock::publish_property_info`
+/// except on Android) or written once before any reader maps it (AOSP
+/// init, and `publish_property_info` on Android); an owner-writable file
+/// usually comes from an in-place writer such as `std::fs::write`, which
+/// can SIGBUS readers mapping it.
 /// Warns by default; `strict` (the `strict-file-validation` feature)
 /// refuses the file with `PermissionDenied`.
 pub(crate) fn check_owner_write(
