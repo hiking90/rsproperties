@@ -70,9 +70,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rsproperties::init`: a mode with an execute, setuid, setgid or sticky
   bit; a mode with a bit for others (`0o006`) when the options have no
   authorizer; and group `u32::MAX`. With an authorizer, init's
-  `property_service` mode `0o666` can be used. Without the option the
-  sockets are created as before. The `Debug` output of `ServiceOptions`
-  has a `socket_access` field.
+  `property_service` mode `0o666` can be used.
+  `SocketAccess::with_label(context)` creates the file with that SELinux
+  context, as init creates its sockets with `property_socket`: the
+  service writes the context to the fscreate attribute of a thread it
+  starts for that `bind` alone. `run` refuses an empty label or one with
+  whitespace or a control byte at `StartupStage::Config`, and fails at
+  `StartupStage::SocketService` when the kernel refuses the label at the
+  fscreate write or at the `bind`; the errno and the conditions depend on
+  the security module and its policy, including whether a context the
+  policy does not define is refused. Without the option the sockets are
+  created as before.
+  The `Debug` output of `ServiceOptions` has a `socket_access` field.
 - Service: `ServiceOptions::max_connections_per_uid(limit)` sets the
   most connections one uid may have open at once on both sockets
   together (see "Changed" for the default). `usize::MAX` removes the

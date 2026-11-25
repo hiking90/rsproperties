@@ -289,8 +289,16 @@ impl Drop for SocketDirEntries {
 }
 
 /// Creates the socket for `tmp_name` and binds it at `dir/tmp_name`
-/// without listening. The file's mode is a subset of `mode`.
-fn bind_temp(dir: &Path, dirfd: &OwnedFd, tmp_name: &str, mode: u32) -> Result<OwnedFd> {
+/// without listening. The file's mode is a subset of `mode`; with
+/// `label`, the file is created with that SELinux context
+/// ([`bind_labeled`]).
+fn bind_temp(
+    dir: &Path,
+    dirfd: &OwnedFd,
+    tmp_name: &str,
+    mode: u32,
+    label: Option<&str>,
+) -> Result<OwnedFd> {
     let path = dir.join(tmp_name);
     // Our own leftover (pid reuse, or a repeated start in this process).
     match rustix::fs::unlinkat(dirfd, tmp_name, AtFlags::empty()) {
@@ -318,8 +326,84 @@ fn bind_temp(dir: &Path, dirfd: &OwnedFd, tmp_name: &str, mode: u32) -> Result<O
     // (0.6.0's std path: 107).
     let addr = SocketAddrUnix::new(path.as_path())
         .with_context_location(|| format!("socket address {path:?}"))?;
-    rustix::net::bind(&fd, &addr).with_context_location(|| format!("bind {path:?}"))?;
+    match label {
+        None => rustix::net::bind(&fd, &addr).with_context_location(|| format!("bind {path:?}"))?,
+        Some(label) => bind_labeled(&fd, &addr, label)
+            .with_context_location(|| format!("bind {path:?} with SELinux label {label:?}"))?,
+    }
     Ok(fd)
+}
+
+/// `bind` with the new file labeled `label`, as init's `CreateSocket`
+/// calls `setfscreatecon` before its `bind` (`util.cpp`).
+///
+/// The fscreate attribute belongs to the thread that writes it and stays
+/// until it is written again. The `bind` therefore runs in a thread
+/// started for it alone, which ends with the attribute still set. On a
+/// thread of tokio's blocking pool the attribute would outlive this call,
+/// and a later task on that thread would create its files with the label
+/// unless a second write reset it; that write can fail too.
+fn bind_labeled(fd: &OwnedFd, addr: &SocketAddrUnix, label: &str) -> Result<()> {
+    std::thread::scope(|scope| {
+        let thread = std::thread::Builder::new()
+            .name("rsprops-labeled".to_owned())
+            .spawn_scoped(scope, || -> Result<()> {
+                write_fscreate(label)?;
+                rustix::net::bind(fd, addr).context_with_location("bind")
+            })
+            .context_with_location("start the thread that binds a labeled socket")?;
+        thread
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+/// Writes `label` to the calling thread's fscreate attribute, with the
+/// NUL at its end that libselinux's `setfscreatecon` writes too. The
+/// attribute is `/proc/thread-self/attr/fscreate` (Linux 3.17), or
+/// `/proc/self/task/<tid>/attr/fscreate` before that.
+///
+/// Without SELinux the kernel answers `EINVAL` (AppArmor, or no security
+/// module that takes the attribute) or `EOPNOTSUPP` (Smack). SELinux
+/// answers `EINVAL` for a context the policy does not define, unless the
+/// process has `CAP_MAC_ADMIN` and its domain is granted `mac_admin` or
+/// not enforced (a permissive domain or permissive mode), and `EACCES`
+/// when the policy does not let the process set the attribute.
+fn write_fscreate(label: &str) -> Result<()> {
+    let mut bytes = Vec::with_capacity(label.len() + 1);
+    bytes.extend_from_slice(label.as_bytes());
+    bytes.push(0);
+    let tid = rustix::thread::gettid().as_raw_pid();
+    let paths = [
+        "/proc/thread-self/attr/fscreate".to_owned(),
+        format!("/proc/self/task/{tid}/attr/fscreate"),
+    ];
+    for path in &paths {
+        match rustix::fs::open(
+            path.as_str(),
+            OFlags::WRONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(file) => {
+                let written = rustix::io::write(&file, &bytes).with_context_location(|| {
+                    format!(
+                        "write {path} (refused when SELinux is off, when the policy does not \
+                         define the context, or when it does not let this process set it)"
+                    )
+                })?;
+                if written != bytes.len() {
+                    return Err(Error::FileValidation(format!(
+                        "{path} took {written} of {} bytes",
+                        bytes.len()
+                    )));
+                }
+                return Ok(());
+            }
+            Err(Errno::NOENT) => continue,
+            Err(e) => return Err(e).with_context_location(|| format!("open {path}")),
+        }
+    }
+    Err(Errno::NOENT).with_context_location(|| format!("none of {paths:?} exists"))
 }
 
 /// Gives the socket at `dir/tmp_name` `access`: its group, when `access`
@@ -351,7 +435,7 @@ fn apply_socket_access(
     dir: &Path,
     dirfd: &OwnedFd,
     tmp_name: &str,
-    access: SocketAccess,
+    access: &SocketAccess,
 ) -> Result<()> {
     let path = dir.join(tmp_name);
     let pfd = rustix::fs::openat(
@@ -439,9 +523,9 @@ fn prepare_temp_socket(
     dir: &Path,
     entries: &mut SocketDirEntries,
     tmp_name: &str,
-    access: SocketAccess,
+    access: &SocketAccess,
 ) -> Result<OwnedFd> {
-    let fd = bind_temp(dir, &entries.dirfd, tmp_name, access.mode())?;
+    let fd = bind_temp(dir, &entries.dirfd, tmp_name, access.mode(), access.label())?;
     entries.names.push(tmp_name.to_owned());
     apply_socket_access(dir, &entries.dirfd, tmp_name, access)?;
     // `listen` only after the group and mode are final (AOSP
@@ -498,13 +582,13 @@ fn bind_service_sockets_at(
         dir,
         &mut entries,
         &property_tmp,
-        access[Listener::Property.index()],
+        &access[Listener::Property.index()],
     )?;
     let system = prepare_temp_socket(
         dir,
         &mut entries,
         &system_tmp,
-        access[Listener::System.index()],
+        &access[Listener::System.index()],
     )?;
     // `renameat` replaces a socket left by a crashed earlier run without a
     // window in which the name is missing. A failure on the second rename
@@ -1799,7 +1883,10 @@ pub(crate) mod tests {
 
     const PROPERTY: &str = PROPERTY_SERVICE_SOCKET_NAME;
     const SYSTEM: &str = PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME;
-    const DEFAULT_ACCESS: [SocketAccess; 2] = [SocketAccess::new(SOCKET_FILE_MODE); 2];
+    const DEFAULT_ACCESS: [SocketAccess; 2] = [
+        SocketAccess::new(SOCKET_FILE_MODE),
+        SocketAccess::new(SOCKET_FILE_MODE),
+    ];
 
     /// Bytes a fixture adds below its dir for its longest socket path:
     /// `/<subdir>/` and the system temp name (the longer of the two).
@@ -1911,6 +1998,132 @@ pub(crate) mod tests {
         );
     }
 
+    /// Whether SELinux is on: its filesystem is mounted.
+    fn selinux_enabled() -> bool {
+        Path::new("/sys/fs/selinux/enforce").exists()
+    }
+
+    /// The `security.selinux` xattr of `path`, without its trailing NUL.
+    fn selinux_label_of(path: &Path) -> String {
+        let mut buf = [0u8; 256];
+        let len = rustix::fs::lgetxattr(path, "security.selinux", &mut buf).unwrap();
+        let label = &buf[..len];
+        String::from_utf8(label.strip_suffix(&[0]).unwrap_or(label).to_vec()).unwrap()
+    }
+
+    /// The message of the innermost [`Error::Context`] layer of `err`,
+    /// which names the step that failed.
+    fn failed_step(err: &Error) -> Option<&str> {
+        let mut step = None;
+        let mut err = err;
+        while let Error::Context { msg, source, .. } = err {
+            step = Some(msg.as_str());
+            err = source;
+        }
+        step
+    }
+
+    /// The kernel refuses a context no policy defines, and the failed
+    /// start leaves nothing in the socket dir: the `property_service`
+    /// temp, bound before the labeled one, is unlinked too. The test is
+    /// skipped when the kernel accepts the context (`CAP_MAC_ADMIN` with
+    /// `mac_admin`, or a permissive domain), and when it accepts it at the
+    /// write and refuses the `bind` with `EACCES`.
+    #[test]
+    fn an_unknown_label_fails_and_leaves_nothing() {
+        const UNKNOWN: &str = "u:object_r:rsprops_no_such_type:s0";
+        let dir = SocketDir::new("rsprops_svc_label_bad");
+        let mut access = DEFAULT_ACCESS;
+        access[Listener::System.index()] = SocketAccess::new(SOCKET_FILE_MODE).with_label(UNKNOWN);
+        let err = match bind_service_sockets(&dir.0, access) {
+            Ok(bound) => {
+                drop(bound);
+                eprintln!(
+                    "skipped: the kernel accepted {UNKNOWN} (CAP_MAC_ADMIN with mac_admin, or \
+                     a permissive domain)"
+                );
+                return;
+            }
+            Err(e) => e,
+        };
+        // The errno itself, not the context message: `EINVAL` from SELinux,
+        // AppArmor or no module that takes the attribute, `EOPNOTSUPP` from
+        // Smack, `ENOENT` on a kernel without `/proc/<pid>/attr`.
+        let errno = match err.root_cause() {
+            Error::Io(io) => io.raw_os_error(),
+            _ => None,
+        };
+        // With `mac_admin` the write takes the context, and an enforcing
+        // domain can then be refused at the `bind` instead.
+        if errno == Some(Errno::ACCESS.raw_os_error()) && failed_step(&err) == Some("bind") {
+            eprintln!("skipped: the kernel took {UNKNOWN} and refused the bind: {err:?}");
+            return;
+        }
+        assert!(
+            [Errno::INVAL, Errno::OPNOTSUPP, Errno::NOENT]
+                .iter()
+                .any(|e| errno == Some(e.raw_os_error())),
+            "{err:?}"
+        );
+        let err = format!("{err:?}");
+        assert!(err.contains("attr/fscreate"), "{err}");
+        assert!(err.contains(UNKNOWN), "{err}");
+        assert_eq!(names_in(&dir.0), Vec::<String>::new());
+    }
+
+    /// Under SELinux the socket gets the label it was given, and the
+    /// calling thread's fscreate attribute stays unset. The label is the
+    /// one of the process's home dir, when it differs from the one the
+    /// socket dir gives a new file; the test is skipped when it does not,
+    /// or when the policy refuses the fscreate write or the `bind` with
+    /// `EACCES`.
+    #[test]
+    fn a_label_is_given_to_the_socket_only() {
+        if !selinux_enabled() {
+            eprintln!("skipped: SELinux is off");
+            return;
+        }
+        let dir = SocketDir::new("rsprops_svc_label_on");
+        let probe = dir.0.join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        let default_label = selinux_label_of(&probe);
+        std::fs::remove_file(&probe).unwrap();
+        let Some(label) = std::env::var_os("HOME")
+            .map(|home| selinux_label_of(Path::new(&home)))
+            .filter(|label| *label != default_label)
+        else {
+            eprintln!("skipped: no label other than {default_label} to test with");
+            return;
+        };
+        let mut access = DEFAULT_ACCESS;
+        access[Listener::Property.index()] =
+            SocketAccess::new(SOCKET_FILE_MODE).with_label(label.clone());
+        let bound = match bind_service_sockets(&dir.0, access) {
+            Ok(bound) => bound,
+            Err(e)
+                if matches!(e.root_cause(), Error::Io(io)
+                    if io.raw_os_error() == Some(Errno::ACCESS.raw_os_error()))
+                    && failed_step(&e).is_some_and(|step| {
+                        step == "bind"
+                            || (step.starts_with("write ") && step.contains("attr/fscreate"))
+                    }) =>
+            {
+                eprintln!("skipped: the policy does not let this process create {label}: {e:?}");
+                return;
+            }
+            Err(e) => panic!("{e:?}"),
+        };
+        assert_eq!(selinux_label_of(&dir.0.join(PROPERTY)), label);
+        assert_eq!(selinux_label_of(&dir.0.join(SYSTEM)), default_label);
+        let fscreate = std::fs::read("/proc/thread-self/attr/fscreate").unwrap();
+        assert!(
+            fscreate.iter().all(|&b| b == 0),
+            "{:?}",
+            String::from_utf8_lossy(&fscreate)
+        );
+        drop(bound);
+    }
+
     /// Socket and directory modes come from the code, not the umask:
     /// under umask 000 created dirs are 0755 and the temp socket is 0660
     /// at `bind`; under umask 077 the socket is 0600 at `bind` and 0660 at
@@ -1929,11 +2142,11 @@ pub(crate) mod tests {
         assert_eq!(mode_of(&dir.0.join("a")), 0o755);
         assert_eq!(mode_of(&nested), 0o755);
         let dirfd = open_socket_dir(&dir.0).unwrap();
-        let _open = bind_temp(&dir.0, &dirfd, "umask000", SOCKET_FILE_MODE).unwrap();
+        let _open = bind_temp(&dir.0, &dirfd, "umask000", SOCKET_FILE_MODE, None).unwrap();
         assert_eq!(mode_of(&dir.0.join("umask000")), SOCKET_FILE_MODE);
 
         rustix::process::umask(Mode::from_raw_mode(0o077));
-        let _narrow = bind_temp(&dir.0, &dirfd, "umask077", SOCKET_FILE_MODE).unwrap();
+        let _narrow = bind_temp(&dir.0, &dirfd, "umask077", SOCKET_FILE_MODE, None).unwrap();
         assert_eq!(mode_of(&dir.0.join("umask077")), 0o600);
         let sockets = SocketDir::new("rsprops_svc_umask_sockets");
         let _bound = bind_service_sockets(&sockets.0, DEFAULT_ACCESS).unwrap();
@@ -1971,8 +2184,8 @@ pub(crate) mod tests {
             SocketAccess::default(),
             SocketAccess::default().with_group(gid),
         ] {
-            assert!(apply_socket_access(&dir.0, &dirfd, "link", access).is_err());
-            assert!(apply_socket_access(&dir.0, &dirfd, "victim", access).is_err());
+            assert!(apply_socket_access(&dir.0, &dirfd, "link", &access).is_err());
+            assert!(apply_socket_access(&dir.0, &dirfd, "victim", &access).is_err());
             assert_eq!(mode_of(&victim), 0o600);
             assert_eq!(
                 std::fs::symlink_metadata(&victim).unwrap().gid(),
@@ -2244,7 +2457,7 @@ pub(crate) mod tests {
         let dir = SocketDir::new("rsprops_svc_listen");
         let dirfd = open_socket_dir(&dir.0).unwrap();
         let tmp = temp_name(PROPERTY);
-        let fd = bind_temp(&dir.0, &dirfd, &tmp, SOCKET_FILE_MODE).unwrap();
+        let fd = bind_temp(&dir.0, &dirfd, &tmp, SOCKET_FILE_MODE, None).unwrap();
 
         let err = std::os::unix::net::UnixStream::connect(dir.0.join(&tmp)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);

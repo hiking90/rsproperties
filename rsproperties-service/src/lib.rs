@@ -879,15 +879,17 @@ impl ServiceOptions {
         self
     }
 
-    /// The owner group and mode of `listener`'s socket file, in place of
-    /// mode `0o660` and the group the file is created with.
+    /// The owner group, mode and SELinux label of `listener`'s socket
+    /// file, in place of mode `0o660` and the group and label the file is
+    /// created with.
     ///
     /// The group is changed and the mode set through a descriptor of the
     /// temp socket, after `bind` and before `listen`, so no peer connects
-    /// before the file has both (see "Socket files" on [`run`]). [`run`]
-    /// checks the mode first, before it changes anything: a mode it
-    /// refuses fails at [`StartupStage::Config`] (see
-    /// [`SocketAccess::new`]).
+    /// before the file has both (see "Socket files" on [`run`]). A label
+    /// is given at `bind` ([`SocketAccess::with_label`]). [`run`] checks
+    /// the mode and the label first, before it changes anything: a value
+    /// it refuses fails at [`StartupStage::Config`] (see
+    /// [`SocketAccess::new`] and [`SocketAccess::with_label`]).
     ///
     /// Without an [authorizer](Self::authorizer), a peer that can connect
     /// may set any property and send any `ctl.*` and `sys.powerctl`
@@ -1307,8 +1309,9 @@ pub enum StartupStage {
     /// A [`ServiceOptions`] value was refused (on Android, options without
     /// an [authorizer](ServiceOptions::authorizer); a
     /// [socket mode](SocketAccess::new) with a bit the service does not
-    /// accept, or a [socket group](SocketAccess::with_group) of
-    /// `u32::MAX`), or
+    /// accept, a [socket group](SocketAccess::with_group) of
+    /// `u32::MAX`, or a [socket label](SocketAccess::with_label) that is
+    /// empty or has whitespace or a control byte), or
     /// `rsproperties::init` rejected the config: a process-global directory
     /// was already set to a different path. The options are checked before
     /// `init`, so a refused option commits no process-global state.
@@ -1489,6 +1492,11 @@ impl std::error::Error for StartupError {
 /// Socket files are created as `socket(SOCK_CLOEXEC|SOCK_NONBLOCK)`,
 /// `fchmod(fd, mode)`, `bind` at `<socket_dir>/.<name>.tmp-<pid>`, where
 /// `mode` is 0660 or the one given to [`ServiceOptions::socket_access`].
+/// With a [label](SocketAccess::with_label), the `bind` runs in a thread
+/// of its own that first writes the label to its fscreate attribute, so
+/// the file has the label from the moment its path exists (except on a
+/// filesystem where the kernel ignores the attribute; see
+/// [`SocketAccess::with_label`]).
 /// The kernel creates the file with the socket's mode minus the umask, so
 /// from the moment the path exists its mode is a subset of `mode`. The
 /// temp socket is then opened `O_PATH|O_NOFOLLOW` relative to the socket
