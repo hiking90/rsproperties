@@ -177,7 +177,8 @@
 //! logs (`<N bytes>`); names are logged in full. One value is not masked:
 //! in a service with an authorizer, `rsproperties` prints the target of a
 //! `ctl.*` request in a `trace` line when `property_contexts` has an exact
-//! entry for `ctl.<action>$<target>` ("Value masking" on the security page
+//! entry for `ctl.<action>$<target>`, or, for `ctl.start`, `ctl.stop` and
+//! `ctl.restart`, for `ctl.<target>` ("Value masking" on the security page
 //! linked below).
 //!
 //! # Further reading

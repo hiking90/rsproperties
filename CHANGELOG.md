@@ -14,7 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each request of a connected client, where init's `CheckPermissions`
   asks SELinux. The authorizer gets a `SetRequest`: the name, the value,
   the name's `property_contexts` context (for `ctl.*`, that of
-  `ctl.<action>$<target>`), the `Listener` the request came in on, and
+  `ctl.<action>$<target>`; for `ctl.start`, `ctl.stop` and `ctl.restart`
+  also that of `ctl.<target>`, init's legacy check, as
+  `SetRequest::legacy_control_context`, which
+  `SetRequest::with_legacy_control_context` sets for a test), the
+  `Listener` the request came in on, and
   the sender's pid, uid and gid (`PeerInfo`, from `SO_PEERCRED`). It is
   called for a set of an ordinary property, a `ctl.*` request and a
   `sys.powerctl` set, after the name check and before the type check.

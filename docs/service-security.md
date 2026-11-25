@@ -61,8 +61,11 @@ in the release build.
   property, a `ctl.*` request and a `sys.powerctl` set, after the name
   check and before the type check, with the name, the value, the
   context `property_contexts` gives the name (for `ctl.*`, the context
-  of `ctl.<action>$<target>`), the socket the request came in on, and
-  the sender's pid, uid and gid from `SO_PEERCRED`. A name that no
+  of `ctl.<action>$<target>`; for `ctl.start`, `ctl.stop` and
+  `ctl.restart` also the context of `ctl.<target>`, which init checks
+  first, as `SetRequest::legacy_control_context`), the socket the
+  request came in on, and the sender's pid, uid and gid from
+  `SO_PEERCRED`. A name that no
   `property_contexts` entry matches has the default context,
   `u:object_r:build_prop:s0`, and is passed to the authorizer with it:
   the service does not refuse such a name, so an authorizer that allows
@@ -269,11 +272,15 @@ discarded.
   identifiers; names are still logged in full. One value is logged: the
   target of a `ctl.*` request (its wire value), at `trace` level, and
   only by a service that has an authorizer. That service looks the
-  request's context up under the name `ctl.<action>$<target>`, and
-  `rsproperties` logs a name whose lookup ends at an exact
+  request's context up under the name `ctl.<action>$<target>`, and, for
+  `ctl.start`, `ctl.stop` and `ctl.restart`, also under `ctl.<target>`
+  (init's legacy name), whether or not the authorizer reads that
+  context; `rsproperties` logs a name whose lookup ends at an exact
   `property_contexts` entry (`Property "ctl.<action>$<target>"
-  resolved: ...`, the name escaped as by `{:?}`). A target without such
-  an entry is not logged, and no other log line prints the target.
+  resolved: ...` or `Property "ctl.<target>" resolved: ...`, the name
+  escaped as by `{:?}`). A target without an
+  exact entry under either name is not logged, and no other log line
+  prints the target.
 - **Init errors propagate**: `run()` calls `rsproperties::init`, so a
   directory already set to a different path surfaces as a `Result`
   (`StartupStage::Config`) rather than silently leaving the service

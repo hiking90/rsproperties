@@ -173,6 +173,7 @@ pub struct SetRequest<'a> {
     name: &'a str,
     value: &'a str,
     context: &'a str,
+    legacy_control_context: Option<&'a str>,
     listener: Listener,
     peer: PeerInfo<'a>,
 }
@@ -185,6 +186,7 @@ impl std::fmt::Debug for SetRequest<'_> {
             .field("name", &self.name)
             .field("value", &format_args!("<{} bytes>", self.value.len()))
             .field("context", &self.context)
+            .field("legacy_control_context", &self.legacy_control_context)
             .field("listener", &self.listener)
             .field("peer", &self.peer)
             .finish()
@@ -223,9 +225,34 @@ impl<'a> SetRequest<'a> {
             name,
             value,
             context,
+            legacy_control_context: None,
             listener,
             peer,
         }
+    }
+
+    /// This request with `context` as its
+    /// [legacy control context](Self::legacy_control_context), to test an
+    /// authorizer with a `ctl.start`, `ctl.stop` or `ctl.restart` request.
+    ///
+    /// ```
+    /// use rsproperties_service::{Listener, PeerInfo, SetRequest};
+    ///
+    /// let peer = PeerInfo::for_test(4242, 1000, 1000);
+    /// let request = SetRequest::for_test(
+    ///     "ctl.start",
+    ///     "bootanim",
+    ///     "u:object_r:ctl_start_prop:s0",
+    ///     Listener::Property,
+    ///     peer,
+    /// )
+    /// .with_legacy_control_context("u:object_r:ctl_bootanim_prop:s0");
+    /// assert_eq!(request.legacy_control_context(), Some("u:object_r:ctl_bootanim_prop:s0"));
+    /// ```
+    #[must_use]
+    pub fn with_legacy_control_context(mut self, context: &'a str) -> Self {
+        self.legacy_control_context = Some(context);
+        self
     }
 
     /// The name as the client sent it; `ctl.<action>` for a control
@@ -238,7 +265,8 @@ impl<'a> SetRequest<'a> {
     /// the command of a `sys.powerctl` set. The service does not log
     /// values, with one exception: the target of a control request is
     /// printed in a `trace` line of `rsproperties` when `property_contexts`
-    /// has an exact entry for `ctl.<action>$<target>` ("Value masking" in
+    /// has an exact entry for `ctl.<action>$<target>`, or, for `ctl.start`,
+    /// `ctl.stop` and `ctl.restart`, for `ctl.<target>` ("Value masking" in
     /// `docs/service-security.md`). The authorizer gets the value in full;
     /// the `Debug` output of the request does not print it. It has not
     /// been checked against the property's type yet.
@@ -258,6 +286,27 @@ impl<'a> SetRequest<'a> {
     /// without an entry.
     pub fn context(&self) -> &'a str {
         self.context
+    }
+
+    /// For `ctl.start`, `ctl.stop` and `ctl.restart`, the context
+    /// `property_contexts` gives `ctl.<target>`; `None` for any other
+    /// request.
+    ///
+    /// This is init's legacy check (`CheckControlPropertyPerms`): for these
+    /// three actions init first asks SELinux with this context and allows
+    /// the request when that check passes; only then does it check
+    /// [`context`](Self::context), the context of `ctl.<action>$<target>`.
+    /// AOSP's `property_contexts` still has entries in this form
+    /// (`ctl.bootanim`, `ctl.console`, ...), so an authorizer that follows
+    /// the SELinux policy allows the request when the policy lets the
+    /// sender set either context. A target without such an entry gets the
+    /// context of the `ctl.` prefix entry, or the default context, as in
+    /// init.
+    ///
+    /// `None` too when the trie cannot be read for `ctl.<target>`; the
+    /// service logs that at `warn`.
+    pub fn legacy_control_context(&self) -> Option<&'a str> {
+        self.legacy_control_context
     }
 
     /// The socket the request came in on.
@@ -352,8 +401,8 @@ impl Authorization {
             return Err(Refused);
         };
         // init looks a control request up as `ctl.<action>$<target>`
-        // (`CheckControlPropertyPerms`); the legacy `ctl.<target>` lookup
-        // it tries first for start, stop and restart is not made.
+        // (`CheckControlPropertyPerms`); its legacy `ctl.<target>` lookup
+        // for start, stop and restart is `legacy_control_context` below.
         let control_name;
         let lookup = if name.starts_with("ctl.") {
             control_name = format!("{name}${value}");
@@ -385,10 +434,29 @@ impl Authorization {
             );
             return Err(Refused);
         };
+        // The target is part of the lookup name, which `rsproperties`
+        // logs at `trace` on an exact match, as for `control_name` above.
+        let legacy_name;
+        let legacy_control_context = if matches!(name, "ctl.start" | "ctl.stop" | "ctl.restart") {
+            legacy_name = format!("ctl.{value}");
+            match trie.context(&legacy_name) {
+                Ok(context) => context,
+                Err(e) => {
+                    log::warn!(
+                        "{name:?} from pid {pid} (uid {uid}, gid {gid}) on {listener}: cannot \
+                         read the context of its legacy name: {e}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let request = SetRequest {
             name,
             value,
             context,
+            legacy_control_context,
             listener,
             peer: PeerInfo {
                 pid,
@@ -400,9 +468,10 @@ impl Authorization {
         let authorizer = &self.authorizer;
         // The lines below log the value's length, not the value
         // (value-masking policy, see `PropertyMessage`'s Debug). The
-        // target of a `ctl.*` request is part of the lookup name above,
+        // target of a `ctl.*` request is part of the lookup names above
+        // (`control_name`, and `legacy_name` for start, stop and restart),
         // which `rsproperties` logs at `trace` when an exact
-        // `property_contexts` entry matches it (`{name:?}`, so escaped);
+        // `property_contexts` entry matches one (`{name:?}`, so escaped);
         // no other log line of the service has the target.
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| authorizer(&request))) {
             Ok(Decision::Allow) => {
@@ -457,6 +526,9 @@ mod tests {
             PropertyInfoEntry::prefix("vendor.", "u:object_r:vendor_prop:s0", "string").unwrap(),
             PropertyInfoEntry::exact("vendor.int", "u:object_r:vendor_prop:s0", "int").unwrap(),
             PropertyInfoEntry::exact("ctl.start$adbd", "u:object_r:ctl_adbd_prop:s0", "string")
+                .unwrap(),
+            // AOSP's legacy form (`ctl.bootanim`, a prefix entry).
+            PropertyInfoEntry::prefix("ctl.bootanim", "u:object_r:ctl_bootanim_prop:s0", "string")
                 .unwrap(),
         ];
         let bytes = build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap();
@@ -568,6 +640,57 @@ mod tests {
         assert_eq!(seen[0].1, "adbd");
         assert_eq!(seen[0].2, "u:object_r:ctl_adbd_prop:s0");
         assert_eq!(seen[1].2, "u:object_r:default_prop:s0");
+    }
+
+    /// `ctl.start`, `ctl.stop` and `ctl.restart` carry the context of
+    /// `ctl.<target>` as well; other control actions and other names do
+    /// not.
+    #[tokio::test]
+    async fn legacy_control_context_is_given_for_start_stop_restart() {
+        /// Name, context and legacy control context of each call.
+        type Contexts = Vec<(String, String, Option<String>)>;
+        let seen: Arc<Mutex<Contexts>> = Arc::default();
+        let record = Arc::clone(&seen);
+        let (mut authorization, sender) = Authorization::new(Arc::new(move |request| {
+            record.lock().unwrap().push((
+                request.name().to_owned(),
+                request.context().to_owned(),
+                request.legacy_control_context().map(str::to_owned),
+            ));
+            Decision::Allow
+        }));
+        sender.send_replace(Some(trie()));
+        for (name, value) in [
+            ("ctl.start", "bootanim"),
+            ("ctl.stop", "bootanim"),
+            ("ctl.restart", "adbd"),
+            ("ctl.sigstop_on", "bootanim"),
+            ("vendor.x", "bootanim"),
+        ] {
+            assert!(
+                authorization
+                    .allows(name, value, Listener::Property, PEER, None)
+                    .await
+            );
+        }
+        let seen = seen.lock().unwrap();
+        let bootanim = Some("u:object_r:ctl_bootanim_prop:s0".to_owned());
+        let default = "u:object_r:default_prop:s0";
+        assert_eq!(
+            seen[0],
+            ("ctl.start".into(), default.into(), bootanim.clone())
+        );
+        assert_eq!(seen[1], ("ctl.stop".into(), default.into(), bootanim));
+        // No `ctl.adbd` entry: the default context, as init's lookup gives.
+        assert_eq!(
+            seen[2],
+            ("ctl.restart".into(), default.into(), Some(default.into()))
+        );
+        assert_eq!(seen[3], ("ctl.sigstop_on".into(), default.into(), None));
+        assert_eq!(
+            seen[4],
+            ("vendor.x".into(), "u:object_r:vendor_prop:s0".into(), None)
+        );
     }
 
     /// `Debug` must not print the value (value-masking policy); the other
