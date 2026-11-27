@@ -13,6 +13,35 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 /// kernel that never agrees from looping.
 const SIZE_RETRIES: usize = 4;
 
+// libc (0.2.191) defines `SO_PEERGROUPS` and `SO_PEERPIDFD` for Linux but
+// not for Android, whose kernel defines them from Linux 4.13 and 6.5
+// (older kernels answer `ENOPROTOOPT`). Every
+// Android architecture takes them from the generic `asm-generic/socket.h`
+// (59 and 77); sparc numbers them differently (0x3d and 0x56) and is no
+// Android target, so any other architecture stops the build here. Use
+// libc's constants once it defines them for Android.
+#[cfg(all(
+    target_os = "android",
+    not(any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    ))
+))]
+compile_error!("SO_PEERGROUPS and SO_PEERPIDFD are not known for this Android architecture");
+
+#[cfg(target_os = "android")]
+const SO_PEERGROUPS: libc::c_int = 59;
+#[cfg(not(target_os = "android"))]
+const SO_PEERGROUPS: libc::c_int = libc::SO_PEERGROUPS;
+
+#[cfg(target_os = "android")]
+const SO_PEERPIDFD: libc::c_int = 77;
+#[cfg(not(target_os = "android"))]
+const SO_PEERPIDFD: libc::c_int = libc::SO_PEERPIDFD;
+
 /// An element type the kernel may fill byte by byte.
 ///
 /// # Safety
@@ -99,7 +128,7 @@ fn read_sized<T: Plain>(
 pub(crate) fn peer_groups(fd: BorrowedFd<'_>) -> io::Result<Vec<u32>> {
     // 32 is `NGROUPS_SMALL`, enough for most processes without a second
     // call.
-    read_sized::<libc::gid_t>(fd, libc::SO_PEERGROUPS, 32)
+    read_sized::<libc::gid_t>(fd, SO_PEERGROUPS, 32)
 }
 
 /// `SO_PEERSEC`: the peer's security label in the format of the LSM that
@@ -118,7 +147,7 @@ pub(crate) fn peer_security_label(fd: BorrowedFd<'_>) -> io::Result<Vec<u8>> {
 /// that called `connect()`.
 pub(crate) fn peer_pidfd(fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     let mut pidfd: [libc::c_int; 1] = [-1];
-    let bytes = read_option(fd, libc::SO_PEERPIDFD, &mut pidfd).map_err(|(e, _)| e)?;
+    let bytes = read_option(fd, SO_PEERPIDFD, &mut pidfd).map_err(|(e, _)| e)?;
     if bytes != std::mem::size_of::<libc::c_int>() || pidfd[0] < 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -166,7 +195,7 @@ mod tests {
             eprintln!("skipped: this process has no supplementary group");
             return;
         }
-        let mut groups = read_sized::<libc::gid_t>(a.as_fd(), libc::SO_PEERGROUPS, 0).unwrap();
+        let mut groups = read_sized::<libc::gid_t>(a.as_fd(), SO_PEERGROUPS, 0).unwrap();
         groups.sort_unstable();
         assert_eq!(groups, expected);
     }

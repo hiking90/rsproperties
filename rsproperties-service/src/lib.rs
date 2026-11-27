@@ -1,17 +1,20 @@
 // Copyright 2024 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Linux emulation of the Android system property service, as a library.
+//! The Android system property service as a library, for Linux hosts and
+//! for Android userspaces that run without init's property service.
 //!
 //! A host binary calls [`run`] on a tokio runtime. The service creates the
 //! property areas from `property_contexts` and build.prop files, serves
 //! the `property_service` / `property_service_for_system` sockets
 //! (`PROP_MSG_SETPROP2`), and passes `ctl.*` and `sys.powerctl` requests
 //! to handlers the host provides, so `rsproperties` clients can `get`,
-//! `set` and wait on a Linux host. It is not usable on Android, where init
-//! owns the property service; the crate compiles only for
-//! `target_os = "linux"` (on other targets the first error names the
-//! reason).
+//! `set` and wait on a Linux host. It also builds for Android, for a
+//! userspace that runs without init's property service (in a mount
+//! namespace of its own, for example); there [`run`] requires an
+//! [authorizer](ServiceOptions::authorizer). The crate compiles only for
+//! `target_os = "linux"` and `"android"` (on other targets the first
+//! error names the reason).
 //!
 //! The V1 command (`PROP_MSG_SETPROP`), which init still handles, is not
 //! supported: such a request sets nothing and gets
@@ -120,13 +123,84 @@
 //! });
 //! ```
 //!
-//! Without an authorizer the service checks no sender beyond the socket
+//! On Android [`run`] fails without an authorizer. On Linux, without one
+//! the service checks no sender beyond the socket
 //! files: every peer that can connect may set any property that is not a
 //! `ro.` property with a value, and send any `ctl.*` and `sys.powerctl`
 //! request. A handler that acts on the host must then check
 //! [`ControlMessage::uid`] (from `SO_PEERCRED`) itself.
 //!
 //! [`AccessPolicy`] is a ready-made authorizer of uid and gid rules.
+//!
+//! # Running on Android
+//!
+//! On Android the service is for a userspace that runs without init's
+//! property service; it does not replace the device's init. [`run`]
+//! requires an authorizer there. These options give the sockets and
+//! `property_info` init's modes and SELinux labels, and decide each
+//! request as init does, by the SELinux policy. The check itself is the
+//! host's (`selinux_allows` below, through libselinux or selinuxfs); the
+//! service passes it the two contexts init passes. The security page
+//! linked below lists what else the host sets up (mount namespace, the
+//! permissions the service's domain needs, and, on AOSP's policy, a
+//! `tmpfs` properties dir that the host relabels `properties_device`
+//! after [`run`] returns and before clients start). AOSP's
+//! policy does not give init `lock` on the files it creates in such a
+//! directory (`init_tmpfs`), which the writer lock's `flock` needs, so on
+//! an unmodified policy [`run`] fails at [`StartupStage::WriterLock`]; the
+//! host policy has to add that permission. With it, the service runs this
+//! way in the `init` domain under enforcing SELinux (measured on the API
+//! 34, 36 and 37 emulators; see the security page).
+//!
+//! The `property_contexts` files are the ones init reads, in its order.
+//! init skips the four after `plat_property_contexts` when they cannot be
+//! read; the service fails to start on a file it cannot open, so the
+//! example passes only the files that exist.
+//!
+//! ```
+//! use rsproperties_service::{Decision, Listener, ServiceOptions, SocketAccess};
+//!
+//! # fn selinux_allows(_source: &str, _target: &str) -> bool { false }
+//! const SOCKET: &str = "u:object_r:property_socket:s0";
+//! const CONTEXTS: [&str; 5] = [
+//!     "/system/etc/selinux/plat_property_contexts",
+//!     "/system_ext/etc/selinux/system_ext_property_contexts",
+//!     "/vendor/etc/selinux/vendor_property_contexts",
+//!     "/product/etc/selinux/product_property_contexts",
+//!     "/odm/etc/selinux/odm_property_contexts",
+//! ];
+//!
+//! let options = ServiceOptions::new()
+//!     .property_contexts_files(
+//!         CONTEXTS
+//!             .into_iter()
+//!             .filter(|path| std::path::Path::new(path).exists()),
+//!     )
+//!     .socket_access(Listener::Property, SocketAccess::new(0o666).with_label(SOCKET))
+//!     .socket_access(
+//!         Listener::System,
+//!         // Group `system` (AID_SYSTEM).
+//!         SocketAccess::new(0o660).with_group(1000).with_label(SOCKET),
+//!     )
+//!     .property_info_label("u:object_r:property_info:s0")
+//!     .authorizer(|request| {
+//!         let Ok(source) = request.peer().security_label() else {
+//!             return Decision::Deny;
+//!         };
+//!         // init checks `ctl.<target>` first for start, stop and restart,
+//!         // then `context()`: for `ctl.*` the context of
+//!         // `ctl.<action>$<target>`, for any other set that of the name.
+//!         let allowed = request
+//!             .legacy_control_context()
+//!             .is_some_and(|legacy| selinux_allows(&source, legacy))
+//!             || selinux_allows(&source, request.context());
+//!         if allowed {
+//!             Decision::Allow
+//!         } else {
+//!             Decision::Deny
+//!         }
+//!     });
+//! ```
 //!
 //! # Setting from the service's process
 //!
@@ -174,7 +248,8 @@
 //! logs (`<N bytes>`); names are logged in full. One value is not masked:
 //! in a service with an authorizer, `rsproperties` prints the target of a
 //! `ctl.*` request in a `trace` line when `property_contexts` has an exact
-//! entry for `ctl.<action>$<target>` ("Value masking" on the security page
+//! entry for `ctl.<action>$<target>`, or, for `ctl.start`, `ctl.stop` and
+//! `ctl.restart`, for `ctl.<target>` ("Value masking" on the security page
 //! linked below).
 //!
 //! # Further reading
@@ -187,18 +262,18 @@
     "- [Files, access control and hardening](https://github.com/hiking90/rsproperties/blob/v",
     env!("CARGO_PKG_VERSION"),
     "/docs/service-security.md): the directory layout, file ownership, who may use \
-     the service, socket permissions, backpressure, and the outcome of a `TimedOut`.\n",
+     the service, running on Android, socket permissions, backpressure, and the \
+     outcome of a `TimedOut`.\n",
     "- [CHANGELOG.md](https://github.com/hiking90/rsproperties/blob/v",
     env!("CARGO_PKG_VERSION"),
     "/CHANGELOG.md): every change, with a migration section per release."
 )]
 #![warn(missing_docs)]
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 compile_error!(
-    "rsproperties-service emulates the Android property service on Linux and builds only for \
-     target_os = \"linux\". It is not usable on Android, where init owns the property service; \
-     use the `rsproperties` client crate there."
+    "rsproperties-service serves the Android property protocol over Unix sockets and futexes \
+     and builds only for target_os = \"linux\" and \"android\"."
 );
 
 use std::path::PathBuf;
@@ -421,6 +496,7 @@ pub struct ServiceOptions {
     authorizer: Option<Authorizer>,
     /// Indexed by [`Listener::index`].
     socket_access: [SocketAccess; 2],
+    property_info_label: Option<String>,
     /// `None`: [`DEFAULT_MAX_CONNECTIONS_PER_UID`].
     max_connections_per_uid: Option<usize>,
     /// Counts uid 0 and the service's own uid too. Only the tests set it:
@@ -441,6 +517,7 @@ impl std::fmt::Debug for ServiceOptions {
             .field("powerctl_handler", &self.powerctl_handler.is_some())
             .field("authorizer", &self.authorizer.is_some())
             .field("socket_access", &self.socket_access)
+            .field("property_info_label", &self.property_info_label)
             .field(
                 "max_connections_per_uid",
                 &self
@@ -749,8 +826,15 @@ impl ServiceOptions {
 
     /// Decides for every request from a client whether it may go on:
     /// init's `CheckPermissions`, with `authorizer` in the place of
-    /// SELinux. Without one, every request of a peer that could connect is
-    /// allowed.
+    /// SELinux. On Linux, without one every request of a peer that could
+    /// connect is allowed.
+    ///
+    /// On Android [`run`] refuses options without an authorizer, at
+    /// [`StartupStage::Config`]. There, init checks every request against
+    /// the SELinux policy, which lets processes of one uid set different
+    /// properties, so access to the socket files cannot stand in for it.
+    /// A host that means to allow every request says so with
+    /// `authorizer(|_| Decision::Allow)`.
     ///
     /// `authorizer` is called for a set of an ordinary property, for a
     /// `ctl.*` request and for a `sys.powerctl` set, after the name check
@@ -870,15 +954,17 @@ impl ServiceOptions {
         self
     }
 
-    /// The owner group and mode of `listener`'s socket file, in place of
-    /// mode `0o660` and the group the file is created with.
+    /// The owner group, mode and SELinux label of `listener`'s socket
+    /// file, in place of mode `0o660` and the group and label the file is
+    /// created with.
     ///
     /// The group is changed and the mode set through a descriptor of the
-    /// temp socket, after `bind` and before `listen`, so no peer connects
-    /// before the file has both (see "Socket files" on [`run`]). [`run`]
-    /// checks the mode first, before it changes anything: a mode it
-    /// refuses fails at [`StartupStage::Config`] (see
-    /// [`SocketAccess::new`]).
+    /// socket file, after `bind` and before `listen`, so no peer connects
+    /// before the file has both (see "Socket files" on [`run`]). A label
+    /// is given at `bind` ([`SocketAccess::with_label`]). [`run`] checks
+    /// the mode and the label first, before it changes anything: a value
+    /// it refuses fails at [`StartupStage::Config`] (see
+    /// [`SocketAccess::new`] and [`SocketAccess::with_label`]).
     ///
     /// Without an [authorizer](Self::authorizer), a peer that can connect
     /// may set any property and send any `ctl.*` and `sys.powerctl`
@@ -896,6 +982,53 @@ impl ServiceOptions {
     /// ```
     pub fn socket_access(mut self, listener: Listener, access: SocketAccess) -> Self {
         self.socket_access[listener.index()] = access;
+        self
+    }
+
+    /// Gives `property_info` the SELinux context `label`, as AOSP init
+    /// gives it the context `file_contexts` names for it
+    /// (`u:object_r:property_info:s0`). Clients open `property_info`
+    /// before any area file, so under SELinux a client whose domain may not
+    /// read the file's type reads no property.
+    ///
+    /// The label is set after the trie is written, synced and checked
+    /// ([`rsproperties::AreaWriterLock::publish_property_info`]). On Linux
+    /// the file is a temp file then renamed onto `property_info`, so under
+    /// SELinux the service's domain needs `relabelto rename` on the label's
+    /// type, and, when a `property_info` already exists (a service restart
+    /// over the same properties dir), `unlink` on that existing file's
+    /// type. On Android it is written at `property_info` itself and labeled
+    /// last, as init does, which needs only `relabelto` on the label's
+    /// type, the one permission AOSP's policy gives init there; `run` then
+    /// fails at [`StartupStage::PropertiesService`] when the properties dir
+    /// already has a `property_info` or `properties_serial`, so a restart
+    /// starts on a fresh properties dir. On every target the relabel also
+    /// needs `relabelfrom` on the type a new file in the properties dir
+    /// gets; AOSP's policy gives no domain, init included, `relabelfrom`
+    /// on `properties_device`, so there the label fails in a directory
+    /// labeled `properties_device`; start on a `tmpfs` directory and
+    /// relabel it after [`run`] returns, as init does (the security page
+    /// has the details, including the `lock` permission on `init_tmpfs`
+    /// that the writer lock needs and AOSP's policy does not give init).
+    /// Without this option the file keeps the label the policy gives a
+    /// new file in the properties dir. The properties dir's own label
+    /// (`properties_device` in AOSP) is not set by the service: it is the
+    /// label of the directory the host creates or mounts, or the one the
+    /// policy gives the directory `run` creates.
+    ///
+    /// [`run`] fails at [`StartupStage::Config`] for an empty `label` or
+    /// one with whitespace or a control byte, and at
+    /// [`StartupStage::PropertiesService`] when the kernel refuses the
+    /// label; which errno, and whether a context the policy does not
+    /// define is refused, depend on the security module and its policy.
+    ///
+    /// ```
+    /// use rsproperties_service::ServiceOptions;
+    ///
+    /// let options = ServiceOptions::new().property_info_label("u:object_r:property_info:s0");
+    /// ```
+    pub fn property_info_label(mut self, label: impl Into<String>) -> Self {
+        self.property_info_label = Some(label.into());
         self
     }
 
@@ -1295,10 +1428,13 @@ impl std::error::Error for ServiceError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StartupStage {
-    /// A [`ServiceOptions`] value was refused (a
+    /// A [`ServiceOptions`] value was refused (on Android, options without
+    /// an [authorizer](ServiceOptions::authorizer); a
     /// [socket mode](SocketAccess::new) with a bit the service does not
-    /// accept, or a [socket group](SocketAccess::with_group) of
-    /// `u32::MAX`), or
+    /// accept, a [socket group](SocketAccess::with_group) of
+    /// `u32::MAX`, or a [socket label](SocketAccess::with_label) or
+    /// [`property_info` label](ServiceOptions::property_info_label) that
+    /// is empty or has whitespace or a control byte), or
     /// `rsproperties::init` rejected the config: a process-global directory
     /// was already set to a different path. The options are checked before
     /// `init`, so a refused option commits no process-global state.
@@ -1306,7 +1442,9 @@ pub enum StartupStage {
     /// Taking the properties dir's writer lock
     /// ([`rsproperties::AreaWriterLock::acquire`]) failed. A second
     /// instance on the same properties dir fails here, with
-    /// `rsproperties::Error::Lock` as the source.
+    /// `rsproperties::Error::Lock` as the source; a `flock` the kernel
+    /// refuses (`EACCES` from SELinux) has that errno in an
+    /// `rsproperties::Error::Context` instead.
     WriterLock,
     /// The properties service failed to start: loading the persistent
     /// properties file (its directory is missing: `NotFound`; it is used
@@ -1314,7 +1452,8 @@ pub enum StartupStage {
     /// `fchmod`ed or `flock`ed for another reason, such as `EACCES` or
     /// `ENOLCK`: that errno's kind, with the lock path in the message),
     /// reading the `property_contexts` or build.prop files, publishing
-    /// `property_info`, or creating the property areas — in that order, so
+    /// `property_info` (with its label, when the options give one), or
+    /// creating the property areas — in that order, so
     /// a persistent-file failure leaves the properties dir unchanged. The
     /// source is a `std::io::Error`.
     PropertiesService,
@@ -1394,7 +1533,8 @@ impl std::error::Error for StartupError {
 ///
 /// # Startup order
 ///
-/// 1. The [`ServiceOptions`] values are checked, then
+/// 1. The [`ServiceOptions`] values are checked (on Android, the options
+///    must have an [authorizer](ServiceOptions::authorizer)), then
 ///    `rsproperties::init(config)`.
 /// 2. The properties dir's writer lock
 ///    ([`rsproperties::AreaWriterLock::acquire`]); this creates a missing
@@ -1476,11 +1616,17 @@ impl std::error::Error for StartupError {
 /// # Socket files
 ///
 /// Socket files are created as `socket(SOCK_CLOEXEC|SOCK_NONBLOCK)`,
-/// `fchmod(fd, mode)`, `bind` at `<socket_dir>/.<name>.tmp-<pid>`, where
-/// `mode` is 0660 or the one given to [`ServiceOptions::socket_access`].
+/// `fchmod(fd, mode)`, `bind` at `<socket_dir>/.<name>.tmp-<pid>` (on
+/// Android at `<socket_dir>/<name>`, see below), where `mode` is 0660 or
+/// the one given to [`ServiceOptions::socket_access`].
+/// With a [label](SocketAccess::with_label), the `bind` runs in a thread
+/// of its own that first writes the label to its fscreate attribute, so
+/// the file has the label from the moment its path exists (except on a
+/// filesystem where the kernel ignores the attribute; see
+/// [`SocketAccess::with_label`]).
 /// The kernel creates the file with the socket's mode minus the umask, so
 /// from the moment the path exists its mode is a subset of `mode`. The
-/// temp socket is then opened `O_PATH|O_NOFOLLOW` relative to the socket
+/// socket file is then opened `O_PATH|O_NOFOLLOW` relative to the socket
 /// dir, and `fstat` must confirm a socket owned by the service's euid.
 /// Through that descriptor, a group given to `socket_access` is set
 /// (`fchownat(fd, "", -1, gid, AT_EMPTY_PATH)`), and if the umask removed
@@ -1494,6 +1640,13 @@ impl std::error::Error for StartupError {
 /// included. Both final names are unlinked when the service ends (see
 /// [`ServiceHandle`]).
 ///
+/// On Android each socket is bound at its final name instead, after an
+/// unlink of what is there, as init's `CreateSocket` does: AOSP's policy
+/// gives init no `rename` on the sockets' type (`property_socket`). Each
+/// name is then missing from its unlink to its `bind`, so start the
+/// clients after `run` has returned, and a failure on the second socket
+/// leaves no socket at the first name either.
+///
 /// The socket dir is opened once at startup; every unlink, rename and
 /// chmod is made relative to that descriptor or to a descriptor whose
 /// inode was checked with `fstat`, so the service changes no existing
@@ -1502,16 +1655,17 @@ impl std::error::Error for StartupError {
 /// `.<either name>.tmp-<pid>` there (the startup sweep removes only
 /// sockets with those prefixes), and never follows a symlink at those
 /// names. `bind` itself takes a path: if the socket dir's path is swapped
-/// after startup opened it, the temp socket is created at the new
-/// location, startup fails, and that socket is left there.
+/// after startup opened it, the socket being bound is created at the new
+/// location (on Android, unless a file has its name there), startup
+/// fails, and that socket is left there.
 ///
 /// Out of scope: any uid other than the service's euid and root that can
 /// write to the socket dir or any of its ancestors can replace the sockets
 /// with its own and so impersonate the service; nothing in the service can
-/// prevent that. Such a uid can also exchange the two temp sockets' names
+/// prevent that. Such a uid can also exchange the two sockets' names
 /// during startup, between `bind` and the `O_PATH` open: the `fstat` check
 /// confirms a socket owned by the service's euid, not the socket just
-/// bound, so the other temp socket passes it and gets the group and mode
+/// bound, so the other socket passes it and gets the group and mode
 /// meant for this name, while the socket just bound listens with the group
 /// it was created with and its mode minus the umask; startup reports no
 /// error. Keep the socket dir and its ancestors writable only by
@@ -1571,16 +1725,22 @@ pub async fn run(
     //
     // The options are checked first: `init` cannot be undone, so a
     // refused option leaves no process-global state behind.
+    check_authorizer_present(cfg!(target_os = "android"), options.authorizer.is_some())
+        .map_err(|e| StartupError::new(StartupStage::Config, e))?;
     for listener in Listener::ALL {
         options.socket_access[listener.index()]
             .check(listener, options.authorizer.is_some())
             .map_err(|e| StartupError::new(StartupStage::Config, e))?;
     }
+    if let Some(label) = &options.property_info_label {
+        access::check_label(label, "property_info label")
+            .map_err(|e| StartupError::new(StartupStage::Config, e))?;
+    }
     rsproperties::init(config).map_err(|e| StartupError::new(StartupStage::Config, e))?;
 
     // The writer lock is taken before either actor is spawned: a second
-    // instance on the same properties dir fails here, before it can rename
-    // its sockets over the running instance's sockets or replace
+    // instance on the same properties dir fails here, before it can replace
+    // the running instance's sockets (rename, or unlink on Android) or
     // `property_info`. (Spawning the socket service only after the
     // properties service is ready would also protect the sockets, but
     // would change the 0.6.0 startup order; the lock is enough.)
@@ -1598,6 +1758,7 @@ pub async fn run(
         powerctl_handler,
         authorizer,
         socket_access,
+        property_info_label,
         max_connections_per_uid,
         count_every_uid,
     } = options;
@@ -1617,6 +1778,7 @@ pub async fn run(
         build_prop_files,
         writer_lock: lock,
         persistent_properties_file,
+        property_info_label,
         trie_sender,
     });
     let handlers = Handlers::new(control_handler, powerctl_handler);
@@ -1683,6 +1845,26 @@ pub async fn run(
     })
 }
 
+/// Refuses options without an authorizer on Android (`on_android`; a
+/// parameter so the Linux tests can check the Android case). init checks
+/// every request there with SELinux, so a service that checks none would
+/// let any process that can connect set what the policy denies it.
+fn check_authorizer_present(
+    on_android: bool,
+    has_authorizer: bool,
+) -> Result<(), rsproperties::Error> {
+    if on_android && !has_authorizer {
+        return Err(rsproperties::Error::InvalidArgument(
+            "on Android the service needs ServiceOptions::authorizer: init checks every \
+             request with SELinux there, and without an authorizer every process that can \
+             connect could set any property (pass `authorizer(|_| Decision::Allow)` to allow \
+             every request)"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Builds the [`StartupError`] for a failed actor: the cause is the
 /// actor's own failure (normally its `on_start` error) when the join
 /// handle has one, the `JoinError` when the task panicked or was
@@ -1723,6 +1905,29 @@ mod tests {
 
     use crate::socket_service::tests::{socket_suffix_len, socket_test_dir};
 
+    /// `ServiceOptions::new()`, plus an authorizer that allows every
+    /// request on Android, where `run` requires one.
+    fn test_options() -> ServiceOptions {
+        let options = ServiceOptions::new();
+        if cfg!(target_os = "android") {
+            options.authorizer(|_| Decision::Allow)
+        } else {
+            options
+        }
+    }
+
+    /// Readies `dir` for a `run` after a stopped one. On Android `run`
+    /// creates `property_info` and `properties_serial` with `O_EXCL`, so
+    /// both are removed first, in place of the new directory a host would
+    /// start on.
+    fn prepare_restart(dir: &Path) {
+        if cfg!(target_os = "android") {
+            for name in ["property_info", "properties_serial"] {
+                std::fs::remove_file(dir.join(name)).unwrap();
+            }
+        }
+    }
+
     /// `Debug` must not print the value (value-masking policy).
     #[test]
     fn test_property_message() {
@@ -1742,6 +1947,11 @@ mod tests {
     /// `run` returns before `init`, so this test leaves no process-global
     /// state behind for [`run_reports_on_start_cause`].
     #[tokio::test]
+    #[cfg_attr(
+        target_os = "android",
+        ignore = "on Android `run` refuses the missing authorizer first \
+                  (`authorizer_is_required_on_android_only`)"
+    )]
     async fn run_refuses_socket_mode_outside_0660_without_authorizer() {
         for (listener, mode) in [(Listener::Property, 0o666), (Listener::System, 0o4660)] {
             let options = ServiceOptions::new().socket_access(listener, SocketAccess::new(mode));
@@ -1767,6 +1977,43 @@ mod tests {
         }
     }
 
+    /// A `property_info` label no SELinux context can be fails at `Config`.
+    /// `run` returns before `init`, as in the test above.
+    #[tokio::test]
+    async fn run_refuses_a_malformed_property_info_label() {
+        for label in ["", "u:object_r:property_info:s0\n"] {
+            let options = ServiceOptions::new()
+                .authorizer(|_| Decision::Allow)
+                .property_info_label(label);
+            let err = match run(rsproperties::PropertyConfig::new(), options).await {
+                Ok(_) => panic!("run must refuse {label:?}"),
+                Err(e) => e,
+            };
+            assert_eq!(err.stage(), StartupStage::Config, "{err}");
+            assert!(
+                std::error::Error::source(&err)
+                    .unwrap()
+                    .to_string()
+                    .contains("property_info label"),
+                "{err}"
+            );
+        }
+    }
+
+    /// Only Android requires an authorizer.
+    #[test]
+    fn authorizer_is_required_on_android_only() {
+        let err = check_authorizer_present(true, false).unwrap_err();
+        assert!(
+            matches!(&err, rsproperties::Error::InvalidArgument(msg)
+                if msg.contains("ServiceOptions::authorizer")),
+            "{err}"
+        );
+        check_authorizer_present(true, true).unwrap();
+        check_authorizer_present(false, false).unwrap();
+        check_authorizer_present(false, true).unwrap();
+    }
+
     /// `run` must return the actor's own `on_start` error, not rsactor's
     /// generic mailbox error, tagged with the stage that failed. The only
     /// test that gets past `init` in this process (`init` is
@@ -1783,11 +2030,7 @@ mod tests {
         let config = rsproperties::PropertyConfig::new()
             .properties_dir(dir.clone())
             .socket_dir(socket_dir);
-        let result = run(
-            config,
-            ServiceOptions::new().property_contexts_files([missing]),
-        )
-        .await;
+        let result = run(config, test_options().property_contexts_files([missing])).await;
         let _ = std::fs::remove_dir_all(&dir);
 
         let err = match result {
@@ -1905,7 +2148,7 @@ mod tests {
             .socket_dir(socket_dir.clone());
         let run_task = tokio::spawn(run(
             config,
-            ServiceOptions::new()
+            test_options()
                 .property_contexts_files([fifo.clone()])
                 .build_prop_files(build_prop_files),
         ));
@@ -2094,7 +2337,7 @@ mod tests {
 
             let result = run(
                 config,
-                ServiceOptions::new()
+                test_options()
                     .property_contexts_files([contexts])
                     .build_prop_files([dir.0.join("missing.prop")]),
             )
@@ -2139,7 +2382,7 @@ mod tests {
 
             let result = run(
                 config,
-                ServiceOptions::new().persistent_properties_file(
+                test_options().persistent_properties_file(
                     dir.0.join("missing").join("persistent_properties"),
                 ),
             )
@@ -2186,7 +2429,7 @@ mod tests {
                 .socket_dir(socket_dir.clone());
             let service = run(
                 config,
-                ServiceOptions::new().persistent_properties_file(file.clone()),
+                test_options().persistent_properties_file(file.clone()),
             )
             .await
             .unwrap();
@@ -2286,7 +2529,7 @@ mod tests {
                     rsproperties::PropertyConfig::new()
                         .properties_dir(dir.0.clone())
                         .socket_dir(socket_dir.clone()),
-                    ServiceOptions::new(),
+                    test_options(),
                 )
             };
 
@@ -2309,6 +2552,7 @@ mod tests {
             );
 
             // join: nothing has ended, so it must not return.
+            prepare_restart(&dir.0);
             let mut service = start().await.expect("run after shutdown");
             assert!(
                 tokio::time::timeout(Duration::from_millis(200), service.join())
@@ -2334,6 +2578,7 @@ mod tests {
             service.shutdown().await.unwrap();
 
             // drop
+            prepare_restart(&dir.0);
             let service = start().await.expect("run after join");
             assert!(sockets_exist(&socket_dir));
             drop(service);
@@ -2376,7 +2621,7 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new().control_handler(move |_, reply| {
+                test_options().control_handler(move |_, reply| {
                     counter.fetch_add(1, Ordering::SeqCst);
                     reply.send(true);
                 }),
@@ -2506,7 +2751,7 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new().powerctl_handler(move |msg| {
+                test_options().powerctl_handler(move |msg| {
                     let _ = requests.send(msg.clone());
                     PowerctlOutcome::Ignored
                 }),
@@ -2605,7 +2850,7 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new()
+                test_options()
                     .control_handler(move |_, reply| {
                         control_counter.fetch_add(1, Ordering::SeqCst);
                         reply.send(true);
@@ -2710,7 +2955,7 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new()
+                test_options()
                     .control_handler(move |_, reply| {
                         control_counter.fetch_add(1, Ordering::SeqCst);
                         reply.send(true);
@@ -2814,7 +3059,7 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new().control_handler(handler),
+                test_options().control_handler(handler),
             )
             .await
             .expect("run");
@@ -2880,6 +3125,11 @@ mod tests {
     /// task that first sees the sockets unlinked, which is the last step
     /// of a failed `run` that does not wait for the call.
     #[test]
+    #[cfg_attr(
+        target_os = "android",
+        ignore = "Android needs an authorizer, which waits for the trie a failed start \
+                  never sends: no handler call runs while such a start fails"
+    )]
     fn failed_run_waits_for_running_control_handler_call() {
         const TEST: &str = "tests::failed_run_waits_for_running_control_handler_call";
         if !is_child(TEST) {
@@ -2908,7 +3158,7 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new()
+                test_options()
                     .property_contexts_files([fifo.clone()])
                     .build_prop_files([dir.0.join("missing.prop")])
                     .control_handler(handler),
@@ -3031,7 +3281,7 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new().control_handler(handler),
+                test_options().control_handler(handler),
             )
             .await
             .expect("run");
@@ -3131,8 +3381,7 @@ mod tests {
                 "rsprops_svc_uid_limit",
                 socket_suffix_len("sockets"),
             ));
-            let (service, property, system) =
-                service_with_uid_limit(&dir, ServiceOptions::new()).await;
+            let (service, property, system) = service_with_uid_limit(&dir, test_options()).await;
 
             // Two connections that send nothing. The service accepts the
             // connections of one socket in the order they were made, so
@@ -3176,7 +3425,7 @@ mod tests {
             ));
             let (handler, mut passed) = deferring_handler();
             let (service, property, _system) =
-                service_with_uid_limit(&dir, ServiceOptions::new().control_handler(handler)).await;
+                service_with_uid_limit(&dir, test_options().control_handler(handler)).await;
 
             // The handler has both requests, so their connection tasks
             // have ended: the two places are held by the replies alone.
@@ -3218,7 +3467,7 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new().control_handler(handler),
+                test_options().control_handler(handler),
             )
             .await
             .expect("run");

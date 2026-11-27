@@ -14,7 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each request of a connected client, where init's `CheckPermissions`
   asks SELinux. The authorizer gets a `SetRequest`: the name, the value,
   the name's `property_contexts` context (for `ctl.*`, that of
-  `ctl.<action>$<target>`), the `Listener` the request came in on, and
+  `ctl.<action>$<target>`; for `ctl.start`, `ctl.stop` and `ctl.restart`
+  also that of `ctl.<target>`, init's legacy check, as
+  `SetRequest::legacy_control_context`, which
+  `SetRequest::with_legacy_control_context` sets for a test), the
+  `Listener` the request came in on, and
   the sender's pid, uid and gid (`PeerInfo`, from `SO_PEERCRED`). It is
   called for a set of an ordinary property, a `ctl.*` request and a
   `sys.powerctl` set, after the name check and before the type check.
@@ -70,14 +74,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rsproperties::init`: a mode with an execute, setuid, setgid or sticky
   bit; a mode with a bit for others (`0o006`) when the options have no
   authorizer; and group `u32::MAX`. With an authorizer, init's
-  `property_service` mode `0o666` can be used. Without the option the
-  sockets are created as before. The `Debug` output of `ServiceOptions`
-  has a `socket_access` field.
+  `property_service` mode `0o666` can be used.
+  `SocketAccess::with_label(context)` creates the file with that SELinux
+  context, as init creates its sockets with `property_socket`: the
+  service writes the context to the fscreate attribute of a thread it
+  starts for that `bind` alone. `run` refuses an empty label or one with
+  whitespace or a control byte at `StartupStage::Config`, and fails at
+  `StartupStage::SocketService` when the kernel refuses the label at the
+  fscreate write or at the `bind`; the errno and the conditions depend on
+  the security module and its policy, including whether a context the
+  policy does not define is refused. Without the option the sockets are
+  created as before.
+  The `Debug` output of `ServiceOptions` has a `socket_access` field.
 - Service: `ServiceOptions::max_connections_per_uid(limit)` sets the
   most connections one uid may have open at once on both sockets
   together (see "Changed" for the default). `usize::MAX` removes the
   limit. The `Debug` output of `ServiceOptions` has a
   `max_connections_per_uid` field.
+- Service: `rsproperties-service` builds for Android
+  (`target_os = "android"`; 0.7.0 stopped the build with a
+  `compile_error!`), for a userspace that runs without init's property
+  service. On Android `run` fails at `StartupStage::Config` when the
+  options have no authorizer; `authorizer(|_| Decision::Allow)` allows
+  every request. Other targets than Linux and Android still do not
+  build. On Android each socket is bound at its final name after an
+  unlink of what is there, as init's `CreateSocket` does (Linux: under a
+  temp name, then renamed): AOSP's policy gives init no `rename` on
+  `property_socket`. Measured on API 34, 36 and 37 emulators with the
+  service in the `init` domain under enforcing SELinux: on AOSP's policy
+  plus `allow init init_tmpfs:file lock;`, the service starts on a
+  `tmpfs` properties dir, stock `getprop` in the `shell` and
+  `untrusted_app` domains reads its areas, stock `setprop` from `shell`
+  sets `debug.*`, and an authorizer that asks selinuxfs refuses the
+  `shell` domain's `sys.*`, `ro.*` and `ctl.start` sets
+  (`untrusted_app` cannot connect: the policy refuses its `connectto` on
+  `init`, as for init's own socket); on the unmodified policy `run` fails at
+  `StartupStage::WriterLock` with `EACCES`. The service's test suite
+  passes there.
+- Service: `ServiceOptions::property_info_label(context)` publishes
+  `property_info` with that SELinux context, as AOSP init gives it
+  `property_info` from `file_contexts`. `run` refuses an empty label or
+  one with whitespace or a control byte at `StartupStage::Config`, and
+  fails at `StartupStage::PropertiesService`, before any area file is
+  created, when the kernel refuses the label. The `Debug` output of
+  `ServiceOptions` has a `property_info_label` field.
 - `PropertyInfoTrie` (`builder` feature): a checked, 4-byte aligned copy
   of the bytes `build_trie` returns. `context(name)` and
   `property_type(name)` return `&str`s that borrow it, without the
@@ -86,6 +126,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `AreaWriterLock::acquire` (`builder` feature) fails with `Error::Lock`
+  only when another writer holds the lock; another `flock` failure is an
+  `Error::Context` with its errno (0.7.0: `Error::Lock` for every `flock`
+  failure, which named another instance for an `EACCES` from SELinux).
+  The callers that take the lock return the same: `SystemProperties::new_area`,
+  and, in the service, the source of a `StartupStage::WriterLock` error.
+  See Migration from 0.7.0.
+- `AreaWriterLock::publish_property_info(trie, label)` (`builder`
+  feature) takes an `Option<&str>` SELinux label (0.7.0:
+  `publish_property_info(trie)`). With `Some(label)`, the file's
+  `security.selinux` is set to `label` by `fsetxattr` after the trie is
+  written, synced and checked, before the file is renamed onto
+  `property_info`; under SELinux the writer's domain needs `relabelto
+  rename` on the label's type (and `unlink` on the type of an existing
+  `property_info` it replaces). A label that is empty or has whitespace
+  or a control byte is refused with `Error::InvalidArgument` before
+  anything is written, and a label the kernel refuses leaves
+  `property_info` unchanged. See Migration from 0.7.0.
+- On Android, `AreaWriterLock::publish_property_info` writes
+  `property_info` at its name and labels it last, as init does (0.7.0: a
+  temp file renamed onto it), but creates it with `O_EXCL` where init
+  opens it with `O_TRUNC`, so a file readers may have mapped is never
+  rewritten in place. `SystemProperties::new_area` / `new_area_locked`
+  create `properties_serial` at its name with `O_EXCL`, as bionic does
+  (0.7.0: renamed into place). AOSP's policy lets only init write these
+  files and gives init `relabelto` on `property_info` and `write
+  relabelto` on `properties_serial`, not the `rename` a temp file needs.
+  Both calls therefore fail with `EEXIST` when the file exists, and
+  `new_area` / `new_area_locked` fail before any area file is created
+  or replaced: start an Android writer on a fresh properties dir. The
+  label still needs `relabelfrom` on the type a new file in the
+  properties dir gets, which AOSP's policy gives no domain on
+  `properties_device`; on that policy start on a `tmpfs` directory and
+  relabel it `properties_device` after the writer returns, as init does
+  (see `docs/service-security.md`; measured on API 34, 36 and 37
+  emulators). That policy does not
+  give init `lock` on the files it creates there (`init_tmpfs`), which
+  the `flock` of the writer lock (`AreaWriterLock::acquire`, also taken
+  by `new_area`) needs, so on an unmodified policy the writer fails at
+  the lock; the host policy has to add it. On every target an
+  area file is now labeled last, after its mode, its size, its header
+  and its mapping: the `setattr` of the `fchmod`, the `write` of the
+  `ftruncate` and of the header, and the `read write map` of the `mmap`
+  are checked on the type a new file in the properties dir gets, not on
+  the label's type (0.7.0: the label came first, so these were checked
+  on the label's type when the label was set), and a failure before the
+  label removes the file under that type. The header is written with
+  `pwrite` before the file is mapped; its bytes are those 0.7.0 wrote.
+  See Migration from 0.7.0.
+- On Android, a property area file whose SELinux context cannot be set
+  (`fsetxattr` of `security.selinux`) is not created:
+  `SystemProperties::new_area` and `new_area_locked` fail with an
+  `Error::Context` naming the context and the temp file (0.7.0: a `warn`
+  and an unlabeled area, which clients whose domain may not read that
+  type cannot read), and the service, which builds for Android from this
+  release on, fails at `StartupStage::PropertiesService`. bionic records
+  the same failure and init stops on it. On other targets it stays a
+  `warn`, which now also names the context and the errno after the
+  path. See Migration from 0.7.0.
 - Service: one uid has at most 32 connections open at once (0.7.0: no
   limit per uid, only the service's 64 handler slots, 256 waiting
   connections and 102 unanswered `ctl.*` requests). A connection beyond
@@ -112,6 +211,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- Service: "Running on Android" in the crate rustdoc (an example with
+  init's socket modes and labels, the `property_info` label and an
+  authorizer that checks both contexts init checks) and in
+  `docs/service-security.md` (what the host sets up and what the service
+  does not provide: the mount namespace, the properties dir's label (on
+  AOSP's policy a `tmpfs` directory relabeled after `run`),
+  the permissions the service's domain needs, no `appcompat_override`, no
+  `restorecon` for `selinux.restorecon_recursive`, no V1).
 - The crate READMEs are short: a description, installation, one
   example and links. Their usage guides moved to the crate-level rustdoc,
   so docs.rs shows them; their API reference lists, which repeated the
@@ -131,6 +238,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that cannot be read is logged at `warn` and skipped, as in the lookups
   of `SystemProperties`, and the errors are those of the types table and
   the type string.
+
+### Migration from 0.7.0
+
+- `AreaWriterLock::acquire` returns `Error::Lock` only when another
+  writer holds the lock (`EWOULDBLOCK`); any other `flock` failure, such
+  as `EACCES` from SELinux, is an `Error::Context` with that errno (0.7.0:
+  `Error::Lock` for every `flock` failure), also through
+  `SystemProperties::new_area` and the service's `StartupStage::WriterLock`.
+  Code that took `Error::Lock` for "the directory is in use" now gets the
+  real cause for the others.
+- `AreaWriterLock::publish_property_info(&trie)` becomes
+  `publish_property_info(&trie, None)`; the file is written as before.
+  Pass `Some("u:object_r:property_info:s0")` (or the context your policy
+  gives `property_info`) to label it.
+- An Android writer (`builder` feature) whose areas could not be labeled
+  ran with unlabeled areas in 0.7.0 and now fails to create them. Run it
+  in a domain the policy lets label files with the `property_contexts`
+  contexts (`relabelto` on those types), on a filesystem that stores
+  `security.*` attributes.
+- An Android writer that 0.7.0 let restart over the same properties dir
+  now fails with `EEXIST` on `property_info` (`publish_property_info`) or
+  `properties_serial` (`new_area`, `new_area_locked`). Give each start a
+  new directory: AOSP's policy lets no domain unlink `properties_serial`
+  and gives init no `unlink` on `property_info`. Where the policy allows
+  it, removing those two files before the start works too. Start readers
+  only after the writer has returned.
+- An SELinux policy (Linux or Android) that granted the writer
+  `setattr`, `write` or `map` only on the area label types also needs
+  them on the type a new file in the properties dir gets: area creation
+  now fails with `Failed to set mode of …`, `Failed to size property
+  area …`, `Failed to write the header of …` or a failed `mmap`
+  (`EACCES`) without them.
+- Service: a uid other than 0 and the service's own effective uid that
+  opens more than 32 connections at once on the two sockets together has
+  the connections beyond 32 closed without a reply, and the client's
+  `set` fails (0.7.0 accepted them). Raise the limit with
+  `ServiceOptions::max_connections_per_uid`; `usize::MAX` removes it.
+- Service: code that matches the text of a `StartupError` must match the
+  new texts (see Changed): `configuration` in place of
+  `configuration (init)` for `StartupStage::Config`, and for
+  `StartupStage::SocketService` `set group and mode of <path>`,
+  `group and mode left unchanged`, `0o660` and `a umask that keeps those
+  bits` in place of `raise mode of <path>`, `mode left unchanged`, `0660`
+  and `keeps group rw`. Matching `StartupError::stage()` instead does not
+  depend on the texts.
 
 ## [0.7.0] - 2026-11-17
 

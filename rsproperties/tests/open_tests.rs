@@ -26,7 +26,7 @@ fn writer(dir: &Path, value: &str) -> SystemProperties {
     let trie = build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap();
 
     let lock = AreaWriterLock::acquire(dir).unwrap();
-    lock.publish_property_info(&trie).unwrap();
+    lock.publish_property_info(&trie, None).unwrap();
     let mut props = SystemProperties::new_area_locked(lock).unwrap();
     props.add("test.x", value).unwrap();
     props

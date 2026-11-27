@@ -62,7 +62,7 @@ fn build_property_info(dir: &Path) {
     // a group-writable file that readers refuse.
     AreaWriterLock::acquire(dir)
         .unwrap()
-        .publish_property_info(&data)
+        .publish_property_info(&data, None)
         .unwrap();
 }
 
@@ -78,8 +78,10 @@ fn install_logger() {
 /// The SELinux-label `warn` of `new_area` names each area's final path, as
 /// in 0.6.0, not the `.area.tmp-*` file the label is set on. For each area
 /// the same label is first set on a probe file in the same dir; where that
-/// fails, the exact 0.6.0 line for the area must be logged. An area whose
-/// probe succeeds (a host that permits the label) is not checked.
+/// fails, a line for the area must be logged that starts with the 0.6.0
+/// text (path included) and goes on with the context and the errno. An
+/// area whose probe succeeds (a host that permits the label) is not
+/// checked.
 #[test]
 fn selinux_warn_names_the_area() {
     install_logger();
@@ -130,8 +132,12 @@ fn selinux_warn_names_the_area() {
         .filter(|l| l.starts_with("Failed to set SELinux context for") && l.contains(dir_str))
         .cloned()
         .collect();
+    // Each line goes on with the context and the errno after the path.
     for want in &expected {
-        assert!(lines.contains(want), "missing {want}; got {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.starts_with(&format!("{want} ("))),
+            "missing {want}; got {lines:?}"
+        );
     }
     assert!(lines.iter().all(|l| !l.contains(".area.tmp-")), "{lines:?}");
 }

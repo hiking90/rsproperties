@@ -153,7 +153,18 @@ async fn start_service(options: rsproperties_service::ServiceOptions) -> Service
 /// frame, and the client still returns `Ok`.
 #[allow(dead_code)]
 pub async fn init_test() {
-    init_test_with(rsproperties_service::ServiceOptions::new).await;
+    init_test_with(default_options).await;
+}
+
+/// `ServiceOptions::new()`, plus an authorizer that allows every request
+/// on Android, where `run` requires one.
+pub fn default_options() -> rsproperties_service::ServiceOptions {
+    let options = rsproperties_service::ServiceOptions::new();
+    if cfg!(target_os = "android") {
+        options.authorizer(|_| rsproperties_service::Decision::Allow)
+    } else {
+        options
+    }
 }
 
 /// [`init_test`] for a service with the options `options` returns. Every

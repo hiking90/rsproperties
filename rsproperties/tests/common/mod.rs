@@ -250,7 +250,7 @@ mod host {
         );
 
         let lock = AreaWriterLock::acquire(dir).expect("AreaWriterLock::acquire");
-        lock.publish_property_info(&trie)
+        lock.publish_property_info(&trie, None)
             .expect("publish_property_info");
         let mut writer = SystemProperties::new_area_locked(lock).expect("new_area_locked");
         for (name, value) in &properties {

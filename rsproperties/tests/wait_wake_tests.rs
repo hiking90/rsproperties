@@ -45,7 +45,7 @@ fn build_property_info(dir: &Path) {
     // a group-writable file that readers refuse.
     AreaWriterLock::acquire(dir)
         .unwrap()
-        .publish_property_info(&data)
+        .publish_property_info(&data, None)
         .unwrap();
 }
 

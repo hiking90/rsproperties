@@ -19,21 +19,43 @@
 //! - \[SM2\] Published ranges. A range is published once an offset that
 //!   reaches it has been Release-stored into a reachable link word
 //!   (`children`, `left`, `right`, `prop`); an area header is published
-//!   when its file is renamed to its final name. This crate accesses
+//!   when its file is renamed to its final name, or, for an area created
+//!   at its final name (`new_rw_in_place`), when the call that created it
+//!   has returned (\[SM3\]). This crate accesses
 //!   published bytes only (a) through atomics — header `bytes_used` /
 //!   `serial`, link words, `PropertyInfo::serial`, value slots, the dirty
 //!   backup slot — or (b) by non-atomic reads of write-once bytes — header
 //!   magic/version, node `namelen` and name, entry name, long value —
 //!   reached through an acquire load (`load_acquire`, \[R-RO\]) paired
-//!   with the publishing Release (for the header: an `open` that follows
-//!   the rename).
+//!   with the publishing Release (for the header, whose bytes `pwrite`
+//!   stored before the file was mapped \[SM3\]: an `open` that follows the
+//!   rename, or, for a header written in place, an `open` that the
+//!   reader's start orders after the creating call's return; syscall
+//!   order, with no Release/Acquire pair in this crate).
 //! - \[SM3\] Fresh ranges. `&mut` references and non-atomic writes are made
 //!   only on ranges no published offset reaches: an allocation between
-//!   `allocate_obj` and `Fresh::link` (the `Fresh` token), and an area
-//!   header in `create_unpublished` before `publish` renames the temp
-//!   file. Readers open only names taken from `property_info` and
-//!   `properties_serial`; context names starting with `.` are rejected, so
-//!   no reader opens a `.area.tmp-*` file.
+//!   `allocate_obj` and `Fresh::link` (the `Fresh` token). An area header
+//!   is never written through a mapping: `init_unpublished` writes
+//!   `PropertyArea::initial_bytes` with `pwrite` before it maps the file,
+//!   for a temp file (`create_unpublished`) and for a file created at its
+//!   final name (`new_rw_in_place`) alike. Readers open only names taken
+//!   from `property_info` and `properties_serial`; context names starting
+//!   with `.` are rejected, so no reader opens a `.area.tmp-*` file. A
+//!   file `new_rw_in_place` creates (`properties_serial` on Android; no
+//!   rename follows) can be mapped by a reader, in this process (the
+//!   global reader on another thread) or in another, before its header is
+//!   written. That reader's reads of the header race the kernel's copy of
+//!   the `pwrite` bytes into the page cache, not a Rust access of this
+//!   process: the access pattern of \[R-INIT\], outside \[SM2\]. What it
+//!   gets is not determined: a file shorter than the header (before the
+//!   `ftruncate`) is refused by `validate_file_metadata`, a header whose
+//!   magic or version is not copied yet is refused by the magic check in
+//!   `new_ro`, and a header whose magic and version are copied is
+//!   accepted (`bytes_used`, which only the writer reads, may still be
+//!   0). The callers that create the file (`SystemProperties::new_area`,
+//!   `new_area_locked`, and `rsproperties-service`'s `run`) document that
+//!   readers start after they return, as bionic's init creates its areas
+//!   before it starts any process; this crate does not check it.
 //! - \[SM4\] Single writer. At most one writable mapping per area file. On
 //!   Linux with this crate as writer: the `.writer_lock` flock held by
 //!   `AreaWriterLock` for the writer's lifetime, and within the process
@@ -89,8 +111,9 @@
 //! - \[R-SIZE\] File size. A file is not truncated below its mapped size
 //!   while a mapping exists; a violation raises SIGBUS, which no bounds
 //!   check can intercept. This crate's writer never truncates a published
-//!   area file (it renames a new file over it). Applies to area files and
-//!   to `property_info`.
+//!   area file (it renames a new file over it, or, `new_rw_in_place`,
+//!   creates the file once with `O_EXCL` and only grows it from 0 to its
+//!   size before returning). Applies to area files and to `property_info`.
 //! - \[R-UNION\] Union variant. The active `PropertyInfo` union variant is
 //!   chosen by the LONG flag (bit 16) of `serial`, and only for names
 //!   starting with `ro.` (bionic `system_properties.cpp` `ReadCallback`).
@@ -170,11 +193,19 @@
 //! - \[IMM\] property_info. `property_info` is mapped `PROT_READ` /
 //!   `MAP_SHARED` on every target, like bionic (`ImmutableFileMap`). A
 //!   writer replaces the file only by renaming a complete new file over it
-//!   (`AreaWriterLock::publish_property_info`; AOSP init writes it once,
-//!   before any reader exists) and never modifies a file in place. This is
-//!   a precondition on every writer, including tools outside this crate,
-//!   which this crate cannot check; an in-place rewrite (0.6.0's service,
-//!   `std::fs::write`) raises SIGBUS past a new EOF or yields a torn read.
+//!   (`AreaWriterLock::publish_property_info` except on Android), or
+//!   writes it once at a name where no file existed before any reader
+//!   maps it (AOSP init, before it starts any process;
+//!   `publish_property_info` on Android, with `O_EXCL`), and never
+//!   modifies a mapped file in place. This is a precondition on every
+//!   writer, including tools outside this crate, which this crate cannot
+//!   check; an in-place rewrite (0.6.0's service, `std::fs::write`) raises
+//!   SIGBUS past a new EOF or yields a torn read. For the write-once case
+//!   the precondition falls on the caller of the writer: no reader maps
+//!   the file before the writing call has returned. A reader that maps it
+//!   earlier holds a `&[u8]` over bytes the kernel is still copying, which
+//!   is outside \[IMM\]; the file only grows, so it reads a torn trie
+//!   (usually refused by the size check of `check_header`), not SIGBUS.
 //!   Readers refuse group/other-writable files (as bionic does) and warn on
 //!   an owner-writable one — refused with the `strict-file-validation`
 //!   feature. The owner-write bit does not stop a writer (root ignores
@@ -288,15 +319,17 @@ impl SerialWord {
 pub(crate) unsafe trait MmapObject {}
 
 // SAFETY: `repr(C, align(4))` of u32/AtomicU32 fields, every bit pattern
-// valid. Non-atomic fields: `magic`, `version`, `reserved` — written by
-// `PropertyArea::init` while the header is fresh [SM3], read as [SM2](b).
+// valid. Non-atomic fields: `magic`, `version`, `reserved` — never written
+// through a mapping (`PropertyArea::initial_bytes` is `pwrite`n before the
+// file is mapped [SM3]), read as [SM2](b).
 unsafe impl MmapObject for PropertyArea {}
 // SAFETY: `repr(C, align(4))` of u32/AtomicU32 fields, every bit pattern
 // valid. Non-atomic field: `namelen` — written by `init_header` while the
 // node is fresh [SM3], read as [SM2](b) after an acquire link load (or by
 // the writer that allocated the node). The root node at offset 0 is reached
 // through the published header instead; its `namelen` is the zero fill of
-// the temp file and is never written.
+// the `ftruncate` that sizes a new area file (a temp file, or a file created
+// at its final name by `new_rw_in_place`) and is never written.
 unsafe impl MmapObject for PropertyTrieNode {}
 // SAFETY: `repr(C, align(4))`: AtomicU32 serial + `UnsafeCell` of a union
 // of an AtomicU8 array and (u8 array, AtomicU32); every bit pattern valid.
@@ -391,14 +424,25 @@ pub(crate) struct PropertyArea {
 }
 
 impl PropertyArea {
-    /// Initializes a fresh header \[SM3\] (temp file, before `publish`).
-    fn init(&mut self, magic: u32, version: u32) {
-        *self.serial.get_mut() = 0;
-        self.magic = magic;
-        self.version = version;
-        self.reserved = [0; 28];
-        *self.bytes_used.get_mut() = mem::size_of::<PropertyTrieNode>() as u32
+    /// The bytes of a new area's header, as bionic's `prop_area`
+    /// constructor sets the fields: `bytes_used` past the root node and the
+    /// reserved backup slot, `serial` 0, magic, version, `reserved` 0, in
+    /// the native byte order the mapping reads them in.
+    /// `PropertyAreaMap::init_unpublished` writes them with `pwrite`
+    /// before it maps the file, so no header field is written through a
+    /// mapping \[SM3\].
+    fn initial_bytes() -> [u8; mem::size_of::<PropertyArea>()] {
+        let bytes_used = mem::size_of::<PropertyTrieNode>() as u32
             + crate::bionic_align(crate::wire::PROP_VALUE_MAX, mem::size_of::<u32>()) as u32;
+        let mut bytes = [0u8; mem::size_of::<PropertyArea>()];
+        for (offset, value) in [
+            (mem::offset_of!(PropertyArea, bytes_used), bytes_used),
+            (mem::offset_of!(PropertyArea, magic), PROP_AREA_MAGIC),
+            (mem::offset_of!(PropertyArea, version), PROP_AREA_VERSION),
+        ] {
+            bytes[offset..offset + mem::size_of::<u32>()].copy_from_slice(&value.to_ne_bytes());
+        }
+        bytes
     }
 
     pub(crate) fn serial(&self) -> &AtomicU32 {
@@ -473,7 +517,7 @@ mod offset {
     /// (1) The root trie node, at the start of the data region.
     pub(super) const ROOT: NodeOffset = AreaOffset::new(0);
     /// (1) The dirty backup slot, right after the root node (see
-    /// `PropertyArea::init`).
+    /// `PropertyArea::initial_bytes`).
     pub(super) const BACKUP_SLOT: AreaOffset<BackupSlot> =
         AreaOffset::new(mem::size_of::<PropertyTrieNode>() as u32);
 
@@ -674,6 +718,38 @@ pub(crate) struct PropertyAreaMap {
     pa_data_size: usize,
 }
 
+/// What a failed `fsetxattr` of an area's SELinux `context` does.
+///
+/// With `fatal` (on Android) the area is not created: bionic records the
+/// failure, `__system_property_area_init` returns -1 and init stops with
+/// `LOG(FATAL)`. A client reads an area only when the policy lets its
+/// domain read the file's type, so an area left with the type the directory
+/// gives a new file would fail later, as unreadable properties on the
+/// client side, instead of at startup.
+///
+/// Otherwise (Linux) it is a warning: the usual hosts of this crate have
+/// no SELinux, and the call fails there as the normal case (`EOPNOTSUPP`,
+/// or `EPERM` for a process that may not set `security.*` attributes).
+fn label_outcome(
+    labeled: rustix::io::Result<()>,
+    fatal: bool,
+    tmp: &Path,
+    filename: &Path,
+    context: &CStr,
+) -> Result<()> {
+    match labeled {
+        Ok(()) => Ok(()),
+        Err(e) if fatal => Err(e).context_with_location(format!(
+            "Failed to set SELinux context {context:?} on {tmp:?}"
+        )),
+        Err(e) => {
+            // The text up to the path is the one 0.7.0 logged.
+            warn!("Failed to set SELinux context for {filename:?} ({context:?}): {e}");
+            Ok(())
+        }
+    }
+}
+
 impl PropertyAreaMap {
     /// Creates a fresh, empty area at `filename`: builds it under a temp
     /// name in the same directory and renames it into place, so a reader
@@ -695,9 +771,56 @@ impl PropertyAreaMap {
         Ok(thiz)
     }
 
+    /// Creates a fresh, empty area at `filename` itself, with `O_EXCL`, as
+    /// bionic creates its area files (`prop_area::map_prop_area_rw`); fails
+    /// with `EEXIST` when `filename` exists. The label is the last step
+    /// (`init_unpublished`), so a failure after the create leaves the file
+    /// with the type it was created with, and the file is removed (a
+    /// refused `unlink` is logged); no step follows the label.
+    ///
+    /// For `properties_serial` on Android: AOSP's policy lets only init
+    /// write that type, and gives init `write` and `relabelto` on it but
+    /// not the `rename` that [`new_rw`](Self::new_rw) needs. A reader that
+    /// maps the file before this call has returned may find no header yet
+    /// and refuse the file \[SM3\]; start readers after it, as init creates
+    /// its areas before it starts services.
+    // Its only caller, `ContextsSerialized::new_rw`, is a `builder` item.
+    #[cfg(feature = "builder")]
+    pub(crate) fn new_rw_in_place(filename: &Path, context: Option<&CStr>) -> Result<Self> {
+        debug!("Creating new read-write property area map in place: {filename:?}");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .custom_flags(fs::OFlags::NOFOLLOW.bits() as _)
+            .mode(0o444)
+            .open(filename)
+            .context_with_location(format!("Failed to create property area {filename:?}"))?;
+        match Self::init_unpublished(
+            file,
+            filename,
+            filename,
+            context,
+            cfg!(target_os = "android"),
+        ) {
+            Ok(thiz) => {
+                info!("Successfully created read-write property area map: {filename:?}");
+                Ok(thiz)
+            }
+            Err(e) => {
+                if let Err(rm) = std::fs::remove_file(filename) {
+                    warn!("Failed to remove incomplete property area {filename:?}: {rm}");
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Creates and initializes the area under `.area.tmp-<pid>-<seq>` next
     /// to `filename`; returns the mapping and the temp path. The temp file
-    /// is removed on every failure after it was created.
+    /// is removed on every failure after it was created; before the label
+    /// (the last step) that `unlink` is checked against the type the file
+    /// was created with.
     fn create_unpublished(filename: &Path, context: Option<&CStr>) -> Result<(Self, PathBuf)> {
         let dir = filename.parent().ok_or_else(|| {
             Error::InvalidArgument(format!("property area path has no parent: {filename:?}"))
@@ -718,7 +841,7 @@ impl PropertyAreaMap {
             .open(&tmp)
             .context_with_location(format!("Failed to create property area {tmp:?}"))?;
 
-        match Self::init_unpublished(file, &tmp, filename, context) {
+        match Self::init_unpublished(file, &tmp, filename, context, cfg!(target_os = "android")) {
             Ok(thiz) => Ok((thiz, tmp)),
             Err(e) => {
                 if let Err(rm) = std::fs::remove_file(&tmp) {
@@ -729,38 +852,23 @@ impl PropertyAreaMap {
         }
     }
 
-    /// `filename` is the final path, for the SELinux `warn` (0.6.0 text);
-    /// the errors name `tmp`, the file they concern.
+    /// `filename` is the final path, for the SELinux `warn`; the errors name
+    /// `tmp`, the file they concern (the same path for an area created in
+    /// place). `label_fatal` is [`label_outcome`]'s `fatal`.
+    ///
+    /// Order: mode, size, header, mapping, label. Every step before the
+    /// label is checked against the type the file was created with, and the
+    /// label is the last step, so a failure leaves the file with that type,
+    /// on which the caller's `remove_file` needs `unlink` (AOSP's policy
+    /// gives init no `unlink` on `properties_serial`). bionic labels first
+    /// (`prop_area::map_prop_area_rw`).
     fn init_unpublished(
         file: File,
         tmp: &Path,
         filename: &Path,
         context: Option<&CStr>,
+        label_fatal: bool,
     ) -> Result<Self> {
-        if let Some(context) = context {
-            // Full xattr name required — the bare "selinux" (no namespace
-            // prefix) is rejected by the kernel with EOPNOTSUPP, which made
-            // this call fail unconditionally. bionic uses XATTR_NAME_SELINUX,
-            // which is "security.selinux".
-            //
-            // Labeling failure is a warning, NOT fatal — a deliberate
-            // deviation from bionic, where init treats it as fatal. This
-            // crate's primary deployments (non-Android hosts, dev
-            // containers) hit EOPNOTSUPP as the normal case; on an SELinux
-            // enforcing system an unlabeled area instead surfaces later as
-            // reader-side denials. The label moves with the inode on rename.
-            if fs::fsetxattr(
-                &file,
-                "security.selinux",
-                context.to_bytes_with_nul(),
-                fs::XattrFlags::empty(),
-            )
-            .is_err()
-            {
-                warn!("Failed to set SELinux context for {filename:?}");
-            }
-        }
-
         // The umask may have cleared read bits of 0444; readers of other
         // uids need all three, like `publish_property_info` (AOSP init runs
         // with umask 0).
@@ -770,24 +878,42 @@ impl PropertyAreaMap {
         fs::ftruncate(&file, PA_SIZE)
             .context_with_location(format!("Failed to size property area {tmp:?}"))?;
 
+        // Before the mapping exists, so the writer makes no `&mut` and no
+        // non-atomic store to the header through a mapping [SM3].
+        std::os::unix::fs::FileExt::write_all_at(&file, &PropertyArea::initial_bytes(), 0)
+            .context_with_location(format!("Failed to write the header of {tmp:?}"))?;
+
         let pa_size = PA_SIZE as usize;
         let pa_data_size = pa_size - std::mem::size_of::<PropertyArea>();
 
-        let mut thiz = Self {
-            mmap: MemoryMap::new(file, pa_size, true)?,
+        let thiz = Self {
+            mmap: MemoryMap::new(&file, pa_size, true)?,
             data_offset: std::mem::size_of::<PropertyArea>(),
             pa_data_size,
         };
 
-        // SAFETY: [SM3] — the header lies in the temp file, which no reader
-        // opens before `publish` renames it.
-        let header = unsafe { thiz.mmap.to_object_mut::<PropertyArea>(0, 0) }?;
-        header.init(PROP_AREA_MAGIC, PROP_AREA_VERSION);
+        if let Some(context) = context {
+            // Full xattr name required — the bare "selinux" (no namespace
+            // prefix) is rejected by the kernel with EOPNOTSUPP, which made
+            // this call fail unconditionally. bionic uses XATTR_NAME_SELINUX,
+            // which is "security.selinux". The label moves with the inode
+            // on rename. SELinux checks the mapping above at `mmap` only, so
+            // the relabel does not affect it.
+            let labeled = fs::fsetxattr(
+                &file,
+                "security.selinux",
+                context.to_bytes_with_nul(),
+                fs::XattrFlags::empty(),
+            );
+            label_outcome(labeled, label_fatal, tmp, filename, context)?;
+        }
         Ok(thiz)
     }
 
     /// Publishes the area header \[SM2\]: renames the temp file over
-    /// `filename`. On failure the temp file is removed.
+    /// `filename`. On failure the temp file is removed. Both run after the
+    /// label, so under SELinux they need `rename` and `unlink` on the
+    /// label's type.
     fn publish(tmp: &Path, filename: &Path) -> Result<()> {
         std::fs::rename(tmp, filename)
             .inspect_err(|_| {
@@ -834,7 +960,7 @@ impl PropertyAreaMap {
         let pa_data_size = pa_size - std::mem::size_of::<PropertyArea>();
 
         let thiz = Self {
-            mmap: MemoryMap::new(file, pa_size, false)?,
+            mmap: MemoryMap::new(&file, pa_size, false)?,
             data_offset: std::mem::size_of::<PropertyArea>(),
             pa_data_size,
         };
@@ -1143,7 +1269,7 @@ impl PropertyAreaMap {
         let total_len = value.len().checked_add(1).ok_or_else(|| {
             Error::InvalidArgument(format!("Backup value too long: {}", value.len()))
         })?;
-        // Bound against the *reserved* backup slot (see `PropertyArea::init`),
+        // Bound against the *reserved* backup slot (see `PropertyArea::initial_bytes`),
         // not the whole data region — a longer value would silently overwrite
         // the first allocated object right after the slot.
         let reserved = crate::bionic_align(crate::wire::PROP_VALUE_MAX, mem::size_of::<u32>());
@@ -1530,12 +1656,13 @@ pub(crate) struct ImmutableFileMap(MemoryMap);
 
 impl ImmutableFileMap {
     pub(crate) fn open(file: File, size: usize) -> Result<Self> {
-        Ok(Self(MemoryMap::new(file, size, false)?))
+        Ok(Self(MemoryMap::new(&file, size, false)?))
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
-        // SAFETY: [IMM] — the file is replaced only by rename, never
-        // written in place while mapped ([R-SIZE] for its length). Offset 0
+        // SAFETY: [IMM] — the file is replaced only by rename or written
+        // once before any reader maps it, never written in place while
+        // mapped ([R-SIZE] for its length). Offset 0
         // and the mapping's own size are in bounds.
         unsafe { self.0.data(0, 0, self.0.size) }
             .expect("offset 0 and the mapping's own size are in bounds")
@@ -1580,7 +1707,7 @@ unsafe impl Send for MemoryMap {}
 unsafe impl Sync for MemoryMap {}
 
 impl MemoryMap {
-    fn new(file: File, size: usize, writable: bool) -> Result<Self> {
+    fn new(file: &File, size: usize, writable: bool) -> Result<Self> {
         debug!("Creating memory map: size={size}, writable={writable}");
 
         if size == 0 {
@@ -1595,8 +1722,9 @@ impl MemoryMap {
             mm::ProtFlags::READ
         };
 
-        // SAFETY: `file` is a valid owned `File`, `size > 0` is checked above,
-        // and `mm::mmap` reports failure via `Result` rather than `MAP_FAILED`.
+        // SAFETY: `file` is an open `File` (the mapping does not need the
+        // fd after `mmap` returns), `size > 0` is checked above, and
+        // `mm::mmap` reports failure via `Result` rather than `MAP_FAILED`.
         let memory_area = unsafe {
             mm::mmap(
                 std::ptr::null_mut(),
@@ -1619,6 +1747,7 @@ impl MemoryMap {
     /// Rejects mutable access to read-only mappings \[R-WRITE\]. Writing
     /// through a PROT_READ mapping kills the process with SIGSEGV — fail
     /// with a typed error at the accessor instead.
+    #[cfg(feature = "builder")]
     fn require_writable(&self) -> Result<()> {
         if !self.writable {
             return Err(Error::PermissionDenied(
@@ -1735,6 +1864,7 @@ impl MemoryMap {
     ///
     /// The range must be fresh per \[SM3\]. This function checks bounds,
     /// alignment and PROT_WRITE.
+    #[cfg(feature = "builder")]
     unsafe fn to_object_mut<T: MmapObject>(
         &mut self,
         offset: usize,
@@ -1818,7 +1948,7 @@ impl MemoryMap {
         base: usize,
         size: usize,
     ) -> Result<&[std::sync::atomic::AtomicU8]> {
-        // The slot's length (`PropertyArea::init` reserves it): a longer
+        // The slot's length (`PropertyArea::initial_bytes` reserves it): a longer
         // view would reach the first allocated object, whose write-once
         // bytes are read non-atomically.
         let slot_len = crate::bionic_align(crate::wire::PROP_VALUE_MAX, mem::size_of::<u32>());
@@ -2058,6 +2188,137 @@ mod tests {
                 assert!(msg.contains("not a `ro.` entry"), "{msg}")
             }
             other => panic!("expected the name refusal, got {other:?}"),
+        }
+    }
+
+    /// A refused label fails the area where it is fatal (Android) and is
+    /// only a warning elsewhere; a label that was set is never an error.
+    #[test]
+    fn label_failure_is_fatal_only_when_asked() {
+        let tmp = Path::new("/props/.area.tmp-1-0");
+        let filename = Path::new("/props/u:object_r:debug_prop:s0");
+        let context = c"u:object_r:debug_prop:s0";
+        for fatal in [false, true] {
+            label_outcome(Ok(()), fatal, tmp, filename, context).unwrap();
+        }
+        label_outcome(
+            Err(rustix::io::Errno::OPNOTSUPP),
+            false,
+            tmp,
+            filename,
+            context,
+        )
+        .unwrap();
+        let err = label_outcome(Err(rustix::io::Errno::ACCESS), true, tmp, filename, context)
+            .unwrap_err();
+        let shown = err.to_string();
+        assert!(
+            shown.contains("debug_prop") && shown.contains(".area.tmp-1-0"),
+            "{shown}"
+        );
+        assert!(
+            matches!(err.root_cause(), Error::Io(io)
+                if io.raw_os_error() == Some(rustix::io::Errno::ACCESS.raw_os_error())),
+            "{err:?}"
+        );
+    }
+
+    /// On Linux the area is created whether or not the kernel takes the
+    /// label. It refuses it for an unprivileged process without SELinux
+    /// (no `security.*` attributes) and under SELinux (a context no policy
+    /// defines); as root without SELinux, or with `mac_admin`, it may take
+    /// it, and then this test does not reach the warning path, which
+    /// `label_failure_is_fatal_only_when_asked` covers.
+    #[test]
+    fn refused_label_creates_the_area_on_linux() {
+        let tmp = TempDir::new("label_warn");
+        let path = tmp.0.join("u:object_r:rsprops_no_such_type:s0");
+        let area =
+            PropertyAreaMap::new_rw(&path, Some(c"u:object_r:rsprops_no_such_type:s0")).unwrap();
+        drop(area);
+        assert!(path.is_file());
+    }
+
+    /// An area created in place is at its final name with mode 0444 and a
+    /// header readers accept; an existing file is neither replaced nor
+    /// removed (`EEXIST`), and no temp file is left either way.
+    #[test]
+    fn in_place_area_creates_only_a_new_file() {
+        let tmp = TempDir::new("in_place");
+        let path = tmp.0.join("properties_serial");
+        let area = PropertyAreaMap::new_rw_in_place(&path, None).unwrap();
+        drop(area);
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o444);
+        PropertyAreaMap::new_ro(&path).unwrap();
+
+        let ino = std::fs::metadata(&path).unwrap().ino();
+        let err = PropertyAreaMap::new_rw_in_place(&path, None).unwrap_err();
+        assert!(
+            matches!(err.root_cause(), Error::Io(io)
+                if io.kind() == std::io::ErrorKind::AlreadyExists),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino);
+        let names: Vec<_> = std::fs::read_dir(&tmp.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["properties_serial"]);
+    }
+
+    /// The label is the last step: when a fatal label is refused (as on
+    /// Android), the file already has its mode, its size and its header,
+    /// so every earlier step ran against the type the file was created
+    /// with. `init_unpublished` leaves the file to its caller, which
+    /// removes it. Skipped where the kernel takes the label (see
+    /// `refused_label_creates_the_area_on_linux`).
+    #[test]
+    fn refused_label_comes_after_the_header() {
+        let tmp = TempDir::new("label_last");
+        let path = tmp.0.join("properties_serial");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .open(&path)
+            .unwrap();
+        let context = c"u:object_r:rsprops_no_such_type:s0";
+        let Err(err) = PropertyAreaMap::init_unpublished(file, &path, &path, Some(context), true)
+        else {
+            eprintln!("the kernel took the label; the order is not observable here");
+            return;
+        };
+        assert!(err.to_string().contains("rsprops_no_such_type"), "{err}");
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o444);
+        assert_eq!(meta.len(), PA_SIZE);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes[..mem::size_of::<PropertyArea>()],
+            PropertyArea::initial_bytes()
+        );
+    }
+
+    /// A new area file holds bionic's `prop_area` header and nothing else:
+    /// `bytes_used` past the root node and the backup slot (20 + 92),
+    /// `serial` 0, magic, version, `reserved` 0, in native byte order; the
+    /// rest of the 128 KiB is zero. Both creation paths write it.
+    #[test]
+    fn new_area_file_has_the_bionic_header() {
+        let tmp = TempDir::new("header_bytes");
+        let renamed = tmp.0.join("ctx");
+        let in_place = tmp.0.join("properties_serial");
+        drop(PropertyAreaMap::new_rw(&renamed, None).unwrap());
+        drop(PropertyAreaMap::new_rw_in_place(&in_place, None).unwrap());
+
+        let mut expected = vec![0u8; 128 * 1024];
+        expected[0..4].copy_from_slice(&112u32.to_ne_bytes());
+        expected[8..12].copy_from_slice(&0x504f_5250u32.to_ne_bytes());
+        expected[12..16].copy_from_slice(&0xfc6e_d0abu32.to_ne_bytes());
+        for path in [&renamed, &in_place] {
+            let bytes = std::fs::read(path).unwrap();
+            assert!(bytes == expected, "{path:?}: {:02x?}", &bytes[..32]);
         }
     }
 }

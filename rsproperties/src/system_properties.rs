@@ -444,6 +444,16 @@ impl SystemProperties {
     /// context whose area file does not exist yet fails until that file is
     /// renamed into place. Start readers after `new_area` /
     /// `new_area_locked` (or `rsproperties_service::run`) has returned.
+    ///
+    /// On Android `properties_serial` is not renamed into place but created
+    /// at its name with `O_EXCL`, as bionic creates it, so this fails with
+    /// `EEXIST` when `<dirname>/properties_serial` exists, before any area
+    /// file is created or replaced: start on a fresh directory, as init
+    /// does on the tmpfs `/dev` of each boot. AOSP's policy gives init
+    /// `write` and `relabelto` on that type, not `rename`. The area files of
+    /// the contexts are still replaced by rename there. A reader that maps
+    /// `properties_serial` before this call has returned may find no
+    /// header yet and fail to open the properties.
     #[cfg(feature = "builder")]
     pub fn new_area(dirname: &Path) -> Result<Self> {
         let contexts = match ContextsSerialized::new_rw(dirname, None) {
@@ -1647,7 +1657,7 @@ pub(crate) mod test_fixture {
             assert!(errors.is_empty(), "{errors:?}");
             let trie = build_trie(&entries, "u:object_r:default_prop:s0", "string").unwrap();
             let lock = AreaWriterLock::acquire(dir).unwrap();
-            lock.publish_property_info(&trie).unwrap();
+            lock.publish_property_info(&trie, None).unwrap();
             let sp = SystemProperties::new_area_locked(lock).unwrap();
             Self { sp, dir: guard }
         }

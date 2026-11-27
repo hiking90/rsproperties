@@ -241,12 +241,15 @@ queue, with the context `property_contexts` gives
 `ctl.<action>$<target>`: a request it denies gets
 `HANDLE_CONTROL_MESSAGE`, does not reach the handler and does not count
 toward the 102. The authorizer decides in place of SELinux, by the
-sender's pid, uid and gid, and one lookup of init's is not made: for
-`ctl.start`, `ctl.stop` and `ctl.restart` init first checks the legacy
-name `ctl.<target>` and allows the request when that check passes; here
-the context is always that of `ctl.<action>$<target>`. In a service
-without an authorizer every sender that can connect reaches the
-handler, which can refuse by the sender's `uid`, `gid` or `pid` (it has
+sender's pid, uid, gid and security label. For `ctl.start`, `ctl.stop`
+and `ctl.restart` init first checks the legacy name `ctl.<target>` and
+allows the request when that check passes; the authorizer gets that
+name's context as `SetRequest::legacy_control_context`, besides the
+context of `ctl.<action>$<target>`, and an authorizer that follows the
+SELinux policy allows the request when the policy lets the sender set
+either context. In a service without an authorizer every sender that
+can connect reaches the handler, which can refuse by the sender's
+`uid`, `gid` or `pid` (it has
 no SELinux context to check) with `reply.send(false)`; its client then
 gets the same `HANDLE_CONTROL_MESSAGE`. Such a request counts toward
 the 102 until it is answered, where init refuses it before its queue.

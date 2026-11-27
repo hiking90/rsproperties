@@ -11,11 +11,18 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
     `include/android-base/parseint.h`
   - libcutils: `system/core/libcutils/properties.cpp`
   - init: `system/core/init/property_service.cpp`
-- 지원 범위: client는 Linux와 Android, `rsproperties-service`는 Linux 전용,
-  Android 지원 API level은 28–37이다(API 37 동작은 AOSP `android-17.0.0_r1`
-  source 기준으로 구현했고, API 37 emulator에서 override 조회와 test suite를
-  실행했다. C3의 검증 항목 참고). Android에서 service를 쓰는 경로와 macOS는
-  비교 대상에서 제외한다.
+- 지원 범위: client는 Linux와 Android다. Android 지원 API level은 28–37이다
+  (API 37 동작은 AOSP `android-17.0.0_r1` source 기준으로 구현했고, API 37
+  emulator에서 override 조회와 test suite를 실행했다. C3의 검증 항목 참고).
+  `rsproperties-service`는 Linux와 Android에서 build된다. Android에서는 init의
+  property service 없이 실행되는 userspace(별도 mount namespace의 guest 등)를
+  대상으로 하고, 기기의 init을 대체하는 배포는 대상이 아니다(issue #69).
+  API 34/36/37 emulator에서 service를 enforcing인 init domain으로 실행해
+  시작, label, client 읽기, 인가를 확인했다. AOSP policy에 `allow init
+  init_tmpfs:file lock;`을 더한 policy에서 실행했다(`docs/service-security.md`의
+  "Which domain can run it").
+  service 항목의 분류 (a)는 Linux host를 기준으로 정했고, Android에서 근거가
+  달라지는 항목은 그 항목에 따로 적는다. macOS는 비교 대상에서 제외한다.
 - 분류
   - (a) Linux emulation이라서 생기는 차이
   - (b) 의도적으로 강화한 동작
@@ -43,7 +50,7 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
 | S8 | service, builder | prop 파일을 읽지 못했을 때의 반환값 | open 실패로 시작 실패는 (b) | 시작 실패는 0.6.0부터 있음, skip 반환값은 0.7.0에서 추가 |
 | S9 | service | V1(`PROP_MSG_SETPROP`) 미지원 | (b), owner 지시 | 0.7.0에서 변경(0.5.0–0.6.0은 V1을 처리했다) |
 | S10 | service | `sys.powerctl`을 일반 property로 저장 | (c), 종료 뒤 거부는 (b) | 0.7.0에서 수정. 저장하지 않고 `ServiceOptions::powerctl_handler`로 전달. 대기 command는 init과 같이 하나만 유지 |
-| S11 | service | set 요청 인가(`CheckPermissions`의 access 검사) 없음 | 판단 주체는 (a), 문자열이 아닌 값의 검사 순서와 `SO_PEERCRED` 실패 응답은 (b) | 0.7.0 다음 release에서 추가. host가 등록한 `ServiceOptions::authorizer`가 요청마다 판단. socket별 group과 mode는 `ServiceOptions::socket_access`. authorizer가 없으면 0.7.0과 같이 전부 허용 |
+| S11 | service | set 요청 인가(`CheckPermissions`의 access 검사) 없음 | 판단 주체는 (a), 문자열이 아닌 값의 검사 순서와 `SO_PEERCRED` 실패 응답은 (b) | 0.7.0 다음 release에서 추가. host가 등록한 `ServiceOptions::authorizer`가 요청마다 판단. socket별 group, mode, SELinux label은 `ServiceOptions::socket_access`. `ctl.start`·`ctl.stop`·`ctl.restart`의 legacy context도 넘긴다. authorizer가 없으면 Linux에서는 0.7.0과 같이 전부 허용하고, Android에서는 `run`이 실패한다 |
 
 ## Client
 
@@ -1233,7 +1240,16 @@ init과 다른 점은 다음과 같다.
   `selinux_android_restorecon`이 끝나면, 실패했을 때도,
   `SetProperty(kRestoreconProperty, path)`로 경로를 저장한다(`:207-211`).
   따라서 restorecon이 끝난 뒤의 값은 이 service가 저장하는 값과 같고, 차이는
-  저장 시점뿐이다. 이 service에는 restorecon을 수행할 대상이 없다. 이 문서의
+  저장 시점뿐이다. Linux에서는 restorecon을 수행할 대상이 없으므로 이 차이가
+  결과를 바꾸지 않는다. Android에서는 대상이 있지만, service는 restorecon을 하지
+  않고 `apply_set`에서 값을 바로 저장한다. 그래서 Android에서는 저장 시점의
+  차이가 동작의 차이가 된다. 값이 나타나는 것을 restorecon 완료로 보는 client는
+  이 service에서는 relabel이 끝나기 전에, 또는 relabel이 일어나지 않은 채로
+  다음 단계로 넘어간다. host가 relabel을 맡아도
+  init의 순서(relabel 뒤 저장)는 맞출 수 없다. 저장 전에 값을 받는 경로는
+  authorizer뿐인데 authorizer는 block하면 안 되고(`ServiceOptions::authorizer`
+  rustdoc), 그 밖에는 저장 뒤의 wait뿐이다(변경 hook 없음, S6). 이 값을 보내는
+  client와 그 client가 완료를 판단하는 방법은 확인 필요다. 이 문서의
   이전 판은 init이 이 값을 저장하지 않는다고 적었는데, thread의 `SetProperty`를
   빠뜨린 서술이었다.
 - 위 세 항목의 init 동작은 API 37 emulator(userdebug, `adb root`)에서
@@ -1286,7 +1302,10 @@ persist 파일을 지정하지 않아도 설정한다. init이 항상 설정하�
 init은 property가 바뀌면 `PropertyChanged`로 `on property:` trigger를
 실행한다(`:183`). service를 내장한 app이 set에 반응할 callback은 없다.
 init.rc trigger는 emulation 범위 밖이다. 따라서 parity 결함이 아니라 기능
-확장 후보로 분류한다.
+확장 후보로 분류한다. Android에서 init 없이 실행되는 userspace에도 init.rc를
+해석하는 주체가 없으므로 분류는 같다. 그런 userspace가 `on property:` action을
+필요로 하면 host가 직접 처리해야 하고, 이 service는 그 입력이 될 hook을 주지
+않는다.
 
 ### S7. properties dir writer lock — (a), 해제 방식은 (b)
 
@@ -1663,16 +1682,24 @@ service process의 fsgid였다. release build service는 root로만 시작하므
 - (a) authorizer가 없는 service. 0.7.0과 같이 접속할 수 있는 client의 요청을
   모두 허용한다. 이때 access 제어는 socket 파일의 소유자, group, mode뿐이며,
   `run`이 other bit를 거부하므로 접속할 수 있는 것은 소유 uid, group의
-  member, `CAP_DAC_OVERRIDE`를 가진 process다.
+  member, `CAP_DAC_OVERRIDE`를 가진 process다. Android에서는 같은 uid의
+  process도 SELinux domain마다 set할 수 있는 property가 다르므로, `run`은
+  authorizer 없는 option을 `StartupStage::Config`에서 거부한다(owner 결정
+  2026-11-25, `84a3d07`).
 - (a) pid 재사용. `PeerInfo`의 값은 `connect()` 시점의 신원이다. pid는 재사용될
   수 있으므로 `/proc/<pid>`를 읽어 판단하는 authorizer는 다른 process의 정보를
   읽을 수 있다. init은 kernel이 socket에 기록한 context를 `getpeercon`으로
   읽으므로 이 문제가 없다. Linux 6.5 이상에서는 `PeerInfo::pidfd`가 반환하는
   pidfd로 `connect()`를 호출한 process를 pid 재사용과 무관하게 식별할 수 있다.
-- (a) `ctl.*`의 legacy 조회 없음. `ctl.start`, `ctl.stop`, `ctl.restart`에서
-  init이 먼저 시도하는 `ctl.<target>` 이름의 context는 authorizer에 넘기지
-  않는다. owner 결정이다. 필요한 host는 `SetRequest::name`과 `value`로
-  판단한다.
+- `ctl.*`의 legacy 조회. `ctl.start`, `ctl.stop`, `ctl.restart`에서 init이
+  먼저 시도하는 `ctl.<target>` 이름의 context를
+  `SetRequest::legacy_control_context`로 넘긴다(`58856c4`). 처음에는 owner
+  결정으로 넘기지 않았다(분류 (a)). Android에서 SELinux policy로 판단하는
+  host는 이 context가 없으면 init과 같은 판단을 할 수 없다. android-17의
+  `property_contexts`에 이 형식의 항목이 7개(`ctl.bootanim` 등) 있기 때문이다.
+  그래서 owner가 2026-11-25에 결정을 바꿨다. init은 legacy 검사가 통과하면
+  허용하고, 실패하면 `ctl.<action>$<target>`으로 다시 검사한다. 이 순서를
+  따르는 판단은 authorizer가 한다.
 - (b) 문자열이 아닌 값. 값에 NUL이 있거나 값이 UTF-8이 아니면
   `read_setprop2`가 authorizer를 호출하기 전에 `PROP_ERROR_INVALID_VALUE`로
   응답한다(이름이 이름 검사에 실패하면 `PROP_ERROR_INVALID_NAME`). init은
@@ -1694,8 +1721,9 @@ service process의 fsgid였다. release build service는 root로만 시작하므
   남긴다. init은 `CheckPermissions` 실패를 source context, target context와
   함께 남긴다. 예외가 하나 있다. `ctl.*` 요청의 조회 이름
   `ctl.<action>$<target>`이 `property_contexts`의 exact entry와 일치하면
-  `rsproperties`의 trie 조회가 그 이름을 `trace` level로 출력한다. owner
-  결정으로 유지했고 `docs/service-security.md`에 적었다.
+  `rsproperties`의 trie 조회가 그 이름을 `trace` level로 출력한다.
+  `ctl.start`, `ctl.stop`, `ctl.restart`의 legacy 조회 이름 `ctl.<target>`도
+  같다. owner 결정으로 유지했고 `docs/service-security.md`에 적었다.
 - (b) uid별 connection 한도. `ServiceOptions::max_connections_per_uid`(기본값
   32)가 한 uid의 열린 connection 수를 제한하고, 한도를 넘는 connection은
   `accept` 직후 응답 없이 닫는다. connection은 `accept`부터 service가 fd를 닫을
@@ -1707,10 +1735,15 @@ service process의 fsgid였다. release build service는 root로만 시작하므
   채울 수 있다. test는 `connection_limit.rs`의 unit test와 `lib.rs`
   `connections_beyond_the_uid_limit_are_closed`,
   `unanswered_control_requests_count_toward_the_uid_limit`이다.
-- (a) read 제한 없음. Android는 context별 area 파일의 SELinux label로 읽기를
-  제한한다. 이 service의 area 파일은 모두 0444다. context별로 group을 나누는
-  방식은 area 파일의 gid 0 소유 검사(`file_validation.rs`)와 충돌하므로 이
-  변경의 범위에서 제외했다.
+- (a) Linux의 read 제한 없음. Android는 context별 area 파일의 SELinux label로
+  읽기를 제한한다. 이 service의 area 파일은 모두 0444다. Linux에서 context별로
+  group을 나누는 방식은 area 파일의 gid 0 소유 검사(`file_validation.rs`)와
+  충돌하므로 이 변경의 범위에서 제외했다. Android에서는 bionic과 같이 각 area
+  파일에 그 context를 label로 붙이므로, read 제한은 policy가 정한다. label을
+  붙이지 못하면 Android에서는 area를 만들지 않고 시작이 실패한다(`dbadbc4`,
+  init이 같은 실패에서 멈추는 동작과 같다). `property_info`의 label은
+  `ServiceOptions::property_info_label`, socket 파일의 label은
+  `SocketAccess::with_label`로 host가 준다(`322ca91`, `dd600fd`).
 
 **포기한 것.**
 - async authorizer. 요청마다 future를 boxing해야 하고, uid와 context를

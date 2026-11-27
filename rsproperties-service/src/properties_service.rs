@@ -22,8 +22,8 @@ pub(crate) struct PropertiesServiceArgs {
     pub(crate) build_prop_files: Vec<PathBuf>,
     /// The writer lock of `rsproperties::properties_dir()`, taken by `run`
     /// before either actor is spawned: the socket service must not bind
-    /// while another instance holds the lock, or it renames its sockets
-    /// over that instance's sockets. A lock for another directory
+    /// while another instance holds the lock, or it replaces that
+    /// instance's sockets (rename, or unlink on Android). A lock for another directory
     /// (compared as paths with [`Path::eq`]) makes `on_start` fail with
     /// `std::io::ErrorKind::InvalidInput` before it writes anything. The
     /// service keeps the lock until it is dropped.
@@ -31,6 +31,10 @@ pub(crate) struct PropertiesServiceArgs {
     /// Stores `persist.*` / `next_boot.*` properties in this file; see
     /// [`crate::ServiceOptions::persistent_properties_file`].
     pub(crate) persistent_properties_file: Option<PathBuf>,
+    /// The SELinux context `property_info` is published with; see
+    /// [`crate::ServiceOptions::property_info_label`]. Already checked by
+    /// `run`.
+    pub(crate) property_info_label: Option<String>,
     /// Gets the trie `on_start` publishes as `property_info`, for the
     /// socket service's authorizer calls
     /// ([`crate::authorization::Authorization`]). Sent once `on_start` has
@@ -56,8 +60,8 @@ where
 
 /// Synchronous initialisation: parses property_contexts files, builds the
 /// trie, loads build.prop files, publishes the trie as `property_info`
-/// under `lock`, and applies the build.prop entries to freshly created
-/// areas.
+/// under `lock` (with the SELinux context `property_info_label` when
+/// given), and applies the build.prop entries to freshly created areas.
 ///
 /// Every input file is read before `property_info` or any area file in
 /// `dir` is written, so a failed input file leaves the previous
@@ -78,6 +82,7 @@ fn init_system_properties_sync(
     build_prop_files: Vec<PathBuf>,
     dir: &Path,
     lock: AreaWriterLock,
+    property_info_label: Option<&str>,
 ) -> std::io::Result<(SystemProperties, PropertyInfoTrie)> {
     let mut property_infos = Vec::new();
     for file in property_contexts_files {
@@ -168,7 +173,8 @@ fn init_system_properties_sync(
             ),
         ));
     }
-    lock.publish_property_info(&data).map_err(io_other)?;
+    lock.publish_property_info(&data, property_info_label)
+        .map_err(io_other)?;
     let mut system_properties = SystemProperties::new_area_locked(lock).map_err(io_other)?;
     // `new_area_locked` starts from a freshly-created, empty area and the
     // BTreeMap keys are unique, so every key is new — `add` alone covers
@@ -369,6 +375,7 @@ impl Actor for PropertiesService {
                 args.build_prop_files,
                 dir,
                 args.writer_lock,
+                args.property_info_label.as_deref(),
             )?;
             let persistent = apply_startup_properties(&mut system_properties, persistent);
             Ok::<_, std::io::Error>((system_properties, persistent, trie))
@@ -537,13 +544,18 @@ mod tests {
         dir: &Path,
     ) -> std::io::Result<SystemProperties> {
         let lock = AreaWriterLock::acquire(dir).map_err(io_other)?;
-        init_system_properties_sync(property_contexts_files, build_prop_files, dir, lock)
+        init_system_properties_sync(property_contexts_files, build_prop_files, dir, lock, None)
             .map(|(system_properties, _trie)| system_properties)
     }
 
     /// A reader that already holds the previous `property_info` must keep
     /// seeing its bytes: the new trie is published on a new inode.
     #[test]
+    #[cfg_attr(
+        target_os = "android",
+        ignore = "Android refuses an existing property_info (rsproperties \
+                  `in_place_property_info_is_written_once`)"
+    )]
     fn property_info_republish_keeps_old_inode_intact() {
         let tmp = TempDir::new("rsprops_svc_info_inode");
         let info_path = tmp.0.join("property_info");
@@ -570,6 +582,11 @@ mod tests {
     /// A leftover group-writable `property_info` (e.g. from a run under
     /// umask 0002) must not make the service reject its own file.
     #[test]
+    #[cfg_attr(
+        target_os = "android",
+        ignore = "Android refuses an existing property_info (rsproperties \
+                  `in_place_property_info_is_written_once`)"
+    )]
     fn property_info_mode_does_not_depend_on_previous_file() {
         let tmp = TempDir::new("rsprops_svc_info_mode");
         let info_path = tmp.0.join("property_info");
@@ -837,11 +854,36 @@ mod tests {
         std::fs::create_dir_all(&props).unwrap();
         let lock = AreaWriterLock::acquire(&other).unwrap();
 
-        let err = init_system_properties_sync(vec![], vec![], &props, lock)
+        let err = init_system_properties_sync(vec![], vec![], &props, lock, None)
             .expect_err("a lock for another dir must be refused");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
         assert!(!props.join("property_info").exists());
         assert!(!other.join("property_info").exists());
+    }
+
+    /// A `property_info` label the kernel refuses fails startup before
+    /// `property_info` or any area file exists. A kernel that takes the
+    /// context (root without SELinux on a filesystem that stores the
+    /// attribute, or `mac_admin`) skips the test.
+    #[test]
+    fn refused_property_info_label_writes_no_file() {
+        const UNKNOWN: &str = "u:object_r:rsprops_no_such_type:s0";
+        let tmp = TempDir::new("rsprops_svc_info_label");
+        let props = tmp.0.join("props");
+        let lock = AreaWriterLock::acquire(&props).unwrap();
+        match init_system_properties_sync(vec![], vec![], &props, lock, Some(UNKNOWN)) {
+            Ok(_) => {
+                eprintln!("skipped: the kernel took {UNKNOWN}");
+                return;
+            }
+            Err(e) => assert!(e.to_string().contains(UNKNOWN), "{e:?}"),
+        }
+        let mut names: Vec<_> = std::fs::read_dir(&props)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, [".writer_lock"]);
     }
 
     /// `on_start`'s persistent steps: load the store at `path` (if any),
