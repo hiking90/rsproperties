@@ -60,15 +60,18 @@ and serves the property service sockets, so `rsproperties` clients can
 requests to handlers the host provides. It asks an authorizer the host
 provides whether each request may go on, where init asks SELinux; without
 an authorizer it checks no sender beyond the socket files' modes. It
-compiles only for Linux: on Android, init owns the property service.
+compiles for Linux and Android. On Android, where init normally runs the
+property service, it serves a userspace that runs without one, and `run`
+requires an authorizer
+([Running on Android](docs/service-security.md#running-on-android)).
 
 ## Platform Support
 
 | Component | Linux | Android |
 |---|---|---|
 | `rsproperties` client (`get`, `set`, `wait`) | supported | supported |
-| `builder` feature (creating property areas) | supported | — (init creates the areas) |
-| `rsproperties-service` | supported | does not compile (init owns the property service) |
+| `builder` feature (creating property areas) | supported | supported, where init does not create them |
+| `rsproperties-service` | supported | supported, for a userspace without init's property service |
 
 Supported Android versions are Android 9 (API level 28) to Android 17
 (API level 37). The Android 17 appcompat-override lookup is implemented
@@ -203,12 +206,14 @@ example `cargo test -p rsproperties-service --test integration_tests`.
 
 ### Building for Android
 
-Only `rsproperties` builds for Android. CI builds it with the Android NDK
-and [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk):
+Both crates build for Android. CI builds `rsproperties` and checks
+`rsproperties-service` with the Android NDK and
+[`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk):
 
 ```sh
 rustup target add aarch64-linux-android
 cargo ndk --target aarch64-linux-android --platform 21 build -p rsproperties --all-features
+cargo ndk --target aarch64-linux-android --platform 21 check -p rsproperties-service --all-targets --all-features
 ```
 
 The Android tests run on an emulator through the `ndk_prepare`,

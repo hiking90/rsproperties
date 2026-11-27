@@ -249,8 +249,9 @@ fn sweep_stale_temps(dirfd: &OwnedFd) {
 /// Entries this instance created directly in the socket dir, unlinked
 /// relative to `dirfd` on drop.
 ///
-/// During startup it holds each temp name once its `bind` succeeded and,
-/// after each rename, the final name in place of the temp, so a failure, a
+/// During startup it holds each name once its `bind` succeeded (a temp
+/// name, or the final name on Android) and, after each rename, the final
+/// name in place of the temp, so a failure, a
 /// panic, or a cancelled start (the `spawn_blocking` result is dropped)
 /// removes exactly what startup created. After a successful start it holds
 /// the two final names and lives in [`SocketService`], so dropping the
@@ -288,20 +289,22 @@ impl Drop for SocketDirEntries {
     }
 }
 
-/// Creates the socket for `tmp_name` and binds it at `dir/tmp_name`
-/// without listening. The file's mode is a subset of `mode`; with
-/// `label`, the file is created with that SELinux context
-/// ([`bind_labeled`]).
-fn bind_temp(
+/// Creates the socket for `name` and binds it at `dir/name` without
+/// listening, after unlinking what is at `name` relative to `dirfd`. The
+/// file's mode is a subset of `mode`; with `label`, the file is created
+/// with that SELinux context ([`bind_labeled`]).
+fn bind_socket(
     dir: &Path,
     dirfd: &OwnedFd,
-    tmp_name: &str,
+    name: &str,
     mode: u32,
     label: Option<&str>,
 ) -> Result<OwnedFd> {
-    let path = dir.join(tmp_name);
-    // Our own leftover (pid reuse, or a repeated start in this process).
-    match rustix::fs::unlinkat(dirfd, tmp_name, AtFlags::empty()) {
+    let path = dir.join(name);
+    // At a temp name, our own leftover (pid reuse, or a repeated start in
+    // this process); at a final name, an earlier run's socket, which
+    // init's `CreateSocket` unlinks the same way.
+    match rustix::fs::unlinkat(dirfd, name, AtFlags::empty()) {
         Ok(()) => {}
         Err(e) if e == Errno::NOENT => {}
         Err(e) => return Err(e).with_context_location(|| format!("unlink {path:?}")),
@@ -406,7 +409,7 @@ fn write_fscreate(label: &str) -> Result<()> {
     Err(Errno::NOENT).with_context_location(|| format!("none of {paths:?} exists"))
 }
 
-/// Gives the socket at `dir/tmp_name` `access`: its group, when `access`
+/// Gives the socket at `dir/name` `access`: its group, when `access`
 /// has one, and exactly its mode, which the umask may have narrowed at
 /// `bind`.
 ///
@@ -434,13 +437,13 @@ fn write_fscreate(label: &str) -> Result<()> {
 fn apply_socket_access(
     dir: &Path,
     dirfd: &OwnedFd,
-    tmp_name: &str,
+    name: &str,
     access: &SocketAccess,
 ) -> Result<()> {
-    let path = dir.join(tmp_name);
+    let path = dir.join(name);
     let pfd = rustix::fs::openat(
         dirfd,
-        tmp_name,
+        name,
         OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
@@ -516,24 +519,24 @@ fn chmod_opened(pfd: &OwnedFd, st: &rustix::fs::Stat, mode: Mode, fd_dirs: &[&st
     Err(Errno::NOENT).with_context_location(|| format!("none of {fd_dirs:?} exists"))
 }
 
-/// One socket up to the point where only the rename is left: bind at its
-/// temp name, group and mode set, listening. The temp name is registered
-/// in `entries` as soon as `bind` created it.
-fn prepare_temp_socket(
+/// One socket bound at `name` (a temp name, or the final name on
+/// Android), group and mode set, listening. `name` is registered in
+/// `entries` as soon as `bind` created it.
+fn prepare_socket(
     dir: &Path,
     entries: &mut SocketDirEntries,
-    tmp_name: &str,
+    name: &str,
     access: &SocketAccess,
 ) -> Result<OwnedFd> {
-    let fd = bind_temp(dir, &entries.dirfd, tmp_name, access.mode(), access.label())?;
-    entries.names.push(tmp_name.to_owned());
-    apply_socket_access(dir, &entries.dirfd, tmp_name, access)?;
+    let fd = bind_socket(dir, &entries.dirfd, name, access.mode(), access.label())?;
+    entries.names.push(name.to_owned());
+    apply_socket_access(dir, &entries.dirfd, name, access)?;
     // `listen` only after the group and mode are final (AOSP
     // `CreateSocket` order: bind → fchownat → fchmodat → listen): until
     // then a `connect` fails with ECONNREFUSED, so no connection is made
     // under an intermediate group or mode.
     // Backlog -1 (SOMAXCONN) as tokio/mio on Linux.
-    let path = dir.join(tmp_name);
+    let path = dir.join(name);
     rustix::net::listen(&fd, -1).with_context_location(|| format!("listen {path:?}"))?;
     Ok(fd)
 }
@@ -546,24 +549,32 @@ struct BoundSockets {
     entries: SocketDirEntries,
 }
 
-/// Creates the socket dir if missing, then [`bind_service_sockets_at`].
-/// The sequence and its limits are documented on [`crate::run`] ("Socket
-/// files").
+/// Creates the socket dir if missing, then [`bind_service_sockets_at`],
+/// binding at the final names on Android. The sequence and its limits are
+/// documented on [`crate::run`] ("Socket files").
 fn bind_service_sockets(dir: &Path, access: [SocketAccess; 2]) -> Result<BoundSockets> {
     ensure_socket_dir(dir)?;
     let dirfd = open_socket_dir(dir)?;
-    bind_service_sockets_at(dir, dirfd, access)
+    bind_service_sockets_at(dir, dirfd, access, cfg!(target_os = "android"))
 }
 
 /// Binds both sockets in the directory `dirfd` refers to, with `access`
 /// indexed by [`Listener::index`]. `dir` is used for `bind` and for
-/// messages; every other operation goes through `dirfd`. Both temp
-/// sockets are set up before either is renamed, so a failure on the
-/// second leaves the existing final names untouched.
+/// messages; every other operation goes through `dirfd`.
+///
+/// Without `in_place`, both temp sockets are set up before either is
+/// renamed, so a failure on the second leaves the existing final names
+/// untouched. With `in_place`, each socket is bound at its final name, as
+/// init's `CreateSocket` does: AOSP's policy gives init no `rename` on the
+/// sockets' type (`property_socket`, `private/init.te`). Each final name
+/// is then missing from its unlink to its `bind`, and a failure on the
+/// second socket also unlinks the first final name, where the earlier
+/// run's socket was replaced already.
 fn bind_service_sockets_at(
     dir: &Path,
     dirfd: OwnedFd,
     access: [SocketAccess; 2],
+    in_place: bool,
 ) -> Result<BoundSockets> {
     let mut entries = SocketDirEntries {
         dirfd,
@@ -576,27 +587,37 @@ fn bind_service_sockets_at(
     }
     sweep_stale_temps(&entries.dirfd);
 
-    let property_tmp = temp_name(PROPERTY_SERVICE_SOCKET_NAME);
-    let system_tmp = temp_name(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
-    let property = prepare_temp_socket(
+    // Unlinking or replacing a final name removes no live service's socket:
+    // the caller holds the properties dir's writer lock, and one instance
+    // serves one socket dir.
+    let bind_name = |name: &str| {
+        if in_place {
+            name.to_owned()
+        } else {
+            temp_name(name)
+        }
+    };
+    let property_name = bind_name(PROPERTY_SERVICE_SOCKET_NAME);
+    let system_name = bind_name(PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME);
+    let property = prepare_socket(
         dir,
         &mut entries,
-        &property_tmp,
+        &property_name,
         &access[Listener::Property.index()],
     )?;
-    let system = prepare_temp_socket(
+    let system = prepare_socket(
         dir,
         &mut entries,
-        &system_tmp,
+        &system_name,
         &access[Listener::System.index()],
     )?;
-    // `renameat` replaces a socket left by a crashed earlier run without a
-    // window in which the name is missing. A failure on the second rename
-    // unlinks the first final name (via `entries`): the name belonged to
-    // no live service, since the caller holds the properties dir's writer
-    // lock and one instance serves one socket dir.
-    entries.rename(dir, &property_tmp, PROPERTY_SERVICE_SOCKET_NAME)?;
-    entries.rename(dir, &system_tmp, PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME)?;
+    if !in_place {
+        // `renameat` replaces a socket left by a crashed earlier run
+        // without a window in which the name is missing. A failure on the
+        // second rename unlinks the first final name (via `entries`).
+        entries.rename(dir, &property_name, PROPERTY_SERVICE_SOCKET_NAME)?;
+        entries.rename(dir, &system_name, PROPERTY_SERVICE_FOR_SYSTEM_SOCKET_NAME)?;
+    }
     Ok(BoundSockets {
         property: property.into(),
         system: system.into(),
@@ -2025,7 +2046,7 @@ pub(crate) mod tests {
 
     /// The kernel refuses a context no policy defines, and the failed
     /// start leaves nothing in the socket dir: the `property_service`
-    /// temp, bound before the labeled one, is unlinked too. The test is
+    /// socket, bound before the labeled one, is unlinked too. The test is
     /// skipped when the kernel accepts the context (`CAP_MAC_ADMIN` with
     /// `mac_admin`, or a permissive domain), and when it accepts it at the
     /// write and refuses the `bind` with `EACCES`.
@@ -2142,11 +2163,11 @@ pub(crate) mod tests {
         assert_eq!(mode_of(&dir.0.join("a")), 0o755);
         assert_eq!(mode_of(&nested), 0o755);
         let dirfd = open_socket_dir(&dir.0).unwrap();
-        let _open = bind_temp(&dir.0, &dirfd, "umask000", SOCKET_FILE_MODE, None).unwrap();
+        let _open = bind_socket(&dir.0, &dirfd, "umask000", SOCKET_FILE_MODE, None).unwrap();
         assert_eq!(mode_of(&dir.0.join("umask000")), SOCKET_FILE_MODE);
 
         rustix::process::umask(Mode::from_raw_mode(0o077));
-        let _narrow = bind_temp(&dir.0, &dirfd, "umask077", SOCKET_FILE_MODE, None).unwrap();
+        let _narrow = bind_socket(&dir.0, &dirfd, "umask077", SOCKET_FILE_MODE, None).unwrap();
         assert_eq!(mode_of(&dir.0.join("umask077")), 0o600);
         let sockets = SocketDir::new("rsprops_svc_umask_sockets");
         let _bound = bind_service_sockets(&sockets.0, DEFAULT_ACCESS).unwrap();
@@ -2457,7 +2478,7 @@ pub(crate) mod tests {
         let dir = SocketDir::new("rsprops_svc_listen");
         let dirfd = open_socket_dir(&dir.0).unwrap();
         let tmp = temp_name(PROPERTY);
-        let fd = bind_temp(&dir.0, &dirfd, &tmp, SOCKET_FILE_MODE, None).unwrap();
+        let fd = bind_socket(&dir.0, &dirfd, &tmp, SOCKET_FILE_MODE, None).unwrap();
 
         let err = std::os::unix::net::UnixStream::connect(dir.0.join(&tmp)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
@@ -2465,34 +2486,86 @@ pub(crate) mod tests {
         std::os::unix::net::UnixStream::connect(dir.0.join(&tmp)).unwrap();
     }
 
-    /// When the second socket cannot be bound (its temp path exceeds
-    /// `sun_path`), the first is not renamed over an existing socket and
-    /// no temp is left behind.
-    #[test]
-    fn second_bind_failure_leaves_no_partial_state() {
-        // rustix `SocketAddrUnix::new` accepts up to 108 path bytes. Pick
-        // the dir length so the property temp path is 103 bytes (5 below
-        // the limit); the system temp name is 11 bytes longer (114).
+    /// A socket dir whose path joined with `name` is `len` bytes long.
+    fn socket_dir_with_path_len(label: &str, name: &str, len: usize) -> SocketDir {
+        // rustix `SocketAddrUnix::new` accepts up to 108 path bytes.
         const SUN_PATH_LIMIT: usize = 108;
-        let dir_len = SUN_PATH_LIMIT - 5 - 1 - temp_name(PROPERTY).len();
+        let dir_len = len - 1 - name.len();
         // The suffix makes `<base>_` shorter than `dir_len`.
-        let base = socket_test_dir("rsprops_svc_len", SUN_PATH_LIMIT + 1 - dir_len);
+        let base = socket_test_dir(label, SUN_PATH_LIMIT + 1 - dir_len);
         let base = format!("{}_", base.to_str().unwrap());
         assert!(base.len() < dir_len, "temp dir path too long: {base}");
         let dir = SocketDir::at(PathBuf::from(format!(
             "{base}{}",
             "x".repeat(dir_len - base.len())
         )));
-        assert_eq!(dir.0.join(temp_name(PROPERTY)).as_os_str().len(), 103);
+        assert_eq!(dir.0.join(name).as_os_str().len(), len);
+        dir
+    }
+
+    /// When the second socket cannot be bound (its temp path exceeds
+    /// `sun_path`), the first is not renamed over an existing socket and
+    /// no temp is left behind.
+    #[test]
+    fn second_bind_failure_leaves_no_partial_state() {
+        // The property temp path is 103 bytes (5 below the limit); the
+        // system temp name is 11 bytes longer (114).
+        let dir = socket_dir_with_path_len("rsprops_svc_len", &temp_name(PROPERTY), 103);
         assert_eq!(dir.0.join(temp_name(SYSTEM)).as_os_str().len(), 114);
 
         let existing = dir.0.join(PROPERTY);
         plant_socket(&existing);
         let ino = std::fs::symlink_metadata(&existing).unwrap().ino();
 
-        assert!(bind_service_sockets(&dir.0, DEFAULT_ACCESS).is_err());
+        let dirfd = open_socket_dir(&dir.0).unwrap();
+        assert!(bind_service_sockets_at(&dir.0, dirfd, DEFAULT_ACCESS, false).is_err());
         assert_eq!(std::fs::symlink_metadata(&existing).unwrap().ino(), ino);
         assert_eq!(names_in(&dir.0), [PROPERTY]);
+    }
+
+    /// Bound in place (Android), a failure on the second socket unlinks the
+    /// first final name, whose earlier socket was replaced already: what
+    /// binding without a rename gives up.
+    #[test]
+    fn in_place_second_bind_failure_unlinks_the_first_name() {
+        // The property path is 103 bytes; the system one 11 bytes longer.
+        let dir = socket_dir_with_path_len("rsprops_svc_len_ip", PROPERTY, 103);
+        assert_eq!(dir.0.join(SYSTEM).as_os_str().len(), 114);
+        plant_socket(&dir.0.join(PROPERTY));
+
+        let dirfd = open_socket_dir(&dir.0).unwrap();
+        assert!(bind_service_sockets_at(&dir.0, dirfd, DEFAULT_ACCESS, true).is_err());
+        assert!(names_in(&dir.0).is_empty(), "{:?}", names_in(&dir.0));
+    }
+
+    /// Bound in place (Android), each socket is created at its final name
+    /// with its mode, without a temp name, over an earlier run's socket
+    /// there, and listens; dropping the result unlinks both names.
+    #[test]
+    fn in_place_binds_at_the_final_names() {
+        let dir = SocketDir::new("rsprops_svc_in_place");
+        let existing = dir.0.join(PROPERTY);
+        plant_socket(&existing);
+        let refused = std::os::unix::net::UnixStream::connect(&existing).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+        // A directory at the property temp name: the temp path's unlink
+        // fails on it (`EISDIR`), and the sweep removes only sockets.
+        let temp = temp_name(PROPERTY);
+        std::fs::create_dir(dir.0.join(&temp)).unwrap();
+
+        let dirfd = open_socket_dir(&dir.0).unwrap();
+        let bound = bind_service_sockets_at(&dir.0, dirfd, DEFAULT_ACCESS, true).unwrap();
+        assert_eq!(
+            names_in(&dir.0),
+            [temp.clone(), PROPERTY.to_owned(), SYSTEM.to_owned()]
+        );
+        for name in [PROPERTY, SYSTEM] {
+            assert_eq!(mode_of(&dir.0.join(name)), SOCKET_FILE_MODE, "{name}");
+            // The planted socket had no listener: this one replaced it.
+            std::os::unix::net::UnixStream::connect(dir.0.join(name)).unwrap();
+        }
+        drop(bound);
+        assert_eq!(names_in(&dir.0), [temp]);
     }
 
     /// Both final names carry `SOCKET_FILE_MODE`, nothing else is left in
@@ -2539,30 +2612,40 @@ pub(crate) mod tests {
     /// After the socket dir's path is swapped for another directory, no
     /// unlink, rename or chmod reaches the new directory: startup fails, a
     /// file there named like a final socket keeps its inode and content,
-    /// and the opened directory gets no final names. The temp socket
-    /// `bind` created through the path is left in the new directory.
+    /// and the opened directory gets no final names. With temp names, the
+    /// temp socket `bind` created through the path is left in the new
+    /// directory; bound in place, the unlink goes to the opened directory
+    /// and the `bind` at the decoy's name fails (`EADDRINUSE`).
     #[test]
     fn operations_stay_in_opened_socket_dir() {
-        let base = SocketDir::new("rsprops_svc_swap");
-        let opened = base.0.join("sockets");
-        let moved = base.0.join("moved");
-        std::fs::create_dir(&opened).unwrap();
-        let dirfd = open_socket_dir(&opened).unwrap();
-        std::fs::rename(&opened, &moved).unwrap();
-        std::fs::create_dir(&opened).unwrap();
-        let decoy = opened.join(PROPERTY);
-        std::fs::write(&decoy, b"decoy").unwrap();
-        let ino = std::fs::symlink_metadata(&decoy).unwrap().ino();
+        for in_place in [false, true] {
+            let base = SocketDir::new(if in_place {
+                "rsprops_svc_swap_ip"
+            } else {
+                "rsprops_svc_swap"
+            });
+            let opened = base.0.join("sockets");
+            let moved = base.0.join("moved");
+            std::fs::create_dir(&opened).unwrap();
+            let dirfd = open_socket_dir(&opened).unwrap();
+            std::fs::rename(&opened, &moved).unwrap();
+            std::fs::create_dir(&opened).unwrap();
+            let decoy = opened.join(PROPERTY);
+            std::fs::write(&decoy, b"decoy").unwrap();
+            let ino = std::fs::symlink_metadata(&decoy).unwrap().ino();
 
-        assert!(bind_service_sockets_at(&opened, dirfd, DEFAULT_ACCESS).is_err());
+            assert!(bind_service_sockets_at(&opened, dirfd, DEFAULT_ACCESS, in_place).is_err());
 
-        assert_eq!(std::fs::symlink_metadata(&decoy).unwrap().ino(), ino);
-        assert_eq!(std::fs::read(&decoy).unwrap(), b"decoy");
-        assert!(names_in(&moved).is_empty(), "{:?}", names_in(&moved));
-        assert_eq!(
-            names_in(&opened),
-            [temp_name(PROPERTY), PROPERTY.to_owned()]
-        );
+            assert_eq!(std::fs::symlink_metadata(&decoy).unwrap().ino(), ino);
+            assert_eq!(std::fs::read(&decoy).unwrap(), b"decoy");
+            assert!(names_in(&moved).is_empty(), "{:?}", names_in(&moved));
+            let left = if in_place {
+                vec![PROPERTY.to_owned()]
+            } else {
+                vec![temp_name(PROPERTY), PROPERTY.to_owned()]
+            };
+            assert_eq!(names_in(&opened), left, "in_place {in_place}");
+        }
     }
 
     /// Dropping the result of a start that never reached `SocketService`

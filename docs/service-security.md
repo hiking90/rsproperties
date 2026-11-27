@@ -154,19 +154,19 @@ in the release build.
   `property_service`, `property_service_for_system`, or
   `.<either name>.tmp-<pid>`, relative to that descriptor, never
   following a symlink at those names. `bind` itself takes a path: if the
-  socket dir's path is swapped after startup opened it, the temp socket
-  is created at the new location, startup fails, and that socket is left
-  there. Any uid other than the service's and root that can write to the
+  socket dir's path is swapped after startup opened it, the socket being
+  bound is created at the new location (on Android, unless a file has
+  its name there), startup fails, and that socket is left there. Any uid other than the service's and root that can write to the
   socket dir or one of its ancestors can replace the sockets with its
   own and so impersonate the service; that is out of scope. So is what
   such a uid can do to a socket's group and mode during startup: between
-  `bind` and the `O_PATH` open of the temp name (see
+  `bind` and the `O_PATH` open of the name just bound (see
   [Socket permissions](#socket-permissions)) it can put another entry at
   that name. The `fstat` check refuses an entry that is not a socket
   owned by the service's euid, so a socket that uid bound itself fails
   startup. The check does not establish that the entry is the socket
   just bound: another socket owned by the service's euid (the service's
-  other temp socket, when the two temp names are exchanged) passes it.
+  other socket, when the two names are exchanged) passes it.
   That socket then gets the group and mode configured for this name, and
   the socket just bound listens with the group it was created with and
   its mode minus the umask's bits; startup reports no error. Keep the
@@ -210,7 +210,14 @@ What the host sets up, and what init does in its place:
   `property_service_for_system` with mode `0660` and group `system`
   (1000), both labeled `u:object_r:property_socket:s0`. The service's
   defaults are `0o660` without a label on both; pass init's values with
-  `ServiceOptions::socket_access` and `SocketAccess::with_label`.
+  `ServiceOptions::socket_access` and `SocketAccess::with_label`. On
+  Android each socket is bound at its final name after an unlink of
+  what is there, as init's `CreateSocket` does, not under a temp name
+  that is then renamed as on Linux: init's policy has no `rename` on
+  `property_socket` (`private/init.te`). On that type the service's
+  domain needs `create setattr getattr unlink`, which init's policy
+  grants. Each name is missing from its unlink to its `bind`, so start
+  the clients after `run` has returned.
 - **`property_info`.** init labels it `u:object_r:property_info:s0`;
   pass that with `ServiceOptions::property_info_label`. On Android the
   service writes the file at `property_info` itself and labels it last,
@@ -310,18 +317,38 @@ What the host sets up, and what init does in its place:
   `StartupStage::WriterLock` with that errno (`Error::Lock`, "already
   owned by another instance", is only for a lock another writer holds).
   The writer lock stays on Android: it keeps a second instance from
-  renaming its sockets over the first one's. The procedure needs a host policy
-  that adds `allow init init_tmpfs:file lock;`; no neverallow in AOSP's
-  policy covers that rule (checked in the compiled policy above).
+  unlinking the first one's sockets and binding its own. The procedure
+  needs a host policy that adds `allow init init_tmpfs:file lock;`; no
+  neverallow in AOSP's policy covers that rule (checked in the compiled
+  policy above).
 
-  This sequence is read from the policy and init's source, not
-  measured; whether the service starts this way in the `init` domain,
-  with or without that rule, was not measured either.
+  Measured on the API 34, 36 and 37 emulator images (userdebug,
+  enforcing), with the service switched to the `init` domain at its
+  start and run in a mount namespace with new `tmpfs` mounts at
+  `/dev/__properties__` and `/dev/socket`. In permissive mode the only
+  permission of the `init` domain the policy lacked was `lock` on
+  `init_tmpfs`. Enforcing, on the device's policy `run` failed at
+  `StartupStage::WriterLock` with `EACCES`; on that policy recompiled
+  with the rule above it started, the files had the labels listed
+  above, the relabel of the directory succeeded, and so did a restart
+  over sockets left by a killed instance. Stock `getprop` in the `shell`
+  and `untrusted_app` domains read the areas; `setprop` from `shell` was
+  allowed for `debug.*` and refused, by an authorizer that asks
+  selinuxfs as `selinux_check_access` does, for `sys.*`, `ro.*` and
+  `ctl.start`; `untrusted_app` could not connect (`connectto` on `init`
+  is refused, as for init's own socket).
 - **The properties dir.** Its label is the one of the directory the host
   creates or mounts; the service does not set it. That label decides the
   type each new file in it starts with, so on AOSP's policy the host
   starts with a `tmpfs` one and relabels it to `properties_device` after
-  `run` (see "Which domain can run it").
+  `run` (see "Which domain can run it"). The directory must be on a
+  `tmpfs` there in any case: the policy lets `property_type` files be
+  associated with `tmpfs` only (`allow property_type
+  tmpfs:filesystem associate;`, `private/property.te`), so on another
+  filesystem the label of each context's area is refused with `EACCES`,
+  whatever the domain (on `/data`, `ext4`: `denied { associate }`
+  against `labeledfs`), and `run` fails at
+  `StartupStage::PropertiesService`.
 - **Not provided.** The service does not create the
   `appcompat_override` directory, which only API 35–36 readers use:
   zygote bind mounts it over `/dev/__properties__`, so without it bionic
@@ -344,7 +371,7 @@ as code.
 Each socket's mode — `0o660`, or the one given to
 `ServiceOptions::socket_access` for that socket — is set on the socket
 fd before `bind`, so the file exists only with that mode minus the
-umask's bits. The temp socket is then opened as an `O_PATH|O_NOFOLLOW`
+umask's bits. The socket file is then opened as an `O_PATH|O_NOFOLLOW`
 descriptor and checked with `fstat` to be a socket owned by the
 service's euid (this does not show it to be the socket just bound; see
 the socket dir contract above). Through that descriptor a configured
@@ -353,7 +380,8 @@ any bits the mode is raised to exactly the configured mode (needs
 `/proc`: `/proc/thread-self/fd`, or `/proc/self/fd` on kernels before
 3.17). Only then does the socket `listen` — a `connect` before that
 fails with `ECONNREFUSED`. Both sockets are bound as `.<name>.tmp-<pid>`
-and renamed onto their final names only after both listen.
+and renamed onto their final names only after both listen; on Android
+each is bound at its final name instead (see "Running on Android").
 
 `run` refuses the setuid, setgid, sticky and execute bits, and, for a
 service without an authorizer, a bit for others: with such a bit, every local

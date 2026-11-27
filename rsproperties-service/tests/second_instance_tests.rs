@@ -87,8 +87,8 @@ async fn second_instance_leaves_running_service_intact() {
 /// Why the check is deterministic: `run` takes the writer lock before it
 /// spawns either actor, so without the lock no socket would be touched;
 /// were the lock missing from `run`, `run` would wait for the socket
-/// service to become ready, which renames the child's sockets over the
-/// parent's, before it handled the properties service's lock failure (and
+/// service to become ready, which replaces the parent's sockets with the
+/// child's (rename, or unlink and bind on Android), before it handled the properties service's lock failure (and
 /// stopping the child's socket service then unlinks them). If `run` stops
 /// waiting for the socket service first, this test can stop detecting that
 /// regression.
@@ -97,9 +97,7 @@ async fn second_instance(parent_dir: &Path) {
     let config = rsproperties::PropertyConfig::new()
         .properties_dir(parent_dir)
         .socket_dir(parent_dir.join("sockets"));
-    let err = match rsproperties_service::run(config, rsproperties_service::ServiceOptions::new())
-        .await
-    {
+    let err = match rsproperties_service::run(config, common::default_options()).await {
         Ok(_) => panic!("a second instance on the same properties dir must fail"),
         Err(e) => e,
     };

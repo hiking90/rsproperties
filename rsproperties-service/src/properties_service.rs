@@ -22,8 +22,8 @@ pub(crate) struct PropertiesServiceArgs {
     pub(crate) build_prop_files: Vec<PathBuf>,
     /// The writer lock of `rsproperties::properties_dir()`, taken by `run`
     /// before either actor is spawned: the socket service must not bind
-    /// while another instance holds the lock, or it renames its sockets
-    /// over that instance's sockets. A lock for another directory
+    /// while another instance holds the lock, or it replaces that
+    /// instance's sockets (rename, or unlink on Android). A lock for another directory
     /// (compared as paths with [`Path::eq`]) makes `on_start` fail with
     /// `std::io::ErrorKind::InvalidInput` before it writes anything. The
     /// service keeps the lock until it is dropped.
@@ -551,6 +551,11 @@ mod tests {
     /// A reader that already holds the previous `property_info` must keep
     /// seeing its bytes: the new trie is published on a new inode.
     #[test]
+    #[cfg_attr(
+        target_os = "android",
+        ignore = "Android refuses an existing property_info (rsproperties \
+                  `in_place_property_info_is_written_once`)"
+    )]
     fn property_info_republish_keeps_old_inode_intact() {
         let tmp = TempDir::new("rsprops_svc_info_inode");
         let info_path = tmp.0.join("property_info");
@@ -577,6 +582,11 @@ mod tests {
     /// A leftover group-writable `property_info` (e.g. from a run under
     /// umask 0002) must not make the service reject its own file.
     #[test]
+    #[cfg_attr(
+        target_os = "android",
+        ignore = "Android refuses an existing property_info (rsproperties \
+                  `in_place_property_info_is_written_once`)"
+    )]
     fn property_info_mode_does_not_depend_on_previous_file() {
         let tmp = TempDir::new("rsprops_svc_info_mode");
         let info_path = tmp.0.join("property_info");

@@ -144,11 +144,13 @@
 //! linked below lists what else the host sets up (mount namespace, the
 //! permissions the service's domain needs, and, on AOSP's policy, a
 //! `tmpfs` properties dir that the host relabels `properties_device`
-//! after [`run`] returns and before clients start; not measured). AOSP's
+//! after [`run`] returns and before clients start). AOSP's
 //! policy does not give init `lock` on the files it creates in such a
 //! directory (`init_tmpfs`), which the writer lock's `flock` needs, so on
 //! an unmodified policy [`run`] fails at [`StartupStage::WriterLock`]; the
-//! host policy has to add that permission.
+//! host policy has to add that permission. With it, the service runs this
+//! way in the `init` domain under enforcing SELinux (measured on the API
+//! 34, 36 and 37 emulators; see the security page).
 //!
 //! The `property_contexts` files are the ones init reads, in its order.
 //! init skips the four after `plat_property_contexts` when they cannot be
@@ -957,7 +959,7 @@ impl ServiceOptions {
     /// created with.
     ///
     /// The group is changed and the mode set through a descriptor of the
-    /// temp socket, after `bind` and before `listen`, so no peer connects
+    /// socket file, after `bind` and before `listen`, so no peer connects
     /// before the file has both (see "Socket files" on [`run`]). A label
     /// is given at `bind` ([`SocketAccess::with_label`]). [`run`] checks
     /// the mode and the label first, before it changes anything: a value
@@ -1614,8 +1616,9 @@ impl std::error::Error for StartupError {
 /// # Socket files
 ///
 /// Socket files are created as `socket(SOCK_CLOEXEC|SOCK_NONBLOCK)`,
-/// `fchmod(fd, mode)`, `bind` at `<socket_dir>/.<name>.tmp-<pid>`, where
-/// `mode` is 0660 or the one given to [`ServiceOptions::socket_access`].
+/// `fchmod(fd, mode)`, `bind` at `<socket_dir>/.<name>.tmp-<pid>` (on
+/// Android at `<socket_dir>/<name>`, see below), where `mode` is 0660 or
+/// the one given to [`ServiceOptions::socket_access`].
 /// With a [label](SocketAccess::with_label), the `bind` runs in a thread
 /// of its own that first writes the label to its fscreate attribute, so
 /// the file has the label from the moment its path exists (except on a
@@ -1623,7 +1626,7 @@ impl std::error::Error for StartupError {
 /// [`SocketAccess::with_label`]).
 /// The kernel creates the file with the socket's mode minus the umask, so
 /// from the moment the path exists its mode is a subset of `mode`. The
-/// temp socket is then opened `O_PATH|O_NOFOLLOW` relative to the socket
+/// socket file is then opened `O_PATH|O_NOFOLLOW` relative to the socket
 /// dir, and `fstat` must confirm a socket owned by the service's euid.
 /// Through that descriptor, a group given to `socket_access` is set
 /// (`fchownat(fd, "", -1, gid, AT_EMPTY_PATH)`), and if the umask removed
@@ -1637,6 +1640,13 @@ impl std::error::Error for StartupError {
 /// included. Both final names are unlinked when the service ends (see
 /// [`ServiceHandle`]).
 ///
+/// On Android each socket is bound at its final name instead, after an
+/// unlink of what is there, as init's `CreateSocket` does: AOSP's policy
+/// gives init no `rename` on the sockets' type (`property_socket`). Each
+/// name is then missing from its unlink to its `bind`, so start the
+/// clients after `run` has returned, and a failure on the second socket
+/// leaves no socket at the first name either.
+///
 /// The socket dir is opened once at startup; every unlink, rename and
 /// chmod is made relative to that descriptor or to a descriptor whose
 /// inode was checked with `fstat`, so the service changes no existing
@@ -1645,16 +1655,17 @@ impl std::error::Error for StartupError {
 /// `.<either name>.tmp-<pid>` there (the startup sweep removes only
 /// sockets with those prefixes), and never follows a symlink at those
 /// names. `bind` itself takes a path: if the socket dir's path is swapped
-/// after startup opened it, the temp socket is created at the new
-/// location, startup fails, and that socket is left there.
+/// after startup opened it, the socket being bound is created at the new
+/// location (on Android, unless a file has its name there), startup
+/// fails, and that socket is left there.
 ///
 /// Out of scope: any uid other than the service's euid and root that can
 /// write to the socket dir or any of its ancestors can replace the sockets
 /// with its own and so impersonate the service; nothing in the service can
-/// prevent that. Such a uid can also exchange the two temp sockets' names
+/// prevent that. Such a uid can also exchange the two sockets' names
 /// during startup, between `bind` and the `O_PATH` open: the `fstat` check
 /// confirms a socket owned by the service's euid, not the socket just
-/// bound, so the other temp socket passes it and gets the group and mode
+/// bound, so the other socket passes it and gets the group and mode
 /// meant for this name, while the socket just bound listens with the group
 /// it was created with and its mode minus the umask; startup reports no
 /// error. Keep the socket dir and its ancestors writable only by
@@ -1728,8 +1739,8 @@ pub async fn run(
     rsproperties::init(config).map_err(|e| StartupError::new(StartupStage::Config, e))?;
 
     // The writer lock is taken before either actor is spawned: a second
-    // instance on the same properties dir fails here, before it can rename
-    // its sockets over the running instance's sockets or replace
+    // instance on the same properties dir fails here, before it can replace
+    // the running instance's sockets (rename, or unlink on Android) or
     // `property_info`. (Spawning the socket service only after the
     // properties service is ready would also protect the sockets, but
     // would change the 0.6.0 startup order; the lock is enough.)
@@ -1894,6 +1905,29 @@ mod tests {
 
     use crate::socket_service::tests::{socket_suffix_len, socket_test_dir};
 
+    /// `ServiceOptions::new()`, plus an authorizer that allows every
+    /// request on Android, where `run` requires one.
+    fn test_options() -> ServiceOptions {
+        let options = ServiceOptions::new();
+        if cfg!(target_os = "android") {
+            options.authorizer(|_| Decision::Allow)
+        } else {
+            options
+        }
+    }
+
+    /// Readies `dir` for a `run` after a stopped one. On Android `run`
+    /// creates `property_info` and `properties_serial` with `O_EXCL`, so
+    /// both are removed first, in place of the new directory a host would
+    /// start on.
+    fn prepare_restart(dir: &Path) {
+        if cfg!(target_os = "android") {
+            for name in ["property_info", "properties_serial"] {
+                std::fs::remove_file(dir.join(name)).unwrap();
+            }
+        }
+    }
+
     /// `Debug` must not print the value (value-masking policy).
     #[test]
     fn test_property_message() {
@@ -1913,6 +1947,11 @@ mod tests {
     /// `run` returns before `init`, so this test leaves no process-global
     /// state behind for [`run_reports_on_start_cause`].
     #[tokio::test]
+    #[cfg_attr(
+        target_os = "android",
+        ignore = "on Android `run` refuses the missing authorizer first \
+                  (`authorizer_is_required_on_android_only`)"
+    )]
     async fn run_refuses_socket_mode_outside_0660_without_authorizer() {
         for (listener, mode) in [(Listener::Property, 0o666), (Listener::System, 0o4660)] {
             let options = ServiceOptions::new().socket_access(listener, SocketAccess::new(mode));
@@ -1991,11 +2030,7 @@ mod tests {
         let config = rsproperties::PropertyConfig::new()
             .properties_dir(dir.clone())
             .socket_dir(socket_dir);
-        let result = run(
-            config,
-            ServiceOptions::new().property_contexts_files([missing]),
-        )
-        .await;
+        let result = run(config, test_options().property_contexts_files([missing])).await;
         let _ = std::fs::remove_dir_all(&dir);
 
         let err = match result {
@@ -2113,7 +2148,7 @@ mod tests {
             .socket_dir(socket_dir.clone());
         let run_task = tokio::spawn(run(
             config,
-            ServiceOptions::new()
+            test_options()
                 .property_contexts_files([fifo.clone()])
                 .build_prop_files(build_prop_files),
         ));
@@ -2302,7 +2337,7 @@ mod tests {
 
             let result = run(
                 config,
-                ServiceOptions::new()
+                test_options()
                     .property_contexts_files([contexts])
                     .build_prop_files([dir.0.join("missing.prop")]),
             )
@@ -2347,7 +2382,7 @@ mod tests {
 
             let result = run(
                 config,
-                ServiceOptions::new().persistent_properties_file(
+                test_options().persistent_properties_file(
                     dir.0.join("missing").join("persistent_properties"),
                 ),
             )
@@ -2394,7 +2429,7 @@ mod tests {
                 .socket_dir(socket_dir.clone());
             let service = run(
                 config,
-                ServiceOptions::new().persistent_properties_file(file.clone()),
+                test_options().persistent_properties_file(file.clone()),
             )
             .await
             .unwrap();
@@ -2494,7 +2529,7 @@ mod tests {
                     rsproperties::PropertyConfig::new()
                         .properties_dir(dir.0.clone())
                         .socket_dir(socket_dir.clone()),
-                    ServiceOptions::new(),
+                    test_options(),
                 )
             };
 
@@ -2517,6 +2552,7 @@ mod tests {
             );
 
             // join: nothing has ended, so it must not return.
+            prepare_restart(&dir.0);
             let mut service = start().await.expect("run after shutdown");
             assert!(
                 tokio::time::timeout(Duration::from_millis(200), service.join())
@@ -2542,6 +2578,7 @@ mod tests {
             service.shutdown().await.unwrap();
 
             // drop
+            prepare_restart(&dir.0);
             let service = start().await.expect("run after join");
             assert!(sockets_exist(&socket_dir));
             drop(service);
@@ -2584,7 +2621,7 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new().control_handler(move |_, reply| {
+                test_options().control_handler(move |_, reply| {
                     counter.fetch_add(1, Ordering::SeqCst);
                     reply.send(true);
                 }),
@@ -2714,7 +2751,7 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new().powerctl_handler(move |msg| {
+                test_options().powerctl_handler(move |msg| {
                     let _ = requests.send(msg.clone());
                     PowerctlOutcome::Ignored
                 }),
@@ -2813,7 +2850,7 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new()
+                test_options()
                     .control_handler(move |_, reply| {
                         control_counter.fetch_add(1, Ordering::SeqCst);
                         reply.send(true);
@@ -2918,7 +2955,7 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new()
+                test_options()
                     .control_handler(move |_, reply| {
                         control_counter.fetch_add(1, Ordering::SeqCst);
                         reply.send(true);
@@ -3022,7 +3059,7 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new().control_handler(handler),
+                test_options().control_handler(handler),
             )
             .await
             .expect("run");
@@ -3088,6 +3125,11 @@ mod tests {
     /// task that first sees the sockets unlinked, which is the last step
     /// of a failed `run` that does not wait for the call.
     #[test]
+    #[cfg_attr(
+        target_os = "android",
+        ignore = "Android needs an authorizer, which waits for the trie a failed start \
+                  never sends: no handler call runs while such a start fails"
+    )]
     fn failed_run_waits_for_running_control_handler_call() {
         const TEST: &str = "tests::failed_run_waits_for_running_control_handler_call";
         if !is_child(TEST) {
@@ -3116,7 +3158,7 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new()
+                test_options()
                     .property_contexts_files([fifo.clone()])
                     .build_prop_files([dir.0.join("missing.prop")])
                     .control_handler(handler),
@@ -3239,7 +3281,7 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new().control_handler(handler),
+                test_options().control_handler(handler),
             )
             .await
             .expect("run");
@@ -3339,8 +3381,7 @@ mod tests {
                 "rsprops_svc_uid_limit",
                 socket_suffix_len("sockets"),
             ));
-            let (service, property, system) =
-                service_with_uid_limit(&dir, ServiceOptions::new()).await;
+            let (service, property, system) = service_with_uid_limit(&dir, test_options()).await;
 
             // Two connections that send nothing. The service accepts the
             // connections of one socket in the order they were made, so
@@ -3384,7 +3425,7 @@ mod tests {
             ));
             let (handler, mut passed) = deferring_handler();
             let (service, property, _system) =
-                service_with_uid_limit(&dir, ServiceOptions::new().control_handler(handler)).await;
+                service_with_uid_limit(&dir, test_options().control_handler(handler)).await;
 
             // The handler has both requests, so their connection tasks
             // have ended: the two places are held by the replies alone.
@@ -3426,7 +3467,7 @@ mod tests {
                 rsproperties::PropertyConfig::new()
                     .properties_dir(dir.0.clone())
                     .socket_dir(socket_dir.clone()),
-                ServiceOptions::new().control_handler(handler),
+                test_options().control_handler(handler),
             )
             .await
             .expect("run");

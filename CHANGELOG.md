@@ -97,7 +97,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   service. On Android `run` fails at `StartupStage::Config` when the
   options have no authorizer; `authorizer(|_| Decision::Allow)` allows
   every request. Other targets than Linux and Android still do not
-  build.
+  build. On Android each socket is bound at its final name after an
+  unlink of what is there, as init's `CreateSocket` does (Linux: under a
+  temp name, then renamed): AOSP's policy gives init no `rename` on
+  `property_socket`. Measured on API 34, 36 and 37 emulators with the
+  service in the `init` domain under enforcing SELinux: on AOSP's policy
+  plus `allow init init_tmpfs:file lock;`, the service starts on a
+  `tmpfs` properties dir, stock `getprop` in the `shell` and
+  `untrusted_app` domains reads its areas, stock `setprop` from `shell`
+  sets `debug.*`, and an authorizer that asks selinuxfs refuses the
+  `shell` domain's `sys.*`, `ro.*` and `ctl.start` sets
+  (`untrusted_app` cannot connect: the policy refuses its `connectto` on
+  `init`, as for init's own socket); on the unmodified policy `run` fails at
+  `StartupStage::WriterLock` with `EACCES`. The service's test suite
+  passes there.
 - Service: `ServiceOptions::property_info_label(context)` publishes
   `property_info` with that SELinux context, as AOSP init gives it
   `property_info` from `file_contexts`. `run` refuses an empty label or
@@ -147,7 +160,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   properties dir gets, which AOSP's policy gives no domain on
   `properties_device`; on that policy start on a `tmpfs` directory and
   relabel it `properties_device` after the writer returns, as init does
-  (see `docs/service-security.md`, not measured). That policy does not
+  (see `docs/service-security.md`; measured on API 34, 36 and 37
+  emulators). That policy does not
   give init `lock` on the files it creates there (`init_tmpfs`), which
   the `flock` of the writer lock (`AreaWriterLock::acquire`, also taken
   by `new_area`) needs, so on an unmodified policy the writer fails at
@@ -202,7 +216,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authorizer that checks both contexts init checks) and in
   `docs/service-security.md` (what the host sets up and what the service
   does not provide: the mount namespace, the properties dir's label (on
-  AOSP's policy a `tmpfs` directory relabeled after `run`, not measured),
+  AOSP's policy a `tmpfs` directory relabeled after `run`),
   the permissions the service's domain needs, no `appcompat_override`, no
   `restorecon` for `selinux.restorecon_recursive`, no V1).
 - The crate READMEs are short: a description, installation, one

@@ -110,8 +110,9 @@ impl<'a> PeerInfo<'a> {
 
     /// The sender's security label (`SO_PEERSEC`), as the security module
     /// that labels the socket formats it, without a trailing NUL. Under
-    /// SELinux it is the context (`system_u:system_r:init_t:s0`), the
-    /// value init's `getpeercon` reads. Other modules (AppArmor, Smack)
+    /// SELinux it is the context (`system_u:system_r:init_t:s0`; on
+    /// Android, for example, `u:r:shell:s0`), the value init's
+    /// `getpeercon` reads. Other modules (AppArmor, Smack)
     /// have their own format, which may hold more than a profile or label
     /// name and was not measured for this crate: read the value on the
     /// target host before comparing with it.

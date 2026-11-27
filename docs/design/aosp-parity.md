@@ -17,6 +17,10 @@ helper, init property service)과 비교해 빠뜨린 기능과 동작 차이를
   `rsproperties-service`는 Linux와 Android에서 build된다. Android에서는 init의
   property service 없이 실행되는 userspace(별도 mount namespace의 guest 등)를
   대상으로 하고, 기기의 init을 대체하는 배포는 대상이 아니다(issue #69).
+  API 34/36/37 emulator에서 service를 enforcing인 init domain으로 실행해
+  시작, label, client 읽기, 인가를 확인했다. AOSP policy에 `allow init
+  init_tmpfs:file lock;`을 더한 policy에서 실행했다(`docs/service-security.md`의
+  "Which domain can run it").
   service 항목의 분류 (a)는 Linux host를 기준으로 정했고, Android에서 근거가
   달라지는 항목은 그 항목에 따로 적는다. macOS는 비교 대상에서 제외한다.
 - 분류

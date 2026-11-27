@@ -158,9 +158,10 @@ impl SocketAccess {
     ///
     /// After `bind` the service uses the file under the label's type, so
     /// the policy must also grant its domain `sock_file getattr`,
-    /// `setattr` (when the group or mode is changed), `rename`, and
-    /// `unlink` (to replace the file a previous run left and to remove it
-    /// at shutdown) on that type. Without `getattr` [`run`](crate::run)
+    /// `setattr` (when the group or mode is changed), `rename` (except on
+    /// Android, where the file is bound at its final name, as init does),
+    /// and `unlink` (to replace the file a previous run left and to remove
+    /// it at shutdown) on that type. Without `getattr` [`run`](crate::run)
     /// fails at `StartupStage::SocketService` with `EACCES`; a refused
     /// `unlink` at shutdown leaves the file behind with a warning.
     ///
