@@ -112,14 +112,18 @@ impl<'a> PeerInfo<'a> {
     /// that labels the socket formats it, without a trailing NUL. Under
     /// SELinux it is the context (`system_u:system_r:init_t:s0`; on
     /// Android, for example, `u:r:shell:s0`), the value init's
-    /// `getpeercon` reads. Other modules (AppArmor, Smack)
-    /// have their own format, which may hold more than a profile or label
-    /// name and was not measured for this crate: read the value on the
-    /// target host before comparing with it.
+    /// `getpeercon` reads. Under AppArmor it is the profile followed by its
+    /// mode (`/usr/bin/client (enforce)`, `client (complain)`), or
+    /// `unconfined`, as measured for a single profile outside a policy
+    /// namespace (a stacked or namespaced label was not measured); compare
+    /// with the whole string, mode included. Under Smack it is the process
+    /// label (`_` unless one was set).
     ///
     /// # Errors
     ///
-    /// `ENOPROTOOPT` when no security module of the kernel labels sockets;
+    /// `ENOPROTOOPT` when no security module of the kernel labels sockets,
+    /// which includes AppArmor on some kernels (measured on Linux 6.13;
+    /// Linux 7.2 returns the label);
     /// [`io::ErrorKind::InvalidData`] for a label that is not UTF-8; any
     /// other error of `getsockopt`.
     pub fn security_label(&self) -> io::Result<String> {

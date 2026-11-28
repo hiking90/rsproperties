@@ -208,6 +208,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `…; mode left unchanged`). For a failed chmod through `/proc`: the
   mode is printed as `0o660` (0.7.0: `0660`) and the hint reads `a umask
   that keeps those bits` (0.7.0: `keeps group rw`).
+- `rsproperties` no longer depends on `pretty-hex`, which no code used.
+- Both crates' manifests drop `homepage`: it was the same URL as
+  `repository`, which crates.io still links.
 
 ### Documentation
 

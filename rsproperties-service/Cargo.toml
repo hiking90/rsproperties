@@ -6,7 +6,6 @@ authors.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/rsproperties-service"
 keywords.workspace = true
 # Not the workspace's "api-bindings": the service binds no foreign API.

@@ -680,12 +680,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pretty-hex"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4f0ef5907a6369b0ab657be63621a651e2c2c9d2eb4f0ea43b4b91bab4c9c58"
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -786,7 +780,6 @@ dependencies = [
  "env_logger",
  "libc",
  "log",
- "pretty-hex",
  "rustix",
  "thiserror",
  "tokio",
