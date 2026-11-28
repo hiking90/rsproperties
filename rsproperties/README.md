@@ -18,25 +18,26 @@ level 28) to Android 17 (API level 37).
   executor.
 - `set` over the property service socket, and `asynchronous::set` on
   tokio (`tokio` feature).
-- Creating property areas on a Linux host (`builder` feature), which
+- Creating property areas on a Linux host, or on Android where init does
+  not create them (`builder` feature), which
   [`rsproperties-service`](https://crates.io/crates/rsproperties-service)
-  uses to emulate the property service.
+  uses to serve the property service.
 
 ## Installation
 
 ```toml
 [dependencies]
-rsproperties = "0.7"
+rsproperties = "0.8"
 ```
 
 | Feature | Adds |
 |---|---|
-| `builder` | Creating property areas and `property_info` (Linux hosts) |
+| `builder` | Creating property areas and `property_info` (Linux hosts, and Android where init does not create them) |
 | `tokio` | `asynchronous::set`; the async waits need no feature |
 | `strict-file-validation` | The root-ownership check on property files in debug builds too, and refusal of a `property_info` whose owner-write bit is set |
 
-The minimum supported Rust version is 1.85. Upgrading from 0.6: see
-[Migration from 0.6.0](https://github.com/hiking90/rsproperties/blob/main/CHANGELOG.md#migration-from-060).
+The minimum supported Rust version is 1.85. Upgrading from 0.7: see
+[Migration from 0.7.0](https://github.com/hiking90/rsproperties/blob/main/CHANGELOG.md#migration-from-070).
 
 ## Example
 

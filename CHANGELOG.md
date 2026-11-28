@@ -6,7 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-1.0: minor bumps may include API changes).
 
-## [Unreleased]
+## [0.8.0] - 2026-11-28
+
+Per-request authorization in the service, and the service on Android.
+The service asks an authorizer the host provides whether each request
+may go on, where init asks SELinux (`ServiceOptions::authorizer`,
+`AccessPolicy`, and the sender's groups, security label and pidfd), sets
+the group, mode and SELinux label of its sockets and the label of
+`property_info`, and limits the connections of one uid.
+`rsproperties-service` builds for Android, for a userspace that runs
+without init's property service; there it requires an authorizer and
+creates its files and sockets the way init does. Breaking:
+`publish_property_info` takes a label, `Error::Lock` now means only that
+another writer holds the lock, an Android writer fails where 0.7.0 went
+on with unlabeled areas or over an existing properties dir, an area file
+is labeled after its mode, size and header, one uid has at most 32
+connections open, and two startup error texts change. See Migration
+from 0.7.0.
 
 ### Added
 
@@ -241,6 +257,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that cannot be read is logged at `warn` and skipped, as in the lookups
   of `SystemProperties`, and the errors are those of the types table and
   the type string.
+- `PeerInfo::security_label` and `docs/service-security.md` give the
+  label format under AppArmor (the profile followed by its mode, or
+  `unconfined`; Linux 6.13 answered `ENOPROTOOPT` for confined senders
+  too, Linux 7.2 returned the label) and Smack (the process label), in
+  place of saying it was not measured.
+- The READMEs and the `rsproperties` rustdoc say that the `builder`
+  feature also works on Android, for a userspace without init's property
+  service (0.7.0 documented it for Linux hosts only).
 
 ### Migration from 0.7.0
 

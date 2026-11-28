@@ -16,7 +16,7 @@
 //!
 //! | Feature | Adds |
 //! |---|---|
-//! | `builder` | Creating property areas and `property_info` on a Linux host: [`AreaWriterLock`], [`SystemProperties::new_area`], [`build_trie`], [`load_properties_from_file`] |
+//! | `builder` | Creating property areas and `property_info` on a Linux host, or on Android where init does not create them: [`AreaWriterLock`], [`SystemProperties::new_area`], [`build_trie`], [`load_properties_from_file`] |
 //! | `tokio` | [`asynchronous::set`], which does not block a thread while it waits for the property service. The async waits need no feature. |
 //! | `strict-file-validation` | The root-ownership check on property files also in builds with `debug-assertions`, and refusal of a `property_info` whose owner-write bit is set |
 //!
@@ -122,14 +122,18 @@
 //!
 //! # Creating property areas
 //!
-//! With the `builder` feature, a Linux host takes the directory's
+//! With the `builder` feature, a writer takes the directory's
 //! [`AreaWriterLock`], publishes `property_info` from a
 //! `property_contexts` file ([`PropertyInfoEntry::parse_from_file`],
 //! [`build_trie`]), creates the areas
 //! ([`SystemProperties::new_area_locked`]) and adds the properties, for
 //! example from build.prop files ([`load_properties_from_file`]).
 //! [`AreaWriterLock`] has the example. `rsproperties-service` does all of
-//! this and serves the socket.
+//! this and serves the socket. On Android the writer creates
+//! `property_info` and `properties_serial` at their names, as init and
+//! bionic do, so each start needs a fresh properties directory
+//! ([`AreaWriterLock::publish_property_info`],
+//! [`SystemProperties::new_area`]).
 //!
 //! # Threads and platforms
 //!
@@ -140,9 +144,10 @@
 //! writer shared between threads needs a lock of its own. `unsafe` is
 //! limited to the mmap / shared-memory layer, the `repr(transparent)`
 //! reference cast behind [`SystemProperties::as_async`], and the async
-//! waiter's load of a registered serial word. The client (reads, waits, [`set`]) supports
-//! Android and Linux; the `builder` feature is for Linux hosts, since init
-//! creates the areas on Android.
+//! waiter's load of a registered serial word. The client (reads, waits,
+//! [`set`]) and the `builder` feature support Android and Linux; on
+//! Android the `builder` feature is for a userspace without init's
+//! property service, since init otherwise creates the areas.
 //!
 //! # Upgrading
 //!
@@ -154,6 +159,7 @@
 )]
 //!
 //! [`AreaWriterLock`]: struct.AreaWriterLock.html
+//! [`AreaWriterLock::publish_property_info`]: struct.AreaWriterLock.html#method.publish_property_info
 //! [`SystemProperties::new_area`]: struct.SystemProperties.html#method.new_area
 //! [`SystemProperties::new_area_locked`]: struct.SystemProperties.html#method.new_area_locked
 //! [`build_trie`]: fn.build_trie.html
