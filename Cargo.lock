@@ -771,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "rsproperties"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "android_system_properties",
  "anyhow",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "rsproperties-service"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",

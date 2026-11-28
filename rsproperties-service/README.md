@@ -35,8 +35,8 @@ the property service, it serves a userspace that runs without one, and
 
 ```toml
 [dependencies]
-rsproperties = "0.7"
-rsproperties-service = "0.7"
+rsproperties = "0.8"
+rsproperties-service = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ```
 

@@ -17,7 +17,7 @@ description = "Linux emulation of the Android system property service, also for 
 targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
-rsproperties = { version = "0.7.0", path = "../rsproperties", features = ["builder"] }
+rsproperties = { version = "0.8.0", path = "../rsproperties", features = ["builder"] }
 rustix.workspace = true
 log.workspace = true
 tokio.workspace = true
@@ -29,7 +29,7 @@ libc = "0.2.174"
 
 [dev-dependencies]
 # `asynchronous::set` against a running service.
-rsproperties = { version = "0.7.0", path = "../rsproperties", features = ["builder", "tokio"] }
+rsproperties = { version = "0.8.0", path = "../rsproperties", features = ["builder", "tokio"] }
 env_logger.workspace = true
 ctrlc.workspace = true
 anyhow.workspace = true

@@ -11,9 +11,9 @@ service's protocol and security details are in [`docs/`](docs/):
 [service-security.md](docs/service-security.md). `docs/design/` holds
 the maintainers' design notes (in Korean).
 
-**Upgrading from 0.6:** 0.7.0 changes the API in many places (pre-1.0, a
-minor release can break it). See
-[Migration from 0.6.0](https://github.com/hiking90/rsproperties/blob/main/CHANGELOG.md#migration-from-060)
+**Upgrading from 0.7:** 0.8.0 changes a few signatures, errors and
+behaviours (pre-1.0, a minor release can break them). See
+[Migration from 0.7.0](https://github.com/hiking90/rsproperties/blob/main/CHANGELOG.md#migration-from-070)
 in the changelog.
 
 ## Crates
@@ -40,8 +40,9 @@ bionic does.
   (`AreaWatcher`), and the same waits as `async fn`s that run on any
   executor (`rsproperties::asynchronous`).
 - `builder` feature: create property areas and `property_info` on a Linux
-  host. `tokio` feature: `asynchronous::set`, which does not block a
-  thread while it waits for the property service.
+  host, or on Android where init does not create them. `tokio` feature:
+  `asynchronous::set`, which does not block a thread while it waits for
+  the property service.
 
 ### `rsproperties-service`
 
@@ -49,13 +50,13 @@ bionic does.
 [crates.io](https://crates.io/crates/rsproperties-service) ·
 [docs.rs](https://docs.rs/rsproperties-service)
 
-A Linux emulation of Android's property service, as a library: a host
-binary calls `run` on a tokio runtime and passes the handlers. It
-creates the property areas from `property_contexts` and build.prop files,
-and serves the property service sockets, so `rsproperties` clients can
-`get`, `set` and wait on a Linux host. It handles the V2 set command
-(`PROP_MSG_SETPROP2`) only, checks values against their
-`property_contexts` type, can store `persist.*` properties in AOSP's
+Android's property service as a library, for Linux hosts and for Android
+userspaces that run without init's property service: a host binary calls
+`run` on a tokio runtime and passes the handlers. It creates the property
+areas from `property_contexts` and build.prop files, and serves the
+property service sockets, so `rsproperties` and bionic clients can `get`,
+`set` and wait. It handles the V2 set command (`PROP_MSG_SETPROP2`)
+only, checks values against their `property_contexts` type, can store `persist.*` properties in AOSP's
 `persistent_properties` format, and passes `ctl.*` and `sys.powerctl`
 requests to handlers the host provides. It asks an authorizer the host
 provides whether each request may go on, where init asks SELinux; without
@@ -88,7 +89,7 @@ The client:
 
 ```toml
 [dependencies]
-rsproperties = "0.7"
+rsproperties = "0.8"
 ```
 
 Creating property areas needs the `builder` feature, and
@@ -96,18 +97,18 @@ Creating property areas needs the `builder` feature, and
 
 ```toml
 [dependencies]
-rsproperties = { version = "0.7", features = ["builder", "tokio"] }
+rsproperties = { version = "0.8", features = ["builder", "tokio"] }
 ```
 
-The Linux property service. `run` takes an `rsproperties::PropertyConfig`,
+The property service. `run` takes an `rsproperties::PropertyConfig`,
 so the service also needs `rsproperties`, and tokio for the runtime
 (`macros`, `rt-multi-thread` and `signal` are what the service README's
 examples use):
 
 ```toml
 [dependencies]
-rsproperties = "0.7"
-rsproperties-service = "0.7"
+rsproperties = "0.8"
+rsproperties-service = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ```
 
@@ -118,8 +119,8 @@ The same release from git:
 
 ```toml
 [dependencies]
-rsproperties = { git = "https://github.com/hiking90/rsproperties", tag = "v0.7.0" }
-rsproperties-service = { git = "https://github.com/hiking90/rsproperties", tag = "v0.7.0" }
+rsproperties = { git = "https://github.com/hiking90/rsproperties", tag = "v0.8.0" }
+rsproperties-service = { git = "https://github.com/hiking90/rsproperties", tag = "v0.8.0" }
 ```
 
 Take both crates from the same source: mixing crates.io and git builds
